@@ -1,0 +1,197 @@
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kawasan-broker
+  labels:
+    app: kawasan
+    component: broker
+spec:
+  serviceName: kawasan-broker-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: kawasan
+      component: broker
+  
+  # Pod Management Policy - Parallel for faster scaling
+  podManagementPolicy: Parallel
+  
+  # Update Strategy - RollingUpdate with partition support
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+  
+  template:
+    metadata:
+      labels:
+        app: kawasan
+        component: broker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9092"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Run as non-root user for security
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      
+      # Init container to set broker ID based on pod ordinal
+      initContainers:
+      - name: init-config
+        image: busybox:1.36
+        command:
+        - sh
+        - -c
+        - |
+          BROKER_ID=${HOSTNAME##*-}
+          echo "Setting broker.id=$BROKER_ID"
+          cp /tmp/config/broker.properties /tmp/config-out/broker.properties
+          sed -i "s/broker.id=0/broker.id=$BROKER_ID/" /tmp/config-out/broker.properties
+          
+          # Set advertised listeners with pod-specific hostname
+          POD_NAME=${HOSTNAME}
+          SERVICE_NAME="kawasan-broker-headless"
+          NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)
+          FQDN="${POD_NAME}.${SERVICE_NAME}.${NAMESPACE}.svc.cluster.local"
+          
+          sed -i "s|advertised.listeners=.*|advertised.listeners=PLAINTEXT://${FQDN}:9092|" /tmp/config-out/broker.properties
+          
+          cat /tmp/config-out/broker.properties
+        volumeMounts:
+        - name: config
+          mountPath: /tmp/config
+        - name: config-out
+          mountPath: /tmp/config-out
+      
+      containers:
+      - name: kawasan-broker
+        image: kawasan/broker:latest
+        imagePullPolicy: IfNotPresent
+        
+        command:
+        - /usr/local/bin/kawasan-broker
+        - --config
+        - /etc/kawasan/broker.properties
+        - --log-level
+        - info
+        
+        ports:
+        - name: kafka
+          containerPort: 9092
+          protocol: TCP
+        - name: metrics
+          containerPort: 9308
+          protocol: TCP
+        
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: KAWASAN_LOG_LEVEL
+          value: "info"
+        
+        # Liveness probe: Is the broker process running?
+        livenessProbe:
+          tcpSocket:
+            port: kafka
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        # Readiness probe: Can the broker accept requests?
+        readinessProbe:
+          tcpSocket:
+            port: kafka
+          initialDelaySeconds: 30
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        
+        # Startup probe: Give extra time for initial startup
+        startupProbe:
+          tcpSocket:
+            port: kafka
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 30
+        
+        # Resource limits and requests
+        resources:
+          requests:
+            cpu: 1000m
+            memory: 2Gi
+          limits:
+            cpu: 4000m
+            memory: 8Gi
+        
+        # Volume mounts
+        volumeMounts:
+        - name: config-out
+          mountPath: /etc/kawasan
+          readOnly: true
+        - name: data
+          mountPath: /var/lib/kawasan
+        - name: logs
+          mountPath: /var/log/kawasan
+        
+        # Security context for container
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          capabilities:
+            drop:
+            - ALL
+      
+      volumes:
+      - name: config
+        configMap:
+          name: kawasan-config
+      - name: config-out
+        emptyDir: {}
+      - name: logs
+        emptyDir: {}
+      
+      # Anti-affinity to spread brokers across nodes
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: kawasan
+                component: broker
+            topologyKey: kubernetes.io/hostname
+      
+      # Graceful shutdown with extra time for broker shutdown
+      terminationGracePeriodSeconds: 60
+  
+  # Volume claim templates for persistent storage
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      labels:
+        app: kawasan
+        component: broker
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 100Gi
+      # Uncomment and set your storage class
+      # storageClassName: fast-ssd

@@ -1,0 +1,909 @@
+#include "kawasan/broker/group_coordinator.h"
+
+#include <algorithm>
+#include <sstream>
+#include <utility>
+
+#include "kawasan/broker/monitoring/metrics_collector.h"
+#include "kawasan/common/logger.h"
+#include "kawasan/storage/log_manager.h"
+
+namespace kawasan::broker {
+
+namespace {
+// Default retention: 7 days in milliseconds
+constexpr int64_t kDefaultGroupRetentionMs = 7 * 24 * 60 * 60 * 1000LL;
+// Default member timeout: 30 seconds
+constexpr int64_t kDefaultMemberTimeoutMs = 30 * 1000LL;
+// Cleanup interval: run every 10 minutes
+constexpr int64_t kCleanupIntervalMs = 10 * 60 * 1000LL;
+}
+
+GroupCoordinator::GroupCoordinator(std::shared_ptr<OffsetManager> offset_manager,
+                                   storage::LogManager* log_manager,
+                                   std::shared_ptr<monitoring::MetricsCollector> metrics_collector)
+    : offset_manager_(std::move(offset_manager)),
+      log_manager_(log_manager),
+      metrics_collector_(std::move(metrics_collector)),
+      group_retention_ms_(kDefaultGroupRetentionMs),
+      member_timeout_ms_(kDefaultMemberTimeoutMs) {
+    Logger::info("GroupCoordinator initialized with persistent offset storage");
+}
+
+GroupCoordinator::~GroupCoordinator() {
+    stopCleanupThread();
+}
+
+GroupCoordinator::JoinGroupResult GroupCoordinator::handleJoinGroup(
+    const protocol::JoinGroupRequest& request,
+    const std::string& client_id,
+    const std::string& client_host) {
+    JoinGroupResult result;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto& group = groups_[request.groupId()];
+
+    if (group.protocol_type.empty()) {
+        group.protocol_type = request.protocolType();
+    }
+
+    if (group.protocol_name.empty()) {
+        if (!request.groupProtocols().empty()) {
+            group.protocol_name = request.groupProtocols().front().name;
+        }
+    }
+
+    if (group.protocol_name.empty()) {
+        result.error = ErrorCode::INCONSISTENT_GROUP_PROTOCOL;
+        return result;
+    }
+
+    const auto metadata = selectMetadata(request, group.protocol_name);
+    auto now = std::chrono::steady_clock::now();
+
+    std::string member_id = request.memberId();
+
+    // Phase 2.2: KIP-345 static membership. If the client supplied a
+    // group.instance.id and we've seen that instance before with a known
+    // member_id, reuse the existing member_id. This is the core static
+    // membership guarantee: a rolling restart of consumers that supply a
+    // stable group.instance.id doesn't trigger a rebalance — they reclaim
+    // their previous member_id and existing assignment.
+    if (request.groupInstanceId().has_value()) {
+        const auto& instance_id = *request.groupInstanceId();
+        for (const auto& [existing_id, existing_state] : group.members) {
+            if (existing_state.group_instance_id.has_value() &&
+                *existing_state.group_instance_id == instance_id) {
+                member_id = existing_id;
+                Logger::info("Static membership: instance '{}' reclaiming member_id '{}' in group '{}'",
+                             instance_id, member_id, request.groupId());
+                break;
+            }
+        }
+    }
+
+    // Phase 2.2: MEMBER_ID_REQUIRED handshake (KIP-394).
+    // For JoinGroup v4+, a client connecting for the first time MUST first
+    // send an empty member_id and receive a freshly-allocated one + the
+    // MEMBER_ID_REQUIRED error code; only on the second JoinGroup with that
+    // assigned member_id is the join real. We synthesize a member_id and
+    // return MEMBER_ID_REQUIRED without admitting the member. For v0–v3 we
+    // keep the legacy "fabricate a member_id and admit immediately" path so
+    // existing kafka-python clients (which don't implement the handshake)
+    // still work.
+    if (member_id.empty() && request.sessionTimeoutMs() >= 0 /* always true */) {
+        std::ostringstream oss;
+        oss << request.groupId() << "-member-" << ++member_sequence_;
+        member_id = oss.str();
+
+        // For v4+ clients we signal MEMBER_ID_REQUIRED and let the client
+        // retry with the assigned id. For older versions, fall through to
+        // the legacy admit-on-first-join path.
+        if (request.protocolType().empty() && request.groupProtocols().empty()) {
+            // Truly empty join — treat as the first-stage handshake.
+            // (Real Kafka uses the request header api_version; we approximate
+            // by checking that the request body looks like a probe.)
+            result.error = static_cast<ErrorCode>(79);  // MEMBER_ID_REQUIRED
+            result.member_id = member_id;
+            result.generation_id = -1;
+            return result;
+        }
+
+        // Phase 2.2: initialize generation_id on first member, but DO NOT
+        // bump on every subsequent join. Reason: kafka-python (and other
+        // clients that don't implement the MEMBER_ID_REQUIRED handshake)
+        // send JoinGroup with empty member_id on every rejoin after
+        // ILLEGAL_GENERATION, which causes the broker to think "new
+        // member!" and bump the generation again — triggering yet another
+        // ILLEGAL_GENERATION on the next heartbeat. That's a rebalance
+        // thrash. Full state-machine work (PreparingRebalance / sync
+        // barrier) is the proper fix; for now we hold the generation
+        // steady, which is the same conservative behavior as before this
+        // attempt.
+        if (group.generation_id == 0) {
+            group.generation_id = 1;
+            Logger::info("Group '{}' initialized at generation 1 (first member '{}')",
+                         request.groupId(), member_id);
+        }
+    }
+
+    MemberState& member = group.members[member_id];
+    member.member_id = member_id;
+    // 0A.10: preserve any previously-seen client identity if this is a known
+    // member rejoining without identity fields populated (rare in practice).
+    if (!client_id.empty()) {
+        member.client_id = client_id;
+    }
+    if (!client_host.empty()) {
+        member.client_host = client_host;
+    }
+    member.metadata = metadata;
+    member.last_heartbeat = now;
+    // Phase 2.2: persist the group_instance_id with the member so future
+    // joins from the same instance can be matched.
+    if (request.groupInstanceId().has_value()) {
+        member.group_instance_id = request.groupInstanceId();
+    }
+    // Phase 2.2: honor per-member session_timeout_ms from the JoinGroup
+    // request. We track the maximum across all members so the cleanup
+    // thread evicts using the right deadline. session_timeout_ms is clamped
+    // to a reasonable range to defend against misconfigured clients.
+    int32_t session_ms = request.sessionTimeoutMs();
+    if (session_ms < 6000) session_ms = 6000;
+    if (session_ms > 300000) session_ms = 300000;
+    if (static_cast<int64_t>(session_ms) > member_timeout_ms_) {
+        member_timeout_ms_ = session_ms;
+    }
+
+    // Update last activity for expiration tracking
+    group.last_activity = std::chrono::system_clock::now();
+
+    if (group.leader_id.empty()) {
+        group.leader_id = member_id;
+    }
+
+    // Phase 2.2: state transitions.
+    //   - Empty → CompletingRebalance when first member joins.
+    //   - Stable → CompletingRebalance + generation bump when a new
+    //     member joins an already-stable group. The bump forces existing
+    //     members to rejoin (their heartbeat at the old generation gets
+    //     ILLEGAL_GENERATION or REBALANCE_IN_PROGRESS), so the leader
+    //     can compute a fresh assignment that includes the new member.
+    if (group.kind == GroupStateKind::Stable) {
+        group.kind = GroupStateKind::CompletingRebalance;
+        group.generation_id++;
+        // Phase EX-1: count per-group rebalances.
+        group.rebalances_total.fetch_add(1, std::memory_order_relaxed);
+        // Set result generation_id to the new bumped value.
+        Logger::info("Group '{}' Stable→CompletingRebalance, generation bumped to {} (new member '{}')",
+                     request.groupId(), group.generation_id, member_id);
+    } else if (group.kind == GroupStateKind::Empty) {
+        group.kind = GroupStateKind::CompletingRebalance;
+        // Phase EX-1: count Empty→CompletingRebalance as a rebalance too.
+        group.rebalances_total.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    result.error = ErrorCode::NONE;
+    result.generation_id = group.generation_id;
+    result.protocol_name = group.protocol_name;
+    result.leader_id = group.leader_id;
+    result.member_id = member_id;
+    result.members.reserve(group.members.size());
+    for (const auto& entry : group.members) {
+        protocol::JoinGroupResponse::Member response_member;
+        response_member.member_id = entry.second.member_id;
+        response_member.metadata = entry.second.metadata;
+        result.members.push_back(std::move(response_member));
+    }
+
+    // Persist group state after member joins (async for performance)
+    persistGroupState(request.groupId(), group);
+
+    return result;
+}
+
+GroupCoordinator::SyncGroupResult GroupCoordinator::handleSyncGroup(
+    const protocol::SyncGroupRequest& request) {
+    SyncGroupResult result;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    GroupState* group = findGroup(request.groupId());
+    if (!group) {
+        result.error = ErrorCode::ILLEGAL_GENERATION;
+        return result;
+    }
+
+    if (request.generationId() != group->generation_id) {
+        result.error = ErrorCode::ILLEGAL_GENERATION;
+        return result;
+    }
+
+    auto member_it = group->members.find(request.memberId());
+    if (member_it == group->members.end()) {
+        result.error = ErrorCode::UNKNOWN_MEMBER_ID;
+        return result;
+    }
+
+    // Store assignments from the leader
+    bool leader_supplied_assignments = false;
+    for (const auto& assignment : request.assignments()) {
+        auto target = group->members.find(assignment.member_id);
+        if (target != group->members.end()) {
+            target->second.assignment = assignment.assignment;
+            leader_supplied_assignments = true;
+        }
+    }
+
+    // Phase 2.2: when the leader has supplied a fresh assignment, the
+    // group transitions out of CompletingRebalance into Stable. We use
+    // "leader supplied assignments" as the proxy because only the
+    // leader's SyncGroup carries assignments in the wire protocol.
+    if (leader_supplied_assignments && group->kind == GroupStateKind::CompletingRebalance) {
+        group->kind = GroupStateKind::Stable;
+        Logger::info("Group '{}' → Stable (generation {} assignment complete)",
+                     request.groupId(), group->generation_id);
+    }
+
+    // Return the assignment for this member
+    auto assigned = group->members.find(request.memberId());
+    if (assigned != group->members.end()) {
+        result.assignment = assigned->second.assignment;
+        assigned->second.last_heartbeat = std::chrono::steady_clock::now();
+
+        // Phase 2.2: when a follower's SyncGroup arrives before the
+        // leader has supplied assignments for this generation, return
+        // REBALANCE_IN_PROGRESS (27) so the follower retries — rather
+        // than handing back an empty assignment that the consumer
+        // would interpret as "no partitions for me, give up." This
+        // mirrors Kafka's `awaitSyncing` state in
+        // `GroupCoordinator.handleSyncGroup`.
+        if (result.assignment.empty() &&
+            group->leader_id != request.memberId() &&
+            group->kind == GroupStateKind::CompletingRebalance) {
+            result.error = static_cast<ErrorCode>(27);  // REBALANCE_IN_PROGRESS
+            result.assignment.clear();
+            return result;
+        }
+
+        // If assignment is empty, create a valid empty assignment
+        // structure for protocol compliance. This is the leader's
+        // "no partitions assigned to me" case (e.g. consumer count >
+        // partition count) and Kafka's normal-empty-result case.
+        if (result.assignment.empty()) {
+            result.assignment.resize(10, 0);
+        }
+    }
+
+    // Persist group state after successful sync (rebalance complete)
+    persistGroupState(request.groupId(), *group);
+
+    result.error = ErrorCode::NONE;
+    return result;
+}
+
+ErrorCode GroupCoordinator::handleHeartbeat(
+    const protocol::HeartbeatRequest& request) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    GroupState* group = findGroup(request.groupId());
+    if (!group) {
+        return ErrorCode::ILLEGAL_GENERATION;
+    }
+
+    // Phase 2.2: when a heartbeat arrives at a stale generation AND
+    // the group is mid-rebalance, return REBALANCE_IN_PROGRESS (27)
+    // instead of ILLEGAL_GENERATION (22). Both trigger a rejoin in
+    // kafka-python, but REBALANCE_IN_PROGRESS is the conventional
+    // signal — it tells the client "we're rebalancing right now,
+    // rejoin to participate" vs ILLEGAL_GENERATION's "your generation
+    // is too old (no information about whether rebalance is active)."
+    if (request.generationId() != group->generation_id) {
+        if (group->kind == GroupStateKind::CompletingRebalance ||
+            group->kind == GroupStateKind::PreparingRebalance) {
+            return static_cast<ErrorCode>(27);  // REBALANCE_IN_PROGRESS
+        }
+        return ErrorCode::ILLEGAL_GENERATION;
+    }
+
+    auto it = group->members.find(request.memberId());
+    if (it == group->members.end()) {
+        return ErrorCode::UNKNOWN_MEMBER_ID;
+    }
+
+    it->second.last_heartbeat = std::chrono::steady_clock::now();
+    group->last_activity = std::chrono::system_clock::now();
+
+    // Phase 2.2: signal in-progress rebalance to members at the
+    // current generation so they rejoin and the leader can compute a
+    // fresh assignment including any newly-joined members.
+    if (group->kind == GroupStateKind::PreparingRebalance ||
+        group->kind == GroupStateKind::CompletingRebalance) {
+        if (group->members.size() > 1) {
+            return static_cast<ErrorCode>(27);
+        }
+    }
+
+    return ErrorCode::NONE;
+}
+
+ErrorCode GroupCoordinator::handleLeaveGroup(const std::string& group_id,
+                                             const std::string& member_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    GroupState* group = findGroup(group_id);
+    if (!group) {
+        return ErrorCode::UNKNOWN_MEMBER_ID;
+    }
+
+    auto it = group->members.find(member_id);
+    if (it == group->members.end()) {
+        return ErrorCode::UNKNOWN_MEMBER_ID;
+    }
+
+    group->members.erase(it);
+    if (group->leader_id == member_id) {
+        group->leader_id.clear();
+        if (!group->members.empty()) {
+            group->leader_id = group->members.begin()->second.member_id;
+        }
+    }
+
+    // Phase 2.2: state transitions on leave.
+    //   - If the group is now empty, → Empty. Generation stays so a
+    //     rejoin gets ILLEGAL_GENERATION (forcing a clean handshake).
+    //   - Otherwise (others still members), → PreparingRebalance because
+    //     the assignment is now invalid — the remaining members need a
+    //     fresh assignment that doesn't reference the departed member.
+    if (group->members.empty()) {
+        group->kind = GroupStateKind::Empty;
+    } else if (group->kind == GroupStateKind::Stable) {
+        group->kind = GroupStateKind::PreparingRebalance;
+    }
+
+    // NOTE: We do NOT erase the group when it becomes empty!
+    // The group should persist with its committed offsets even when there are no active members.
+    // This allows consumers to rejoin and continue from their last committed offset.
+
+    // Persist group state after member leaves
+    persistGroupState(group_id, *group);
+
+    return ErrorCode::NONE;
+}
+
+std::vector<protocol::OffsetCommitResponse::Topic>
+GroupCoordinator::handleOffsetCommit(const protocol::OffsetCommitRequest& request,
+                                     ErrorCode& overall_error) {
+    std::vector<protocol::OffsetCommitResponse::Topic> topics;
+    overall_error = ErrorCode::NONE;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    GroupState* group = findGroup(request.groupId());
+    if (!group) {
+        Logger::warn("OffsetCommit: group '{}' not found - returning ILLEGAL_GENERATION", request.groupId());
+        overall_error = ErrorCode::ILLEGAL_GENERATION;
+    } else if (request.generationId() != group->generation_id) {
+        Logger::warn("OffsetCommit: group='{}' generation mismatch (request={}, group={}) - returning ILLEGAL_GENERATION",
+                    request.groupId(), request.generationId(), group->generation_id);
+        overall_error = ErrorCode::ILLEGAL_GENERATION;
+    } else if (!request.memberId().empty() &&
+               group->members.find(request.memberId()) == group->members.end()) {
+        // Phase 2.4: when the client supplies a member_id, it must match a
+        // current member of the group. Empty member_id is the legacy
+        // "consumer not in group" path and is allowed for backward compat
+        // (commits without a generation, simple producers committing offsets).
+        Logger::warn("OffsetCommit: group='{}' member='{}' not in members map "
+                     "- returning UNKNOWN_MEMBER_ID",
+                     request.groupId(), request.memberId());
+        overall_error = ErrorCode::UNKNOWN_MEMBER_ID;
+    }
+    // NOTE: We intentionally do NOT check if the member exists in the group anymore
+    // Kafka allows offset commits from members that have left the group
+    // This is important for auto-commit scenarios where the member might have already left
+    // but still wants to commit its final offsets
+
+    // Update last activity if group exists
+    if (group) {
+        group->last_activity = std::chrono::system_clock::now();
+    }
+
+    // Collect all offsets for batch commit (better performance)
+    std::vector<OffsetManager::OffsetCommitData> batch_offsets;
+    
+    for (const auto& topic_request : request.topics()) {
+        protocol::OffsetCommitResponse::Topic topic_response;
+        topic_response.topic = topic_request.topic;
+
+        for (const auto& partition_request : topic_request.partitions) {
+            protocol::OffsetCommitResponse::Partition partition_response;
+            partition_response.partition = partition_request.partition;
+            partition_response.error = overall_error;
+
+            if (overall_error == ErrorCode::NONE && group) {
+                // Add to batch
+                OffsetManager::OffsetCommitData data;
+                data.topic = topic_request.topic;
+                data.partition = partition_request.partition;
+                data.offset = partition_request.offset;
+                data.metadata = partition_request.metadata;
+                batch_offsets.push_back(std::move(data));
+                
+                partition_response.error = ErrorCode::NONE;
+            } else {
+                Logger::warn("OffsetCommit: group='{}' topic='{}' partition={} - FAILED (error={})",
+                           request.groupId(), topic_request.topic, partition_request.partition,
+                           static_cast<int>(overall_error));
+            }
+
+            topic_response.partitions.push_back(partition_response);
+        }
+
+        topics.push_back(std::move(topic_response));
+    }
+    
+    // Batch commit all offsets in one RocksDB write
+    if (!batch_offsets.empty() && overall_error == ErrorCode::NONE) {
+        try {
+            offset_manager_->commitOffsetBatch(request.groupId(), batch_offsets);
+            Logger::info("OffsetCommit: group='{}' committed {} offsets in batch",
+                        request.groupId(), batch_offsets.size());
+        } catch (const std::exception& e) {
+            Logger::error("OffsetCommit: Failed to batch commit offsets for group='{}': {}",
+                        request.groupId(), e.what());
+            // Update all responses to indicate error
+            for (auto& topic : topics) {
+                for (auto& partition : topic.partitions) {
+                    partition.error = ErrorCode::COORDINATOR_NOT_AVAILABLE;
+                }
+            }
+        }
+    }
+
+    return topics;
+}
+
+std::vector<protocol::OffsetFetchResponse::Topic>
+GroupCoordinator::handleOffsetFetch(const protocol::OffsetFetchRequest& request,
+                                    ErrorCode& overall_error) const {
+    std::vector<protocol::OffsetFetchResponse::Topic> topics;
+    overall_error = ErrorCode::NONE;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    const GroupState* group = findGroup(request.groupId());
+
+    for (const auto& topic_request : request.topics()) {
+        protocol::OffsetFetchResponse::Topic topic_response;
+        topic_response.topic = topic_request.topic;
+
+        for (const auto& partition_request : topic_request.partitions) {
+            protocol::OffsetFetchResponse::Partition partition_response;
+            partition_response.partition = partition_request.partition;
+            // 1.12 (unset offset fix): Kafka's wire contract says the unset
+            // offset is -1, NOT 0. Returning 0 silently re-positioned every
+            // never-committed consumer to the beginning of the partition,
+            // causing duplicate reprocessing.
+            partition_response.offset = -1;
+            partition_response.metadata = "";
+            partition_response.error = ErrorCode::NONE;
+
+            if (group) {
+                // Fetch offset from OffsetManager (persistent storage)
+                auto offset_metadata = offset_manager_->fetchOffsetWithMetadata(
+                    request.groupId(),
+                    topic_request.topic,
+                    partition_request.partition
+                );
+
+                if (offset_metadata.has_value()) {
+                    partition_response.offset = offset_metadata->offset;
+                    partition_response.metadata = offset_metadata->metadata;
+                    Logger::info("OffsetFetch: group='{}' topic='{}' partition={} -> offset={} (FOUND in persistent storage)",
+                                 request.groupId(), topic_request.topic, partition_request.partition,
+                                 partition_response.offset);
+                } else {
+                    Logger::info("OffsetFetch: group='{}' topic='{}' partition={} -> offset=-1 (NOT FOUND, returning Kafka unset sentinel)",
+                                 request.groupId(), topic_request.topic, partition_request.partition);
+                }
+            } else {
+                Logger::info("OffsetFetch: group='{}' NOT FOUND, topic='{}' partition={} -> returning offset=-1",
+                             request.groupId(), topic_request.topic, partition_request.partition);
+            }
+
+            topic_response.partitions.push_back(std::move(partition_response));
+        }
+
+        topics.push_back(std::move(topic_response));
+    }
+
+    return topics;
+}
+
+GroupCoordinator::GroupState* GroupCoordinator::findGroup(
+    const std::string& group_id) {
+    auto it = groups_.find(group_id);
+    if (it == groups_.end()) {
+        return nullptr;
+    }
+    return &it->second;
+}
+
+const GroupCoordinator::GroupState* GroupCoordinator::findGroup(
+    const std::string& group_id) const {
+    auto it = groups_.find(group_id);
+    if (it == groups_.end()) {
+        return nullptr;
+    }
+    return &it->second;
+}
+
+std::vector<uint8_t> GroupCoordinator::selectMetadata(
+    const protocol::JoinGroupRequest& request, const std::string& protocol_name) {
+    for (const auto& protocol : request.groupProtocols()) {
+        if (protocol.name == protocol_name) {
+            return protocol.metadata;
+        }
+    }
+
+    if (!request.groupProtocols().empty()) {
+        return request.groupProtocols().front().metadata;
+    }
+
+    return {};
+}
+
+std::vector<protocol::DescribeGroupsResponse::Group> GroupCoordinator::describeGroups(
+    const std::vector<std::string>& group_ids) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<protocol::DescribeGroupsResponse::Group> groups;
+    groups.reserve(group_ids.size());
+
+    for (const auto& group_id : group_ids) {
+        protocol::DescribeGroupsResponse::Group group_response;
+        group_response.group_id = group_id;
+
+        const GroupState* group = findGroup(group_id);
+        if (!group) {
+            group_response.error_code = ErrorCode::NONE;
+            group_response.group_state = "Dead";
+            group_response.protocol_type = "";
+            group_response.protocol_data = "";
+        } else {
+            group_response.error_code = ErrorCode::NONE;
+            // Phase 2.2: report the explicit state-machine kind.
+            group_response.group_state = stateKindName(group->kind);
+            group_response.protocol_type = group->protocol_type;
+            group_response.protocol_data = group->protocol_name;
+
+            group_response.members.reserve(group->members.size());
+            for (const auto& [member_id, member_state] : group->members) {
+                protocol::DescribeGroupsResponse::Member member_response;
+                member_response.member_id = member_state.member_id;
+                // 0A.10: report the real client.id and peer address learned at
+                // JoinGroup time; fall back to legacy "unknown" only if missing.
+                member_response.client_id =
+                    member_state.client_id.empty() ? "unknown" : member_state.client_id;
+                member_response.client_host =
+                    member_state.client_host.empty() ? "unknown" : member_state.client_host;
+                member_response.member_metadata = member_state.metadata;
+                member_response.member_assignment = member_state.assignment;
+                group_response.members.push_back(std::move(member_response));
+            }
+        }
+
+        groups.push_back(std::move(group_response));
+    }
+
+    return groups;
+}
+
+std::vector<protocol::ListGroupsResponse::Group> GroupCoordinator::listGroups() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<protocol::ListGroupsResponse::Group> groups;
+    groups.reserve(groups_.size());
+
+    for (const auto& [group_id, group_state] : groups_) {
+        protocol::ListGroupsResponse::Group group;
+        group.group_id = group_id;
+        group.protocol_type = group_state.protocol_type;
+        // Phase 2.2: report the explicit state-machine kind.
+        group.group_state = stateKindName(group_state.kind);
+        groups.push_back(std::move(group));
+    }
+
+    return groups;
+}
+
+void GroupCoordinator::loadGroupsFromStorage() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    // Get all group IDs from offset manager
+    auto group_ids = offset_manager_->listGroups();
+    
+    Logger::info("Loading {} groups from persistent storage", group_ids.size());
+    
+    for (const auto& group_id : group_ids) {
+        auto metadata_opt = offset_manager_->loadGroupMetadata(group_id);
+        if (!metadata_opt) {
+            Logger::warn("Failed to load metadata for group: {}", group_id);
+            continue;
+        }
+        
+        const auto& metadata = *metadata_opt;
+        
+        // Restore group state
+        GroupState& group = groups_[group_id];
+        group.generation_id = metadata.generation;
+        group.protocol_type = metadata.protocol_type;
+        group.protocol_name = metadata.protocol;
+        group.last_activity = std::chrono::system_clock::time_point(
+            std::chrono::milliseconds(metadata.last_update_timestamp));
+        
+        // Restore members
+        for (const auto& member_meta : metadata.members) {
+            MemberState member;
+            member.member_id = member_meta.member_id;
+            // 0A.10: restore identity from persisted metadata (treat the legacy
+            // sentinel "unknown" as missing so a later JoinGroup can repopulate).
+            if (member_meta.client_id != "unknown") {
+                member.client_id = member_meta.client_id;
+            }
+            if (member_meta.client_host != "unknown") {
+                member.client_host = member_meta.client_host;
+            }
+            member.metadata = member_meta.metadata;
+            member.assignment = member_meta.assignment;
+            member.last_heartbeat = std::chrono::steady_clock::now();
+            
+            group.members[member.member_id] = std::move(member);
+            
+            // Set leader if not set
+            if (group.leader_id.empty()) {
+                group.leader_id = member_meta.member_id;
+            }
+        }
+        
+        Logger::info("Restored group: {} (state={}, generation={}, members={})",
+                    group_id, metadata.state, metadata.generation, metadata.members.size());
+    }
+}
+
+void GroupCoordinator::persistGroupState(const std::string& group_id, const GroupState& group) {
+    // Convert GroupState to GroupMetadata
+    OffsetManager::GroupMetadata metadata;
+    
+    // Determine state based on members
+    if (group.members.empty()) {
+        metadata.state = "Empty";
+    } else {
+        metadata.state = "Stable";
+    }
+    
+    metadata.protocol_type = group.protocol_type;
+    metadata.protocol = group.protocol_name;
+    metadata.generation = group.generation_id;
+    metadata.last_update_timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    
+    // Convert members
+    for (const auto& [member_id, member_state] : group.members) {
+        OffsetManager::MemberMetadata member_meta;
+        member_meta.member_id = member_state.member_id;
+        // 0A.10: persist the real identity so it survives broker restart.
+        member_meta.client_id =
+            member_state.client_id.empty() ? "unknown" : member_state.client_id;
+        member_meta.client_host =
+            member_state.client_host.empty() ? "unknown" : member_state.client_host;
+        member_meta.metadata = member_state.metadata;
+        member_meta.assignment = member_state.assignment;
+
+        metadata.members.push_back(std::move(member_meta));
+    }
+    
+    try {
+        offset_manager_->saveGroupMetadata(group_id, metadata);
+        Logger::debug("Persisted group state: {} (state={}, generation={}, members={})",
+                     group_id, metadata.state, metadata.generation, metadata.members.size());
+    } catch (const std::exception& e) {
+        Logger::error("Failed to persist group state for {}: {}", group_id, e.what());
+    }
+}
+
+void GroupCoordinator::startCleanupThread() {
+    if (cleanup_running_.load()) {
+        Logger::warn("Cleanup thread already running");
+        return;
+    }
+    
+    cleanup_running_.store(true);
+    cleanup_thread_ = std::thread(&GroupCoordinator::cleanupExpiredGroups, this);
+    Logger::info("Started group cleanup thread (retention={}ms, interval={}ms)",
+                 group_retention_ms_, kCleanupIntervalMs);
+}
+
+void GroupCoordinator::stopCleanupThread() {
+    if (!cleanup_running_.load()) {
+        return;
+    }
+    
+    cleanup_running_.store(false);
+    cleanup_cv_.notify_all();
+    
+    if (cleanup_thread_.joinable()) {
+        cleanup_thread_.join();
+    }
+    
+    Logger::info("Stopped group cleanup thread");
+}
+
+void GroupCoordinator::cleanupExpiredGroups() {
+    while (cleanup_running_.load()) {
+        // Wait for the cleanup interval or until stopped
+        {
+            std::unique_lock<std::mutex> lock(cleanup_mutex_);
+            cleanup_cv_.wait_for(lock, std::chrono::milliseconds(kCleanupIntervalMs),
+                                [this] { return !cleanup_running_.load(); });
+        }
+        
+        if (!cleanup_running_.load()) {
+            break;
+        }
+        
+        // Check for timed-out members first
+        checkMemberTimeouts();
+        
+        // Scan for expired groups
+        auto now = std::chrono::system_clock::now();
+        std::vector<std::string> expired_groups;
+        
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            
+            for (const auto& [group_id, group_state] : groups_) {
+                // Only expire groups with no active members
+                if (group_state.members.empty()) {
+                    auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - group_state.last_activity).count();
+                    
+                    if (age_ms > group_retention_ms_) {
+                        expired_groups.push_back(group_id);
+                    }
+                }
+            }
+        }
+        
+        // Delete expired groups (outside the main lock to avoid long critical section)
+        for (const auto& group_id : expired_groups) {
+            try {
+                // Delete from storage
+                offset_manager_->deleteGroup(group_id);
+                
+                // Remove from in-memory map
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    groups_.erase(group_id);
+                }
+                
+                Logger::info("Deleted expired group: {} (no activity for >{}ms)",
+                            group_id, group_retention_ms_);
+            } catch (const std::exception& e) {
+                Logger::error("Failed to delete expired group {}: {}", group_id, e.what());
+            }
+        }
+        
+        if (!expired_groups.empty()) {
+            Logger::info("Cleanup completed: deleted {} expired groups", expired_groups.size());
+        }
+    }
+}
+
+void GroupCoordinator::checkMemberTimeouts() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto now = std::chrono::steady_clock::now();
+    
+    for (auto& [group_id, group_state] : groups_) {
+        std::vector<std::string> timed_out_members;
+        
+        // Find timed-out members
+        for (const auto& [member_id, member_state] : group_state.members) {
+            auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - member_state.last_heartbeat).count();
+            
+            if (age_ms > member_timeout_ms_) {
+                timed_out_members.push_back(member_id);
+            }
+        }
+        
+        // Remove timed-out members
+        for (const auto& member_id : timed_out_members) {
+            group_state.members.erase(member_id);
+            // Phase EX-1: count per-broker member timeouts.
+            member_timeout_total_.fetch_add(1, std::memory_order_relaxed);
+
+            // Update leader if necessary
+            if (group_state.leader_id == member_id) {
+                group_state.leader_id.clear();
+                if (!group_state.members.empty()) {
+                    group_state.leader_id = group_state.members.begin()->first;
+                }
+            }
+
+            Logger::info("Evicted timed-out member: group={}, member={} (no heartbeat for >{}ms)",
+                        group_id, member_id, member_timeout_ms_);
+        }
+        
+        // Persist group state if members were evicted
+        if (!timed_out_members.empty()) {
+            group_state.last_activity = std::chrono::system_clock::now();
+            persistGroupState(group_id, group_state);
+        }
+    }
+}
+
+void GroupCoordinator::computeAndRecordConsumerLag() {
+    // Cannot compute lag without log_manager or metrics_collector
+    if (!log_manager_ || !metrics_collector_) {
+        return;
+    }
+
+    // Step 1: Quickly collect group IDs under lock
+    std::vector<std::string> group_ids;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        group_ids.reserve(groups_.size());
+        for (const auto& [group_id, group_state] : groups_) {
+            // Only compute lag for groups with committed offsets
+            if (group_state.generation_id > 0) {
+                group_ids.push_back(group_id);
+            }
+        }
+    }
+
+    // Step 2: Process groups outside the lock to avoid blocking consumer operations
+    for (const auto& group_id : group_ids) {
+        // Get all committed offsets for this group (RocksDB I/O)
+        auto committed_offsets = offset_manager_->fetchAllOffsets(group_id);
+
+        // Skip if no offsets committed yet
+        if (committed_offsets.empty()) {
+            continue;
+        }
+
+        for (const auto& [topic_partition, committed_offset] : committed_offsets) {
+            const auto& topic = topic_partition.first;
+            const auto& partition = topic_partition.second;
+
+            // Get log end offset
+            auto* log = log_manager_->getLog(topic, partition);
+            if (!log) {
+                // Log doesn't exist, skip
+                continue;
+            }
+
+            int64_t log_end_offset = log->logEndOffset();
+            int64_t lag = log_end_offset - committed_offset;
+
+            // Lag should not be negative
+            if (lag < 0) {
+                lag = 0;
+            }
+
+            // Record the lag metric (thread-safe)
+            metrics_collector_->setConsumerLag(group_id, topic, partition, lag);
+        }
+    }
+}
+
+GroupCoordinator::Metrics GroupCoordinator::getMetrics() const {
+    Metrics m{};
+    m.member_timeout_total = member_timeout_total_.load(std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(mutex_);
+    m.groups.reserve(groups_.size());
+    for (const auto& [group_id, gs] : groups_) {
+        GroupMetric gm;
+        gm.group_id = group_id;
+        gm.state = stateKindName(gs.kind);
+        gm.rebalances_total = gs.rebalances_total.load(std::memory_order_relaxed);
+        m.groups.push_back(std::move(gm));
+    }
+    return m;
+}
+
+}  // namespace kawasan::broker
+

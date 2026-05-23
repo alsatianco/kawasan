@@ -1,0 +1,42 @@
+# Candidate Docker-Compose: locally-built Kawasan broker.
+#
+# 0B.1: pairs with docker-compose.kafka.yml — same external surface (port
+# 9092 PLAINTEXT, default settings, durable volume), different broker
+# implementation. The harness scripts in scripts/ are agnostic about which
+# of the two stacks they hit, and the run_all.sh orchestrator passes the
+# right one based on the `kafka` vs `kawasan` argument.
+#
+# The Kawasan image is built from the repo root Dockerfile; bring it up
+# from this directory with:
+#   docker compose -f docker-compose.kawasan.yml up --build -d
+#   ./scripts/run_all.sh kawasan
+#   docker compose -f docker-compose.kawasan.yml down -v
+
+services:
+  kawasan:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: kawasan-harness-candidate
+    hostname: kawasan
+    ports:
+      - "9092:9092"
+      - "9094:9094"      # /metrics, /readiness, /liveness
+    environment:
+      # The image entrypoint reads KAWASAN_* env vars (now that 0A.14 unifies
+      # the JSON/properties config formats, either format works).
+      KAWASAN_BROKER_ID: "0"
+      KAWASAN_HOST: "localhost"
+      KAWASAN_PORT: "9092"
+      KAWASAN_LOG_DIR: "/var/lib/kawasan/data"
+      KAWASAN_LOG_LEVEL: "info"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9092"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - kawasan-data:/var/lib/kawasan/data
+
+volumes:
+  kawasan-data:

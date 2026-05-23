@@ -1,0 +1,203 @@
+{{- if eq .Values.deploymentType "statefulset" }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "kawasan.fullname" . }}
+  labels:
+    {{- include "kawasan.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "kawasan.fullname" . }}-headless
+  replicas: {{ .Values.replicaCount }}
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "kawasan.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "kawasan.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "kawasan.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      
+      initContainers:
+      - name: init-config
+        image: busybox:1.36
+        command:
+        - sh
+        - -c
+        - |
+          BROKER_ID=${HOSTNAME##*-}
+          echo "Setting broker.id=$BROKER_ID"
+          cp /tmp/config/broker.properties /tmp/config-out/broker.properties
+          sed -i "s/broker.id=0/broker.id=$BROKER_ID/" /tmp/config-out/broker.properties
+          
+          # Set advertised listeners with pod-specific hostname
+          POD_NAME=${HOSTNAME}
+          SERVICE_NAME="{{ include "kawasan.fullname" . }}-headless"
+          NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)
+          FQDN="${POD_NAME}.${SERVICE_NAME}.${NAMESPACE}.svc.cluster.local"
+          
+          sed -i "s|advertised.listeners=.*|advertised.listeners=PLAINTEXT://${FQDN}:{{ .Values.service.port }}|" /tmp/config-out/broker.properties
+          
+          cat /tmp/config-out/broker.properties
+        volumeMounts:
+        - name: config
+          mountPath: /tmp/config
+        - name: config-out
+          mountPath: /tmp/config-out
+      
+      containers:
+      - name: kawasan-broker
+        securityContext:
+          {{- toYaml .Values.securityContext | nindent 12 }}
+        image: {{ include "kawasan.image" . }}
+        imagePullPolicy: {{ include "kawasan.imagePullPolicy" . }}
+        command:
+        - /usr/local/bin/kawasan-broker
+        - --config
+        - /etc/kawasan/broker.properties
+        - --log-level
+        - {{ .Values.logging.level }}
+        ports:
+        - name: kafka
+          containerPort: 9092
+          protocol: TCP
+        {{- if .Values.metrics.enabled }}
+        - name: metrics
+          containerPort: {{ .Values.metrics.port }}
+          protocol: TCP
+        {{- end }}
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        {{- with .Values.extraEnv }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.livenessProbe.enabled }}
+        livenessProbe:
+          tcpSocket:
+            port: kafka
+          initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+          periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+          timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds }}
+          failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
+        {{- end }}
+        {{- if .Values.readinessProbe.enabled }}
+        readinessProbe:
+          tcpSocket:
+            port: kafka
+          initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
+          periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+          timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds }}
+          failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
+        {{- end }}
+        {{- if .Values.startupProbe.enabled }}
+        startupProbe:
+          tcpSocket:
+            port: kafka
+          initialDelaySeconds: {{ .Values.startupProbe.initialDelaySeconds }}
+          periodSeconds: {{ .Values.startupProbe.periodSeconds }}
+          timeoutSeconds: {{ .Values.startupProbe.timeoutSeconds }}
+          failureThreshold: {{ .Values.startupProbe.failureThreshold }}
+        {{- end }}
+        resources:
+          {{- toYaml .Values.resources | nindent 12 }}
+        volumeMounts:
+        - name: config-out
+          mountPath: /etc/kawasan
+          readOnly: true
+        - name: data
+          mountPath: /var/lib/kawasan
+        - name: logs
+          mountPath: /var/log/kawasan
+        {{- with .Values.extraVolumeMounts }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      
+      volumes:
+      - name: config
+        configMap:
+          name: {{ include "kawasan.fullname" . }}-config
+      - name: config-out
+        emptyDir: {}
+      - name: logs
+        emptyDir: {}
+      {{- with .Values.extraVolumes }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+      
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      {{- if eq .podAntiAffinity.type "required" }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                {{- include "kawasan.selectorLabels" $ | nindent 16 }}
+            topologyKey: {{ .podAntiAffinity.topologyKey }}
+      {{- else }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  {{- include "kawasan.selectorLabels" $ | nindent 18 }}
+              topologyKey: {{ .podAntiAffinity.topologyKey }}
+      {{- end }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+  
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      labels:
+        {{- include "kawasan.labels" . | nindent 8 }}
+      {{- with .Values.persistence.annotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      accessModes:
+      - {{ .Values.persistence.accessMode }}
+      resources:
+        requests:
+          storage: {{ .Values.persistence.size }}
+      {{- if .Values.persistence.storageClass }}
+      storageClassName: {{ .Values.persistence.storageClass }}
+      {{- end }}
+  {{- end }}
+{{- end }}

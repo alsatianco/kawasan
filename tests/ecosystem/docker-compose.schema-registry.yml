@@ -1,0 +1,34 @@
+# Phase 5.3 gauntlet: Confluent Schema Registry against Kawasan.
+#
+# This compose runs Schema Registry pointed at a Kawasan broker exposed
+# on localhost:9092. Schema Registry uses the broker as its storage
+# layer (writes schemas to the `_schemas` topic and reads them back on
+# startup), so a successful boot + schema register + retrieval validates
+# Produce/Fetch/CreateTopics/Metadata at the Java-client wire-protocol
+# level.
+#
+# Usage (kawasan running natively on host port 9092):
+#   docker compose -f docker-compose.schema-registry.yml up -d schema-registry
+#   # ...then bash scripts/13_schema_registry.sh
+#   docker compose -f docker-compose.schema-registry.yml down -v
+#
+# Note: `host.docker.internal` resolves to the host from inside the
+# container on Docker Desktop / OrbStack / colima. On native Linux you
+# may need `--add-host=host.docker.internal:host-gateway`.
+
+services:
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.5.0
+    container_name: kawasan-schema-registry
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://host.docker.internal:9092
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC: _schemas
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: "1"
+      SCHEMA_REGISTRY_KAFKASTORE_INIT_TIMEOUT_MS: "30000"
+      SCHEMA_REGISTRY_DEBUG: "true"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

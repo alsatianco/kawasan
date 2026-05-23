@@ -1,0 +1,61 @@
+# Prometheus configuration for Kawasan broker monitoring
+
+global:
+  scrape_interval: 15s      # Default scrape interval
+  evaluation_interval: 15s  # How frequently to evaluate rules
+  external_labels:
+    cluster: 'kawasan-cluster'
+    environment: 'production'
+
+# Alertmanager configuration (optional)
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          # - 'alertmanager:9093'
+
+# Load rules once and periodically evaluate them
+rule_files:
+  - 'alerts.yml'
+
+# Scrape configurations
+scrape_configs:
+  # Kawasan broker metrics
+  - job_name: 'kawasan-broker'
+    static_configs:
+      - targets: ['localhost:8080']  # HTTP monitoring port
+        labels:
+          instance: 'broker-1'
+          datacenter: 'dc1'
+    
+    # For multiple brokers in a cluster, add more targets:
+    # - targets: ['broker-1:8080', 'broker-2:8080', 'broker-3:8080']
+
+  # Kubernetes service discovery (if running in Kubernetes)
+  # - job_name: 'kawasan-k8s'
+  #   kubernetes_sd_configs:
+  #     - role: pod
+  #       namespaces:
+  #         names:
+  #           - kawasan
+  #   relabel_configs:
+  #     - source_labels: [__meta_kubernetes_pod_label_app]
+  #       action: keep
+  #       regex: kawasan-broker
+  #     - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+  #       action: keep
+  #       regex: true
+  #     - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+  #       action: replace
+  #       target_label: __metrics_path__
+  #       regex: (.+)
+  #     - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+  #       action: replace
+  #       regex: ([^:]+)(?::\d+)?;(\d+)
+  #       replacement: $1:$2
+  #       target_label: __address__
+
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

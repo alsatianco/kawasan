@@ -1,0 +1,60 @@
+[Unit]
+Description=Kawasan Broker Service
+Documentation=https://github.com/yourusername/kawasan
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kawasan
+Group=kawasan
+
+# Working directory
+WorkingDirectory=/opt/kawasan
+
+# Environment
+Environment="KAWASAN_HOME=/opt/kawasan"
+Environment="KAWASAN_LOG_DIR=/var/log/kawasan"
+Environment="KAWASAN_DATA_DIR=/var/lib/kawasan"
+
+# Start command
+ExecStart=/usr/local/bin/kawasan-broker \
+    --config /etc/kawasan/broker.properties \
+    --log-level info
+
+# Graceful shutdown (SIGTERM with 30s timeout)
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Restart policy
+Restart=on-failure
+RestartSec=10s
+StartLimitInterval=300s
+StartLimitBurst=5
+
+# Resource limits
+LimitNOFILE=100000
+LimitNPROC=32768
+TasksMax=infinity
+
+# CPU and Memory limits (adjust based on your hardware)
+# Uncomment and adjust these values as needed:
+# CPUQuota=400%
+# MemoryMax=4G
+# MemoryHigh=3G
+
+# Security hardening
+# NoNewPrivileges=true
+# PrivateTmp=true
+# ProtectSystem=strict
+# ProtectHome=true
+# ReadWritePaths=/var/lib/kawasan /var/log/kawasan
+
+# Standard output/error to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kawasan-broker
+
+[Install]
+WantedBy=multi-user.target

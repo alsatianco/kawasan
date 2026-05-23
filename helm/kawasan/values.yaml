@@ -1,0 +1,222 @@
+# Default values for kawasan.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# Image configuration
+image:
+  repository: kawasan/broker
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Deployment type: "statefulset" or "deployment"
+# Use "statefulset" for production with persistent storage
+deploymentType: statefulset
+
+# Replica configuration
+replicaCount: 3
+
+# Service account
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# Pod annotations
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "9092"
+  prometheus.io/path: "/metrics"
+
+# Pod security context
+podSecurityContext:
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  runAsNonRoot: true
+
+# Container security context
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  capabilities:
+    drop:
+    - ALL
+
+# Service configuration
+service:
+  type: ClusterIP
+  port: 9092
+  metricsPort: 9308
+  annotations: {}
+  
+  # Headless service for StatefulSet
+  headless:
+    enabled: true
+
+# Resource limits and requests
+resources:
+  requests:
+    cpu: 1000m
+    memory: 2Gi
+  limits:
+    cpu: 4000m
+    memory: 8Gi
+
+# Persistent storage
+persistence:
+  enabled: true
+  storageClass: ""  # Use default storage class if empty
+  accessMode: ReadWriteOnce
+  size: 100Gi
+  annotations: {}
+
+# Broker configuration
+config:
+  # Network Settings
+  listeners: "PLAINTEXT://0.0.0.0:9092"
+  numNetworkThreads: 8
+  numIoThreads: 8
+  
+  # Socket Settings
+  socketSendBufferBytes: 102400
+  socketReceiveBufferBytes: 102400
+  socketRequestMaxBytes: 104857600
+  
+  # Log Settings
+  logDirs: "/var/lib/kawasan/logs"
+  numPartitions: 3
+  numRecoveryThreadsPerDataDir: 1
+  
+  # Log Retention
+  logRetentionHours: 168
+  logRetentionBytes: 1073741824
+  logSegmentBytes: 1073741824
+  logRetentionCheckIntervalMs: 300000
+  
+  # Log Cleanup
+  logCleanupPolicy: "delete"
+  logCleanerEnable: true
+  
+  # Replication Settings
+  defaultReplicationFactor: 1
+  minInsyncReplicas: 1
+  
+  # Performance Tuning
+  compressionType: "lz4"
+  numReplicaFetchers: 4
+  replicaFetchMaxBytes: 1048576
+  
+  # Group Coordinator Settings
+  groupInitialRebalanceDelayMs: 3000
+  groupMaxSessionTimeoutMs: 300000
+  groupMinSessionTimeoutMs: 6000
+  
+  # Other Settings
+  autoCreateTopicsEnable: true
+  deleteTopicEnable: true
+
+# Logging configuration
+logging:
+  level: "info"
+  format: "text"  # "text" or "json"
+
+# Probes configuration
+livenessProbe:
+  enabled: true
+  initialDelaySeconds: 60
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  enabled: true
+  initialDelaySeconds: 30
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+startupProbe:
+  enabled: true
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 30
+
+# Node selector
+nodeSelector: {}
+
+# Tolerations
+tolerations: []
+
+# Affinity rules
+affinity:
+  podAntiAffinity:
+    # Use "required" for production, "preferred" for dev
+    type: required
+    topologyKey: kubernetes.io/hostname
+
+# Termination grace period
+terminationGracePeriodSeconds: 60
+
+# Metrics and monitoring
+metrics:
+  enabled: true
+  port: 9308
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}
+
+# Ingress configuration (optional)
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # kubernetes.io/tls-acme: "true"
+  hosts:
+    - host: kawasan.local
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls: []
+  #  - secretName: kawasan-tls
+  #    hosts:
+  #      - kawasan.local
+
+# Network policies
+networkPolicy:
+  enabled: false
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress: []
+
+# Pod Disruption Budget
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+  # maxUnavailable: 1
+
+# Extra environment variables
+extraEnv: []
+# - name: JAVA_OPTS
+#   value: "-Xmx4g -Xms4g"
+
+# Extra volume mounts
+extraVolumeMounts: []
+# - name: extra-config
+#   mountPath: /etc/extra
+
+# Extra volumes
+extraVolumes: []
+# - name: extra-config
+#   configMap:
+#     name: extra-config

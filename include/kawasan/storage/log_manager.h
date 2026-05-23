@@ -1,0 +1,129 @@
+#pragma once
+
+#include <atomic>
+#include <condition_variable>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <shared_mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+#include "kawasan/common/types.h"
+#include "kawasan/storage/log.h"
+
+namespace kawasan::storage {
+
+/// @brief Manages all logs (topic-partitions) for a broker
+class LogManager {
+public:
+    explicit LogManager(const std::string& base_log_dir,
+                        LogConfig default_config = LogConfig());
+    ~LogManager();
+
+    /// @brief 0A.4: register a per-topic LogConfig that overrides the default.
+    /// Logs newly created under this topic inherit the registered config.
+    /// Existing in-memory Log objects are NOT mutated here; alter-config support
+    /// arrives later (Phase 4).
+    void setTopicConfig(const std::string& topic, const LogConfig& config);
+
+    /// @brief 0A.4: returns the effective config for a topic (override or default).
+    LogConfig getTopicConfig(const std::string& topic) const;
+
+    /// @brief Phase 3.2: configure the cleanup-loop wake interval in ms.
+    /// Default is 300000 (5 minutes — Kafka default). Tests / dev configs
+    /// can set this much lower (e.g. 5000) to observe compaction quickly.
+    void setCleanupIntervalMs(int64_t ms) { cleanup_interval_ms_ = ms; }
+
+    // Non-copyable/movable
+    LogManager(const LogManager&) = delete;
+    LogManager& operator=(const LogManager&) = delete;
+    LogManager(LogManager&&) = delete;
+    LogManager& operator=(LogManager&&) = delete;
+
+    /// @brief Gets or creates a log for the given topic-partition
+    /// @param topic Topic name
+    /// @param partition Partition ID
+    /// @return Pointer to the log
+    Log* getOrCreateLog(const std::string& topic, PartitionId partition);
+
+    /// @brief Gets a log for the given topic-partition
+    /// @param topic Topic name
+    /// @param partition Partition ID
+    /// @return Pointer to the log, or nullptr if not found
+    Log* getLog(const std::string& topic, PartitionId partition);
+
+    /// @brief Deletes a log for the given topic-partition
+    /// @param topic Topic name
+    /// @param partition Partition ID
+    void deleteLog(const std::string& topic, PartitionId partition);
+
+    /// @brief Returns all logs
+    std::vector<Log*> allLogs();
+
+    /// @brief Flushes all logs
+    void flushAll();
+
+    /// @brief Closes all logs
+    void closeAll();
+
+    /// @brief Performs cleanup on all logs
+    void cleanupAll();
+
+    /// @brief Starts the log manager background tasks
+    void start();
+
+    /// @brief Stops the log manager
+    void stop();
+
+    /// @brief Phase EX-1 (§6.3): Prometheus metrics snapshot for LogCleaner.
+    struct CleanerMetrics {
+        bool running;                  // gauge (0 or 1)
+        int64_t compactions_total;     // counter: compaction passes that dropped >0 batches
+        int64_t dedupe_buffer_utilization;  // gauge: average OffsetMap size across last pass
+        // Per-(topic, partition) dirty ratio. Range [0, 1].
+        struct PartitionRatio {
+            std::string topic;
+            int32_t partition;
+            double dirty_ratio;
+        };
+        std::vector<PartitionRatio> partition_dirty_ratios;
+    };
+    CleanerMetrics getCleanerMetrics() const;
+
+    /// @brief Phase EX-1: bumped by Log::cleanup() when a compaction pass
+    /// dropped >0 batches.
+    void incrementCompactionsTotal();
+    void recordDedupeBufferSize(int64_t size);
+
+private:
+    std::string getLogDir(const std::string& topic, PartitionId partition) const;
+    void cleanupThread();
+
+    std::string base_log_dir_;
+    LogConfig default_config_;
+    std::map<TopicPartition, std::unique_ptr<Log>> logs_;
+    // 0A.4: per-topic config overrides (cleanup.policy etc. from CreateTopics).
+    std::unordered_map<std::string, LogConfig> topic_configs_;
+    mutable std::shared_mutex mutex_;  // Changed to shared_mutex for better concurrency
+    bool running_ = false;
+    bool stop_requested_ = false;
+    int64_t cleanup_interval_ms_ = 300000;  // 5 minutes default
+    std::mutex cleanup_mutex_;
+    std::condition_variable cleanup_cv_;
+    std::thread cleanup_thread_;
+
+    // Phase EX-1 metrics.
+    std::atomic<bool> cleanup_running_{false};
+    std::atomic<int64_t> compactions_total_{0};
+    std::atomic<int64_t> dedupe_buffer_last_size_{0};
+    // Per-(topic, partition) dirty-ratio snapshot updated on each
+    // cleanup pass. Mutex-guarded; small (one entry per partition).
+    mutable std::mutex dirty_ratio_mutex_;
+    std::map<TopicPartition, double> dirty_ratios_;
+};
+
+}  // namespace kawasan::storage

@@ -1,0 +1,63 @@
+# Phase EX-4 (§6.4): nightly matrix compat run against `latest` images
+# of every Confluent ecosystem service. Catches regressions in the
+# ecosystem tools that pinned-version CI wouldn't see.
+name: compat-matrix-nightly
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        component:
+          - schema-registry
+          - kafka-ui
+          - kafka-connect
+          - ksqldb
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake build-essential ninja-build \
+            libboost-all-dev librocksdb-dev libsnappy-dev liblz4-dev libzstd-dev \
+            libfmt-dev libspdlog-dev libgtest-dev nlohmann-json3-dev \
+            libssl-dev python3-pip curl docker.io
+          pip install kafka-python
+
+      - name: Build kawasan
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -GNinja
+          cmake --build build -j$(nproc) --target kawasan-broker
+
+      - name: Start broker (docker config)
+        run: |
+          ./build/tools/kawasan-broker --config config/broker.docker.properties > /tmp/k-mx.log 2>&1 &
+          for i in $(seq 1 30); do
+            grep -q "Broker TCP listener active" /tmp/k-mx.log && break
+            sleep 1
+          done
+
+      - name: Run ${{ matrix.component }} smoke
+        env:
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          case "$COMPONENT" in
+            schema-registry) bash tests/ecosystem/scripts/13_schema_registry.sh kawasan ;;
+            kafka-ui)        bash tests/ecosystem/scripts/14_kafka_ui.sh kawasan ;;
+            kafka-connect)   bash tests/ecosystem/scripts/15_kafka_connect.sh kawasan ;;
+            ksqldb)          bash tests/ecosystem/scripts/16_ksqldb.sh kawasan ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: compat-${{ matrix.component }}-logs
+          path: /tmp/k-mx.log

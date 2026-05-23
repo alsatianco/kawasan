@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Service Label -->
+    <key>Label</key>
+    <string>com.kawasan.broker</string>
+
+    <!-- Program to Run -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/kawasan-broker</string>
+        <string>--config</string>
+        <string>/usr/local/etc/kawasan/broker.properties</string>
+        <string>--log-level</string>
+        <string>info</string>
+    </array>
+
+    <!-- Run at Load -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Keep Alive - Restart if Crashed -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <!-- Working Directory -->
+    <key>WorkingDirectory</key>
+    <string>/usr/local/var/kawasan</string>
+
+    <!-- Standard Output Log -->
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/kawasan/broker.log</string>
+
+    <!-- Standard Error Log -->
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/kawasan/broker-error.log</string>
+
+    <!-- User to Run As (optional, remove to run as root) -->
+    <key>UserName</key>
+    <string>_kawasan</string>
+
+    <!-- Group to Run As (optional) -->
+    <key>GroupName</key>
+    <string>_kawasan</string>
+
+    <!-- Environment Variables -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Process Type (Background daemon) -->
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!-- Throttle Interval (seconds between restart attempts) -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Exit Timeout (seconds to wait for graceful shutdown) -->
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+
+    <!-- Resource Limits -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <!-- Max Open Files -->
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+
+    <key>HardResourceLimits</key>
+    <dict>
+        <!-- Max Open Files -->
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+
+    <!-- Enable Low Priority I/O -->
+    <key>LowPriorityIO</key>
+    <false/>
+
+    <!-- Nice Value (lower = higher priority, -20 to 20) -->
+    <key>Nice</key>
+    <integer>0</integer>
+
+    <!-- Disable Abandonment of Process -->
+    <key>AbandonProcessGroup</key>
+    <true/>
+</dict>
+</plist>

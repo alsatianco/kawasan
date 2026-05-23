@@ -1,0 +1,123 @@
+# Multi-stage Production Dockerfile for Kawasan Broker
+# Optimized for security, performance, and small image size
+
+# Stage 1: Build stage with all dependencies
+FROM ubuntu:22.04 AS builder
+
+# Avoid interactive prompts during build
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    curl \
+    zip \
+    unzip \
+    tar \
+    pkg-config \
+    libboost-all-dev \
+    librocksdb-dev \
+    libspdlog-dev \
+    nlohmann-json3-dev \
+    libgtest-dev \
+    libssl-dev \
+    zlib1g-dev \
+    libsnappy-dev \
+    liblz4-dev \
+    libzstd-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /build
+
+# Copy only necessary files for build (respecting .dockerignore)
+COPY CMakeLists.txt vcpkg.json ./
+COPY cmake/ ./cmake/
+COPY src/ ./src/
+COPY include/ ./include/
+COPY tools/ ./tools/
+COPY examples/ ./examples/
+COPY tests/ ./tests/
+COPY config/ ./config/
+
+# Build with optimizations
+RUN mkdir -p build && cd build && \
+    cmake -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_CXX_FLAGS="-O3 -march=native -DNDEBUG" \
+          .. && \
+    cmake --build . -j$(nproc) --target kawasan-broker kawasan-topics
+
+# Strip debug symbols to reduce binary size
+RUN strip /build/build/tools/kawasan-broker /build/build/tools/kawasan-topics
+
+# Stage 2: Minimal runtime stage
+FROM ubuntu:22.04
+
+# Avoid interactive prompts
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Create kawasan user and group (non-root for security)
+RUN groupadd -r -g 1000 kawasan && \
+    useradd -r -u 1000 -g kawasan -s /bin/false -c "Kawasan Broker User" kawasan
+
+# Install only runtime dependencies (minimal set)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libboost-system1.74.0 \
+    libboost-program-options1.74.0 \
+    libboost-filesystem1.74.0 \
+    libboost-thread1.74.0 \
+    librocksdb6.11 \
+    libspdlog1 \
+    libssl3 \
+    zlib1g \
+    libsnappy1v5 \
+    liblz4-1 \
+    libzstd1 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Copy built binaries from builder stage
+COPY --from=builder /build/build/tools/kawasan-broker /usr/local/bin/
+COPY --from=builder /build/build/tools/kawasan-topics /usr/local/bin/
+
+# Copy configuration files
+COPY --from=builder /build/config/server.properties.example /etc/kawasan/server.properties.template
+COPY docker/kawasan-entrypoint.sh /usr/local/bin/entrypoint.sh
+
+# Create necessary directories with proper ownership
+RUN mkdir -p /var/lib/kawasan/data \
+             /var/log/kawasan \
+             /etc/kawasan && \
+    chown -R kawasan:kawasan /var/lib/kawasan \
+                           /var/log/kawasan \
+                           /etc/kawasan && \
+    chmod 755 /usr/local/bin/entrypoint.sh
+
+# Set working directory
+WORKDIR /var/lib/kawasan
+
+# Expose Kafka-compatible port
+EXPOSE 9092
+
+# Health check configuration
+# Checks if the broker is responsive every 30 seconds
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD /usr/local/bin/kawasan-topics --broker-list localhost:9092 --list || exit 1
+
+# Set resource limits (can be overridden in docker-compose)
+# ENV JAVA_OPTS="-Xmx1g -Xms1g"
+
+# Use non-root user for security
+USER kawasan
+
+# Volume for persistent data
+VOLUME ["/var/lib/kawasan/data", "/var/log/kawasan"]
+
+# Set entrypoint
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+
+# Default command (can be overridden)
+CMD ["kawasan-broker", "--config", "/etc/kawasan/server.properties", "--log-level", "info"]

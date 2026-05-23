@@ -1,0 +1,9 @@
+{
+  "_note": "Phase EX-11 baseline. Replace by running `python3 bench/produce_perf.py > bench/baseline.json` against a known-good build. The CI bench-regression job alerts on >10% delta from these numbers.",
+  "records": 100000,
+  "record_size": 1024,
+  "throughput_mb_s": 80.0,
+  "p50_ms": 5.0,
+  "p95_ms": 15.0,
+  "p99_ms": 50.0
+}

@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - "8088:8080"
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=kawasan
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=host.docker.internal:9092
+      - DYNAMIC_CONFIG_ENABLED=true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - kafka-ui-network
+
+networks:
+  kafka-ui-network:
+    driver: bridge

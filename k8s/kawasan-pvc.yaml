@@ -1,0 +1,38 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kawasan-data-pvc
+  labels:
+    app: kawasan
+    component: broker
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  # Uncomment and specify your storage class for production
+  # storageClassName: fast-ssd
+  # For AWS EBS
+  # storageClassName: gp3
+  # For GCP Persistent Disk
+  # storageClassName: pd-ssd
+  # For Azure Disk
+  # storageClassName: managed-premium
+
+---
+# Storage Class Example - Fast SSD for production
+# Uncomment and customize for your cloud provider
+# apiVersion: storage.k8s.io/v1
+# kind: StorageClass
+# metadata:
+#   name: fast-ssd
+# provisioner: kubernetes.io/aws-ebs  # Change based on cloud provider
+# parameters:
+#   type: gp3  # AWS EBS gp3
+#   iopsPerGB: "10"
+#   throughput: "125"
+# allowVolumeExpansion: true
+# volumeBindingMode: WaitForFirstConsumer
+# reclaimPolicy: Retain

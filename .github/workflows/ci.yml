@@ -1,0 +1,54 @@
+name: Quick Start Smoke
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    name: Quick Start & Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    env:
+      KAWASAN_BUILD_TYPE: RelWithDebInfo
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare cache directories
+        run: |
+          mkdir -p external
+          mkdir -p ~/.cache/vcpkg/archives
+
+      - name: Cache vcpkg
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/vcpkg/archives
+            external/vcpkg
+          key: ${{ runner.os }}-vcpkg-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-
+
+      - name: Run quick start flow
+        run: ./scripts/quick-start.sh
+
+      - name: Stop broker and clean logs
+        if: always()
+        run: |
+          if [ -f /tmp/kawasan-broker.pid ]; then
+            kill "$(cat /tmp/kawasan-broker.pid)" || true
+            rm -f /tmp/kawasan-broker.pid
+          fi
+          rm -rf /tmp/kawasan-logs
+
+      - name: Run unit tests
+        run: ctest --test-dir build --output-on-failure

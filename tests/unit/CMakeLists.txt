@@ -1,0 +1,84 @@
+# Buffer test
+add_executable(buffer_test buffer_test.cpp)
+target_link_libraries(buffer_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME BufferTest COMMAND buffer_test)
+
+# Record batch test
+add_executable(record_batch_test record_batch_test.cpp)
+target_link_libraries(record_batch_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME RecordBatchTest COMMAND record_batch_test)
+
+# Kafka broker error test
+add_executable(kawasan_broker_error_test kawasan_broker_error_test.cpp)
+target_link_libraries(kawasan_broker_error_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME KawasanBrokerErrorTest COMMAND kawasan_broker_error_test)
+
+# Log segment test
+add_executable(log_segment_test log_segment_test.cpp)
+target_link_libraries(log_segment_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME LogSegmentTest COMMAND log_segment_test)
+
+# Raft protocol test
+add_executable(raft_protocol_test raft_protocol_test.cpp)
+target_link_libraries(raft_protocol_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME RaftProtocolTest COMMAND raft_protocol_test)
+
+# Raft transport test
+add_executable(raft_transport_test raft_transport_test.cpp)
+target_link_libraries(raft_transport_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME RaftTransportTest COMMAND raft_transport_test)
+
+# ISR management test
+add_executable(isr_management_test isr_management_test.cpp)
+target_link_libraries(isr_management_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME ISRManagementTest COMMAND isr_management_test)
+
+# Streams topology test
+add_executable(streams_topology_test streams_topology_test.cpp)
+target_link_libraries(streams_topology_test PRIVATE kawasan_streams kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME StreamsTopologyTest COMMAND streams_topology_test)
+
+# Phase 2.1: ProducerStateManager (idempotent producer dedup)
+add_executable(producer_state_manager_test producer_state_manager_test.cpp)
+target_link_libraries(producer_state_manager_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME ProducerStateManagerTest COMMAND producer_state_manager_test)
+
+# Phase 4.2c: AclStore
+add_executable(acl_store_test acl_store_test.cpp)
+target_link_libraries(acl_store_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME AclStoreTest COMMAND acl_store_test)
+
+# Phase 4.2b: SCRAM-SHA-256/512 authentication
+add_executable(scram_auth_test scram_auth_test.cpp)
+target_link_libraries(scram_auth_test PRIVATE kawasan OpenSSL::Crypto GTest::gtest GTest::gtest_main)
+add_test(NAME ScramAuthTest COMMAND scram_auth_test)
+
+# Phase 1.4: FetchSessionManager
+add_executable(fetch_session_manager_test fetch_session_manager_test.cpp)
+target_link_libraries(fetch_session_manager_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME FetchSessionManagerTest COMMAND fetch_session_manager_test)
+
+# Phase 5.2: InstallSnapshot wire-format
+add_executable(install_snapshot_test install_snapshot_test.cpp)
+target_link_libraries(install_snapshot_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME InstallSnapshotTest COMMAND install_snapshot_test)
+
+# Phase 3.3: TransactionCoordinator state machine
+add_executable(transaction_coordinator_test transaction_coordinator_test.cpp)
+target_link_libraries(transaction_coordinator_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME TransactionCoordinatorTest COMMAND transaction_coordinator_test)
+
+# Phase EX-1 (§6.3): required metrics contract
+add_executable(required_metrics_test required_metrics_test.cpp)
+target_link_libraries(required_metrics_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME RequiredMetricsTest COMMAND required_metrics_test)
+
+# Phase EX-10: read_committed isolation tracker
+add_executable(isolation_tracker_test isolation_tracker_test.cpp)
+target_link_libraries(isolation_tracker_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME IsolationTrackerTest COMMAND isolation_tracker_test)
+
+# Phase EX-3: schema-driven codegen byte-for-byte equivalence
+add_executable(codegen_golden_bytes_test codegen_golden_bytes_test.cpp)
+target_link_libraries(codegen_golden_bytes_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME CodegenGoldenBytesTest COMMAND codegen_golden_bytes_test)

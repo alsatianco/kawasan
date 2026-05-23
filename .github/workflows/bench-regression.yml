@@ -1,0 +1,52 @@
+# Phase EX-4 (§6.4): Nightly benchmark regression check. Compares the
+# current throughput + p99 latency against bench/baseline.json. Alerts
+# (failing the job) when regression > 10%.
+name: bench-regression
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake build-essential ninja-build \
+            libboost-all-dev librocksdb-dev libsnappy-dev liblz4-dev libzstd-dev \
+            libfmt-dev libspdlog-dev libgtest-dev nlohmann-json3-dev \
+            libssl-dev python3-pip
+          pip install kafka-python
+
+      - name: Build (Release)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -GNinja
+          cmake --build build -j$(nproc) --target kawasan-broker
+
+      - name: Run produce benchmark
+        run: |
+          ./build/tools/kawasan-broker --config config/broker.dev.properties > /tmp/k-bench.log 2>&1 &
+          BPID=$!
+          sleep 5
+          python3 bench/produce_perf.py --records 1000000 --record-size 1024 > /tmp/bench-result.json
+          kill -9 $BPID
+          cat /tmp/bench-result.json
+
+      - name: Compare to baseline
+        run: |
+          python3 bench/check_regression.py \
+            --baseline bench/baseline.json \
+            --current /tmp/bench-result.json \
+            --threshold-pct 10
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-result
+          path: /tmp/bench-result.json

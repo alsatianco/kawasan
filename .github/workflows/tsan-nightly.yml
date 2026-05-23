@@ -1,0 +1,47 @@
+# Phase EX-4 (§6.4): ThreadSanitizer nightly.
+name: tsan-nightly
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  tsan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake build-essential ninja-build clang-15 \
+            libboost-all-dev librocksdb-dev libsnappy-dev liblz4-dev libzstd-dev \
+            libfmt-dev libspdlog-dev libgtest-dev nlohmann-json3-dev \
+            libssl-dev
+
+      - name: Configure (TSan)
+        env:
+          CC: clang-15
+          CXX: clang++-15
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DKAWASAN_ENABLE_TSAN=ON \
+            -DKAWASAN_BUILD_TESTS=ON \
+            -GNinja
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Run tests (TSan)
+        env:
+          TSAN_OPTIONS: "halt_on_error=1:report_thread_leaks=0"
+        run: ctest --test-dir build --output-on-failure --timeout 600
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: tsan-logs
+          path: build/Testing/Temporary/

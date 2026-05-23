@@ -1,0 +1,13 @@
+{
+  "apiKey": 17,
+  "type": "request",
+  "listeners": ["broker", "controller"],
+  "name": "SaslHandshakeRequest",
+  "validVersions": "0-1",
+  "flexibleVersions": "none",
+  "_source": "Vendored snapshot of upstream kafka:clients/src/main/resources/common/message/SaslHandshakeRequest.json (Kafka 4.x). KIP-152 keeps SaslHandshake non-flexible at every version — flexibleVersions:'none' is the canonical encoding for that.",
+  "fields": [
+    { "name": "Mechanism", "type": "string", "versions": "0+",
+      "about": "The SASL mechanism chosen by the client." }
+  ]
+}

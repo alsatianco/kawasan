@@ -1,0 +1,123 @@
+# Prometheus alerting rules for Kawasan broker
+
+groups:
+  - name: kawasan_broker_alerts
+    interval: 30s
+    rules:
+      # Broker availability
+      - alert: KawasanBrokerDown
+        expr: up{job="kawasan-broker"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: broker
+        annotations:
+          summary: "Kawasan broker is down"
+          description: "Broker {{ $labels.instance }} has been down for more than 1 minute."
+
+      # High latency alerts
+      - alert: KawasanHighProduceLatency
+        expr: histogram_quantile(0.99, rate(kawasan_produce_latency_ms_bucket[5m])) > 1000
+        for: 5m
+        labels:
+          severity: warning
+          component: broker
+        annotations:
+          summary: "High produce latency detected"
+          description: "P99 produce latency on {{ $labels.instance }} is {{ $value }}ms (threshold: 1000ms)"
+
+      - alert: KawasanHighFetchLatency
+        expr: histogram_quantile(0.99, rate(kawasan_fetch_latency_ms_bucket[5m])) > 1000
+        for: 5m
+        labels:
+          severity: warning
+          component: broker
+        annotations:
+          summary: "High fetch latency detected"
+          description: "P99 fetch latency on {{ $labels.instance }} is {{ $value }}ms (threshold: 1000ms)"
+
+      # Disk space alerts
+      - alert: KawasanLowDiskSpace
+        expr: kawasan_disk_usage_bytes > 80 * 1024 * 1024 * 1024  # 80GB
+        for: 10m
+        labels:
+          severity: warning
+          component: storage
+        annotations:
+          summary: "Low disk space on broker"
+          description: "Broker {{ $labels.instance }} is using {{ $value | humanize }}B of disk space"
+
+      - alert: KawasanCriticalDiskSpace
+        expr: kawasan_disk_usage_bytes > 90 * 1024 * 1024 * 1024  # 90GB (assuming 100GB total)
+        for: 5m
+        labels:
+          severity: critical
+          component: storage
+        annotations:
+          summary: "Critical disk space on broker"
+          description: "Broker {{ $labels.instance }} is using {{ $value | humanize }}B of disk space - immediate action required"
+
+      # Memory alerts
+      - alert: KawasanHighMemoryUsage
+        expr: kawasan_memory_usage_bytes > 6 * 1024 * 1024 * 1024  # 6GB
+        for: 10m
+        labels:
+          severity: warning
+          component: broker
+        annotations:
+          summary: "High memory usage detected"
+          description: "Broker {{ $labels.instance }} is using {{ $value | humanize }}B of memory"
+
+      # Error rate alerts
+      - alert: KawasanHighErrorRate
+        expr: rate(kawasan_request_errors_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+          component: broker
+        annotations:
+          summary: "High error rate detected"
+          description: "Broker {{ $labels.instance }} is experiencing {{ $value }} errors/sec for API {{ $labels.api }}"
+
+      # Connection alerts
+      - alert: KawasanNoActiveConnections
+        expr: kawasan_active_connections == 0
+        for: 5m
+        labels:
+          severity: info
+          component: broker
+        annotations:
+          summary: "No active connections"
+          description: "Broker {{ $labels.instance }} has no active client connections for 5 minutes"
+
+      - alert: KawasanTooManyConnections
+        expr: kawasan_active_connections > 1000
+        for: 10m
+        labels:
+          severity: warning
+          component: broker
+        annotations:
+          summary: "Too many active connections"
+          description: "Broker {{ $labels.instance }} has {{ $value }} active connections (threshold: 1000)"
+
+      # Throughput degradation
+      - alert: KawasanLowThroughput
+        expr: rate(kawasan_messages_produced_total[5m]) < 100
+        for: 15m
+        labels:
+          severity: info
+          component: broker
+        annotations:
+          summary: "Low message throughput"
+          description: "Broker {{ $labels.instance }} is processing only {{ $value }} messages/sec (expected: >100)"
+
+      # Broker health check failures
+      - alert: KawasanBrokerUnhealthy
+        expr: probe_success{job="kawasan-broker"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: broker
+        annotations:
+          summary: "Broker health check failing"
+          description: "Health check for broker {{ $labels.instance }} has been failing for 2 minutes"

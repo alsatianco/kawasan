@@ -1,0 +1,24 @@
+# Phase 5.3 gauntlet: provectuslabs/kafka-ui against Kawasan.
+#
+# kafka-ui is a popular browser UI for inspecting/managing Kafka brokers.
+# It exercises Metadata, DescribeConfigs, DescribeGroups, DescribeAcls,
+# ListTopics, ListGroups, etc — a great breadth test for the admin
+# API surface.
+#
+# Usage (kawasan running natively on host with docker config):
+#   docker compose -f docker-compose.kafka-ui.yml up -d kafka-ui
+#   curl -s http://localhost:8082/api/clusters
+#   docker compose -f docker-compose.kafka-ui.yml down -v
+
+services:
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kawasan-kafka-ui
+    ports:
+      - "8082:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: kawasan
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: host.docker.internal:9092
+      LOGGING_LEVEL_COM_PROVECTUS: INFO
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

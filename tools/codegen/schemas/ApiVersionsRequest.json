@@ -1,0 +1,15 @@
+{
+  "apiKey": 18,
+  "type": "request",
+  "listeners": ["broker", "controller"],
+  "name": "ApiVersionsRequest",
+  "validVersions": "0-4",
+  "flexibleVersions": "3+",
+  "_source": "Vendored snapshot of upstream kafka:clients/src/main/resources/common/message/ApiVersionsRequest.json (Kafka 4.x). Update when bumping protocol coverage.",
+  "fields": [
+    { "name": "ClientSoftwareName", "type": "string", "versions": "3+",
+      "ignorable": true, "about": "The name of the client." },
+    { "name": "ClientSoftwareVersion", "type": "string", "versions": "3+",
+      "ignorable": true, "about": "The version of the client." }
+  ]
+}

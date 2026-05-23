@@ -1,0 +1,73 @@
+# Phase EX-4 (§6.4): libFuzzer nightly. Each fuzz target runs 5 minutes
+# against the previously-recorded corpus (cache the corpus dir between
+# runs so escaping coverage accumulates).
+name: fuzz-nightly
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - request_header
+          - record_batch
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake build-essential ninja-build clang-15 \
+            libboost-all-dev librocksdb-dev libsnappy-dev liblz4-dev libzstd-dev \
+            libfmt-dev libspdlog-dev libgtest-dev nlohmann-json3-dev \
+            libssl-dev
+
+      - name: Configure (libFuzzer + ASan)
+        env:
+          CC: clang-15
+          CXX: clang++-15
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DKAWASAN_BUILD_FUZZ=ON \
+            -DKAWASAN_ENABLE_ASAN=ON \
+            -GNinja
+
+      - name: Build fuzzer
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cmake --build build -j$(nproc) --target "fuzz_${TARGET}"
+
+      - name: Cache corpus
+        uses: actions/cache@v4
+        env:
+          TARGET: ${{ matrix.target }}
+        with:
+          path: corpus-${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Run 5-minute fuzz
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p "corpus-${TARGET}"
+          ./build/tests/fuzz/fuzz_${TARGET} "corpus-${TARGET}" \
+            -max_total_time=300 \
+            -print_final_stats=1
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: |
+            crash-*
+            leak-*

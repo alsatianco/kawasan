@@ -1,0 +1,122 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kawasan-broker
+  labels:
+    app: kawasan
+    component: broker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kawasan
+      component: broker
+  template:
+    metadata:
+      labels:
+        app: kawasan
+        component: broker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9092"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Run as non-root user for security
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      
+      containers:
+      - name: kawasan-broker
+        image: kawasan/broker:latest
+        imagePullPolicy: IfNotPresent
+        
+        ports:
+        - name: kafka
+          containerPort: 9092
+          protocol: TCP
+        - name: metrics
+          containerPort: 9308
+          protocol: TCP
+        
+        env:
+        - name: KAWASAN_BROKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: KAWASAN_LOG_LEVEL
+          value: "info"
+        - name: KAWASAN_DATA_DIR
+          value: "/var/lib/kawasan"
+        
+        # Liveness probe: Is the broker process running?
+        livenessProbe:
+          tcpSocket:
+            port: kafka
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        # Readiness probe: Can the broker accept requests?
+        readinessProbe:
+          tcpSocket:
+            port: kafka
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        
+        # Resource limits and requests
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+        
+        # Volume mounts
+        volumeMounts:
+        - name: config
+          mountPath: /etc/kawasan
+          readOnly: true
+        - name: data
+          mountPath: /var/lib/kawasan
+        - name: logs
+          mountPath: /var/log/kawasan
+        
+        # Security context for container
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          capabilities:
+            drop:
+            - ALL
+      
+      volumes:
+      - name: config
+        configMap:
+          name: kawasan-config
+      - name: data
+        emptyDir: {}
+      - name: logs
+        emptyDir: {}
+      
+      # Anti-affinity to spread brokers across nodes
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: kawasan
+                  component: broker
+              topologyKey: kubernetes.io/hostname
+      
+      # Graceful shutdown
+      terminationGracePeriodSeconds: 30

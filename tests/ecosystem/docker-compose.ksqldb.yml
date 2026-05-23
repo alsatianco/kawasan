@@ -1,0 +1,24 @@
+# Phase 5.3 gauntlet: ksqlDB against Kawasan.
+#
+# ksqlDB is a stream-processing engine that uses Kafka as its underlying
+# storage and processing fabric. It uses transactional producers and
+# consumer groups heavily — the hardest of the gauntlet integrations.
+
+services:
+  ksqldb-server:
+    image: confluentinc/ksqldb-server:0.29.0
+    container_name: kawasan-ksqldb
+    ports:
+      - "8088:8088"
+    environment:
+      KSQL_BOOTSTRAP_SERVERS: host.docker.internal:9092
+      KSQL_LISTENERS: http://0.0.0.0:8088
+      KSQL_KSQL_SERVICE_ID: kawasan-ksql
+      KSQL_KSQL_LOGGING_PROCESSING_TOPIC_AUTO_CREATE: "true"
+      KSQL_KSQL_LOGGING_PROCESSING_STREAM_AUTO_CREATE: "true"
+      KSQL_KSQL_STREAMS_REPLICATION_FACTOR: "1"
+      KSQL_KSQL_LOGGING_PROCESSING_TOPIC_REPLICATION_FACTOR: "1"
+      # Without a Schema Registry we use plain JSON not Avro.
+      KSQL_KSQL_SCHEMA_REGISTRY_URL: ""
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

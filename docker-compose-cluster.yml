@@ -1,0 +1,106 @@
+version: '3.8'
+
+services:
+  # Broker 0
+  broker-0:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kawasan-broker-0
+    hostname: broker-0
+    networks:
+      - kawasan-network
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    volumes:
+      - broker-0-data:/var/lib/kawasan/data
+      - broker-0-logs:/var/log/kawasan
+      - ./config/broker-0.properties:/etc/kawasan/server.properties:ro
+    environment:
+      - BROKER_ID=0
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+  # Broker 1
+  broker-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kawasan-broker-1
+    hostname: broker-1
+    networks:
+      - kawasan-network
+    ports:
+      - "9192:9092"
+      - "9193:9093"
+    volumes:
+      - broker-1-data:/var/lib/kawasan/data
+      - broker-1-logs:/var/log/kawasan
+      - ./config/broker-1.properties:/etc/kawasan/server.properties:ro
+    environment:
+      - BROKER_ID=1
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    depends_on:
+      - broker-0
+
+  # Broker 2
+  broker-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kawasan-broker-2
+    hostname: broker-2
+    networks:
+      - kawasan-network
+    ports:
+      - "9292:9092"
+      - "9293:9093"
+    volumes:
+      - broker-2-data:/var/lib/kawasan/data
+      - broker-2-logs:/var/log/kawasan
+      - ./config/broker-2.properties:/etc/kawasan/server.properties:ro
+    environment:
+      - BROKER_ID=2
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    depends_on:
+      - broker-0
+      - broker-1
+
+networks:
+  kawasan-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  broker-0-data:
+    driver: local
+  broker-0-logs:
+    driver: local
+  broker-1-data:
+    driver: local
+  broker-1-logs:
+    driver: local
+  broker-2-data:
+    driver: local
+  broker-2-logs:
+    driver: local

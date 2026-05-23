@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  kawasan-broker-1:
+    build: .
+    container_name: kawasan-broker-1
+    hostname: broker1
+    ports:
+      - "9092:9092"
+    environment:
+      - KAWASAN_BROKER_ID=0
+      - KAWASAN_HOST=broker1
+      - KAWASAN_PORT=9092
+      - KAWASAN_LOG_DIR=/var/lib/kawasan/data
+    volumes:
+      - kawasan-data-1:/var/lib/kawasan/data
+    networks:
+      - kawasan-network
+
+  # Uncomment for multi-broker cluster
+  # kawasan-broker-2:
+  #   build: .
+  #   container_name: kawasan-broker-2
+  #   hostname: broker2
+  #   ports:
+  #     - "9093:9092"
+  #   environment:
+  #     - KAWASAN_BROKER_ID=1
+  #     - KAWASAN_HOST=broker2
+  #     - KAWASAN_PORT=9092
+  #     - KAWASAN_LOG_DIR=/var/lib/kawasan/data
+  #   volumes:
+  #     - kawasan-data-2:/var/lib/kawasan/data
+  #   networks:
+  #     - kawasan-network
+
+  # kawasan-broker-3:
+  #   build: .
+  #   container_name: kawasan-broker-3
+  #   hostname: broker3
+  #   ports:
+  #     - "9094:9092"
+  #   environment:
+  #     - KAWASAN_BROKER_ID=2
+  #     - KAWASAN_HOST=broker3
+  #     - KAWASAN_PORT=9092
+  #     - KAWASAN_LOG_DIR=/var/lib/kawasan/data
+  #   volumes:
+  #     - kawasan-data-3:/var/lib/kawasan/data
+  #   networks:
+  #     - kawasan-network
+
+volumes:
+  kawasan-data-1:
+  # kawasan-data-2:
+  # kawasan-data-3:
+
+networks:
+  kawasan-network:
+    driver: bridge
+

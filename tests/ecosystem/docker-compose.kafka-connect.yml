@@ -1,0 +1,34 @@
+# Phase 5.3 gauntlet: Confluent Kafka Connect against Kawasan.
+#
+# Kafka Connect runs source/sink connectors as managed worker pools.
+# The worker process uses consumer groups internally for coordination
+# (similar to Schema Registry's leader election) and stores its
+# offsets in dedicated config/offset/status topics.
+
+services:
+  kafka-connect:
+    image: confluentinc/cp-kafka-connect:7.5.0
+    container_name: kawasan-kafka-connect
+    ports:
+      - "8083:8083"
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: host.docker.internal:9092
+      CONNECT_REST_PORT: "8083"
+      CONNECT_GROUP_ID: kawasan-connect-cluster
+      CONNECT_CONFIG_STORAGE_TOPIC: connect-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: connect-offsets
+      CONNECT_STATUS_STORAGE_TOPIC: connect-status
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_INTERNAL_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_INTERNAL_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_REST_ADVERTISED_HOST_NAME: kawasan-kafka-connect
+      CONNECT_LOG4J_ROOT_LOGLEVEL: WARN
+      CONNECT_PLUGIN_PATH: /usr/share/java
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

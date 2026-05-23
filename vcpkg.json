@@ -1,0 +1,49 @@
+{
+  "name": "kawasan",
+  "version": "0.1.0",
+  "builtin-baseline": "8fbf295ab5283313932f65a597a2c1f09a73fafd",
+  "description": "Apache Kafka port to modern C++",
+  "homepage": "https://github.com/kawasan/kawasan",
+  "license": "Apache-2.0",
+  "dependencies": [
+    {
+      "name": "boost-asio"
+    },
+    {
+      "name": "boost-beast"
+    },
+    {
+      "name": "boost-program-options"
+    },
+    {
+      "name": "boost-system"
+    },
+    {
+      "name": "rocksdb"
+    },
+    {
+      "name": "spdlog"
+    },
+    {
+      "name": "nlohmann-json"
+    },
+    {
+      "name": "gtest"
+    },
+    {
+      "name": "zlib"
+    },
+    {
+      "name": "snappy"
+    },
+    {
+      "name": "lz4"
+    },
+    {
+      "name": "zstd"
+    },
+    {
+      "name": "openssl"
+    }
+  ]
+}

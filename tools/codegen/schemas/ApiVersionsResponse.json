@@ -1,0 +1,25 @@
+{
+  "apiKey": 18,
+  "type": "response",
+  "name": "ApiVersionsResponse",
+  "validVersions": "0-4",
+  "flexibleVersions": "3+",
+  "_source": "Vendored snapshot of upstream kafka:clients/src/main/resources/common/message/ApiVersionsResponse.json (Kafka 4.x).",
+  "fields": [
+    { "name": "ErrorCode", "type": "int16", "versions": "0+",
+      "about": "The top-level error code." },
+    { "name": "ApiKeys", "type": "[]ApiVersion", "versions": "0+",
+      "about": "The APIs supported by the broker.",
+      "fields": [
+        { "name": "ApiKey", "type": "int16", "versions": "0+",
+          "about": "The API index." },
+        { "name": "MinVersion", "type": "int16", "versions": "0+",
+          "about": "The minimum supported version, inclusive." },
+        { "name": "MaxVersion", "type": "int16", "versions": "0+",
+          "about": "The maximum supported version, inclusive." }
+      ]
+    },
+    { "name": "ThrottleTimeMs", "type": "int32", "versions": "1+",
+      "ignorable": true, "about": "The duration in milliseconds for which the request was throttled due to a quota violation, or zero if the request did not violate any quota." }
+  ]
+}

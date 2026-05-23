@@ -1,0 +1,26 @@
+apiVersion: v2
+name: kawasan
+description: A Helm chart for Kawasan message broker
+type: application
+
+# This is the chart version
+version: 1.0.0
+
+# This is the version of the application being deployed
+appVersion: "1.0.0"
+
+keywords:
+  - kawasan
+  - kafka
+  - message-broker
+  - streaming
+
+home: https://github.com/yourusername/kawasan
+sources:
+  - https://github.com/yourusername/kawasan
+
+maintainers:
+  - name: Kawasan Team
+    email: team@kawasan.io
+
+icon: https://raw.githubusercontent.com/yourusername/kawasan/main/docs/logo.png

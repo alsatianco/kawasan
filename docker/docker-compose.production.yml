@@ -1,0 +1,343 @@
+# Production Docker Compose Configuration for Kawasan Broker
+# Features: Resource limits, health checks, monitoring, persistent volumes, logging
+
+version: '3.8'
+
+services:
+  # Primary Kawasan Broker
+  kawasan-broker-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.production
+    container_name: kawasan-broker-1
+    hostname: broker1
+    restart: unless-stopped
+    
+    ports:
+      - "9092:9092"
+      # - "9093:9093"  # Optional: JMX monitoring port
+    
+    environment:
+      # Broker Configuration
+      - KAWASAN_BROKER_ID=0
+      - KAWASAN_HOST=broker1
+      - KAWASAN_PORT=9092
+      - KAWASAN_LOG_DIR=/var/lib/kawasan/data
+      - KAWASAN_LOG_LEVEL=info
+      
+      # Performance Tuning
+      - KAWASAN_NUM_NETWORK_THREADS=8
+      - KAWASAN_NUM_IO_THREADS=8
+      - KAWASAN_SOCKET_SEND_BUFFER_BYTES=102400
+      - KAWASAN_SOCKET_RECEIVE_BUFFER_BYTES=102400
+      - KAWASAN_SOCKET_REQUEST_MAX_BYTES=104857600
+      
+      # Log Retention
+      - KAWASAN_LOG_RETENTION_HOURS=168  # 7 days
+      - KAWASAN_LOG_SEGMENT_BYTES=1073741824  # 1GB
+      - KAWASAN_LOG_RETENTION_CHECK_INTERVAL_MS=300000
+      
+      # Replication (for cluster)
+      - KAWASAN_DEFAULT_REPLICATION_FACTOR=1
+      - KAWASAN_MIN_INSYNC_REPLICAS=1
+    
+    volumes:
+      # Persistent data storage
+      - kawasan-data-1:/var/lib/kawasan/data
+      - kawasan-logs-1:/var/log/kawasan
+      # Custom configuration (optional)
+      - ./config/broker.production.properties:/etc/kawasan/server.properties:ro
+    
+    networks:
+      - kawasan-network
+    
+    # Resource limits for production stability
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 4G
+        reservations:
+          cpus: '2.0'
+          memory: 2G
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+        labels: "service=kawasan-broker"
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/kawasan-topics", "--broker-list", "localhost:9092", "--list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+    
+    # Ulimits for file descriptors
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+  # Second broker for high availability (optional)
+  kawasan-broker-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.production
+    container_name: kawasan-broker-2
+    hostname: broker2
+    restart: unless-stopped
+    
+    ports:
+      - "9093:9092"
+    
+    environment:
+      - KAWASAN_BROKER_ID=1
+      - KAWASAN_HOST=broker2
+      - KAWASAN_PORT=9092
+      - KAWASAN_LOG_DIR=/var/lib/kawasan/data
+      - KAWASAN_LOG_LEVEL=info
+      - KAWASAN_NUM_NETWORK_THREADS=8
+      - KAWASAN_NUM_IO_THREADS=8
+      - KAWASAN_SOCKET_SEND_BUFFER_BYTES=102400
+      - KAWASAN_SOCKET_RECEIVE_BUFFER_BYTES=102400
+      - KAWASAN_LOG_RETENTION_HOURS=168
+      - KAWASAN_LOG_SEGMENT_BYTES=1073741824
+      - KAWASAN_DEFAULT_REPLICATION_FACTOR=2
+      - KAWASAN_MIN_INSYNC_REPLICAS=2
+    
+    volumes:
+      - kawasan-data-2:/var/lib/kawasan/data
+      - kawasan-logs-2:/var/log/kawasan
+      - ./config/broker.production.properties:/etc/kawasan/server.properties:ro
+    
+    networks:
+      - kawasan-network
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 4G
+        reservations:
+          cpus: '2.0'
+          memory: 2G
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+        labels: "service=kawasan-broker"
+    
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/kawasan-topics", "--broker-list", "localhost:9092", "--list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    
+    security_opt:
+      - no-new-privileges:true
+    
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    
+    # Wait for broker-1 to be healthy before starting
+    depends_on:
+      kawasan-broker-1:
+        condition: service_healthy
+
+  # Third broker for cluster (optional)
+  kawasan-broker-3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.production
+    container_name: kawasan-broker-3
+    hostname: broker3
+    restart: unless-stopped
+    
+    ports:
+      - "9094:9092"
+    
+    environment:
+      - KAWASAN_BROKER_ID=2
+      - KAWASAN_HOST=broker3
+      - KAWASAN_PORT=9092
+      - KAWASAN_LOG_DIR=/var/lib/kawasan/data
+      - KAWASAN_LOG_LEVEL=info
+      - KAWASAN_NUM_NETWORK_THREADS=8
+      - KAWASAN_NUM_IO_THREADS=8
+      - KAWASAN_SOCKET_SEND_BUFFER_BYTES=102400
+      - KAWASAN_SOCKET_RECEIVE_BUFFER_BYTES=102400
+      - KAWASAN_LOG_RETENTION_HOURS=168
+      - KAWASAN_LOG_SEGMENT_BYTES=1073741824
+      - KAWASAN_DEFAULT_REPLICATION_FACTOR=3
+      - KAWASAN_MIN_INSYNC_REPLICAS=2
+    
+    volumes:
+      - kawasan-data-3:/var/lib/kawasan/data
+      - kawasan-logs-3:/var/log/kawasan
+      - ./config/broker.production.properties:/etc/kawasan/server.properties:ro
+    
+    networks:
+      - kawasan-network
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 4G
+        reservations:
+          cpus: '2.0'
+          memory: 2G
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+        labels: "service=kawasan-broker"
+    
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/kawasan-topics", "--broker-list", "localhost:9092", "--list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    
+    security_opt:
+      - no-new-privileges:true
+    
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    
+    depends_on:
+      kawasan-broker-2:
+        condition: service_healthy
+
+  # Prometheus for metrics collection (optional but recommended)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: kawasan-prometheus
+    hostname: prometheus
+    restart: unless-stopped
+    
+    ports:
+      - "9090:9090"
+    
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    
+    networks:
+      - kawasan-network
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # Grafana for visualization (optional but recommended)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: kawasan-grafana
+    hostname: grafana
+    restart: unless-stopped
+    
+    ports:
+      - "3000:3000"
+    
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin  # Change in production!
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    
+    networks:
+      - kawasan-network
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    
+    depends_on:
+      - prometheus
+
+# Named volumes for data persistence
+volumes:
+  kawasan-data-1:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /var/lib/kawasan/broker-1/data
+  
+  kawasan-data-2:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /var/lib/kawasan/broker-2/data
+  
+  kawasan-data-3:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /var/lib/kawasan/broker-3/data
+  
+  kawasan-logs-1:
+    driver: local
+  
+  kawasan-logs-2:
+    driver: local
+  
+  kawasan-logs-3:
+    driver: local
+  
+  prometheus-data:
+    driver: local
+  
+  grafana-data:
+    driver: local
+
+# Network configuration
+networks:
+  kawasan-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.25.0.0/16

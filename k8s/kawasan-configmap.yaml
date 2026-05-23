@@ -1,0 +1,70 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kawasan-config
+  labels:
+    app: kawasan
+    component: broker
+data:
+  broker.properties: |
+    # Broker Configuration
+    broker.id=0
+    
+    # Network Settings
+    listeners=PLAINTEXT://0.0.0.0:9092
+    advertised.listeners=PLAINTEXT://kawasan-broker:9092
+    num.network.threads=8
+    num.io.threads=8
+    
+    # Socket Settings
+    socket.send.buffer.bytes=102400
+    socket.receive.buffer.bytes=102400
+    socket.request.max.bytes=104857600
+    
+    # Log Settings
+    log.dirs=/var/lib/kawasan/logs
+    num.partitions=3
+    num.recovery.threads.per.data.dir=1
+    
+    # Log Retention
+    log.retention.hours=168
+    log.retention.bytes=1073741824
+    log.segment.bytes=1073741824
+    log.retention.check.interval.ms=300000
+    
+    # Log Cleanup
+    log.cleanup.policy=delete
+    log.cleaner.enable=true
+    
+    # Replication Settings
+    default.replication.factor=1
+    min.insync.replicas=1
+    
+    # Performance Tuning
+    compression.type=lz4
+    num.replica.fetchers=4
+    replica.fetch.max.bytes=1048576
+    
+    # Group Coordinator Settings
+    group.initial.rebalance.delay.ms=3000
+    group.max.session.timeout.ms=300000
+    group.min.session.timeout.ms=6000
+    
+    # Other Settings
+    auto.create.topics.enable=true
+    delete.topic.enable=true
+    
+  log4j.properties: |
+    log4j.rootLogger=INFO, stdout, fileAppender
+    
+    log4j.appender.stdout=org.apache.log4j.ConsoleAppender
+    log4j.appender.stdout.layout=org.apache.log4j.PatternLayout
+    log4j.appender.stdout.layout.ConversionPattern=[%d] %p %m (%c)%n
+    
+    log4j.appender.fileAppender=org.apache.log4j.RollingFileAppender
+    log4j.appender.fileAppender.File=/var/log/kawasan/broker.log
+    log4j.appender.fileAppender.MaxFileSize=100MB
+    log4j.appender.fileAppender.MaxBackupIndex=3
+    log4j.appender.fileAppender.layout=org.apache.log4j.PatternLayout
+    log4j.appender.fileAppender.layout.ConversionPattern=[%d] %p %m (%c)%n
