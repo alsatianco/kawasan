@@ -82,3 +82,8 @@ add_test(NAME IsolationTrackerTest COMMAND isolation_tracker_test)
 add_executable(codegen_golden_bytes_test codegen_golden_bytes_test.cpp)
 target_link_libraries(codegen_golden_bytes_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME CodegenGoldenBytesTest COMMAND codegen_golden_bytes_test)
+
+# Phase EX-12: GroupCoordinator protocol echo + rebalance-timeout recovery
+add_executable(group_coordinator_test group_coordinator_test.cpp)
+target_link_libraries(group_coordinator_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME GroupCoordinatorTest COMMAND group_coordinator_test)

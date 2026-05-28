@@ -15,8 +15,13 @@ namespace {
 constexpr int64_t kDefaultGroupRetentionMs = 7 * 24 * 60 * 60 * 1000LL;
 // Default member timeout: 30 seconds
 constexpr int64_t kDefaultMemberTimeoutMs = 30 * 1000LL;
-// Cleanup interval: run every 10 minutes
+// Group-retention scan interval: run every 10 minutes.
 constexpr int64_t kCleanupIntervalMs = 10 * 60 * 1000LL;
+// EX-12: timeout-check cadence. The cleanup thread wakes this often to
+// enforce member session timeouts and rebalance timeouts (the retention
+// scan still runs only every kCleanupIntervalMs). 1s gives ~1s precision
+// on a 30s session timeout / 60s rebalance timeout without busy-spinning.
+constexpr int64_t kTimeoutCheckIntervalMs = 1000LL;
 }
 
 GroupCoordinator::GroupCoordinator(std::shared_ptr<OffsetManager> offset_manager,
@@ -155,6 +160,17 @@ GroupCoordinator::JoinGroupResult GroupCoordinator::handleJoinGroup(
         member_timeout_ms_ = session_ms;
     }
 
+    // EX-12: track the max rebalance.timeout.ms across members so the
+    // cleanup thread can force-complete a stalled rebalance using the
+    // right deadline. Clamp to a sane range (1s–15min) to defend against
+    // misconfigured clients. Connect defaults to 60s.
+    int32_t rebalance_ms = request.rebalanceTimeoutMs();
+    if (rebalance_ms < 1000) rebalance_ms = 1000;
+    if (rebalance_ms > 900000) rebalance_ms = 900000;
+    if (rebalance_ms > group.rebalance_timeout_ms) {
+        group.rebalance_timeout_ms = rebalance_ms;
+    }
+
     // Update last activity for expiration tracking
     group.last_activity = std::chrono::system_clock::now();
 
@@ -174,6 +190,8 @@ GroupCoordinator::JoinGroupResult GroupCoordinator::handleJoinGroup(
         group.generation_id++;
         // Phase EX-1: count per-group rebalances.
         group.rebalances_total.fetch_add(1, std::memory_order_relaxed);
+        // EX-12: stamp the rebalance deadline on entry to CompletingRebalance.
+        group.rebalance_started_at = now;
         // Set result generation_id to the new bumped value.
         Logger::info("Group '{}' Stable→CompletingRebalance, generation bumped to {} (new member '{}')",
                      request.groupId(), group.generation_id, member_id);
@@ -181,10 +199,20 @@ GroupCoordinator::JoinGroupResult GroupCoordinator::handleJoinGroup(
         group.kind = GroupStateKind::CompletingRebalance;
         // Phase EX-1: count Empty→CompletingRebalance as a rebalance too.
         group.rebalances_total.fetch_add(1, std::memory_order_relaxed);
+        // EX-12: stamp the rebalance deadline.
+        group.rebalance_started_at = now;
+    } else if (group.kind == GroupStateKind::PreparingRebalance) {
+        // EX-12: a member (re)joining a group that a rebalance-timeout
+        // reset into PreparingRebalance advances it to CompletingRebalance,
+        // awaiting the (possibly new) leader's SyncGroup. Refresh the
+        // deadline so the new leader gets a full rebalance window.
+        group.kind = GroupStateKind::CompletingRebalance;
+        group.rebalance_started_at = now;
     }
 
     result.error = ErrorCode::NONE;
     result.generation_id = group.generation_id;
+    result.protocol_type = group.protocol_type;
     result.protocol_name = group.protocol_name;
     result.leader_id = group.leader_id;
     result.member_id = member_id;
@@ -277,6 +305,9 @@ GroupCoordinator::SyncGroupResult GroupCoordinator::handleSyncGroup(
     // Persist group state after successful sync (rebalance complete)
     persistGroupState(request.groupId(), *group);
 
+    // EX-12: echo the group's protocol_type/protocol_name (SyncGroup v5+).
+    result.protocol_type = group->protocol_type;
+    result.protocol_name = group->protocol_name;
     result.error = ErrorCode::NONE;
     return result;
 }
@@ -733,21 +764,36 @@ void GroupCoordinator::stopCleanupThread() {
 }
 
 void GroupCoordinator::cleanupExpiredGroups() {
+    // EX-12: the loop wakes every kTimeoutCheckIntervalMs to enforce member
+    // and rebalance timeouts promptly; the expensive expired-group retention
+    // scan runs only every `retention_scan_every` iterations to preserve the
+    // original 10-minute cadence.
+    const int64_t retention_scan_every =
+        std::max<int64_t>(1, kCleanupIntervalMs / kTimeoutCheckIntervalMs);
+    int64_t iteration = 0;
+
     while (cleanup_running_.load()) {
-        // Wait for the cleanup interval or until stopped
+        // Wait for the timeout-check interval or until stopped
         {
             std::unique_lock<std::mutex> lock(cleanup_mutex_);
-            cleanup_cv_.wait_for(lock, std::chrono::milliseconds(kCleanupIntervalMs),
+            cleanup_cv_.wait_for(lock, std::chrono::milliseconds(kTimeoutCheckIntervalMs),
                                 [this] { return !cleanup_running_.load(); });
         }
-        
+
         if (!cleanup_running_.load()) {
             break;
         }
-        
-        // Check for timed-out members first
+
+        // Enforce timeouts on every wake (cheap, ~1s cadence).
         checkMemberTimeouts();
-        
+        // EX-12: force-complete any rebalance that overran its deadline.
+        checkRebalanceTimeouts();
+
+        // Only run the retention scan periodically.
+        if (++iteration % retention_scan_every != 0) {
+            continue;
+        }
+
         // Scan for expired groups
         auto now = std::chrono::system_clock::now();
         std::vector<std::string> expired_groups;
@@ -832,6 +878,79 @@ void GroupCoordinator::checkMemberTimeouts() {
         if (!timed_out_members.empty()) {
             group_state.last_activity = std::chrono::system_clock::now();
             persistGroupState(group_id, group_state);
+        }
+    }
+}
+
+void GroupCoordinator::checkRebalanceTimeouts() {
+    std::vector<std::string> recovered_groups;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto now = std::chrono::steady_clock::now();
+
+        for (auto& [group_id, group] : groups_) {
+            const bool rebalancing =
+                group.kind == GroupStateKind::PreparingRebalance ||
+                group.kind == GroupStateKind::CompletingRebalance;
+            if (!rebalancing) {
+                continue;
+            }
+
+            // Skip groups whose timeout was never set (e.g. reloaded from
+            // older persisted state without the field) — we have no
+            // trustworthy deadline, so don't force-recover them.
+            if (group.rebalance_timeout_ms <= 0) {
+                continue;
+            }
+
+            const auto elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - group.rebalance_started_at)
+                    .count();
+            if (elapsed_ms <= group.rebalance_timeout_ms) {
+                continue;  // still within the rebalance window
+            }
+
+            // The rebalance overran its deadline — the leader never
+            // completed it (no SyncGroup). Evict the stalled leader and
+            // force a fresh rebalance so the remaining members can elect
+            // a new leader instead of waiting forever.
+            const std::string stalled_leader = group.leader_id;
+            if (!stalled_leader.empty()) {
+                group.members.erase(stalled_leader);
+            }
+
+            group.generation_id++;
+            group.rebalances_total.fetch_add(1, std::memory_order_relaxed);
+            group.leader_id.clear();  // first re-joiner becomes new leader
+
+            if (group.members.empty()) {
+                group.kind = GroupStateKind::Empty;
+            } else {
+                // PreparingRebalance: the generation bump makes remaining
+                // members' heartbeats return REBALANCE_IN_PROGRESS, so they
+                // re-JoinGroup; the next joiner is elected leader and drives
+                // SyncGroup to Stable.
+                group.kind = GroupStateKind::PreparingRebalance;
+                group.rebalance_started_at = now;
+            }
+
+            Logger::warn(
+                "Group '{}' rebalance timed out after {}ms; evicted stalled "
+                "leader '{}', forcing generation {} (remaining members: {})",
+                group_id, group.rebalance_timeout_ms, stalled_leader,
+                group.generation_id, group.members.size());
+            recovered_groups.push_back(group_id);
+        }
+    }
+
+    // Persist outside the lock to keep the critical section short.
+    for (const auto& group_id : recovered_groups) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = groups_.find(group_id);
+        if (it != groups_.end()) {
+            it->second.last_activity = std::chrono::system_clock::now();
+            persistGroupState(group_id, it->second);
         }
     }
 }

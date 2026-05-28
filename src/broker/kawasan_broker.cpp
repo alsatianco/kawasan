@@ -2414,7 +2414,19 @@ Buffer KawasanBroker::handleJoinGroup(RequestDispatcher::RequestContext& context
     protocol::JoinGroupResponse response;
     response.setErrorCode(result.error);
     response.setGenerationId(result.generation_id);
-    response.setGroupProtocol(result.protocol_name);
+    response.setGroupProtocol(result.protocol_name);  // v0–v6 single field
+    // EX-12: v7+ split group_protocol into protocol_type + protocol_name
+    // (both NULLABLE). Kafka Connect's leader-side performAssignment()
+    // calls ConnectProtocolCompatibility.fromProtocol(protocol_name),
+    // which throws on null — so a Connect worker that receives a null
+    // protocol_name never advances to SyncGroup. Echo the real values;
+    // leave them null only on error paths (handled by buildJoinGroupError).
+    if (!result.protocol_type.empty()) {
+        response.setProtocolType(result.protocol_type);
+    }
+    if (!result.protocol_name.empty()) {
+        response.setProtocolName(result.protocol_name);
+    }
     response.setLeaderId(result.leader_id);
     response.setMemberId(result.member_id);
     response.setMembers(result.members);
@@ -2460,6 +2472,13 @@ Buffer KawasanBroker::handleSyncGroup(RequestDispatcher::RequestContext& context
     protocol::SyncGroupResponse response;
     response.setErrorCode(result.error);
     response.setAssignment(result.assignment);
+    // EX-12: SyncGroup v5+ echoes protocol_type/protocol_name (KIP-559).
+    if (!result.protocol_type.empty()) {
+        response.setProtocolType(result.protocol_type);
+    }
+    if (!result.protocol_name.empty()) {
+        response.setProtocolName(result.protocol_name);
+    }
 
     const int16_t version =
         std::clamp<int16_t>(context.header.apiVersion(), 0, kSyncGroupMaxVersion);

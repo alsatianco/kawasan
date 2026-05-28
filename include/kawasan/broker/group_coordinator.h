@@ -53,6 +53,7 @@ public:
     struct JoinGroupResult {
         ErrorCode error = ErrorCode::NONE;
         int32_t generation_id = 0;
+        std::string protocol_type;  // EX-12: echoed in JoinGroup v7+ response
         std::string protocol_name;
         std::string leader_id;
         std::string member_id;
@@ -61,6 +62,8 @@ public:
 
     struct SyncGroupResult {
         ErrorCode error = ErrorCode::NONE;
+        std::string protocol_type;  // EX-12: echoed in SyncGroup v5+ response
+        std::string protocol_name;
         std::vector<uint8_t> assignment;
     };
 
@@ -117,6 +120,13 @@ public:
     /// @brief Computes and records consumer lag for all groups.
     /// Should be called periodically (e.g., every 10 seconds).
     void computeAndRecordConsumerLag();
+
+    /// @brief EX-12: forces a fresh rebalance for any group stuck in
+    /// Preparing/CompletingRebalance past its rebalance_timeout deadline.
+    /// Evicts the unresponsive leader so a stalled (e.g. multi-worker
+    /// Connect) leader cannot hang followers indefinitely. Called from the
+    /// cleanup thread; public so unit tests can drive it deterministically.
+    void checkRebalanceTimeouts();
 
     /// @brief Phase EX-1 (§6.3): Prometheus metrics snapshot.
     struct GroupMetric {
@@ -201,6 +211,15 @@ private:
         std::string leader_id;
         std::unordered_map<std::string, MemberState> members;
         std::chrono::system_clock::time_point last_activity;  // For expiration tracking
+        // EX-12: rebalance-timeout enforcement. rebalance_timeout_ms is the
+        // max client-supplied rebalance.timeout.ms across members; the
+        // deadline is (rebalance_started_at + rebalance_timeout_ms). If a
+        // group lingers in Preparing/CompletingRebalance past the deadline
+        // (e.g. a stalled leader never sends SyncGroup), the cleanup thread
+        // evicts the leader and forces a fresh rebalance. steady_clock so
+        // it is immune to wall-clock adjustments.
+        int32_t rebalance_timeout_ms = 0;  // 0 = unset; first joiner sets it
+        std::chrono::steady_clock::time_point rebalance_started_at;
         // Phase EX-1: per-group rebalance counter (incremented on every
         // generation bump). Atomic so getMetrics() can read without
         // holding the coordinator mutex.
@@ -212,6 +231,8 @@ private:
               protocol_type(other.protocol_type),
               protocol_name(other.protocol_name), leader_id(other.leader_id),
               members(other.members), last_activity(other.last_activity),
+              rebalance_timeout_ms(other.rebalance_timeout_ms),
+              rebalance_started_at(other.rebalance_started_at),
               rebalances_total(other.rebalances_total.load()) {}
         GroupState& operator=(const GroupState& other) {
             if (this != &other) {
@@ -222,6 +243,8 @@ private:
                 leader_id = other.leader_id;
                 members = other.members;
                 last_activity = other.last_activity;
+                rebalance_timeout_ms = other.rebalance_timeout_ms;
+                rebalance_started_at = other.rebalance_started_at;
                 rebalances_total.store(other.rebalances_total.load());
             }
             return *this;
