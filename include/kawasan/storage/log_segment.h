@@ -28,8 +28,11 @@ public:
 
     /// @brief Appends a record batch to the segment
     /// @param batch The record batch to append
+    /// @param sync If true, fsync the write (RocksDB WriteOptions.sync) before
+    ///        returning so the record is durable across a power loss. If false,
+    ///        the write is WAL-buffered only. Defaults to true (durability-first).
     /// @return The offset of the first record in the batch
-    Offset append(const RecordBatch& batch);
+    Offset append(const RecordBatch& batch, bool sync = true);
 
     /// @brief Reads a record batch at the given offset
     /// @param offset The offset to read from

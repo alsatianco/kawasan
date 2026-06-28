@@ -62,6 +62,20 @@ public:
     /// @brief Returns the total binding count (testing aid).
     size_t size() const;
 
+    /// @brief Authorization decision against the stored bindings, following
+    /// Kafka's AclAuthorizer semantics:
+    ///   - an explicit DENY that matches wins over any ALLOW;
+    ///   - otherwise a matching ALLOW grants access;
+    ///   - if no binding matches, the result is `allow_if_no_acl`.
+    /// Matching requires the exact resource_type and the operation (or the ALL
+    /// operation), and honors LITERAL/PREFIXED resource patterns, the "*"
+    /// wildcard resource name, the "User:*" principal wildcard, and "*"/empty
+    /// host wildcards. `principal` is the full "User:name" form; `host` is the
+    /// client IP (or "" — treated as matching wildcard-host bindings).
+    bool authorize(const std::string& principal, int8_t operation,
+                   int8_t resource_type, const std::string& resource_name,
+                   const std::string& host, bool allow_if_no_acl) const;
+
 private:
     static bool matches(const Filter& f, const Binding& b);
 

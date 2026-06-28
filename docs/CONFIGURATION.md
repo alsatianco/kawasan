@@ -1,698 +1,285 @@
-# Kawasan Configuration Guide
+# Kawasan Configuration Reference
 
-## Overview
+Broker configuration-key reference for Kawasan. This page documents the file formats, environment-variable substitution, the per-category key tables, and the startup-validation rules. For runtime tuning recipes and per-environment deployment guidance see [./OPERATIONS.md](./OPERATIONS.md); for the broker architecture see [./ARCHITECTURE.md](./ARCHITECTURE.md).
 
-This document provides comprehensive documentation for all Kawasan broker configuration options, environment variable support, and best practices for different deployment environments.
+## Contents
 
----
+- [File formats](#file-formats)
+- [Environment-variable substitution](#environment-variable-substitution)
+- [Which keys are actually honored](#which-keys-are-actually-honored)
+- [Identity](#identity)
+- [Network](#network)
+- [Storage paths](#storage-paths)
+- [Log segments and retention](#log-segments-and-retention)
+- [Replication and Raft](#replication-and-raft)
+- [Consumer-group and offsets](#consumer-group-and-offsets)
+- [Monitoring](#monitoring)
+- [Kafka-protocol TLS/SSL](#kafka-protocol-tlsssl)
+- [SASL authentication](#sasl-authentication)
+- [Accepted-but-inert keys](#accepted-but-inert-keys)
+- [Startup validation](#startup-validation)
+- [Command-line overrides](#command-line-overrides)
 
-## Table of Contents
+## File formats
 
-1. [Configuration Files](#configuration-files)
-2. [Environment Variable Support](#environment-variable-support)
-3. [Configuration Options Reference](#configuration-options-reference)
-4. [Environment-Specific Configurations](#environment-specific-configurations)
-5. [Validation Rules](#validation-rules)
-6. [Security Best Practices](#security-best-practices)
-7. [Performance Tuning](#performance-tuning)
-8. [Examples](#examples)
+The config loader (`src/common/config.cpp`) auto-detects the file format from the first non-whitespace byte:
 
----
+| First byte | Format | Example file |
+|------------|--------|--------------|
+| `{` or `[` | JSON object | `config/broker.dev.properties`, `config/broker.dev.json`, `config/broker.production.properties` |
+| anything else | Kafka-style `key=value` properties | `config/broker-0.properties`, `config/broker-1.properties`, `config/broker-2.properties` |
 
-## Configuration Files
+Both formats are first-class — there is no "JSON-only" mode. The `.properties` extension on the JSON files is historical; the loader ignores the extension and dispatches purely on content. See [../CLAUDE.md](../CLAUDE.md) for this gotcha.
 
-Kawasan uses JSON-formatted configuration files with support for environment variable substitution.
+Properties parsing rules: keys/values are split on the first `=` (falling back to the first `:`); leading/trailing whitespace is trimmed; lines beginning with `#` or `!` are comments; malformed lines (no separator) are skipped silently. Property values are coerced to a typed JSON value so that `getInt`/`getBool`/`getString` behave identically regardless of source format — `true`/`false` become booleans, all-digit strings (optional leading `-`) become integers, everything else stays a string.
 
-### Available Configuration Templates
+JSON files conventionally carry comments as dummy string keys (e.g. `"# Broker Identity": ""`); these unknown keys are loaded and harmlessly ignored.
 
-- **`config/broker.dev.properties`** - Development environment
-  - Fast startup, minimal resources
-  - Verbose logging for debugging
-  - Short retention periods
-  - No durability guarantees
+## Environment-variable substitution
 
-- **`config/broker.staging.properties`** - Staging environment
-  - Mirrors production topology
-  - Moderate resource usage
-  - Environment variable support
-  - Suitable for testing
+Both formats expand `${...}` references inside string values before the value is stored:
 
-- **`config/broker.production.properties`** - Production environment
-  - High durability and reliability
-  - Optimized for performance
-  - Comprehensive security settings
-  - All secrets via environment variables
+| Syntax | Behavior |
+|--------|----------|
+| `${VAR}` | Required. The broker throws `Required environment variable not set: VAR` at load time if `VAR` is unset or empty. |
+| `${VAR:default}` | Optional. Uses `default` when `VAR` is unset or empty. |
 
-- **`config/server.properties.example`** - Basic example
-  - Simple configuration for getting started
-  - Minimal settings with defaults
-
----
-
-## Environment Variable Support
-
-Kawasan supports environment variable substitution in configuration files using the syntax:
-
-```
-${VARIABLE_NAME}           - Required variable (throws error if not set)
-${VARIABLE_NAME:default}   - Optional variable with default value
-```
-
-### Examples
+An unset env var with no default is fatal — load fails with `Error in config key '<key>': Required environment variable not set: VAR`. Substitution applies to string values only; numeric/boolean JSON literals pass through unchanged.
 
 ```json
 {
   "broker.id": "${KAWASAN_BROKER_ID}",
   "host": "${KAWASAN_HOST:0.0.0.0}",
-  "port": "${KAWASAN_PORT:9092}",
-  "log.dirs": "${KAWASAN_LOG_DIRS:/var/lib/kawasan/data}"
+  "monitoring.port": "${KAWASAN_MONITORING_PORT:8080}"
 }
 ```
 
-In this example:
-- `KAWASAN_BROKER_ID` is **required** (no default)
-- `KAWASAN_HOST` defaults to `0.0.0.0` if not set
-- `KAWASAN_PORT` defaults to `9092` if not set
-- `KAWASAN_LOG_DIRS` defaults to `/var/lib/kawasan/data` if not set
+## Which keys are actually honored
 
-### Setting Environment Variables
+This build of the single-node broker reads a specific subset of keys; the remaining Kafka-compatible keys present in the sample configs are accepted (stored and round-trippable) but are not wired to any subsystem. Inert keys are catalogued in [Accepted-but-inert keys](#accepted-but-inert-keys) so the sample files stay drop-in compatible with Kafka tooling without implying behavior that does not exist. The tables below mark each key **Honored** or **Inert**.
 
-**Linux/macOS:**
-```bash
-export KAWASAN_BROKER_ID=1
-export KAWASAN_ADVERTISED_HOST=broker1.example.com
-export KAWASAN_SSL_KEYSTORE_PASSWORD=secret123
-```
+## Identity
 
-**Docker:**
-```bash
-docker run -e KAWASAN_BROKER_ID=1 \
-           -e KAWASAN_ADVERTISED_HOST=broker1 \
-           kawasan/broker
-```
+Read in `src/broker/kawasan_broker.cpp`.
 
-**Kubernetes:**
-```yaml
-env:
-  - name: KAWASAN_BROKER_ID
-    value: "1"
-  - name: KAWASAN_SSL_KEYSTORE_PASSWORD
-    valueFrom:
-      secretKeyRef:
-        name: kawasan-secrets
-        key: keystore-password
-```
+| Key | Type | Default | Status | Description |
+|-----|------|---------|--------|-------------|
+| `broker.id` | int | — (required) | Honored | Unique broker id. Must be present and `>= 0`. |
+| `host` | string | `localhost` | Honored | Bind address for the Kafka TCP listener (`0.0.0.0` for all interfaces). |
+| `advertised.host` | string | value of `host` | Honored | Hostname/IP returned to clients in Metadata responses. |
+| `port` | int | `9092` | Honored | Kafka protocol listener port (1–65535). |
+| `cluster.id` | string | `kawasan-cluster` | Honored | Initial cluster id; once metadata is persisted, the stored cluster id takes precedence. |
 
----
+## Network
 
-## Configuration Options Reference
+| Key | Type | Default | Status | Description |
+|-----|------|---------|--------|-------------|
+| `network.io_threads` | int | hardware concurrency (≥1) | Honored | TCP server I/O thread count. Values `<= 0` fall back to the hardware default. |
+| `network.max_frame_bytes` | long | `16777216` (16 MiB) | Honored | Maximum accepted request frame size. |
+| `num.network.threads` | int | `8` | Inert | Accepted; only range-validated. Use `network.io_threads`. |
+| `num.io.threads` | int | `8` | Inert | Accepted; only range-validated. |
+| `socket.send.buffer.bytes` | int | `102400` | Inert | Accepted; not applied. |
+| `socket.receive.buffer.bytes` | int | `102400` | Inert | Accepted; not applied. |
+| `socket.request.max.bytes` | int | `104857600` | Inert | Accepted; frame cap is `network.max_frame_bytes`. |
 
-### Broker Identity
+## Storage paths
 
-| Key | Type | Required | Default | Description |
-|-----|------|----------|---------|-------------|
-| `broker.id` | int | Yes | - | Unique identifier for this broker in the cluster |
-| `host` | string | Yes | - | Host address to bind to (use `0.0.0.0` for all interfaces) |
-| `advertised.host` | string | No | Same as `host` | Externally accessible hostname/IP for clients |
-| `port` | int | Yes | 9092 | Port number for broker to listen on (1-65535) |
+| Key | Type | Default | Status | Description |
+|-----|------|---------|--------|-------------|
+| `log.dirs` | string | `/tmp/kawasan-logs` | Honored | Directory for RocksDB-backed log segments. Required by validation. |
+| `metadata.dir` | string | `<log.dirs>/meta` | Honored | Directory for cluster metadata and persisted Raft state (`<metadata.dir>/raft`). |
 
-### Storage Configuration
+## Log segments and retention
 
-| Key | Type | Required | Default | Description |
-|-----|------|----------|---------|-------------|
-| `log.dirs` | string | Yes | - | Directory for storing log segments (use SSD for production) |
-| `log.segment.bytes` | long | No | 1073741824 | Maximum size of a single log segment file (1GB default) |
-| `log.retention.hours` | long | No | 168 | Hours to retain log segments (168 = 7 days, -1 = unlimited) |
-| `log.retention.bytes` | long | No | -1 | Maximum size of log before deletion (-1 = unlimited) |
-| `log.retention.check.interval.ms` | long | No | 300000 | How often to check for log deletion (5 minutes) |
-| `log.cleanup.policy` | string | No | delete | `delete` (time/size based) or `compact` (keep latest per key) |
+Read in `src/broker/kawasan_broker.cpp`. Time-based keys are resolved most-specific-first.
 
-### Network Settings
+| Key | Type | Default | Status | Description |
+|-----|------|---------|--------|-------------|
+| `log.segment.bytes` | long | `1073741824` (1 GiB) | Honored | Max size of a single segment. Validation requires `>= 1024`. |
+| `log.roll.ms` | long | (internal default) | Honored | Time-based segment roll interval. Takes precedence over `log.roll.hours`. |
+| `log.roll.hours` | long | — | Honored | Segment roll interval in hours; used only when `log.roll.ms <= 0`. |
+| `log.retention.ms` | long | (internal default) | Honored | Time-based retention. Takes precedence over `log.retention.hours`. |
+| `log.retention.hours` | long | — | Honored | Retention in hours; used only when `log.retention.ms <= 0`. Validation requires `>= -1`. |
+| `log.retention.bytes` | long | `-1` (unlimited) | Honored | Size-based retention cap. |
+| `log.cleaner.interval.ms` | long | `300000` (5 min) | Honored | Compaction + retention sweep interval. |
+| `log.cleanup.policy` | string | `delete` | Inert | Accepted; `delete` vs `compact` selection is per-topic, not driven by this broker-level key. |
+| `log.retention.check.interval.ms` | long | `300000` | Inert | Accepted; sweep cadence is `log.cleaner.interval.ms`. |
+| `log.durability` | string | `sync` | Honored | Partition-log write durability. `sync` (default) fsyncs each acked produce (`WriteOptions.sync=true`) so an acknowledged record survives a power loss / OS crash; `async` is WAL-buffered only (lower latency, but a machine crash before the next flush loses the tail). |
+| `log.flush.interval.messages` | long | `10000` | Inert | Accepted; not applied. Durability is controlled by `log.durability`. |
+| `log.flush.interval.ms` | long | `1000` | Inert | Accepted; not applied. |
+| `offsets.topic.num.partitions` | int | `16` | Honored | Partition count for the internal `__consumer_offsets` topic. Each partition is its own RocksDB instance, so a lower count reduces the startup file-descriptor footprint (Kafka's default is 50). Fixed at first creation. |
+| `transaction.state.topic.num.partitions` | int | `16` | Honored | Partition count for the internal `__transaction_state` topic. Same FD trade-off as above. |
+| `compression.type` | string | `none` | Inert (validated) | Accepted; value is validated against `none/gzip/snappy/lz4/zstd` but compression selection is per-batch from the client. |
 
-| Key | Type | Required | Default | Description |
-|-----|------|----------|---------|-------------|
-| `num.network.threads` | int | No | 8 | Number of threads for network I/O |
-| `num.io.threads` | int | No | 8 | Number of threads for disk I/O |
-| `socket.send.buffer.bytes` | int | No | 102400 | Socket send buffer size (100KB) |
-| `socket.receive.buffer.bytes` | int | No | 102400 | Socket receive buffer size (100KB) |
-| `socket.request.max.bytes` | int | No | 104857600 | Maximum request size (100MB) |
+Durability note: with `log.durability=sync` (the default) message/log writes are fsynced (`sync=true`) before the produce is acknowledged, as are offset commits, for at-least-once durability; consumer-group metadata uses async writes (`sync=false`) protected by the WAL. The high-watermark checkpoint is written atomically (temp file + fsync + rename). See [./OPERATIONS.md](./OPERATIONS.md) for the durability model.
 
-### Durability & Flush Settings
+## Replication and Raft
 
-| Key | Type | Required | Default | Description |
-|-----|------|----------|---------|-------------|
-| `log.flush.interval.messages` | long | No | 10000 | Flush to disk after N messages |
-| `log.flush.interval.ms` | long | No | 1000 | Flush to disk after N milliseconds |
-| `log.flush.scheduler.interval.ms` | long | No | 60000 | Background flush check interval |
+Single-node is the primary, hardened mode. Multi-broker Raft replication exists but is not production-hardened.
 
-### Replication Settings
+| Key | Type | Default | Status | Description |
+|-----|------|---------|--------|-------------|
+| `default.replication.factor` | int | `1` | Honored (clamped) | Default RF for new topics. Values `> 1` are **forced to 1** in this build; `< 1` is corrected to 1. With `deployment.mode=production`, RF > 1 is **rejected at startup** instead of silently clamped (see Deployment mode). |
+| `raft.port` | int | `9093` | Honored | Inter-broker Raft listener port. |
+| `raft.peers` | string | `""` (single-node) | Honored | Comma-separated `id:host:port` list, e.g. `0:host0:9093,1:host1:9093`. Empty = single-node. If non-empty, **this broker's `broker.id` must appear in the list** or startup fails. |
+| `raft.ssl.enabled` | bool | `false` | Parsed, **not enforced** | When `true`, the cert/key/ca paths below are read and validated, but `src/raft/raft_transport.{cpp,h}` contains no TLS code — inter-broker Raft traffic stays PLAINTEXT regardless. See [../CLAUDE.md](../CLAUDE.md). |
+| `raft.ssl.cert.file` | string | `""` | Parsed, not enforced | PEM server certificate (required by `isValid()` when `raft.ssl.enabled=true`). |
+| `raft.ssl.key.file` | string | `""` | Parsed, not enforced | PEM private key. |
+| `raft.ssl.key.password` | string | `""` | Parsed, not enforced | Private-key password. |
+| `raft.ssl.ca.file` | string | `""` | Parsed, not enforced | PEM CA bundle for peer verification. |
+| `min.insync.replicas` | int | `1` | Inert (validated) | Accepted; range/cross-checked at validation but not enforced at write time. With `deployment.mode=production`, a value `> 1` is **rejected at startup** (it would be inert on a single node). |
+| `offsets.topic.replication.factor` | int | `1` | Inert | Accepted; not applied. |
+| `transaction.state.log.replication.factor` | int | `1` | Inert | Accepted; not applied. |
+| `transaction.state.log.min.isr` | int | `1` | Inert | Accepted; not applied. |
+| `replica.lag.time.max.ms` | long | `30000` | Inert | Accepted; not applied. |
+| `num.replica.fetchers` | int | `1` | Inert | Accepted; not applied. |
+| `num.recovery.threads.per.data.dir` | int | `1` | Inert | Accepted; not applied. |
 
-| Key | Type | Required | Default | Description |
-|-----|------|----------|---------|-------------|
-| `default.replication.factor` | int | No | 1 | Default replication factor for new topics |
-| `min.insync.replicas` | int | No | 1 | Minimum replicas that must acknowledge writes |
-| `offsets.topic.replication.factor` | int | No | 1 | Replication factor for offset topic |
-| `transaction.state.log.replication.factor` | int | No | 1 | Replication factor for transaction log |
-| `transaction.state.log.min.isr` | int | No | 1 | Min ISR for transaction log |
-| `replica.lag.time.max.ms` | long | No | 30000 | Max lag before removing replica from ISR |
-| `num.replica.fetchers` | int | No | 1 | Number of fetcher threads per broker |
+The `broker-0/1/2.properties` files also use Kafka-native `listeners` / `advertised.listeners` keys (e.g. `PLAINTEXT://0.0.0.0:9092`). These are not parsed by the broker — the listener is configured via `host`/`port`. Treat `listeners`/`advertised.listeners` in those files as documentation, not active config.
 
-### Recovery Settings
+Enabling `raft.ssl.enabled=true` produces a broker that logs "TLS enabled for Raft protocol" yet sends plaintext on the wire. Do not rely on it for confidentiality.
 
-| Key | Type | Required | Default | Description |
-|-----|------|----------|---------|-------------|
-| `num.recovery.threads.per.data.dir` | int | No | 1 | Threads for log recovery and flushing |
+## Consumer-group and offsets
 
-### Compression
+The group coordinator and offset manager use hardcoded defaults; the keys below are accepted but not read from config. Per-member session and rebalance timeouts come from the client's JoinGroup request (clamped to a safe range), and offset/group retention defaults to 7 days in code.
 
-| Key | Type | Required | Default | Description |
-|-----|------|----------|---------|-------------|
-| `compression.type` | string | No | none | Compression type: `none`, `gzip`, `snappy`, `lz4`, `zstd` |
+| Key | Type | Default | Status | Description |
+|-----|------|---------|--------|-------------|
+| `group.initial.rebalance.delay.ms` | int | `0` | Inert | Rebalance is driven by client-supplied timeouts. |
+| `group.min.session.timeout.ms` | int | `6000` | Inert | Session-timeout clamp is internal. |
+| `group.max.session.timeout.ms` | int | `300000` | Inert | Session-timeout clamp is internal. |
+| `group.retention.ms` | long | `604800000` (7 days) | Inert | Group retention is a hardcoded 7-day default. |
+| `offsets.retention.minutes` | int | (7 days in code) | Inert | Offset retention is a hardcoded 7-day default. |
+| `consumer.lag.metrics.enabled` | bool | `false` | Inert | Present in dev configs; not wired in this build. |
+| `consumer.lag.check.interval.ms` | int | `30000` | Inert | Not wired. |
 
-### Consumer Group Settings
+Offset-commit durability: commits use synchronous RocksDB writes and are batched across partitions into a single `WriteBatch`. See [./OPERATIONS.md](./OPERATIONS.md).
 
-| Key | Type | Required | Default | Description |
-|-----|------|----------|---------|-------------|
-| `group.initial.rebalance.delay.ms` | int | No | 0 | Delay before first rebalance (give consumers time to join) |
-| `group.max.session.timeout.ms` | int | No | 300000 | Maximum session timeout (5 minutes) |
-| `group.min.session.timeout.ms` | int | No | 6000 | Minimum session timeout (6 seconds) |
+## Monitoring
 
-### Producer Settings
+Read in `src/broker/kawasan_broker.cpp`. Serves Prometheus metrics at `/metrics` and health endpoints (Boost.Beast HTTP).
 
-| Key | Type | Required | Default | Description |
-|-----|------|----------|---------|-------------|
-| `max.request.size` | int | No | 1048576 | Maximum size of a produce request (1MB) |
+| Key | Type | Default | Status | Description |
+|-----|------|---------|--------|-------------|
+| `monitoring.host` | string | `0.0.0.0` | Honored | Bind address for the HTTP monitoring server. |
+| `monitoring.port` | int | `9094` | Honored | HTTP port for metrics/health. Must differ from `port` (validation error if equal); range 1–65535. |
+| `monitoring.enabled` | bool | `true` | Inert | Accepted; the monitoring server is started regardless in this build. |
+| `metrics.recording.level` | string | `INFO` | Inert | Accepted; not applied. |
 
-### Consumer Settings
+Port note: the default is **9094** (used by `broker.dev`, `broker.docker`, and `broker-N` configs). The staging and production sample configs override it to **8080** via `${KAWASAN_MONITORING_PORT:8080}`, and `monitoring/prometheus.yml` scrapes `:8080`. Pick the port to match your scrape target.
 
-| Key | Type | Required | Default | Description |
-|-----|------|----------|---------|-------------|
-| `fetch.min.bytes` | int | No | 1 | Minimum bytes to fetch in a request |
-| `fetch.max.wait.ms` | int | No | 500 | Maximum time to wait for fetch |
+## Kafka-protocol TLS/SSL
 
-### Partition Settings
+| Key | Type | Default | Status | Description |
+|-----|------|---------|--------|-------------|
+| `security.protocol` | string | `PLAINTEXT` | Honored (gating) | `PLAINTEXT` or `SSL`. `SSL` sets the TLS-enabled flag — see refusal below. `SASL_*` values are not gating in this build. |
+| `ssl.enabled` | bool | `false` | Honored (gating) | Alternative to `security.protocol=SSL`; either one enables the TLS path. |
 
-| Key | Type | Required | Default | Description |
-|-----|------|----------|---------|-------------|
-| `num.partitions` | int | No | 1 | Default number of partitions for new topics |
+**TLS for the Kafka protocol is not implemented in this build.** If `security.protocol=SSL` or `ssl.enabled=true`, the broker **refuses to start** and throws (`kawasan_broker.cpp`) rather than silently listening as plaintext. To run this build, keep `security.protocol=PLAINTEXT` / `ssl.enabled=false`.
 
-### Metrics and Monitoring
+Sample configs: `config/broker.production.properties` now defaults `security.protocol` to `PLAINTEXT` and `ssl.enabled` to `false` (so it starts out of the box). You can still opt into the TLS path via `KAWASAN_SECURITY_PROTOCOL`/`KAWASAN_SSL_ENABLED`, but the broker will then refuse to start until client TLS is implemented.
 
-| Key | Type | Required | Default | Description |
-|-----|------|----------|---------|-------------|
-| `metrics.recording.level` | string | No | INFO | Metrics detail level: `DEBUG`, `INFO`, `WARN`, `ERROR` |
-| `monitoring.port` | int | No | 8080 | HTTP port for health checks and Prometheus metrics |
-| `monitoring.enabled` | bool | No | true | Enable monitoring endpoints |
+The following client-TLS keys appear in `server.properties.example` / `broker.production.properties` but are **not read** by the broker (the TLS path refuses before they would be used): `ssl.cert.file`, `ssl.key.file`, `ssl.ca.file`, `ssl.key.password`, `ssl.client.auth`, `ssl.keystore.location`, `ssl.keystore.password`, `ssl.truststore.location`, `ssl.truststore.password`, `ssl.protocol`, `ssl.cipher.suites`. The two sample files even disagree on scheme (PEM `ssl.cert.file` vs JKS `ssl.keystore.*`); neither is consumed.
 
-### Topic Management
+## SASL authentication
 
-| Key | Type | Required | Default | Description |
-|-----|------|----------|---------|-------------|
-| `auto.create.topics.enable` | bool | No | true | Auto-create topics on first produce/consume |
-| `delete.topic.enable` | bool | No | true | Allow topic deletion |
+SASL/PLAIN and SASL/SCRAM-SHA-256 credentials are loaded from two sources each (a credentials file, then an inline JSON object); both sources merge into one credential map. If no credentials are configured, PLAIN falls back to "accept any non-empty user/password" (dev mode) — but **only outside production**: with `deployment.mode=production`, PLAIN auth with no configured credentials is rejected. PLAIN password comparison is constant-time.
 
-### Logging
+| Key | Type | Default | Status | Description |
+|-----|------|---------|--------|-------------|
+| `sasl.plain.credentials.file` | string | `""` | Honored | Path to a `user:password`-per-line file (`#` comments). Missing file is fatal. |
+| `sasl.plain.users` | string (JSON) | `""` | Honored | Inline `{"user":"password", ...}` object. |
+| `sasl.scram.credentials.file` | string | `""` | Honored | SCRAM-SHA-256 `user:password`-per-line file; salt/keys derived at startup. |
+| `sasl.scram.users` | string (JSON) | `""` | Honored | Inline `{"user":"password", ...}` for SCRAM-SHA-256. |
+| `sasl.enabled` | bool | `false` | Inert | Accepted; SASL handlers are available irrespective of this flag. |
+| `sasl.mechanism` | string | `PLAIN` | Inert | Accepted; offered mechanisms are determined by which credential maps are populated. |
+| `sasl.jaas.config` | string | `""` | Inert | Accepted; not parsed. |
 
-| Key | Type | Required | Default | Description |
-|-----|------|----------|---------|-------------|
-| `log.level` | string | No | info | Log level: `trace`, `debug`, `info`, `warn`, `error`, `critical` |
-| `log.format` | string | No | text | Log format: `text` or `json` |
+## Authorization (ACLs)
 
-### Security Settings
+ACL **enforcement** is opt-in. When disabled (the default), bindings can still be created/described/deleted via the ACL APIs but are not consulted on requests — behavior is unchanged from earlier builds. When enabled, the broker consults `AclStore` on Produce (WRITE), Fetch (READ), CreateTopics (CREATE), and DeleteTopics (DELETE), with Kafka semantics: an explicit DENY beats any ALLOW; if no binding matches, the result is `allow.everyone.if.no.acl.found`. The principal is the authenticated SASL user (`User:<name>`) or `User:ANONYMOUS`.
 
-| Key | Type | Required | Default | Description |
-|-----|------|----------|---------|-------------|
-| `security.protocol` | string | No | PLAINTEXT | Security protocol: `PLAINTEXT`, `SSL`, `SASL_PLAINTEXT`, `SASL_SSL` |
+| Key | Type | Default | Status | Description |
+|-----|------|---------|--------|-------------|
+| `authorizer.enabled` | bool | `false` | Honored | Master switch for ACL enforcement. Off = no enforcement (bindings stored only). |
+| `allow.everyone.if.no.acl.found` | bool | `false` | Honored | When the authorizer is enabled and no binding matches a request, allow it (`true`) or deny it (`false`, Kafka default). |
+| `super.users` | string | `""` | Honored | `;`-separated principals that bypass all ACL checks, e.g. `User:admin;User:svc`. |
 
-### TLS/SSL Configuration
+## Client quotas
 
-| Key | Type | Required | Default | Description |
-|-----|------|----------|---------|-------------|
-| `ssl.enabled` | bool | No | false | Enable TLS encryption |
-| `ssl.keystore.location` | string | Conditional | - | Path to keystore file (required if SSL enabled) |
-| `ssl.keystore.password` | string | Conditional | - | Keystore password (required if SSL enabled) |
-| `ssl.key.password` | string | Conditional | - | Private key password (required if SSL enabled) |
-| `ssl.truststore.location` | string | No | - | Path to truststore file |
-| `ssl.truststore.password` | string | Conditional | - | Truststore password (if truststore used) |
-| `ssl.protocol` | string | No | TLSv1.3 | TLS protocol version |
-| `ssl.cipher.suites` | string | No | - | Comma-separated cipher suites (empty = defaults) |
-| `ssl.client.auth` | string | No | none | Client auth: `none`, `requested`, `required` |
+Per-client byte-rate throttling. Disabled (unlimited) when `<= 0` (the default). When set, a client exceeding its rate receives a `throttle_time_ms` in its Produce/Fetch response so well-behaved clients back off.
 
-### SASL Authentication
+| Key | Type | Default | Status | Description |
+|-----|------|---------|--------|-------------|
+| `quota.producer.default` | long | `0` (unlimited) | Honored | Per-client produce byte/sec quota. |
+| `quota.consumer.default` | long | `0` (unlimited) | Honored | Per-client consume byte/sec quota. |
 
-| Key | Type | Required | Default | Description |
-|-----|------|----------|---------|-------------|
-| `sasl.enabled` | bool | No | false | Enable SASL authentication |
-| `sasl.mechanism` | string | No | PLAIN | SASL mechanism: `PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`, `GSSAPI` |
-| `sasl.jaas.config` | string | Conditional | - | JAAS configuration (required if SASL enabled) |
+## Deployment mode
 
-### Performance Tuning
+| Key | Type | Default | Status | Description |
+|-----|------|---------|--------|-------------|
+| `deployment.mode` | string | `""` | Honored | Set to `production` (or env `KAWASAN_DEPLOYMENT_MODE=production`) to fail fast at startup on settings the broker cannot honor (TLS-implying `security.protocol`, `default.replication.factor > 1`, `min.insync.replicas > 1`) and to refuse SASL/PLAIN "accept-any" when no credentials are configured. |
 
-| Key | Type | Required | Default | Description |
-|-----|------|----------|---------|-------------|
-| `background.threads` | int | No | 10 | Number of background threads |
-| `log.message.timestamp.type` | string | No | CreateTime | Timestamp type: `CreateTime`, `LogAppendTime` |
+## Accepted-but-inert keys
 
-### Quota and Rate Limiting
+These keys are present in the sample configs for Kafka tooling compatibility but have no effect in this build (stored and round-trippable; some are validated). Do not rely on them to change behavior.
 
-| Key | Type | Required | Default | Description |
-|-----|------|----------|---------|-------------|
-| `quota.producer.default` | long | No | -1 | Producer quota (bytes/sec, -1 = unlimited) |
-| `quota.consumer.default` | long | No | -1 | Consumer quota (bytes/sec, -1 = unlimited) |
+| Category | Keys |
+|----------|------|
+| Network | `num.network.threads`, `num.io.threads`, `socket.send.buffer.bytes`, `socket.receive.buffer.bytes`, `socket.request.max.bytes` |
+| Flush / cleanup | `log.flush.interval.messages`, `log.flush.interval.ms`, `log.flush.scheduler.interval.ms`, `log.retention.check.interval.ms`, `log.cleanup.policy` |
+| Replication | `min.insync.replicas`, `offsets.topic.replication.factor`, `transaction.state.log.replication.factor`, `transaction.state.log.min.isr`, `replica.lag.time.max.ms`, `num.replica.fetchers`, `num.recovery.threads.per.data.dir` |
+| Producer / consumer | `max.request.size`, `fetch.min.bytes`, `fetch.max.wait.ms`, `compression.type` |
+| Groups / offsets | `group.initial.rebalance.delay.ms`, `group.min.session.timeout.ms`, `group.max.session.timeout.ms`, `group.retention.ms`, `offsets.retention.minutes`, `consumer.lag.metrics.enabled`, `consumer.lag.check.interval.ms` |
+| Monitoring | `monitoring.enabled`, `metrics.recording.level` |
+| Topics | `auto.create.topics.enable` (honored), `delete.topic.enable` (inert) |
+| Logging | `log.level` (set via `--log-level` flag), `log.format` (inert) |
+| ZooKeeper / TXN | `zookeeper.connect`, `zookeeper.connection.timeout.ms`, `background.threads`, `log.message.timestamp.type` |
+| TLS (Kafka protocol) | `ssl.cert.file`, `ssl.key.file`, `ssl.ca.file`, `ssl.key.password`, `ssl.client.auth`, `ssl.keystore.*`, `ssl.truststore.*`, `ssl.protocol`, `ssl.cipher.suites` |
+| Listeners | `listeners`, `advertised.listeners` (use `host`/`port` instead) |
 
-### ZooKeeper Settings
+`auto.create.topics.enable` is honored (defaults `true`); `delete.topic.enable` is accepted but inert.
 
-| Key | Type | Required | Default | Description |
-|-----|------|----------|---------|-------------|
-| `zookeeper.connect` | string | No | - | ZooKeeper connection string (optional, Raft is default) |
-| `zookeeper.connection.timeout.ms` | int | No | 18000 | ZooKeeper connection timeout |
+## Startup validation
 
----
+`Config::validate()` (`src/common/config.cpp`) runs before the broker is constructed (called from `tools/kawasan-broker.cpp`). Any error aborts startup with `Configuration validation failed:` followed by the list; warnings print to stderr and continue.
 
-## Environment-Specific Configurations
+Required keys (each missing key is an error): `broker.id`, `host`, `port`, `log.dirs`.
 
-### Development Environment
+| Rule | Severity |
+|------|----------|
+| `broker.id >= 0` | error |
+| `1 <= port <= 65535` | error |
+| `num.network.threads >= 1` | error |
+| `num.network.threads <= 1024` | warning ("very high … may cause resource issues") |
+| `num.io.threads >= 1` | error |
+| `log.segment.bytes >= 1024` | error |
+| `log.retention.hours >= -1` | error |
+| `default.replication.factor >= 1` | error |
+| `min.insync.replicas >= 1` | error |
+| `min.insync.replicas <= default.replication.factor` | error |
+| `1 <= monitoring.port <= 65535` | error |
+| `monitoring.port != port` | error |
+| `compression.type` ∈ `{none, gzip, snappy, lz4, zstd}` | error |
 
-**Use:** Local development, testing, debugging
+Validation only checks the keys above; it does not warn about inert keys or about TLS-refusal config (that refusal happens later, during broker construction).
 
-**Key Characteristics:**
-- Fast startup and restarts
-- Verbose logging (debug level)
-- Short retention (24 hours)
-- No replication
-- Minimal resource usage
-- Data in `/tmp` (ephemeral)
+## Command-line overrides
 
-**Configuration:** `config/broker.dev.properties`
+`kawasan-broker` (Boost.Program_options) accepts a config file and a few overrides applied **after** the file loads and **before** validation:
 
-```bash
-./kawasan-broker --config config/broker.dev.properties
-```
-
-### Staging Environment
-
-**Use:** Pre-production testing, integration testing
-
-**Key Characteristics:**
-- Mirrors production topology (3+ brokers)
-- Moderate resource usage
-- JSON logging for aggregation
-- 72-hour retention
-- Replication factor 3
-- Environment variable support
-
-**Configuration:** `config/broker.staging.properties`
+| Flag | Maps to | Notes |
+|------|---------|-------|
+| `--config, -c <path>` | — | Config file to load (auto-detected JSON or properties). |
+| `--broker-id <int>` | `broker.id` | Override. |
+| `--host <string>` | `host` | Override. |
+| `--port, -p <int>` | `port` | Override. |
+| `--log-dir <path>` | `log.dirs` | Override. |
+| `--log-level <level>` | logger only | `trace`/`debug`/`info`/`warn`/`error`/`critical`; defaults to `info`. Initializes the logger; not stored as a config key. |
+| `--help, -h` | — | Print options and exit. |
 
 ```bash
-export KAWASAN_BROKER_ID=1
-export KAWASAN_ADVERTISED_HOST=staging-broker1.example.com
-./kawasan-broker --config config/broker.staging.properties
+./build/tools/kawasan-broker --config config/broker.dev.properties --log-level debug
 ```
 
-### Production Environment
-
-**Use:** Production deployments
-
-**Key Characteristics:**
-- High durability (min.insync.replicas=2)
-- 7-day retention (configurable)
-- TLS encryption enabled
-- SASL authentication (optional)
-- JSON logging for ELK/Splunk
-- Prometheus metrics enabled
-- All secrets from environment variables
-
-**Configuration:** `config/broker.production.properties`
-
-```bash
-export KAWASAN_BROKER_ID=1
-export KAWASAN_ADVERTISED_HOST=prod-broker1.example.com
-export KAWASAN_SSL_KEYSTORE_PASSWORD=$(vault read -field=password secret/kawasan/ssl)
-export KAWASAN_SSL_KEY_PASSWORD=$(vault read -field=keypassword secret/kawasan/ssl)
-./kawasan-broker --config config/broker.production.properties
-```
-
----
-
-## Validation Rules
-
-The broker performs automatic validation on startup. The following rules are enforced:
-
-### Required Keys
-- `broker.id` - Must be present
-- `host` - Must be present
-- `port` - Must be present
-- `log.dirs` - Must be present
-
-### Value Constraints
-- `broker.id` ≥ 0
-- `port` between 1 and 65535
-- `num.network.threads` ≥ 1
-- `num.io.threads` ≥ 1
-- `log.segment.bytes` ≥ 1024
-- `log.retention.hours` ≥ -1 (-1 means unlimited)
-- `default.replication.factor` ≥ 1
-- `min.insync.replicas` ≥ 1
-- `min.insync.replicas` ≤ `default.replication.factor`
-- `monitoring.port` between 1 and 65535
-- `monitoring.port` ≠ `port` (must be different)
-- `compression.type` must be one of: `none`, `gzip`, `snappy`, `lz4`, `zstd`
-
-### Warnings
-- `num.network.threads` > 1024 (may cause resource issues)
-
----
-
-## Security Best Practices
-
-### 1. Never Commit Secrets
-
-❌ **Bad:**
-```json
-{
-  "ssl.keystore.password": "mypassword123"
-}
-```
-
-✅ **Good:**
-```json
-{
-  "ssl.keystore.password": "${KAWASAN_SSL_KEYSTORE_PASSWORD}"
-}
-```
-
-### 2. Use Secrets Managers
-
-**HashiCorp Vault:**
-```bash
-export KAWASAN_SSL_KEYSTORE_PASSWORD=$(vault kv get -field=password secret/kawasan/ssl)
-```
-
-**AWS Secrets Manager:**
-```bash
-export KAWASAN_SSL_KEYSTORE_PASSWORD=$(aws secretsmanager get-secret-value \
-  --secret-id kawasan/ssl/keystore --query SecretString --output text)
-```
-
-**Azure Key Vault:**
-```bash
-export KAWASAN_SSL_KEYSTORE_PASSWORD=$(az keyvault secret show \
-  --name kawasan-ssl-keystore --vault-name mykeyvault --query value -o tsv)
-```
-
-### 3. Rotate Credentials Regularly
-
-- SSL certificates: Every 90 days
-- SASL passwords: Every 30 days
-- Access keys: Every 90 days
-
-### 4. Use Principle of Least Privilege
-
-- Run broker as dedicated `kawasan` user (not root)
-- Restrict file permissions: 600 for configs, 700 for data dirs
-- Use network policies in Kubernetes
-- Enable firewall rules
-
-### 5. Enable TLS in Production
-
-```json
-{
-  "security.protocol": "SSL",
-  "ssl.enabled": true,
-  "ssl.keystore.location": "/etc/kawasan/ssl/keystore.jks",
-  "ssl.keystore.password": "${KAWASAN_SSL_KEYSTORE_PASSWORD}",
-  "ssl.key.password": "${KAWASAN_SSL_KEY_PASSWORD}",
-  "ssl.protocol": "TLSv1.3"
-}
-```
-
----
-
-## Performance Tuning
-
-### High Throughput Scenarios
-
-**Increase network and I/O threads:**
-```json
-{
-  "num.network.threads": 16,
-  "num.io.threads": 16,
-  "socket.send.buffer.bytes": 262144,
-  "socket.receive.buffer.bytes": 262144
-}
-```
-
-**Use efficient compression:**
-```json
-{
-  "compression.type": "lz4"
-}
-```
-
-**Increase partition count:**
-```json
-{
-  "num.partitions": 12
-}
-```
-
-### Low Latency Scenarios
-
-**Reduce flush intervals:**
-```json
-{
-  "log.flush.interval.messages": 1000,
-  "log.flush.interval.ms": 100
-}
-```
-
-**Optimize fetch settings:**
-```json
-{
-  "fetch.min.bytes": 1,
-  "fetch.max.wait.ms": 100
-}
-```
-
-### High Durability Scenarios
-
-**Increase replication:**
-```json
-{
-  "default.replication.factor": 3,
-  "min.insync.replicas": 2,
-  "offsets.topic.replication.factor": 3,
-  "transaction.state.log.replication.factor": 3,
-  "transaction.state.log.min.isr": 2
-}
-```
-
-**More aggressive flushing:**
-```json
-{
-  "log.flush.interval.messages": 1000,
-  "log.flush.interval.ms": 500
-}
-```
-
-### Resource-Constrained Environments
-
-**Reduce thread counts:**
-```json
-{
-  "num.network.threads": 2,
-  "num.io.threads": 2,
-  "background.threads": 4
-}
-```
-
-**Aggressive cleanup:**
-```json
-{
-  "log.retention.hours": 24,
-  "log.retention.bytes": 10737418240,
-  "log.segment.bytes": 104857600
-}
-```
-
----
-
-## Examples
-
-### Example 1: Single Development Broker
-
-```bash
-# Start with development config
-./kawasan-broker --config config/broker.dev.properties --log-level debug
-```
-
-### Example 2: Production Cluster (3 Brokers)
-
-**Broker 1:**
-```bash
-export KAWASAN_BROKER_ID=1
-export KAWASAN_ADVERTISED_HOST=broker1.prod.example.com
-export KAWASAN_SSL_KEYSTORE_PASSWORD=$(vault read -field=password secret/kawasan/ssl)
-export KAWASAN_SSL_KEY_PASSWORD=$(vault read -field=keypassword secret/kawasan/ssl)
-./kawasan-broker --config config/broker.production.properties
-```
-
-**Broker 2:**
-```bash
-export KAWASAN_BROKER_ID=2
-export KAWASAN_ADVERTISED_HOST=broker2.prod.example.com
-# ... same SSL setup
-./kawasan-broker --config config/broker.production.properties
-```
-
-**Broker 3:**
-```bash
-export KAWASAN_BROKER_ID=3
-export KAWASAN_ADVERTISED_HOST=broker3.prod.example.com
-# ... same SSL setup
-./kawasan-broker --config config/broker.production.properties
-```
-
-### Example 3: Docker Deployment
-
-```bash
-docker run -d \
-  --name kawasan-broker \
-  -p 9092:9092 \
-  -p 8080:8080 \
-  -e KAWASAN_BROKER_ID=1 \
-  -e KAWASAN_ADVERTISED_HOST=localhost \
-  -e KAWASAN_LOG_DIRS=/var/lib/kawasan \
-  -v kawasan-data:/var/lib/kawasan \
-  -v $(pwd)/config/broker.production.properties:/etc/kawasan/broker.properties:ro \
-  kawasan/broker \
-  --config /etc/kawasan/broker.properties
-```
-
-### Example 4: Kubernetes StatefulSet
-
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: kawasan-config
-data:
-  broker.properties: |
-    {
-      "broker.id": "${KAWASAN_BROKER_ID}",
-      "host": "0.0.0.0",
-      "advertised.host": "${POD_NAME}.kawasan-headless.default.svc.cluster.local",
-      "port": 9092,
-      "log.dirs": "/var/lib/kawasan/data",
-      "default.replication.factor": 3,
-      "min.insync.replicas": 2
-    }
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: kawasan
-spec:
-  serviceName: kawasan-headless
-  replicas: 3
-  selector:
-    matchLabels:
-      app: kawasan
-  template:
-    metadata:
-      labels:
-        app: kawasan
-    spec:
-      containers:
-      - name: broker
-        image: kawasan/broker:latest
-        env:
-        - name: POD_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.name
-        - name: KAWASAN_BROKER_ID
-          value: "$(echo ${POD_NAME} | cut -d'-' -f2)"
-        - name: KAWASAN_SSL_KEYSTORE_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: kawasan-ssl
-              key: keystore-password
-        volumeMounts:
-        - name: config
-          mountPath: /etc/kawasan
-        - name: data
-          mountPath: /var/lib/kawasan
-      volumes:
-      - name: config
-        configMap:
-          name: kawasan-config
-  volumeClaimTemplates:
-  - metadata:
-      name: data
-    spec:
-      accessModes: ["ReadWriteOnce"]
-      resources:
-        requests:
-          storage: 100Gi
-```
-
----
-
-## Troubleshooting
-
-### Configuration File Not Found
-
-```
-Error: Failed to open configuration file: config/broker.properties
-```
-
-**Solution:** Ensure the file path is correct and the file exists.
-
-### Environment Variable Not Set
-
-```
-Error in config key 'broker.id': Required environment variable not set: KAWASAN_BROKER_ID
-```
-
-**Solution:** Set the required environment variable:
-```bash
-export KAWASAN_BROKER_ID=1
-```
-
-### Validation Errors
-
-```
-Configuration validation failed:
-  - port must be between 1 and 65535
-  - min.insync.replicas cannot be greater than default.replication.factor
-```
-
-**Solution:** Fix the configuration values according to the validation rules.
-
-### Port Already in Use
-
-```
-Error: Failed to bind to port 9092
-```
-
-**Solution:** Either:
-1. Stop the process using the port
-2. Change the `port` configuration
-3. Use a different `monitoring.port`
-
----
-
-## Additional Resources
-
-- [Production Deployment Guide](PRODUCTION_DEPLOYMENT.md)
-- [Monitoring Guide](../monitoring/README.md)
-- [Kubernetes Deployment](../k8s/README.md)
-- [Helm Chart Documentation](../helm/kawasan/README.md)
-- [Architecture Documentation](ARCHITECTURE.md)
-
----
-
-## Revision History
-
-- **2025-11-18**: Initial configuration documentation for Phase 7
+See [./OPERATIONS.md](./OPERATIONS.md) for tuning and deployment, [./ARCHITECTURE.md](./ARCHITECTURE.md) for subsystem design, and [./FAQ.md](./FAQ.md) for common issues.

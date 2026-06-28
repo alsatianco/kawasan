@@ -10,25 +10,22 @@ This Helm chart deploys Kawasan message broker on Kubernetes.
 - Helm 3.0+
 - PersistentVolume provisioner support in the underlying infrastructure
 
-### Add Helm Repository
-
-```bash
-helm repo add kawasan https://charts.kawasan.io
-helm repo update
-```
-
 ### Install Chart
+
+Install directly from this repository's chart directory:
 
 ```bash
 # Install with default values
-helm install kawasan kawasan/kawasan
+helm install kawasan ./helm/kawasan
 
 # Install with custom values
-helm install kawasan kawasan/kawasan -f values.yaml
+helm install kawasan ./helm/kawasan -f values.yaml
 
 # Install in a specific namespace
-helm install kawasan kawasan/kawasan --namespace kawasan-system --create-namespace
+helm install kawasan ./helm/kawasan --namespace kawasan-system --create-namespace
 ```
+
+The examples below use `kawasan/kawasan`; substitute `./helm/kawasan` when installing from a local checkout.
 
 ## Configuration
 
@@ -186,5 +183,5 @@ kubectl exec -it kawasan-broker-0 -- /bin/sh
 ## Support
 
 For issues and questions, please visit:
-- GitHub: https://github.com/yourusername/kawasan
-- Documentation: https://docs.kawasan.io
+- GitHub: https://github.com/kawasan/kawasan
+- Documentation: see [`docs/`](../../docs/) in this repository

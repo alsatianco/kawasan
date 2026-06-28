@@ -5,30 +5,54 @@
 (or rely on the `compat-smoke` CI job) to refresh.
 
 Total Kafka APIs: **68**.
-Currently advertised by Kawasan: **18**.
+Currently advertised by Kawasan: **42**.
 
 ## Implemented (advertised in ApiVersions)
 
 | Key | API | Kawasan range | Kafka 4.2 max |
 |----:|-----|:---:|:---:|
-| 0 | `PRODUCE` | 0–2 | 11 |
-| 1 | `FETCH` | 0–3 | 16 |
-| 2 | `LIST_OFFSETS` | 0–5 | 8 |
-| 3 | `METADATA` | 0–7 | 12 |
-| 8 | `OFFSET_COMMIT` | 2–2 | 9 |
-| 9 | `OFFSET_FETCH` | 2–2 | 9 |
-| 10 | `FIND_COORDINATOR` | 0–2 | 4 |
-| 11 | `JOIN_GROUP` | 0–0 | 9 |
-| 12 | `HEARTBEAT` | 0–0 | 4 |
-| 13 | `LEAVE_GROUP` | 0–0 | 5 |
-| 14 | `SYNC_GROUP` | 0–0 | 5 |
-| 15 | `DESCRIBE_GROUPS` | 0–2 | 5 |
-| 16 | `LIST_GROUPS` | 0–2 | 5 |
+| 0 | `PRODUCE` | 0–9 | 11 |
+| 1 | `FETCH` | 0–12 | 16 |
+| 2 | `LIST_OFFSETS` | 0–7 | 8 |
+| 3 | `METADATA` | 0–12 | 12 |
+| 8 | `OFFSET_COMMIT` | 0–8 | 9 |
+| 9 | `OFFSET_FETCH` | 0–8 | 9 |
+| 10 | `FIND_COORDINATOR` | 0–4 | 4 |
+| 11 | `JOIN_GROUP` | 0–9 | 9 |
+| 12 | `HEARTBEAT` | 0–4 | 4 |
+| 13 | `LEAVE_GROUP` | 0–5 | 5 |
+| 14 | `SYNC_GROUP` | 0–5 | 5 |
+| 15 | `DESCRIBE_GROUPS` | 0–5 | 5 |
+| 16 | `LIST_GROUPS` | 0–4 | 5 |
+| 17 | `SASL_HANDSHAKE` | 0–1 | 1 |
 | 18 | `API_VERSIONS` | 0–4 | 3 |
-| 19 | `CREATE_TOPICS` | 0–4 | 7 |
-| 20 | `DELETE_TOPICS` | 0–2 | 6 |
+| 19 | `CREATE_TOPICS` | 0–7 | 7 |
+| 20 | `DELETE_TOPICS` | 0–6 | 6 |
+| 21 | `DELETE_RECORDS` | 0–0 | 2 |
+| 22 | `INIT_PRODUCER_ID` | 0–4 | 4 |
+| 23 | `OFFSET_FOR_LEADER_EPOCH` | 0–4 | 4 |
+| 24 | `ADD_PARTITIONS_TO_TXN` | 0–0 | 5 |
+| 25 | `ADD_OFFSETS_TO_TXN` | 0–0 | 4 |
+| 26 | `END_TXN` | 0–0 | 4 |
+| 28 | `TXN_OFFSET_COMMIT` | 0–0 | 4 |
+| 29 | `DESCRIBE_ACLS` | 0–0 | 3 |
+| 30 | `CREATE_ACLS` | 0–0 | 3 |
+| 31 | `DELETE_ACLS` | 0–0 | 3 |
 | 32 | `DESCRIBE_CONFIGS` | 0–4 | 4 |
-| 60 | `DESCRIBE_CLUSTER` | 0–0 | 1 |
+| 33 | `ALTER_CONFIGS` | 0–2 | 2 |
+| 34 | `ALTER_REPLICA_LOG_DIRS` | 0–0 | 2 |
+| 35 | `DESCRIBE_LOG_DIRS` | 0–0 | 4 |
+| 36 | `SASL_AUTHENTICATE` | 0–1 | 2 |
+| 37 | `CREATE_PARTITIONS` | 0–0 | 3 |
+| 42 | `DELETE_GROUPS` | 0–0 | 2 |
+| 43 | `ELECT_LEADERS` | 0–1 | 2 |
+| 44 | `INCREMENTAL_ALTER_CONFIGS` | 0–1 | 1 |
+| 47 | `OFFSET_DELETE` | 0–0 | 0 |
+| 56 | `ALTER_PARTITION` | 0–0 | 0 |
+| 60 | `DESCRIBE_CLUSTER` | 0–1 | 1 |
+| 61 | `DESCRIBE_PRODUCERS` | 0–0 | 0 |
+| 65 | `DESCRIBE_TRANSACTIONS` | 0–0 | 0 |
+| 66 | `LIST_TRANSACTIONS` | 0–0 | 0 |
 
 ## Absent (returns `UNSUPPORTED_VERSION`)
 
@@ -38,33 +62,13 @@ Currently advertised by Kawasan: **18**.
 | 5 | `STOP_REPLICA` | 4 |
 | 6 | `UPDATE_METADATA` | 8 |
 | 7 | `CONTROLLED_SHUTDOWN` | 3 |
-| 17 | `SASL_HANDSHAKE` | 1 |
-| 21 | `DELETE_RECORDS` | 2 |
-| 22 | `INIT_PRODUCER_ID` | 4 |
-| 23 | `OFFSET_FOR_LEADER_EPOCH` | 4 |
-| 24 | `ADD_PARTITIONS_TO_TXN` | 5 |
-| 25 | `ADD_OFFSETS_TO_TXN` | 4 |
-| 26 | `END_TXN` | 4 |
 | 27 | `WRITE_TXN_MARKERS` | 1 |
-| 28 | `TXN_OFFSET_COMMIT` | 4 |
-| 29 | `DESCRIBE_ACLS` | 3 |
-| 30 | `CREATE_ACLS` | 3 |
-| 31 | `DELETE_ACLS` | 3 |
-| 33 | `ALTER_CONFIGS` | 2 |
-| 34 | `ALTER_REPLICA_LOG_DIRS` | 2 |
-| 35 | `DESCRIBE_LOG_DIRS` | 4 |
-| 36 | `SASL_AUTHENTICATE` | 2 |
-| 37 | `CREATE_PARTITIONS` | 3 |
 | 38 | `CREATE_DELEGATION_TOKEN` | — |
 | 39 | `RENEW_DELEGATION_TOKEN` | — |
 | 40 | `EXPIRE_DELEGATION_TOKEN` | — |
 | 41 | `DESCRIBE_DELEGATION_TOKEN` | — |
-| 42 | `DELETE_GROUPS` | 2 |
-| 43 | `ELECT_LEADERS` | 2 |
-| 44 | `INCREMENTAL_ALTER_CONFIGS` | 1 |
 | 45 | `ALTER_PARTITION_REASSIGNMENTS` | — |
 | 46 | `LIST_PARTITION_REASSIGNMENTS` | — |
-| 47 | `OFFSET_DELETE` | 0 |
 | 48 | `DESCRIBE_CLIENT_QUOTAS` | — |
 | 49 | `ALTER_CLIENT_QUOTAS` | — |
 | 50 | `DESCRIBE_USER_SCRAM_CREDENTIALS` | — |
@@ -73,14 +77,10 @@ Currently advertised by Kawasan: **18**.
 | 53 | `BEGIN_QUORUM_EPOCH` | — |
 | 54 | `END_QUORUM_EPOCH` | — |
 | 55 | `DESCRIBE_QUORUM` | — |
-| 56 | `ALTER_PARTITION` | 0 |
 | 57 | `UPDATE_FEATURES` | — |
 | 58 | `ENVELOPE` | — |
 | 59 | `FETCH_SNAPSHOT` | — |
-| 61 | `DESCRIBE_PRODUCERS` | 0 |
 | 62 | `BROKER_REGISTRATION` | — |
 | 63 | `BROKER_HEARTBEAT` | — |
 | 64 | `UNREGISTER_BROKER` | — |
-| 65 | `DESCRIBE_TRANSACTIONS` | 0 |
-| 66 | `LIST_TRANSACTIONS` | 0 |
 | 67 | `ALLOCATE_PRODUCER_IDS` | 0 |

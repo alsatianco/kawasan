@@ -10,10 +10,14 @@ data:
     broker.id=0
     
     # Network Settings
-    listeners={{ .Values.config.listeners }}
-    advertised.listeners=PLAINTEXT://{{ include "kawasan.fullname" . }}:{{ .Values.service.port }}
-    num.network.threads={{ .Values.config.numNetworkThreads }}
-    num.io.threads={{ .Values.config.numIoThreads }}
+    # The broker parses host/port/advertised.host/advertised.port (not Kafka's
+    # listeners=/advertised.listeners=). advertised.host is the service DNS name
+    # so in-cluster clients reach the broker after the Metadata redirect.
+    host={{ .Values.config.host }}
+    port={{ .Values.service.port }}
+    advertised.host={{ include "kawasan.fullname" . }}
+    advertised.port={{ .Values.service.port }}
+    network.io_threads={{ .Values.config.numIoThreads }}
     
     # Socket Settings
     socket.send.buffer.bytes={{ .Values.config.socketSendBufferBytes }}

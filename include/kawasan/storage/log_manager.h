@@ -64,6 +64,12 @@ public:
     /// @brief Returns all logs
     std::vector<Log*> allLogs();
 
+    /// @brief Returns the number of currently-open partition logs. Each open log
+    /// is one or more RocksDB instances (file descriptors), so this is a proxy
+    /// for the broker's storage FD footprint — used by the FD-budget test and
+    /// exposed as a metric.
+    size_t openLogCount() const;
+
     /// @brief Flushes all logs
     void flushAll();
 

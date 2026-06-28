@@ -87,4 +87,61 @@ TEST(AclStoreTest, FilterByOperation) {
     EXPECT_EQ(results[0].operation, 3);
 }
 
+// ---- authorize() semantics (Phase A5) ----
+// Operation/resource/pattern/permission enum values match Kafka:
+//   READ=3 WRITE=4; TOPIC=2; LITERAL=3 PREFIXED=4; DENY=2 ALLOW=3; ALL op=2.
+
+TEST(AclStoreTest, AuthorizeAllowsMatchingBinding) {
+    AclStore s;
+    s.add(makeBinding("topic-a", /*op=*/4, /*ALLOW=*/3));  // WRITE allow
+    EXPECT_TRUE(s.authorize("User:test", 4, 2, "topic-a", "10.0.0.1", false));
+}
+
+TEST(AclStoreTest, AuthorizeDeniesWhenNoMatchAndNoDefaultAllow) {
+    AclStore s;
+    s.add(makeBinding("topic-a", 4, 3));
+    // Different topic, no matching ACL, allow_if_no_acl=false -> denied.
+    EXPECT_FALSE(s.authorize("User:test", 4, 2, "topic-b", "10.0.0.1", false));
+}
+
+TEST(AclStoreTest, AuthorizeAllowsWhenNoMatchAndDefaultAllow) {
+    AclStore s;
+    EXPECT_TRUE(s.authorize("User:anybody", 4, 2, "topic-x", "10.0.0.1", true));
+}
+
+TEST(AclStoreTest, AuthorizeDenyBeatsAllow) {
+    AclStore s;
+    s.add(makeBinding("topic-a", 4, /*ALLOW=*/3));
+    s.add(makeBinding("topic-a", 4, /*DENY=*/2));
+    EXPECT_FALSE(s.authorize("User:test", 4, 2, "topic-a", "10.0.0.1", true));
+}
+
+TEST(AclStoreTest, AuthorizeAllOperationGrantsAnyOperation) {
+    AclStore s;
+    s.add(makeBinding("topic-a", /*ALL=*/2, /*ALLOW=*/3));
+    EXPECT_TRUE(s.authorize("User:test", /*READ=*/3, 2, "topic-a", "h", false));
+    EXPECT_TRUE(s.authorize("User:test", /*WRITE=*/4, 2, "topic-a", "h", false));
+}
+
+TEST(AclStoreTest, AuthorizePrefixedPatternMatches) {
+    AclStore s;
+    s.add(makeBinding("orders-", 4, 3, 2, /*PREFIXED=*/4));
+    EXPECT_TRUE(s.authorize("User:test", 4, 2, "orders-eu", "h", false));
+    EXPECT_FALSE(s.authorize("User:test", 4, 2, "shipments", "h", false));
+}
+
+TEST(AclStoreTest, AuthorizeWildcardResourceAndPrincipal) {
+    AclStore s;
+    AclStore::Binding b = makeBinding("*", 4, 3);  // LITERAL "*"
+    b.principal = "User:*";
+    s.add(b);
+    EXPECT_TRUE(s.authorize("User:whoever", 4, 2, "any-topic", "h", false));
+}
+
+TEST(AclStoreTest, AuthorizePrincipalMustMatch) {
+    AclStore s;
+    s.add(makeBinding("topic-a", 4, 3));  // principal User:test
+    EXPECT_FALSE(s.authorize("User:other", 4, 2, "topic-a", "h", false));
+}
+
 }  // namespace

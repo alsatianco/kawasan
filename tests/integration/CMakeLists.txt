@@ -10,6 +10,18 @@ add_executable(log_recovery_test log_recovery_test.cpp)
 target_link_libraries(log_recovery_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME LogRecoveryTest COMMAND log_recovery_test)
 
+add_executable(internal_topic_fd_test internal_topic_fd_test.cpp)
+target_link_libraries(internal_topic_fd_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME InternalTopicFdTest COMMAND internal_topic_fd_test)
+
+add_executable(production_config_test production_config_test.cpp)
+target_link_libraries(production_config_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME ProductionConfigTest COMMAND production_config_test)
+
+add_executable(acl_enforcement_test acl_enforcement_test.cpp)
+target_link_libraries(acl_enforcement_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME AclEnforcementTest COMMAND acl_enforcement_test)
+
 # Phase EX-10 / opus2 Item 1: V2 batch header round-trip through
 # appendBatch + RocksDB persist + reopen. Locks the invariant that
 # producer_id, producer_epoch, base_sequence, isTransactional, and

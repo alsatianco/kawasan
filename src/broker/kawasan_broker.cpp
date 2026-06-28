@@ -3,10 +3,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <optional>
+#include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 #include <zlib.h>
 
 #include "kawasan/broker/replica_manager.h"
@@ -20,6 +23,7 @@
 #include "kawasan/broker/fetch_session_manager.h"
 #include "kawasan/broker/isolation_tracker.h"
 #include "kawasan/broker/producer_state_manager.h"
+#include "kawasan/broker/quota_manager.h"
 #include "kawasan/broker/scram_auth.h"
 #include "kawasan/broker/transaction_coordinator.h"
 #include "kawasan/protocol/txn_request.h"
@@ -72,6 +76,76 @@ constexpr int16_t kOffsetFetchMaxVersion = 8;  // Phase 1.12 (v8 multi-group sup
 constexpr int16_t kDescribeGroupsMaxVersion = 5;  // Phase 1.13
 constexpr int16_t kListGroupsMaxVersion = 4;  // Phase 1.14
 }  // namespace
+
+void KawasanBroker::validateProductionConfig() const {
+    if (!production_mode_) {
+        return;
+    }
+
+    std::vector<std::string> errors;
+
+    // Client/broker TLS is not implemented; SASL_SSL/SSL would not actually
+    // encrypt. (security.protocol=SSL is already refused above; catch SASL_SSL
+    // and ssl.enabled here too so production never silently runs plaintext under
+    // a TLS-implying protocol.)
+    const std::string security_protocol =
+        config_.get<std::string>("security.protocol", "PLAINTEXT");
+    if (security_protocol.find("SSL") != std::string::npos ||
+        config_.get<bool>("ssl.enabled", false)) {
+        errors.emplace_back(
+            "security.protocol implies TLS (" + security_protocol +
+            ") but client/broker TLS is not implemented; use PLAINTEXT/SASL_PLAINTEXT "
+            "and terminate TLS at a proxy");
+    }
+
+    // Multi-broker replication is experimental and RF>1 is forced to 1; in
+    // production refuse rather than silently weaken the durability contract.
+    if (config_.get<int>("default.replication.factor", 1) > 1) {
+        errors.emplace_back(
+            "default.replication.factor > 1 is not supported (multi-broker "
+            "replication is experimental and would be forced to 1); set it to 1");
+    }
+    if (config_.get<int>("min.insync.replicas", 1) > 1) {
+        errors.emplace_back(
+            "min.insync.replicas > 1 is inert on a single-node broker (only the "
+            "leader is in the ISR); set it to 1");
+    }
+
+    if (!errors.empty()) {
+        std::string msg =
+            "deployment.mode=production but the configuration requests capabilities "
+            "this build cannot honor:";
+        for (const auto& e : errors) {
+            msg += "\n  - " + e;
+        }
+        throw std::runtime_error(msg);
+    }
+    Logger::info("Production-mode config validation passed");
+}
+
+bool KawasanBroker::authorize(const RequestDispatcher::RequestContext& context,
+                              int8_t operation, int8_t resource_type,
+                              const std::string& resource_name) const {
+    if (!authorizer_enabled_) {
+        return true;  // enforcement opted out — preserve pre-authorizer behavior
+    }
+    const std::string principal =
+        (context.connection && context.connection->authenticated_principal)
+            ? *context.connection->authenticated_principal
+            : std::string("User:ANONYMOUS");
+    if (super_users_.count(principal) > 0) {
+        return true;
+    }
+    // peer_identity is "ip:port"; ACL host matching uses the IP.
+    std::string host = context.peer_identity;
+    const auto colon = host.rfind(':');
+    if (colon != std::string::npos) {
+        host = host.substr(0, colon);
+    }
+    return acl_store_ && acl_store_->authorize(principal, operation, resource_type,
+                                               resource_name, host,
+                                               allow_everyone_if_no_acl_);
+}
 
 KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
     broker_id_ = config_.get<BrokerId>("broker.id");
@@ -147,6 +221,23 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
     configured_log.retention_bytes =
         config_.get<int64_t>("log.retention.bytes", configured_log.retention_bytes);
 
+    // Durability mode for partition-log writes. "sync" (default) fsyncs each
+    // produce append so an acknowledged record survives a power loss; "async"
+    // trades that for throughput (WAL-buffered, lost on machine crash). This
+    // backs the at-least-once guarantee the docs advertise.
+    const std::string durability = config_.get<std::string>("log.durability", "sync");
+    if (durability == "async") {
+        configured_log.flush_mode = storage::FlushMode::kAsync;
+        Logger::warn(
+            "log.durability=async: acked records are WAL-buffered and may be lost on a "
+            "power loss / OS crash. Use log.durability=sync for at-least-once durability.");
+    } else {
+        if (durability != "sync") {
+            Logger::warn("Unknown log.durability='{}'; defaulting to 'sync'", durability);
+        }
+        configured_log.flush_mode = storage::FlushMode::kSync;
+    }
+
     log_config_ = configured_log;
     
     // Parse TLS configuration for Kafka protocol
@@ -155,23 +246,76 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
                           config_.get<bool>("ssl.enabled", false);
     
     if (tls_config_.enabled) {
-        // 0A.12 (refuse-loud, per Anti-pattern A5 in improve-opus.md §5):
-        // until the Kafka TCP session class actually wraps its socket in
-        // boost::asio::ssl::stream and performs async_handshake(), accepting
-        // an `ssl.enabled=true` config produces a broker that *thinks* it
-        // serves TLS but listens as plain TCP. That's worse than refusing —
-        // it generates "WrongVersionNumber" alerts on the client when the
-        // ClientHello is read as Kafka request framing. Refuse loudly so the
-        // operator knows TLS is not in this build, and rejects the config.
+        // Until TcpSession wraps its socket in boost::asio::ssl::stream and
+        // performs async_handshake(), accepting ssl.enabled=true would produce a
+        // broker that *thinks* it serves TLS but listens as plain TCP — worse
+        // than refusing, because the client's ClientHello is read as Kafka
+        // request framing and surfaces as a confusing "WrongVersionNumber"
+        // alert. Refuse loudly so the operator knows TLS is not in this build.
         throw std::runtime_error(
-            "ssl.enabled / security.protocol=SSL is configured, but TLS is not "
-            "implemented in this build (TcpSession uses a plain socket). Either "
-            "set security.protocol=PLAINTEXT or wait for the TLS-reality task. "
-            "See improve-opus.md §2.10(b) and §5 Anti-pattern A5.");
+            "security.protocol=SSL / ssl.enabled=true is configured, but client/broker "
+            "TLS is not implemented in this build (the TCP session uses a plain socket). "
+            "Set security.protocol=PLAINTEXT (or SASL_PLAINTEXT) and terminate TLS at a "
+            "proxy if you need encryption in transit.");
     } else {
         Logger::info("TLS disabled for Kafka protocol (using PLAINTEXT)");
     }
-    
+
+    // Determine deployment mode once. Production mode (a) makes the validator
+    // below fail fast on settings the broker can't honor and (b) tightens
+    // runtime behavior such as refusing SASL/PLAIN "accept-any".
+    {
+        std::string mode = config_.get<std::string>("deployment.mode", "");
+        if (mode.empty()) {
+            if (const char* env = std::getenv("KAWASAN_DEPLOYMENT_MODE")) {
+                mode = env;
+            }
+        }
+        production_mode_ = (mode == "production");
+    }
+
+    // Fail fast on settings the broker cannot actually honor instead of silently
+    // degrading them. An operator who asked for RF=3 in production must not
+    // discover at 3am that it was quietly forced to 1.
+    validateProductionConfig();
+
+    // Authorization (ACL enforcement). Off by default so deployments with no
+    // ACLs behave exactly as before; opt in with authorizer.enabled=true.
+    authorizer_enabled_ = config_.get<bool>("authorizer.enabled", false);
+    allow_everyone_if_no_acl_ =
+        config_.get<bool>("allow.everyone.if.no.acl.found", false);
+    {
+        const std::string supers = config_.get<std::string>("super.users", "");
+        size_t start = 0;
+        while (start < supers.size()) {
+            size_t sep = supers.find(';', start);
+            if (sep == std::string::npos) sep = supers.size();
+            std::string p = supers.substr(start, sep - start);
+            // trim surrounding whitespace
+            const auto b = p.find_first_not_of(" \t");
+            const auto e = p.find_last_not_of(" \t");
+            if (b != std::string::npos) super_users_.insert(p.substr(b, e - b + 1));
+            start = sep + 1;
+        }
+    }
+    if (authorizer_enabled_) {
+        Logger::info(
+            "Authorizer ENABLED (allow.everyone.if.no.acl.found={}, {} super.user(s))",
+            allow_everyone_if_no_acl_, super_users_.size());
+    }
+
+    // Client quotas (per-client byte-rate throttling). Disabled by default
+    // (bytes/sec <= 0). When set, an over-quota client gets a throttle_time_ms
+    // in its response so it backs off, protecting the broker from noisy clients.
+    quota_manager_ = std::make_unique<QuotaManager>(
+        config_.get<int64_t>("quota.producer.default", 0),
+        config_.get<int64_t>("quota.consumer.default", 0));
+    if (quota_manager_->producerQuotaEnabled() || quota_manager_->consumerQuotaEnabled()) {
+        Logger::info("Client quotas ENABLED (producer={} B/s, consumer={} B/s)",
+                     config_.get<int64_t>("quota.producer.default", 0),
+                     config_.get<int64_t>("quota.consumer.default", 0));
+    }
+
     // Parse TLS configuration for Raft inter-broker communication
     raft_tls_config_.enabled = config_.get<bool>("raft.ssl.enabled", false);
     
@@ -762,22 +906,35 @@ void KawasanBroker::initializeMetadata() {
     // Kafka convention so `kafka-consumer-groups.sh --describe` can find
     // commits by reading a deterministic partition rather than scanning.
     if (metadata_controller_) {
-        constexpr int32_t kConsumerOffsetsPartitions = 50;
+        // Internal-topic partition counts are configurable. Each partition is a
+        // RocksDB instance, so Kafka's default of 50 means ~100 RocksDB handles
+        // (offsets + txn) opened at startup — heavy for a single-node broker and
+        // a file-descriptor hazard under tight ulimits. Default to a smaller,
+        // single-node-appropriate count; raise it for higher group/txn fan-out.
+        const int32_t offsets_partitions =
+            std::max(1, config_.get<int32_t>("offsets.topic.num.partitions", 16));
         TopicSpecification spec;
         spec.name = "__consumer_offsets";
-        spec.num_partitions = kConsumerOffsetsPartitions;
+        spec.num_partitions = offsets_partitions;
         spec.replication_factor = 1;
         spec.configs["cleanup.policy"] = "compact";
         spec.configs["segment.bytes"] = "104857600";
         auto result = metadata_controller_->createTopic(spec);
         if (result.error_code == ErrorCode::NONE) {
             Logger::info("Created internal topic __consumer_offsets with {} partitions",
-                         kConsumerOffsetsPartitions);
+                         offsets_partitions);
         } else if (result.error_code == ErrorCode::TOPIC_ALREADY_EXISTS) {
             Logger::debug("Internal topic __consumer_offsets already exists");
         } else {
             Logger::warn("Failed to create __consumer_offsets: {}",
                          result.error_message);
+        }
+        // Capture the actual partition count (handles a pre-existing topic with
+        // a different count) so offset-commit routing uses the true modulus.
+        const auto offsets_md = metadata_controller_->describeTopics({"__consumer_offsets"});
+        if (!offsets_md.empty() && !offsets_md.front().partitions.empty()) {
+            offsets_topic_num_partitions_ =
+                static_cast<int32_t>(offsets_md.front().partitions.size());
         }
 
         // Phase 3.3: auto-create `__transaction_state`. Kafka uses 50
@@ -787,10 +944,11 @@ void KawasanBroker::initializeMetadata() {
         // entries here. For now the topic exists so Java AdminClient
         // probes and transactional producers don't see
         // UNKNOWN_TOPIC_OR_PARTITION on initial setup.
-        constexpr int32_t kTxnStatePartitions = 50;
+        const int32_t txn_partitions =
+            std::max(1, config_.get<int32_t>("transaction.state.topic.num.partitions", 16));
         TopicSpecification txn_spec;
         txn_spec.name = "__transaction_state";
-        txn_spec.num_partitions = kTxnStatePartitions;
+        txn_spec.num_partitions = txn_partitions;
         txn_spec.replication_factor = 1;
         txn_spec.configs["cleanup.policy"] = "compact";
         txn_spec.configs["segment.bytes"] = "104857600";
@@ -798,7 +956,7 @@ void KawasanBroker::initializeMetadata() {
         auto txn_result = metadata_controller_->createTopic(txn_spec);
         if (txn_result.error_code == ErrorCode::NONE) {
             Logger::info("Created internal topic __transaction_state with {} partitions",
-                         kTxnStatePartitions);
+                         txn_partitions);
         } else if (txn_result.error_code == ErrorCode::TOPIC_ALREADY_EXISTS) {
             Logger::debug("Internal topic __transaction_state already exists");
         } else {
@@ -1356,6 +1514,14 @@ Buffer KawasanBroker::handleCreateTopics(RequestDispatcher::RequestContext& cont
         protocol::CreatableTopicResult result;
         result.name = topic.name;
 
+        // Authorization: CREATE on the topic (no-op when authorizer disabled).
+        if (!authorize(context, /*CREATE=*/5, /*TOPIC=*/2, topic.name)) {
+            result.error_code = ErrorCode::TOPIC_AUTHORIZATION_FAILED;
+            result.error_message = "Not authorized to create topic";
+            response.addTopicResult(result);
+            continue;
+        }
+
         if (!metadata_controller_) {
             result.error_code = ErrorCode::BROKER_NOT_AVAILABLE;
             result.error_message = "Metadata controller unavailable";
@@ -1446,6 +1612,14 @@ Buffer KawasanBroker::handleDeleteTopics(RequestDispatcher::RequestContext& cont
             }
         }
 
+        // Authorization: DELETE on the topic (no-op when authorizer disabled).
+        if (!authorize(context, /*DELETE=*/6, /*TOPIC=*/2, resolved_name)) {
+            result.error_code = ErrorCode::TOPIC_AUTHORIZATION_FAILED;
+            result.error_message = "Not authorized to delete topic";
+            response.addResult(result);
+            continue;
+        }
+
         auto operation = metadata_controller_->deleteTopic(resolved_name);
         result.error_code = operation.error_code;
         if (!operation.error_message.empty()) {
@@ -1496,7 +1670,15 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
     }
 
     protocol::ProduceResponse response;
-    response.setThrottleTimeMs(0);
+    // Client quota: record the produced bytes and surface any throttle delay so
+    // an over-quota producer backs off. No-op (0) when producer quota disabled.
+    int32_t produce_throttle_ms = 0;
+    if (quota_manager_) {
+        produce_throttle_ms = quota_manager_->recordAndThrottleMs(
+            QuotaManager::Type::kProducer, context.header.clientId(),
+            context.frame_size_bytes);
+    }
+    response.setThrottleTimeMs(produce_throttle_ms);
 
     const auto now_ms = []() -> Timestamp {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1509,6 +1691,24 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
     for (const auto& topic_data : request.topics()) {
         protocol::ProduceTopicResponse topic_response;
         topic_response.topic = topic_data.topic;
+
+        // Authorization: WRITE on the topic (no-op when the authorizer is
+        // disabled, which is the default). Deny → every partition of this topic
+        // fails with TOPIC_AUTHORIZATION_FAILED, matching Kafka's behavior.
+        if (!authorize(context, /*WRITE=*/4, /*TOPIC=*/2, topic_data.topic)) {
+            for (const auto& partition_data : topic_data.partitions) {
+                protocol::ProducePartitionResponse pr;
+                pr.partition = partition_data.partition;
+                pr.base_offset = 0;
+                pr.log_start_offset = 0;
+                pr.log_append_time = -1;
+                pr.error_code = ErrorCode::TOPIC_AUTHORIZATION_FAILED;
+                topic_response.partitions.push_back(pr);
+            }
+            response.addTopic(topic_response);
+            has_error = true;
+            continue;
+        }
 
         auto [topic_metadata_opt, topic_error] =
             getTopicMetadata(topic_data.topic, auto_create_topics_enabled_);
@@ -1852,6 +2052,23 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
             auto [topic_metadata_opt, topic_error] =
                 getTopicMetadata(lookup_name, auto_create_topics_enabled_);
 
+            // Authorization: READ on the topic (no-op when the authorizer is
+            // disabled, the default). Deny → each requested partition fails with
+            // TOPIC_AUTHORIZATION_FAILED.
+            if (!authorize(context, /*READ=*/3, /*TOPIC=*/2, lookup_name)) {
+                for (const auto& partition : topic.partitions) {
+                    protocol::FetchPartitionResponse pr;
+                    pr.partition = partition.partition;
+                    pr.error_code = ErrorCode::TOPIC_AUTHORIZATION_FAILED;
+                    pr.high_watermark = 0;
+                    pr.last_stable_offset = 0;
+                    pr.log_start_offset = 0;
+                    topic_response.partitions.push_back(pr);
+                }
+                response.addTopic(topic_response);
+                continue;
+            }
+
             for (const auto& partition : topic.partitions) {
                 protocol::FetchPartitionResponse partition_response;
                 partition_response.partition = partition.partition;
@@ -2126,8 +2343,17 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now() - start_time)
                                 .count();
-    response.setThrottleTimeMs(static_cast<int32_t>(
-        std::min<int64_t>(elapsed_ms, std::numeric_limits<int32_t>::max())));
+    int32_t fetch_throttle_ms = static_cast<int32_t>(
+        std::min<int64_t>(elapsed_ms, std::numeric_limits<int32_t>::max()));
+    // Consumer quota: record the fetched bytes; if the client is over its
+    // configured rate, raise the throttle so it backs off. No-op when the
+    // consumer quota is disabled (the default), preserving prior behavior.
+    if (quota_manager_) {
+        const int32_t quota_throttle = quota_manager_->recordAndThrottleMs(
+            QuotaManager::Type::kConsumer, context.header.clientId(), bytes_returned);
+        fetch_throttle_ms = std::max(fetch_throttle_ms, quota_throttle);
+    }
+    response.setThrottleTimeMs(fetch_throttle_ms);
 
     const int16_t version =
         std::clamp<int16_t>(context.header.apiVersion(), 0, kFetchMaxVersion);
@@ -2600,8 +2826,10 @@ Buffer KawasanBroker::handleOffsetCommit(RequestDispatcher::RequestContext& cont
         for (unsigned char c : request.groupId()) {
             h = 31 * h + static_cast<int32_t>(c);
         }
+        const uint32_t offsets_partitions =
+            static_cast<uint32_t>(std::max(1, offsets_topic_num_partitions_));
         const int32_t target_partition =
-            static_cast<int32_t>(static_cast<uint32_t>(h) % 50u);
+            static_cast<int32_t>(static_cast<uint32_t>(h) % offsets_partitions);
         auto* offsets_log = log_manager_->getLog("__consumer_offsets", target_partition);
         if (offsets_log != nullptr) {
             std::vector<Record> commit_records;
@@ -3864,6 +4092,21 @@ Buffer KawasanBroker::handleSaslHandshake(
     });
 }
 
+// Constant-time string comparison: iterates the full maximum length regardless
+// of where (or whether) bytes differ, so an attacker cannot infer a password
+// prefix from response timing. (std::string::operator== short-circuits on the
+// first mismatch and leaks that timing.)
+static bool constantTimeEquals(const std::string& a, const std::string& b) {
+    unsigned char diff = static_cast<unsigned char>(a.size() ^ b.size());
+    const size_t n = std::max(a.size(), b.size());
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char ca = i < a.size() ? static_cast<unsigned char>(a[i]) : 0;
+        const unsigned char cb = i < b.size() ? static_cast<unsigned char>(b[i]) : 0;
+        diff = static_cast<unsigned char>(diff | (ca ^ cb));
+    }
+    return diff == 0;
+}
+
 Buffer KawasanBroker::handleSaslAuthenticate(
     RequestDispatcher::RequestContext& context) {
     protocol::SaslAuthenticateRequest req;
@@ -3890,6 +4133,10 @@ Buffer KawasanBroker::handleSaslAuthenticate(
                 resp.setAuthBytes(out);
                 if (auth->authenticated()) {
                     resp.setSessionLifetimeMs(0);
+                    if (context.connection) {
+                        context.connection->authenticated_principal =
+                            "User:" + auth->username();
+                    }
                     Logger::info("SaslAuthenticate: SCRAM completed for user '{}' from {}",
                                  auth->username(), context.peer_identity);
                     sasl_sessions_.erase(it);
@@ -3932,11 +4179,21 @@ Buffer KawasanBroker::handleSaslAuthenticate(
             resp.setErrorCode(static_cast<ErrorCode>(58));
             resp.setErrorMessage("Invalid SASL/PLAIN payload");
         } else if (!sasl_plain_creds_.empty()) {
-            // Production path: strict credential check against configured map.
+            // Strict credential check against the configured map, using a
+            // constant-time comparison so a wrong password can't be brute-forced
+            // by timing. A missing user is still constant-time-compared against a
+            // dummy so "unknown user" and "bad password" take similar time.
             auto it = sasl_plain_creds_.find(username);
-            if (it != sasl_plain_creds_.end() && it->second == password) {
+            const std::string& expected =
+                (it != sasl_plain_creds_.end()) ? it->second : password;  // dummy on miss
+            const bool ok = (it != sasl_plain_creds_.end()) &&
+                            constantTimeEquals(expected, password);
+            if (ok) {
                 resp.setErrorCode(ErrorCode::NONE);
                 resp.setSessionLifetimeMs(0);
+                if (context.connection) {
+                    context.connection->authenticated_principal = "User:" + username;
+                }
                 Logger::info("SaslAuthenticate: PLAIN user='{}' authenticated", username);
             } else {
                 resp.setErrorCode(static_cast<ErrorCode>(58));  // SASL_AUTHENTICATION_FAILED
@@ -3944,10 +4201,23 @@ Buffer KawasanBroker::handleSaslAuthenticate(
                 Logger::warn("SaslAuthenticate: PLAIN user='{}' rejected (unknown user or bad password)",
                              username);
             }
+        } else if (production_mode_) {
+            // No credentials configured in production is a misconfiguration:
+            // refuse rather than authenticate anyone. (In dev we accept below.)
+            resp.setErrorCode(static_cast<ErrorCode>(58));  // SASL_AUTHENTICATION_FAILED
+            resp.setErrorMessage(
+                "SASL/PLAIN requires configured credentials in production "
+                "(set sasl.plain.credentials.file or sasl.plain.users)");
+            Logger::warn(
+                "SaslAuthenticate: PLAIN rejected for user='{}' — no credentials configured "
+                "(production mode)", username);
         } else {
             // Dev mode: no credentials configured → accept any non-empty pair.
             resp.setErrorCode(ErrorCode::NONE);
             resp.setSessionLifetimeMs(0);
+            if (context.connection) {
+                context.connection->authenticated_principal = "User:" + username;
+            }
             Logger::info("SaslAuthenticate: PLAIN user='{}' accepted (dev mode — no sasl.plain.users)",
                          username);
         }

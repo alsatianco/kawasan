@@ -94,4 +94,37 @@ size_t AclStore::size() const {
     return bindings_.size();
 }
 
+bool AclStore::authorize(const std::string& principal, int8_t operation,
+                         int8_t resource_type, const std::string& resource_name,
+                         const std::string& host, bool allow_if_no_acl) const {
+    constexpr int8_t kAllOperation = 2;
+    constexpr int8_t kDenyPermission = 2;
+    constexpr int8_t kAllowPermission = 3;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    bool matched_allow = false;
+    for (const auto& b : bindings_) {
+        if (b.resource_type != resource_type) continue;
+        if (b.operation != operation && b.operation != kAllOperation) continue;
+        if (b.principal != principal && b.principal != "User:*") continue;
+        if (!b.host.empty() && b.host != "*" && b.host != host) continue;
+
+        bool name_ok = false;
+        if (b.pattern_type == kLiteralPatternType) {
+            name_ok = (b.resource_name == "*") || (b.resource_name == resource_name);
+        } else if (b.pattern_type == kPrefixedPatternType) {
+            name_ok = resource_name.size() >= b.resource_name.size() &&
+                      resource_name.compare(0, b.resource_name.size(), b.resource_name) == 0;
+        }
+        if (!name_ok) continue;
+
+        // A matching DENY is decisive (DENY beats ALLOW); keep scanning for a
+        // DENY even after seeing an ALLOW.
+        if (b.permission_type == kDenyPermission) return false;
+        if (b.permission_type == kAllowPermission) matched_allow = true;
+    }
+    if (matched_allow) return true;
+    return allow_if_no_acl;
+}
+
 }  // namespace kawasan::broker

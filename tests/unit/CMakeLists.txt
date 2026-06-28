@@ -3,6 +3,11 @@ add_executable(buffer_test buffer_test.cpp)
 target_link_libraries(buffer_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME BufferTest COMMAND buffer_test)
 
+# Config test (accessor coercion)
+add_executable(config_test config_test.cpp)
+target_link_libraries(config_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME ConfigTest COMMAND config_test)
+
 # Record batch test
 add_executable(record_batch_test record_batch_test.cpp)
 target_link_libraries(record_batch_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
@@ -17,6 +22,16 @@ add_test(NAME KawasanBrokerErrorTest COMMAND kawasan_broker_error_test)
 add_executable(log_segment_test log_segment_test.cpp)
 target_link_libraries(log_segment_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME LogSegmentTest COMMAND log_segment_test)
+
+# Log durability test (Phase A1: sync default + atomic checkpoint)
+add_executable(log_durability_test log_durability_test.cpp)
+target_link_libraries(log_durability_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME LogDurabilityTest COMMAND log_durability_test)
+
+# Quota manager test (Phase A6: client byte-rate throttling)
+add_executable(quota_manager_test quota_manager_test.cpp)
+target_link_libraries(quota_manager_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME QuotaManagerTest COMMAND quota_manager_test)
 
 # Raft protocol test
 add_executable(raft_protocol_test raft_protocol_test.cpp)

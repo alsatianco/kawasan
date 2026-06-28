@@ -1,7 +1,13 @@
 #include "kawasan/storage/log.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -166,7 +172,7 @@ Offset Log::append(const std::vector<Record>& records) {
     }
 
     // Append to active segment
-    Offset offset = segment->append(batch);
+    Offset offset = segment->append(batch, config_.flush_mode == FlushMode::kSync);
 
     // Update high watermark (simplified - in reality this is managed by replication)
     high_watermark_ = segment->nextOffset();
@@ -187,7 +193,7 @@ Offset Log::appendBatch(RecordBatch batch) {
         segment = activeSegment();
     }
 
-    Offset offset = segment->append(batch);
+    Offset offset = segment->append(batch, config_.flush_mode == FlushMode::kSync);
     high_watermark_ = segment->nextOffset();
     persistCheckpointLocked();
     return offset;
@@ -617,15 +623,56 @@ void Log::persistCheckpointLocked() const {
     Logger::debug("Persisting checkpoint for {}-{} start={} end={} hw={}", topic_,
                   partition_, start, end, high_watermark_);
     fs::create_directories(log_dir_);
-    std::ofstream out(path, std::ios::trunc);
-    if (!out.is_open()) {
-        Logger::error("Failed to persist checkpoint for {}-{} at {}", topic_, partition_, path);
+
+    // Crash-safe write: render the payload, write to a temp file, fsync it, then
+    // atomically rename over the real checkpoint. A plain ofstream left the
+    // checkpoint exposed to truncation/torn writes on crash, so recovery could
+    // read a stale or partial high-watermark. The temp+fsync+rename sequence
+    // guarantees the checkpoint is either the old value or the fully-written new
+    // one — never a torn intermediate.
+    std::ostringstream payload;
+    payload << "log_start_offset=" << start << "\n";
+    payload << "log_end_offset=" << end << "\n";
+    payload << "high_watermark=" << high_watermark_ << "\n";
+    const std::string data = payload.str();
+
+    const std::string tmp_path = path + ".tmp";
+    const int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        Logger::error("Failed to open checkpoint temp for {}-{} at {}", topic_, partition_,
+                      tmp_path);
         return;
     }
-
-    out << "log_start_offset=" << start << "\n";
-    out << "log_end_offset=" << end << "\n";
-    out << "high_watermark=" << high_watermark_ << "\n";
+    const char* buf = data.data();
+    size_t remaining = data.size();
+    bool write_ok = true;
+    while (remaining > 0) {
+        const ssize_t n = ::write(fd, buf, remaining);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            Logger::error("Failed to write checkpoint for {}-{}: {}", topic_, partition_,
+                          std::strerror(errno));
+            write_ok = false;
+            break;
+        }
+        buf += n;
+        remaining -= static_cast<size_t>(n);
+    }
+    if (write_ok && ::fsync(fd) != 0) {
+        Logger::error("Failed to fsync checkpoint for {}-{}: {}", topic_, partition_,
+                      std::strerror(errno));
+        write_ok = false;
+    }
+    ::close(fd);
+    if (!write_ok) {
+        ::unlink(tmp_path.c_str());
+        return;
+    }
+    if (::rename(tmp_path.c_str(), path.c_str()) != 0) {
+        Logger::error("Failed to rename checkpoint for {}-{}: {}", topic_, partition_,
+                      std::strerror(errno));
+        ::unlink(tmp_path.c_str());
+    }
 }
 
 std::optional<std::tuple<Offset, Offset, Offset>> Log::readCheckpointFromDisk() const {

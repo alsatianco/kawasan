@@ -16,8 +16,11 @@ fullnameOverride: ""
 # Use "statefulset" for production with persistent storage
 deploymentType: statefulset
 
-# Replica configuration
-replicaCount: 3
+# Replica configuration.
+# Multi-broker data replication is EXPERIMENTAL and not production-hardened
+# (acked data is not yet replicated to followers). Run a single replica in
+# production; raise this only for experimental cluster testing.
+replicaCount: 1
 
 # Service account
 serviceAccount:
@@ -77,8 +80,11 @@ persistence:
 
 # Broker configuration
 config:
-  # Network Settings
-  listeners: "PLAINTEXT://0.0.0.0:9092"
+  # Network Settings.
+  # The broker parses host/port/advertised.host/advertised.port — NOT Kafka-style
+  # listeners=/advertised.listeners=. advertised.host is set to the service DNS
+  # name in the configmap template so in-cluster clients can reach the broker.
+  host: "0.0.0.0"
   numNetworkThreads: 8
   numIoThreads: 8
   
@@ -199,10 +205,13 @@ networkPolicy:
   ingress: []
   egress: []
 
-# Pod Disruption Budget
+# Pod Disruption Budget.
+# With a single replica (the supported production topology) a PDB requiring
+# minAvailable would block voluntary disruptions/node drains, so it is disabled
+# by default. Enable and raise minAvailable only for experimental clusters.
 podDisruptionBudget:
-  enabled: true
-  minAvailable: 2
+  enabled: false
+  minAvailable: 1
   # maxUnavailable: 1
 
 # Extra environment variables

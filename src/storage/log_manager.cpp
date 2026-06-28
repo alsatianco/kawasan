@@ -131,6 +131,11 @@ std::vector<Log*> LogManager::allLogs() {
     return result;
 }
 
+size_t LogManager::openLogCount() const {
+    std::shared_lock<std::shared_mutex> read_lock(mutex_);
+    return logs_.size();
+}
+
 void LogManager::flushAll() {
     std::shared_lock<std::shared_mutex> read_lock(mutex_);
 

@@ -1,1056 +1,762 @@
 # Kawasan Operations Guide
 
-**Version**: 0.2.0-alpha  
-**Last Updated**: November 24, 2025
+How to install, run, monitor, back up, scale, troubleshoot, and tune a Kawasan broker. This guide covers the operational surface; for system design see [./ARCHITECTURE.md](./ARCHITECTURE.md), for the full config-key reference see [./CONFIGURATION.md](./CONFIGURATION.md), and for protocol/API support see [./api_coverage_matrix.md](./api_coverage_matrix.md).
 
-This guide provides comprehensive information for deploying, configuring, and operating Kawasan brokers in production environments.
-
----
+The **single-node broker is the primary, supported deployment**. Multi-broker Raft replication exists but is not production-hardened; caveats are called out where relevant.
 
 ## Table of Contents
 
-1. [Installation](#installation)
-2. [Configuration Reference](#configuration-reference)
-3. [Starting, Stopping, and Restarting](#starting-stopping-and-restarting)
-4. [Monitoring](#monitoring)
-5. [Backup and Restore](#backup-and-restore)
-6. [Scaling](#scaling)
-7. [Troubleshooting](#troubleshooting)
-8. [Performance Tuning](#performance-tuning)
+- [Installation](#installation)
+  - [Build](#build)
+  - [Install script (Linux)](#install-script-linux)
+  - [Docker](#docker)
+  - [Docker Compose cluster](#docker-compose-cluster)
+  - [Kubernetes](#kubernetes)
+  - [macOS service (launchd)](#macos-service-launchd)
+  - [Linux service (systemd)](#linux-service-systemd)
+- [Configuration essentials](#configuration-essentials)
+- [Running and lifecycle management](#running-and-lifecycle-management)
+- [Monitoring](#monitoring)
+  - [Ports](#ports)
+  - [Health endpoints](#health-endpoints)
+  - [Metrics catalog](#metrics-catalog)
+  - [Prometheus and Grafana](#prometheus-and-grafana)
+- [Backup and restore](#backup-and-restore)
+- [Scaling](#scaling)
+- [Troubleshooting playbook](#troubleshooting-playbook)
+- [Incident severity](#incident-severity)
+- [Performance tuning](#performance-tuning)
+  - [Targets](#targets)
+  - [OS tuning](#os-tuning)
+  - [Profiling](#profiling)
+- [Connecting Kafka UI and admin tools](#connecting-kafka-ui-and-admin-tools)
+- [Running the test suites](#running-the-test-suites)
 
 ---
 
 ## Installation
 
-### Prerequisites
+### Build
 
-- **Operating System**: Linux (Ubuntu 20.04+, CentOS 8+, RHEL 8+) or macOS 11+
-- **Memory**: Minimum 4GB RAM (8GB+ recommended for production)
-- **Disk**: SSD with at least 100GB free space
-- **CPU**: 4+ cores recommended
-- **Dependencies**:
-  - Boost 1.74+
-  - RocksDB 6.11+
-  - OpenSSL 1.1+
-  - spdlog 1.9+
-  - CMake 3.20+
-
-### Installation Methods
-
-#### 1. Using the Installation Script (Linux)
-
-The recommended way to install Kawasan on Linux systems:
+All installation paths start from a build. See [../README.md](../README.md) for prerequisites and the canonical build commands. In brief:
 
 ```bash
-# Build from source
-cd kawasan
-mkdir build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-cmake --build . -j$(nproc)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.logicalcpu)
+```
 
-# Run installation script (requires sudo)
-cd ..
+This produces the broker and CLI tools under `build/tools/`: `kawasan-broker`, `kawasan-topics`, `kawasan-groups`, `kawasan-metadata-check`.
+
+The broker accepts these CLI flags (any of which override the config file): `--config`/`-c`, `--broker-id`, `--host`, `--port`/`-p`, `--log-dir`, `--log-level` (`trace|debug|info|warn|error|critical`, default `info`), and `--help`/`-h`.
+
+```bash
+./build/tools/kawasan-broker --config config/broker.dev.properties
+./build/tools/kawasan-broker --config config/broker.macos.properties --log-level debug
+```
+
+### Install script (Linux)
+
+`scripts/install.sh` installs a system-wide Linux deployment. It must run as root and expects the project already built (`build/tools/kawasan-broker` present).
+
+```bash
 sudo ./scripts/install.sh
 ```
 
-This script will:
-- Create the `kawasan` user and group
-- Install binaries to `/usr/local/bin`
-- Create configuration directory at `/etc/kawasan`
-- Set up data directory at `/var/lib/kawasan`
-- Set up log directory at `/var/log/kawasan`
-- Install systemd service file
+It performs the following:
 
-#### 2. Using Docker
+| Step | Detail |
+|------|--------|
+| User/group | Creates the `kawasan` system user and group |
+| Binaries | Installs to `/usr/local/bin` |
+| Config | `/etc/kawasan` |
+| Data | `/var/lib/kawasan` |
+| Logs | `/var/log/kawasan` |
+| Service | Installs `systemd/kawasan-broker.service` to `/etc/systemd/system` (skipped with a warning if the unit file is absent) |
 
-Single broker:
+`scripts/install-systemd-service.sh` (Linux) and `scripts/install-macos-service.sh` (macOS) are the service-focused variants used in the [systemd](#linux-service-systemd) and [launchd](#macos-service-launchd) sections below.
+
+### Docker
+
+The repository ships a multi-stage `Dockerfile`. The image exposes the Kafka port `9092` and the Raft port `9093`, runs `kawasan-broker --config /etc/kawasan/server.properties`, and includes a `nc -z localhost 9092` health check.
 
 ```bash
 docker build -t kawasan:latest .
+
 docker run -d \
-  -p 9092:9092 \
+  -p 9092:9092 -p 9094:9094 \
   -v kawasan-data:/var/lib/kawasan/data \
+  -v "$PWD/config/broker.docker.properties:/etc/kawasan/server.properties:ro" \
   --name kawasan-broker \
   kawasan:latest
 ```
 
-Three-broker cluster:
+A single-broker `docker-compose.yml` is also provided (service `kawasan-broker-1`, additional brokers commented out as a starting point).
 
 ```bash
-docker-compose -f docker-compose-cluster.yml up -d
+docker compose up -d
+docker compose logs -f
+docker compose down
 ```
 
-#### 3. Using Kubernetes
+### Docker Compose cluster
+
+`docker-compose-cluster.yml` brings up a three-broker layout (`broker-0`, `broker-1`, `broker-2`), each mounting its own config from `config/broker-N.properties` and publishing host ports `9092/9192/9292` (Kafka) and `9093/9193/9293` (Raft).
 
 ```bash
-# Apply Kubernetes manifests
-kubectl apply -f k8s/kawasan-configmap.yaml
-kubectl apply -f k8s/kawasan-statefulset.yaml
-kubectl apply -f k8s/kawasan-service.yaml
+docker compose -f docker-compose-cluster.yml up -d
+docker compose -f docker-compose-cluster.yml logs -f broker-0
+docker compose -f docker-compose-cluster.yml restart broker-0
+docker compose -f docker-compose-cluster.yml down
 ```
 
-#### 4. Manual Installation
+> Multi-broker Raft is not production-hardened. Use the cluster compose file for local experimentation and compatibility testing, not for production traffic. See [Scaling](#scaling).
 
-1. Build the project:
-   ```bash
-   mkdir build && cd build
-   cmake -DCMAKE_BUILD_TYPE=Release ..
-   cmake --build . -j$(nproc)
-   ```
+### Kubernetes
 
-2. Copy binaries to desired location:
-   ```bash
-   sudo cp build/tools/kawasan-broker /usr/local/bin/
-   sudo cp build/tools/kawasan-topics /usr/local/bin/
-   ```
+Two paths are supported: the Helm chart (recommended) and the raw manifests in `k8s/`.
 
-3. Create configuration directory:
-   ```bash
-   sudo mkdir -p /etc/kawasan
-   sudo cp config/server.properties.example /etc/kawasan/broker.properties
-   ```
-
-4. Create data and log directories:
-   ```bash
-   sudo mkdir -p /var/lib/kawasan /var/log/kawasan
-   sudo chown -R <user>:<group> /var/lib/kawasan /var/log/kawasan
-   ```
-
----
-
-## Configuration Reference
-
-### Essential Configuration Properties
-
-#### Broker Identity
-
-```properties
-# Unique identifier for this broker (required in multi-broker clusters)
-broker.id=0
-```
-
-#### Network Configuration
-
-```properties
-# Network interfaces to bind to
-listeners=PLAINTEXT://0.0.0.0:9092
-
-# Addresses clients use to connect (hostname or IP)
-advertised.listeners=PLAINTEXT://broker-0:9092
-
-# Number of network threads handling requests
-num.network.threads=3
-
-# Number of I/O threads
-num.io.threads=8
-```
-
-#### Storage Configuration
-
-```properties
-# Directory where log data is stored
-log.dirs=/var/lib/kawasan/data
-
-# Default number of partitions per topic
-num.partitions=3
-
-# Default replication factor for topics
-default.replication.factor=1
-
-# Log segment size (1GB)
-log.segment.bytes=1073741824
-```
-
-#### Log Retention Configuration
-
-```properties
-# Time-based retention (hours)
-log.retention.hours=168
-
-# Size-based retention (bytes, -1 = unlimited)
-log.retention.bytes=-1
-
-# Interval for log cleanup (milliseconds)
-log.retention.check.interval.ms=300000
-```
-
-#### Raft Configuration (Multi-Broker)
-
-```properties
-# Port for Raft inter-broker communication
-raft.port=9093
-
-# Peer list: broker_id:host:port,broker_id:host:port,...
-raft.peers=0:broker-0:9093,1:broker-1:9093,2:broker-2:9093
-```
-
-#### Consumer Group Configuration
-
-```properties
-# How long to retain consumer group metadata (7 days)
-group.retention.ms=604800000
-
-# Interval for consumer lag computation (30 seconds)
-consumer.lag.check.interval.ms=30000
-```
-
-#### Monitoring Configuration
-
-```properties
-# Enable monitoring server
-monitoring.enabled=true
-
-# Monitoring server host
-monitoring.host=0.0.0.0
-
-# Monitoring server port (Prometheus metrics endpoint)
-monitoring.port=9094
-```
-
-#### TLS/SSL Configuration
-
-```properties
-# Enable SSL for client connections
-ssl.enabled=false
-
-# Server certificate (PEM format)
-ssl.cert.file=/path/to/server-cert.pem
-
-# Server private key (PEM format)
-ssl.key.file=/path/to/server-key.pem
-
-# Private key password (optional)
-ssl.key.password=
-
-# CA certificate for client verification (PEM format)
-ssl.ca.file=/path/to/ca-cert.pem
-
-# Client authentication: none, requested, required
-ssl.client.auth=none
-```
-
-#### Raft TLS Configuration
-
-```properties
-# Enable SSL for Raft inter-broker communication
-raft.ssl.enabled=false
-
-# Raft SSL certificate/key/CA files
-raft.ssl.cert.file=/path/to/raft-cert.pem
-raft.ssl.key.file=/path/to/raft-key.pem
-raft.ssl.ca.file=/path/to/raft-ca.pem
-```
-
-### Advanced Configuration
-
-#### Auto-Create Topics
-
-```properties
-# Automatically create topics when produced to
-auto.create.topics.enable=true
-```
-
-#### Compression
-
-```properties
-# Compression type for log segments (none, gzip, snappy, lz4, zstd)
-compression.type=none
-```
-
-#### Resource Limits
-
-```properties
-# Maximum message size (1MB)
-message.max.bytes=1048576
-
-# Maximum request size (1MB)
-max.request.size=1048576
-```
-
----
-
-## Starting, Stopping, and Restarting
-
-### Using Systemd (Linux)
-
-#### Start the Broker
+**Helm** — chart at `helm/kawasan/`, documented in [../helm/kawasan/README.md](../helm/kawasan/README.md):
 
 ```bash
+helm install kawasan ./helm/kawasan --namespace kawasan --create-namespace
+helm upgrade kawasan ./helm/kawasan --namespace kawasan --values custom-values.yaml
+helm rollback kawasan -n kawasan
+helm uninstall kawasan -n kawasan
+```
+
+**Raw manifests** — the `k8s/` directory contains `kawasan-configmap.yaml`, `kawasan-service.yaml`, `kawasan-statefulset.yaml`, `kawasan-deployment.yaml`, and `kawasan-pvc.yaml`:
+
+```bash
+kubectl create namespace kawasan
+kubectl apply -n kawasan -f k8s/kawasan-configmap.yaml
+kubectl apply -n kawasan -f k8s/kawasan-service.yaml
+kubectl apply -n kawasan -f k8s/kawasan-statefulset.yaml   # or kawasan-deployment.yaml for dev
+```
+
+Verify and reach the broker:
+
+```bash
+kubectl get pods,svc,pvc -n kawasan
+kubectl logs -f -n kawasan kawasan-broker-0
+kubectl port-forward -n kawasan svc/kawasan-broker 9092:9092
+```
+
+Common pod-level checks:
+
+```bash
+kubectl describe pod kawasan-broker-0 -n kawasan          # events, scheduling, probes
+kubectl logs kawasan-broker-0 -n kawasan --previous       # logs from a crashed instance
+kubectl top pods -n kawasan                               # resource usage
+```
+
+For per-parameter Helm values (replica count, persistence, resources, ServiceMonitor) see [../helm/kawasan/README.md](../helm/kawasan/README.md).
+
+### macOS service (launchd)
+
+`scripts/install-macos-service.sh` installs the broker as a launchd daemon using the `macos/com.kawasan.broker.plist` template.
+
+```bash
+sudo ./scripts/install-macos-service.sh
+# Optional overrides:
+sudo ./scripts/install-macos-service.sh \
+  --broker-path ./build/tools/kawasan-broker \
+  --config-path ./config/broker.macos.properties \
+  --user kawasan
+```
+
+Layout created: binary at `/usr/local/bin/kawasan-broker`, config at `/usr/local/etc/kawasan/broker.properties`, data at `/usr/local/var/kawasan`, logs at `/usr/local/var/log/kawasan/{broker.log,broker-error.log}`, plist at `/Library/LaunchDaemons/com.kawasan.broker.plist`. The plist enables `RunAtLoad`, restart-on-crash via `KeepAlive` (crash only, not clean exit), a 30s graceful-shutdown timeout, and a 65536 file-descriptor soft/hard limit.
+
+Lifecycle:
+
+```bash
+sudo launchctl load   /Library/LaunchDaemons/com.kawasan.broker.plist   # start
+sudo launchctl unload /Library/LaunchDaemons/com.kawasan.broker.plist   # stop
+sudo launchctl list | grep kawasan                                      # status
+tail -f /usr/local/var/log/kawasan/broker.log                           # logs
+plutil -lint /Library/LaunchDaemons/com.kawasan.broker.plist            # validate plist
+```
+
+Uninstall (`--keep-data` / `--keep-config` preserve state):
+
+```bash
+sudo ./scripts/uninstall-macos-service.sh
+```
+
+The macOS profile (`config/broker.macos.properties`) uses data dir `/usr/local/var/kawasan/data`, lower thread counts (4 network / 4 I/O), 512MB log segments, and replication factor 1 — appropriate for single-node development.
+
+### Linux service (systemd)
+
+`scripts/install-systemd-service.sh` installs and enables the systemd unit (`systemd/kawasan-broker.service`).
+
+```bash
+sudo ./scripts/install-systemd-service.sh            # or pass a build dir
+sudo nano /etc/kawasan/broker.properties
 sudo systemctl start kawasan-broker
 ```
 
-#### Stop the Broker
+The unit is configured with `Restart=on-failure`, `RestartSec=10s`, a restart burst limit, a 30s graceful-shutdown (`SIGTERM`) timeout, and `LimitNOFILE=100000`. Optional hardening directives (`NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`, `ProtectHome`, `ReadWritePaths`) and resource caps (`CPUQuota`, `MemoryMax`, `MemoryHigh`) can be enabled by editing the unit, then `sudo systemctl daemon-reload && sudo systemctl restart kawasan-broker`.
+
+> Per-broker systemd template units (`kawasan-broker@N`) are **not** provided. Run one broker per host with the single `kawasan-broker` unit.
+
+---
+
+## Configuration essentials
+
+The full key reference lives in [./CONFIGURATION.md](./CONFIGURATION.md). The operationally critical points:
+
+**Both config formats are supported and auto-detected.** `src/common/config.cpp` dispatches on the first non-whitespace byte: a leading `{` or `[` is parsed as a **JSON object** (e.g. `config/broker.dev.properties`, `config/broker.docker.properties`); anything else is parsed as **Kafka-style `key=value` properties** (e.g. `config/broker-0.properties`). Despite the `.properties` extension, several shipped files are JSON — open the file to see which form it uses.
+
+**Environment-variable substitution** applies to both formats: `${VAR}` expands to the variable's value (and errors if unset), and `${VAR:default}` falls back to `default` when unset. This is how the staging/production configs parameterize ports and toggles.
+
+The handful of keys you adjust most often when operating a broker:
+
+| Key | Purpose | Typical value |
+|-----|---------|---------------|
+| `broker.id` | Unique broker identity | `0` (single node) |
+| `host` / `listeners` | Bind address | `0.0.0.0` |
+| `port` | Kafka client port | `9092` |
+| `advertised.host` / `advertised.port` | Address clients are told to use | matches reachable address (see [Kafka UI](#connecting-kafka-ui-and-admin-tools)) |
+| `log.dirs` | Data directory | `/var/lib/kawasan/data` |
+| `log.retention.hours` / `log.retention.bytes` | Retention | `168` / `-1` |
+| `num.network.threads` / `num.io.threads` | Concurrency | tune to cores |
+| `compression.type` | `none`/`gzip`/`snappy`/`lz4`/`zstd` | `snappy` or `lz4` |
+| `monitoring.enabled` / `monitoring.host` / `monitoring.port` | HTTP metrics + health server | see [Ports](#ports) |
+
+**Durability behavior** (fixed, not configurable per request): message/log writes and consumer offset commits use synchronous RocksDB writes (`sync=true`) for at-least-once durability, with offset commits batched across partitions into a single `WriteBatch`; consumer-group metadata uses async writes (`sync=false`) protected by the RocksDB WAL.
+
+**Raft TLS is a known limitation.** The `raft.ssl.*` keys are parsed and validated at broker startup (`src/broker/kawasan_broker.cpp` around lines 176–190), so an invalid combination throws at boot. However, the Raft transport (`src/raft/raft_transport.{cpp,h}`) contains no SSL code, so **inter-broker Raft traffic is plaintext even when `raft.ssl.enabled=true`**. Do not rely on Raft TLS for confidentiality; isolate inter-broker traffic at the network layer instead.
+
+---
+
+## Running and lifecycle management
+
+### systemd (Linux)
 
 ```bash
-sudo systemctl stop kawasan-broker
-```
-
-#### Restart the Broker
-
-```bash
+sudo systemctl start   kawasan-broker
+sudo systemctl stop    kawasan-broker      # SIGTERM, up to 30s graceful
 sudo systemctl restart kawasan-broker
+sudo systemctl enable  kawasan-broker      # start on boot
+sudo systemctl status  kawasan-broker
+sudo systemctl is-active kawasan-broker
 ```
 
-#### Enable Auto-Start on Boot
+Logs via journald:
 
 ```bash
-sudo systemctl enable kawasan-broker
-```
-
-#### Check Status
-
-```bash
-sudo systemctl status kawasan-broker
-```
-
-#### View Logs
-
-```bash
-# Follow logs in real-time
-sudo journalctl -u kawasan-broker -f
-
-# View last 100 lines
-sudo journalctl -u kawasan-broker -n 100
-
-# View logs since today
+sudo journalctl -u kawasan-broker -f             # follow
+sudo journalctl -u kawasan-broker -n 200 --no-pager
 sudo journalctl -u kawasan-broker --since today
+sudo journalctl -u kawasan-broker -p err         # errors only
 ```
 
-### Manual Start (Development)
+Journald rotation is configured in `/etc/systemd/journald.conf` (`SystemMaxUse`, `SystemMaxFileSize`, `MaxRetentionSec`); apply with `sudo systemctl restart systemd-journald`.
+
+### launchd (macOS)
+
+See [macOS service](#macos-service-launchd). Restart = `unload` then `load`.
+
+### Docker
 
 ```bash
-# Start broker in foreground
-./build/tools/kawasan-broker --config config/broker.macos.properties
-
-# Start broker in background
-./build/tools/kawasan-broker --config config/broker.macos.properties &
-
-# With custom log level
-./build/tools/kawasan-broker --config config/broker.macos.properties --log-level debug
-```
-
-### Using Docker
-
-```bash
-# Start container
-docker start kawasan-broker
-
-# Stop container
-docker stop kawasan-broker
-
-# Restart container
-docker restart kawasan-broker
-
-# View logs
+docker start|stop|restart kawasan-broker
 docker logs -f kawasan-broker
 ```
 
-### Using Docker Compose
+### Manual / development
 
 ```bash
-# Start cluster
-docker-compose -f docker-compose-cluster.yml up -d
+./build/tools/kawasan-broker --config config/broker.dev.properties
+./build/tools/kawasan-broker --config config/broker.dev.properties --log-level debug
+```
 
-# Stop cluster
-docker-compose -f docker-compose-cluster.yml down
+Logs are structured (spdlog) and written to stdout and the configured log directory; control verbosity with `--log-level` (`trace|debug|info|warn|error`).
 
-# Restart specific broker
-docker-compose -f docker-compose-cluster.yml restart broker-0
+### Verifying the broker is up
 
-# View logs
-docker-compose -f docker-compose-cluster.yml logs -f broker-0
+```bash
+nc -zv localhost 9092
+curl -s http://localhost:9094/health
+./build/tools/kawasan-topics --bootstrap-server localhost:9092 --list
 ```
 
 ---
 
 ## Monitoring
 
-### Health Checks
+The broker runs an embedded HTTP server (Boost.Beast) that serves Prometheus metrics and health endpoints. It is controlled by `monitoring.enabled`, `monitoring.host`, and `monitoring.port`.
 
-#### HTTP Endpoints
+### Ports
 
-Kawasan exposes several health check endpoints:
+| Port | Service | Default in |
+|------|---------|-----------|
+| `9092` | Kafka client protocol | all configs |
+| `9093` | Raft inter-broker (multi-broker only) | cluster configs |
+| `9094` | HTTP monitoring (metrics + health) | dev / docker / `broker-N.properties` |
+| `8080` | HTTP monitoring (metrics + health) | staging / production, via `${KAWASAN_MONITORING_PORT:8080}` |
+
+The **default monitoring port is 9094** in the development, Docker, and numbered-broker configs. The **staging and production configs override it to 8080** through `"monitoring.port": "${KAWASAN_MONITORING_PORT:8080}"`. Accordingly, `monitoring/prometheus.yml` scrapes `:8080`. Use whichever port your active profile binds — substitute it for `9094` in the examples below if you run a staging/production config.
+
+### Health endpoints
 
 ```bash
-# General health check
-curl http://localhost:9094/health
-
-# Readiness probe (ready to serve traffic)
-curl http://localhost:9094/readiness
-
-# Liveness probe (process is alive)
-curl http://localhost:9094/liveness
+curl http://localhost:9094/health      # alias: /healthz  → overall status
+curl http://localhost:9094/ready       # alias: /readiness → ready to serve
+curl http://localhost:9094/live        # alias: /liveness  → process alive
 ```
 
-Response format:
+Example response:
+
 ```json
-{
-  "status": "UP",
-  "healthy": true,
-  "ready": true
-}
+{ "status": "UP", "healthy": true, "ready": true }
 ```
 
-### Metrics
+These map directly to Kubernetes liveness/readiness probes (use `/live` and `/ready`).
 
-#### Prometheus Metrics
-
-Access metrics in Prometheus format:
+### Metrics catalog
 
 ```bash
 curl http://localhost:9094/metrics
 ```
 
-Key metrics include:
+| Metric | Type | Description |
+|--------|------|-------------|
+| `kawasan_broker_uptime_seconds` | Gauge | Broker uptime |
+| `kawasan_active_connections` | Gauge | Current active client connections |
+| `kawasan_topics` | Gauge | Number of topics |
+| `kawasan_partitions` | Gauge | Number of partitions |
+| `kawasan_consumer_groups` | Gauge | Number of consumer groups |
+| `kawasan_messages_produced_total` | Counter | Total messages produced |
+| `kawasan_messages_consumed_total` | Counter | Total messages consumed |
+| `kawasan_bytes_in_total` | Counter | Total bytes received |
+| `kawasan_bytes_out_total` | Counter | Total bytes sent |
+| `kawasan_requests_total` | Counter | Total requests, by API |
+| `kawasan_request_errors_total` | Counter | Total request errors, by API |
+| `kawasan_produce_latency_ms` | Histogram | Produce latency (P50/P95/P99) |
+| `kawasan_fetch_latency_ms` | Histogram | Fetch latency (P50/P95/P99) |
+| `kawasan_disk_usage_bytes` | Gauge | Disk usage |
+| `kawasan_memory_usage_bytes` | Gauge | Memory usage |
+| `kawasan_consumer_lag` | Gauge | Messages behind, labeled `{group,topic,partition}` |
 
-**Broker Metrics:**
-- `kawasan_broker_uptime_seconds` - Broker uptime
-- `kawasan_active_connections` - Current active client connections
-- `kawasan_topics` - Number of topics
-- `kawasan_partitions` - Number of partitions
-- `kawasan_consumer_groups` - Number of consumer groups
+### Prometheus and Grafana
 
-**Throughput Metrics:**
-- `kawasan_messages_produced_total` - Total messages produced
-- `kawasan_messages_consumed_total` - Total messages consumed
-- `kawasan_bytes_in_total` - Total bytes received
-- `kawasan_bytes_out_total` - Total bytes sent
+A complete stack lives in [`monitoring/`](../monitoring/), which contains `prometheus.yml`, `alerts.yml`, `alertmanager.yml`, `grafana-datasource.yml`, `grafana-dashboard.json`, and `docker-compose.monitoring.yml`.
 
-**Latency Metrics:**
-- `kawasan_produce_latency_ms` - Produce request latency (p50, p95, p99, p999)
-- `kawasan_fetch_latency_ms` - Fetch request latency (p50, p95, p99, p999)
+Bring the stack up (Prometheus `:9090`, Grafana `:3000` admin/admin, Alertmanager `:9093`):
 
-**Consumer Lag:**
-- `kawasan_consumer_lag{group="...",topic="...",partition="..."}` - Messages behind
-
-#### Setting Up Prometheus
-
-1. Install Prometheus:
-   ```bash
-   # Using Docker
-   docker run -d -p 9090:9090 \
-     -v $PWD/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml \
-     prom/prometheus
-   ```
-
-2. Configure Prometheus (`monitoring/prometheus.yml`):
-   ```yaml
-   scrape_configs:
-     - job_name: 'kawasan'
-       static_configs:
-         - targets: ['localhost:9094']
-   ```
-
-3. Access Prometheus UI: `http://localhost:9090`
-
-#### Setting Up Grafana
-
-1. Install Grafana:
-   ```bash
-   docker run -d -p 3000:3000 grafana/grafana
-   ```
-
-2. Import dashboard:
-   - Navigate to `http://localhost:3000` (admin/admin)
-   - Go to Dashboards → Import
-   - Upload `monitoring/grafana-dashboard.json`
-
-### Log Monitoring
-
-Logs are written to:
-- **Systemd**: `/var/log/syslog` or view with `journalctl`
-- **Docker**: Container logs via `docker logs`
-- **File**: Configured via spdlog (default: stdout)
-
-Log levels:
-- `trace` - Very detailed debugging
-- `debug` - Debugging information
-- `info` - Informational messages (default)
-- `warn` - Warning messages
-- `error` - Error messages
-- `critical` - Critical errors
-
-Change log level:
 ```bash
-./kawasan-broker --config broker.properties --log-level debug
+cd monitoring
+docker compose -f docker-compose.monitoring.yml up -d
 ```
+
+Point Prometheus at your broker(s) in `monitoring/prometheus.yml` — adjust the port to match your profile (`8080` for staging/prod, `9094` for dev/docker):
+
+```yaml
+scrape_configs:
+  - job_name: 'kawasan-broker'
+    static_configs:
+      - targets: ['localhost:8080']
+      # cluster: ['broker-0:8080', 'broker-1:8080', 'broker-2:8080']
+```
+
+Import the Grafana dashboard: **Dashboards → Import →** upload `monitoring/grafana-dashboard.json`, select the Prometheus data source. It visualizes status/uptime, throughput, P50/P95/P99 latency, requests and errors by API, connections, consumer groups, and disk/memory.
+
+Alerting rules in `monitoring/alerts.yml` cover broker-down, high P99 latency, disk-space thresholds, high memory, high error rate, and connection anomalies. Wire notifications (Slack/email/PagerDuty) in `monitoring/alertmanager.yml`.
+
+On Kubernetes, the Helm chart can emit a `ServiceMonitor` for the Prometheus Operator (`metrics.serviceMonitor.enabled=true`); see [../helm/kawasan/README.md](../helm/kawasan/README.md).
 
 ---
 
-## Backup and Restore
+## Backup and restore
 
-### Data Directories
-
-Important directories to backup:
+Back up two locations: the data directory (log segments + RocksDB state) and the config directory.
 
 ```
-/var/lib/kawasan/data/       # Log segments and indexes
-/etc/kawasan/                # Configuration files
+/var/lib/kawasan/data/    # log segments, indexes, RocksDB
+/etc/kawasan/             # configuration
 ```
 
-### Backup Procedures
-
-#### 1. Snapshot Backup (Recommended)
+### Snapshot backup (offline, simplest)
 
 ```bash
-# Stop the broker
 sudo systemctl stop kawasan-broker
-
-# Create backup
-sudo tar -czf kawasan-backup-$(date +%Y%m%d).tar.gz \
-  /var/lib/kawasan/data \
-  /etc/kawasan
-
-# Restart the broker
+sudo tar -czf kawasan-backup-$(date +%Y%m%d).tar.gz /var/lib/kawasan/data /etc/kawasan
 sudo systemctl start kawasan-broker
 ```
 
-#### 2. Hot Backup (RocksDB Checkpoint)
+### RocksDB checkpoint (online)
 
-Kawasan uses RocksDB which supports online backups through checkpoints:
+RocksDB supports consistent online copies. The simplest operational form copies the data directory while the broker runs; for a transactionally consistent snapshot, prefer a filesystem/volume snapshot (below) over a plain `cp` of a live directory.
 
 ```bash
-# Create checkpoint (broker keeps running)
-# This creates a consistent snapshot in the checkpoint directory
 cp -r /var/lib/kawasan/data /backup/kawasan-checkpoint-$(date +%Y%m%d)
 ```
 
-#### 3. Volume Snapshots (Cloud)
+### Volume snapshots (cloud / Kubernetes)
 
-For cloud deployments, use provider-specific snapshot capabilities:
-
-**AWS EBS:**
 ```bash
-aws ec2 create-snapshot \
-  --volume-id vol-xxxxx \
-  --description "Kawasan data backup $(date +%Y%m%d)"
-```
+# AWS EBS
+aws ec2 create-snapshot --volume-id vol-xxxx \
+  --description "kawasan $(date +%Y%m%d)"
 
-**Docker Volumes:**
-```bash
-docker run --rm \
-  -v kawasan-data:/data \
-  -v $(pwd):/backup \
+# Docker volume → tarball
+docker run --rm -v kawasan-data:/data -v "$PWD:/backup" \
   ubuntu tar czf /backup/kawasan-data-backup.tar.gz /data
 ```
 
-### Restore Procedures
+On Kubernetes use a `VolumeSnapshot` against the broker's PVC (`data-kawasan-broker-0`); restore by creating a new PVC with that snapshot as `dataSource`. See the manifests in [`k8s/`](../k8s/).
 
-#### 1. From Snapshot Backup
+### Restore (tar + chown flow)
 
 ```bash
-# Stop the broker
 sudo systemctl stop kawasan-broker
-
-# Clear existing data
 sudo rm -rf /var/lib/kawasan/data/*
-
-# Extract backup
 sudo tar -xzf kawasan-backup-YYYYMMDD.tar.gz -C /
-
-# Fix permissions
 sudo chown -R kawasan:kawasan /var/lib/kawasan/data
-
-# Restart broker
 sudo systemctl start kawasan-broker
 ```
 
-#### 2. From Checkpoint
+From a checkpoint copy:
 
 ```bash
-# Stop the broker
 sudo systemctl stop kawasan-broker
-
-# Replace data directory
 sudo rm -rf /var/lib/kawasan/data
 sudo cp -r /backup/kawasan-checkpoint-YYYYMMDD /var/lib/kawasan/data
 sudo chown -R kawasan:kawasan /var/lib/kawasan/data
-
-# Restart broker
 sudo systemctl start kawasan-broker
 ```
 
-### Backup Best Practices
+The `chown` step is mandatory after any restore — extracted or copied files are owned by `root` and the broker runs as the unprivileged `kawasan` user.
 
-1. **Schedule Regular Backups**: Use cron or systemd timers
-2. **Retention Policy**: Keep 7 daily, 4 weekly, 12 monthly backups
-3. **Test Restores**: Regularly verify backups can be restored
-4. **Off-Site Storage**: Store backups in different location/region
-5. **Monitor Backup Size**: Track growth trends
-6. **Encrypt Backups**: Use encryption for sensitive data
+**Practices:** schedule via cron/systemd timers, keep a tiered retention (e.g. 7 daily / 4 weekly / 12 monthly), store copies off-host, periodically rehearse a restore, and encrypt backups containing sensitive payloads.
 
 ---
 
 ## Scaling
 
-### Vertical Scaling
+**Single-node is the primary, supported topology.** Scale a single broker vertically first; treat multi-broker as experimental.
 
-#### Increase Broker Resources
+### Vertical scaling
 
-1. **CPU**: Add more cores, increase `num.io.threads` and `num.network.threads`
-2. **Memory**: Allocate more RAM for better caching
-3. **Disk**: Use faster SSDs, add more disk space
+| Resource | Action |
+|----------|--------|
+| CPU | Add cores; raise `num.io.threads` and `num.network.threads` |
+| Memory | Add RAM for OS page cache / RocksDB block cache |
+| Disk | Faster NVMe, more capacity; larger `log.segment.bytes` |
 
-Configuration adjustments for larger machines:
+Example for a 16-core host:
 
 ```properties
-# 16-core machine
 num.io.threads=16
 num.network.threads=8
-
-# Larger batch sizes
-log.segment.bytes=2147483648  # 2GB segments
+log.segment.bytes=2147483648
 ```
 
-Update systemd service limits:
+On systemd, raise the caps to match (`LimitNOFILE`, `MemoryMax`, `CPUQuota`). On Kubernetes, bump resource requests/limits via Helm (`resources.*`) or `kubectl scale`.
 
-```ini
-[Service]
-LimitNOFILE=200000
-MemoryMax=8G
-CPUQuota=800%
-```
+### Partition parallelism
 
-### Horizontal Scaling
-
-#### Adding Brokers to Cluster
-
-**Prerequisites:**
-- Raft networking must be fully implemented (currently single-node)
-- All brokers must have unique `broker.id`
-- Network connectivity between brokers
-
-**Steps:**
-
-1. Configure new broker with unique ID:
-   ```properties
-   broker.id=3
-   raft.port=9093
-   raft.peers=0:broker-0:9093,1:broker-1:9093,2:broker-2:9093,3:broker-3:9093
-   ```
-
-2. Update existing brokers' `raft.peers` configuration:
-   ```properties
-   # Add new broker to peers list
-   raft.peers=0:broker-0:9093,1:broker-1:9093,2:broker-2:9093,3:broker-3:9093
-   ```
-
-3. Rolling restart existing brokers:
-   ```bash
-   for i in 0 1 2; do
-     sudo systemctl restart kawasan-broker@$i
-     sleep 30  # Wait for broker to rejoin cluster
-   done
-   ```
-
-4. Start new broker:
-   ```bash
-   sudo systemctl start kawasan-broker@3
-   ```
-
-5. Verify cluster membership:
-   ```bash
-   ./kawasan-topics --bootstrap-server localhost:9092 --describe
-   ```
-
-#### Removing Brokers
-
-⚠️ **Note**: Multi-broker replication is not yet implemented. This is for future reference.
-
-1. Reassign partitions to remaining brokers
-2. Gracefully shut down broker to remove
-3. Update `raft.peers` on remaining brokers
-4. Rolling restart remaining brokers
-
-### Partition Management
-
-#### Increasing Partitions
-
-More partitions = higher parallelism for consumers:
+Consumer parallelism is bounded by partition count. Create topics with enough partitions up front:
 
 ```bash
-# Create topic with 12 partitions
-./kawasan-topics --bootstrap-server localhost:9092 \
-  --create --topic high-throughput \
-  --partitions 12 --replication-factor 3
+./build/tools/kawasan-topics --bootstrap-server localhost:9092 \
+  --create --topic high-throughput --partitions 12 --replication-factor 1
 ```
 
-Guidelines:
-- More partitions = more parallelism but more overhead
-- Aim for 2-4 partitions per broker
-- Don't exceed 1000 partitions per broker
+Guidance: more partitions = more parallelism but more per-partition overhead; do not over-provision (avoid thousands of partitions on one broker).
+
+### Horizontal scaling (experimental)
+
+Multi-broker Raft replication is **not production-hardened**. The `docker-compose-cluster.yml` and `k8s` StatefulSet exist for experimentation and compatibility testing. If you run a multi-broker cluster:
+
+- Every broker needs a unique `broker.id`.
+- Configure `raft.port` and `raft.peers` (`id:host:port,...`) consistently across brokers.
+- Use an odd broker count (3, 5) so Raft can form a majority.
+- Remember inter-broker Raft traffic is **plaintext** regardless of `raft.ssl.*` (see [Configuration essentials](#configuration-essentials)) — isolate it at the network layer.
+
+For production-grade durability today, run a single broker with synchronous writes (default) plus disciplined backups rather than relying on replication.
 
 ---
 
-## Troubleshooting
+## Troubleshooting playbook
 
-### Common Issues
-
-#### Broker Won't Start
-
-**Symptoms:**
-- Service fails to start
-- Error in logs: "Address already in use"
-
-**Solutions:**
-1. Check if port is already in use:
-   ```bash
-   sudo lsof -i :9092
-   sudo netstat -tulpn | grep 9092
-   ```
-
-2. Check permissions on data directory:
-   ```bash
-   ls -la /var/lib/kawasan/data
-   sudo chown -R kawasan:kawasan /var/lib/kawasan
-   ```
-
-3. Check configuration file syntax:
-   ```bash
-   cat /etc/kawasan/broker.properties
-   ```
-
-4. View detailed logs:
-   ```bash
-   sudo journalctl -u kawasan-broker -n 200 --no-pager
-   ```
-
-#### Connection Refused
-
-**Symptoms:**
-- Clients cannot connect to broker
-- Error: "Connection refused" or "Connection timeout"
-
-**Solutions:**
-1. Verify broker is running:
-   ```bash
-   sudo systemctl status kawasan-broker
-   ```
-
-2. Check listener configuration:
-   ```properties
-   listeners=PLAINTEXT://0.0.0.0:9092
-   ```
-
-3. Test connectivity:
-   ```bash
-   nc -zv localhost 9092
-   telnet localhost 9092
-   ```
-
-4. Check firewall rules:
-   ```bash
-   sudo iptables -L -n
-   sudo firewall-cmd --list-all
-   ```
-
-#### High CPU Usage
-
-**Symptoms:**
-- CPU at 100%
-- Slow request processing
-
-**Solutions:**
-1. Check metrics for hot paths:
-   ```bash
-   curl http://localhost:9094/metrics | grep latency
-   ```
-
-2. Increase I/O threads:
-   ```properties
-   num.io.threads=16
-   ```
-
-3. Review log retention/cleanup:
-   ```properties
-   log.retention.check.interval.ms=600000
-   ```
-
-4. Profile with system tools:
-   ```bash
-   # Linux
-   perf record -p <broker-pid>
-   perf report
-   
-   # macOS
-   sudo instruments -t "Time Profiler" -p <broker-pid>
-   ```
-
-#### High Memory Usage
-
-**Symptoms:**
-- Memory usage keeps growing
-- OOM killer kills broker
-
-**Solutions:**
-1. Check metrics:
-   ```bash
-   curl http://localhost:9094/metrics | grep memory
-   ```
-
-2. Limit memory in systemd:
-   ```ini
-   [Service]
-   MemoryMax=4G
-   MemoryHigh=3G
-   ```
-
-3. Reduce cache sizes (future config)
-4. Check for memory leaks with valgrind (development only)
-
-#### Slow Consumer
-
-**Symptoms:**
-- Consumer lag growing
-- Slow message processing
-
-**Solutions:**
-1. Check consumer lag:
-   ```bash
-   curl http://localhost:9094/metrics | grep consumer_lag
-   ```
-
-2. Increase consumer parallelism:
-   - Add more consumer instances
-   - Increase topic partitions
-
-3. Check consumer configuration:
-   ```python
-   # kafka-python example
-   consumer = KafkaConsumer(
-       max_poll_records=500,  # Increase batch size
-       fetch_min_bytes=1024   # Increase fetch size
-   )
-   ```
-
-4. Optimize consumer processing code
-
-#### Disk Full
-
-**Symptoms:**
-- Broker stops accepting writes
-- Error: "No space left on device"
-
-**Solutions:**
-1. Check disk usage:
-   ```bash
-   df -h /var/lib/kawasan
-   du -sh /var/lib/kawasan/data/*
-   ```
-
-2. Reduce retention:
-   ```properties
-   log.retention.hours=24
-   log.retention.bytes=10737418240  # 10GB
-   ```
-
-3. Manually clean old segments:
-   ```bash
-   sudo systemctl stop kawasan-broker
-   # Remove old log segments carefully
-   sudo systemctl start kawasan-broker
-   ```
-
-4. Add more disk space or move to larger volume
-
-### Debug Techniques
-
-#### Enable Debug Logging
+### Broker won't start
 
 ```bash
-# Temporary (current session)
-./kawasan-broker --config broker.properties --log-level debug
-
-# Permanent (edit service file)
-sudo vim /etc/systemd/system/kawasan-broker.service
-# Change --log-level info to --log-level debug
-sudo systemctl daemon-reload
-sudo systemctl restart kawasan-broker
+sudo systemctl status kawasan-broker
+sudo journalctl -u kawasan-broker -n 200 --no-pager      # read the actual error
 ```
 
-#### Network Debugging
+Most common causes and checks:
 
 ```bash
-# Capture packets
-sudo tcpdump -i any -w kawasan-traffic.pcap port 9092
+# Port already in use
+sudo lsof -i :9092
+sudo netstat -tulpn | grep 9092        # Linux; macOS: lsof -i :9092
 
-# View Kafka protocol traffic (requires kafka tools)
-kafka-console-consumer --bootstrap-server localhost:9092 \
-  --topic test --from-beginning
+# Data directory permissions
+ls -la /var/lib/kawasan/data
+sudo chown -R kawasan:kawasan /var/lib/kawasan
+
+# Config error (invalid JSON, bad ${VAR} with no value, invalid raft.ssl.* combo)
+#   → the broker logs the offending key/line and exits; fix and restart.
+
+# Binary present and executable
+ls -la /usr/local/bin/kawasan-broker
 ```
 
-#### RocksDB Debugging
+If a port conflict is the broker's own stale process, stop it cleanly (`systemctl stop` / `launchctl unload`) rather than `kill -9` to allow a graceful flush.
+
+### Connection refused
 
 ```bash
-# Check RocksDB stats
+sudo systemctl status kawasan-broker        # is it running?
+nc -zv localhost 9092                        # is the port reachable?
+```
+
+If the broker is up but clients still fail, the cause is almost always the **advertised address** — the metadata response points clients at an address they can't reach. See [Connecting Kafka UI and admin tools](#connecting-kafka-ui-and-admin-tools). Also check firewall rules:
+
+```bash
+sudo iptables -L -n                          # iptables
+sudo firewall-cmd --list-all                 # firewalld
+sudo ufw status                              # ufw
+```
+
+### High CPU
+
+```bash
+top -p $(pgrep kawasan-broker)
+top -H -p $(pgrep kawasan-broker)            # per-thread (Linux)
+curl -s http://localhost:9094/metrics | grep latency
+curl -s http://localhost:9094/metrics | grep active_connections
+```
+
+Mitigations: raise `num.network.threads` for connection-bound load; check whether RocksDB compaction is running hot; profile to find the hot path (see [Profiling](#profiling)). If the connection count is very high, rate-limit producers or add capacity.
+
+### High memory / OOM
+
+```bash
+free -h
+ps aux | grep kawasan-broker
+sudo dmesg | grep -i "killed process"        # OOM killer
+sudo journalctl -k | grep -i "out of memory"
+watch -n 5 'ps aux | grep [k]awasan-broker'  # growing RSS ⇒ investigate
+```
+
+Immediate mitigation: restart to reclaim, then cap memory in the service unit (`MemoryMax`, `MemoryHigh`) so the broker is throttled before the host OOM-kills it. Sustained, unbounded growth under steady load should be captured (build with `-DKAWASAN_ENABLE_ASAN=ON` in a non-prod environment) and reported.
+
+### Slow consumer / growing lag
+
+```bash
+curl -s http://localhost:9094/metrics | grep consumer_lag
+watch -n 5 'curl -s http://localhost:9094/metrics | grep consumer_lag'
+./build/tools/kawasan-groups --bootstrap-server localhost:9092 --describe <group>
+./build/tools/kawasan-groups --bootstrap-server localhost:9092 --list
+```
+
+Lag growing faster than it drains means consumers can't keep up with production. Options: add consumer instances to the group (parallelism is capped by partition count), create higher-partition topics, increase client `max.poll.records` / `fetch.min.bytes`, or commit offsets less frequently. If lag is bounded and draining, no action is needed.
+
+### Disk full
+
+```bash
+df -h /var/lib/kawasan
+du -ah /var/lib/kawasan/data | sort -rh | head -20
+```
+
+Fastest recovery is to reduce retention so cleanup reclaims space on the next pass:
+
+```bash
+sudo systemctl stop kawasan-broker
+# edit config: log.retention.hours=24  and/or  log.retention.bytes=10737418240
+sudo systemctl start kawasan-broker
+sudo journalctl -u kawasan-broker -f | grep -i cleanup
+```
+
+Or move the data dir to a larger volume and repoint `log.dirs` (stop broker, `rsync` data, update config, `chown`, start). Never hand-delete the active (newest) segment of a partition.
+
+### RocksDB inspection
+
+```bash
 ldb --db=/var/lib/kawasan/data/meta dump_live_files
-
-# Compact database
 ldb --db=/var/lib/kawasan/data/meta compact
 ```
 
+### Cluster metadata consistency (multi-broker)
+
+```bash
+./build/tools/kawasan-metadata-check --brokers localhost:9092 localhost:9192 localhost:9292
+# Reports "✓ All brokers have consistent metadata" when aligned.
+```
+
 ---
 
-## Performance Tuning
+## Incident severity
 
-### Operating System Tuning
+| Sev | Definition | Examples | First move |
+|-----|------------|----------|-----------|
+| **P1** | Service down or data at risk | Broker down, disk full blocking writes, OOM crash loop, suspected data corruption | Page on-call; restore service before root-causing |
+| **P2** | Major degradation, no outage | Sustained consumer lag, network instability, client connection failures | Mitigate (scale/restart), then diagnose |
+| **P3** | Minor / contained degradation | Sustained high CPU without latency breach, single noisy client | Investigate during business hours |
+| **P4** | Cosmetic / informational | Log noise, transient blips that self-resolve | Track in backlog |
 
-#### Linux System Limits
+General flow for any incident: **detect** (alert / health failure) → **assess** severity and impact → **mitigate** to restore service (the playbook above) → **verify** (`systemctl status`, `/health`, a produce/consume round-trip) → **review** root cause and capture preventive follow-ups. When restoring, confirm recovery with an end-to-end check, not just process liveness:
 
-Edit `/etc/security/limits.conf`:
+```bash
+curl -s http://localhost:9094/health
+./build/tools/kawasan-topics --bootstrap-server localhost:9092 --list
+```
+
+---
+
+## Performance tuning
+
+### Targets
+
+| Dimension | Target |
+|-----------|--------|
+| Throughput | 100k+ msg/sec (single broker, ~10 partitions, 100-byte messages) |
+| Latency | p99 < 5ms for produce |
+| Memory | < 1GB idle, stable under load |
+
+Approximate single-node baseline (1-partition smoke test, 100-byte messages): ~30k msg/sec produce, ~18k msg/sec consume. Treat this as a rough baseline, not a guaranteed number — it varies with hardware, partition count, batch size, and compression. The throughput and replication benchmarks live under `tests/benchmark/` (built when `KAWASAN_BUILD_TESTS=ON`):
+
+```bash
+./build/tests/benchmark/throughput_benchmark
+```
+
+### OS tuning
+
+**File descriptors** — `/etc/security/limits.conf` (Linux):
 
 ```
 kawasan soft nofile 100000
 kawasan hard nofile 100000
-kawasan soft nproc 32768
-kawasan hard nproc 32768
 ```
 
-#### Kernel Parameters
+The systemd unit also sets `LimitNOFILE=100000`; verify with `sudo systemctl show kawasan-broker | grep LimitNOFILE`. On macOS, raise the launchd limit (`sudo launchctl limit maxfiles 65536 200000`); the broker plist already requests 65536.
 
-Edit `/etc/sysctl.conf`:
+**Kernel parameters** — `/etc/sysctl.d/99-kawasan.conf` (Linux), then `sudo sysctl -p /etc/sysctl.d/99-kawasan.conf`:
+
+```ini
+# Network
+net.core.somaxconn = 1024
+net.ipv4.tcp_max_syn_backlog = 4096
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.ipv4.tcp_rmem = 4096 87380 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
+
+# Memory
+vm.swappiness = 1
+vm.dirty_ratio = 80
+vm.dirty_background_ratio = 5
+
+# File descriptors
+fs.file-max = 2097152
+```
+
+**Disk** — use SSD/NVMe for `log.dirs`; mount with `noatime,nodiratime`. For SSDs prefer the `none`/`noop` I/O scheduler.
+
+**Broker knobs** — start from a balanced profile and adjust toward throughput (more threads, larger segments, `lz4`/`snappy` compression) or latency (fewer threads, smaller segments, no compression). See [./CONFIGURATION.md](./CONFIGURATION.md) for the full set.
+
+### Profiling
+
+**Linux (`perf`):**
 
 ```bash
-# Network settings
-net.core.somaxconn=1024
-net.ipv4.tcp_max_syn_backlog=4096
-net.core.netdev_max_backlog=5000
-
-# Memory settings
-vm.swappiness=1
-vm.dirty_ratio=15
-vm.dirty_background_ratio=5
-
-# File descriptor limits
-fs.file-max=2097152
+sudo perf record -g -F 999 -p $(pgrep kawasan-broker) -- sleep 60
+sudo perf report
 ```
 
-Apply:
-```bash
-sudo sysctl -p
-```
-
-#### Disk I/O Scheduler
-
-For SSDs, use `noop` or `none`:
+**macOS (Instruments):**
 
 ```bash
-echo noop | sudo tee /sys/block/sda/queue/scheduler
-# Or add to /etc/default/grub:
-# GRUB_CMDLINE_LINUX="elevator=noop"
+instruments -t "Time Profiler" -D profile.trace -l 60000 \
+  ./build/tests/benchmark/throughput_benchmark
+open profile.trace
+# Or attach to a running broker:
+sudo instruments -t "Time Profiler" -p $(pgrep kawasan-broker) -l 60000
 ```
 
-### Broker Configuration Tuning
-
-#### High Throughput
-
-```properties
-# More threads
-num.io.threads=16
-num.network.threads=8
-
-# Larger segments
-log.segment.bytes=2147483648
-
-# Compression
-compression.type=lz4
-
-# Batch sizes
-batch.size=65536
-```
-
-#### Low Latency
-
-```properties
-# Fewer threads (reduce context switching)
-num.io.threads=4
-num.network.threads=2
-
-# Smaller segments for faster rotation
-log.segment.bytes=536870912
-
-# Disable compression
-compression.type=none
-
-# Smaller batches
-batch.size=16384
-```
-
-#### Balanced
-
-```properties
-num.io.threads=8
-num.network.threads=3
-log.segment.bytes=1073741824
-compression.type=snappy
-batch.size=32768
-```
-
-### Hardware Recommendations
-
-#### Production Deployment
-
-**Recommended:**
-- **CPU**: 8-16 cores (Intel Xeon or AMD EPYC)
-- **Memory**: 16-32 GB RAM
-- **Disk**: NVMe SSD with 500+ GB
-- **Network**: 1 Gbps minimum, 10 Gbps preferred
-
-**Minimum:**
-- **CPU**: 4 cores
-- **Memory**: 8 GB RAM
-- **Disk**: SSD with 100 GB
-- **Network**: 100 Mbps
-
-#### Storage Sizing
-
-Estimate required storage:
-
-```
-Storage = (messages/day) × (message_size) × (retention_days) × (replication_factor)
-
-Example:
-1M msgs/day × 1KB × 7 days × 3 replicas = 21 GB
-```
-
-Add 20-30% overhead for indexes and overhead.
+Hot paths to expect: record-batch encode/decode, RocksDB read/write and compaction, and network I/O. Capacity planning for storage: `messages/day × message_size × retention_days × replication_factor`, plus ~20–30% for indexes and overhead.
 
 ---
 
-## Security Best Practices
+## Connecting Kafka UI and admin tools
 
-1. **Run as non-root user**: Always use dedicated `kawasan` user
-2. **Enable TLS**: Use SSL/TLS for production deployments
-3. **Firewall**: Restrict access to broker ports
-4. **File permissions**: Ensure data directories are not world-readable
-5. **Regular updates**: Keep dependencies up to date
-6. **Audit logging**: Enable logging for all operations
-7. **Network segmentation**: Isolate broker network
-8. **Backup encryption**: Encrypt backups at rest
+Kafka clients (Kafka UI, `kcat`, console tools, language clients) discover brokers via the Metadata API: they connect to the bootstrap address, fetch metadata, then connect directly to the **advertised** address each broker reports. If the advertised address isn't reachable from the client, connections fail with "Connection refused" or "Timed out waiting for a node assignment" — even though the broker is up. Set `advertised.host`/`advertised.port` to an address the client can actually reach.
+
+| Scenario | `host` | `advertised.host` |
+|----------|--------|-------------------|
+| Everything on the host | `localhost` | (omit; defaults to `host`) |
+| UI in Docker, broker on host | `0.0.0.0` | `host.docker.internal` |
+| Both in Docker (same network) | `0.0.0.0` | the broker's compose service name (e.g. `kawasan-broker`) |
+
+The `kafka-ui` profile generates a UI-ready config without hand-editing files. It sets `host=0.0.0.0`, `advertised.host=host.docker.internal` (override with `KAWASAN_ADVERTISED_HOST`), and matches `advertised.port` to the listener port (override with `KAWASAN_ADVERTISED_PORT`):
+
+```bash
+KAWASAN_PROFILE=kafka-ui bash scripts/reset.sh
+# or with overrides:
+KAWASAN_PROFILE=kafka-ui \
+KAWASAN_ADVERTISED_HOST=host.docker.internal \
+bash scripts/reset.sh
+```
+
+Then start Kafka UI (the root `docker-compose-kafka-ui.yml` runs `provectuslabs/kafka-ui` on `:8088`, bootstrapping `host.docker.internal:9092` with `DYNAMIC_CONFIG_ENABLED=true`):
+
+```bash
+docker compose -f docker-compose-kafka-ui.yml up -d
+# UI at http://localhost:8088
+```
+
+Verify the broker advertises the address you expect:
+
+```bash
+python3 scripts/debug_metadata.py localhost 9092
+# Broker 0: id=0, host=host.docker.internal, port=9092, rack=None
+```
+
+If the UI still shows the cluster offline: check `docker logs kafka-ui`, confirm the advertised host is reachable from inside the UI container (`docker exec kafka-ui nc -zv host.docker.internal 9092`), and that port 9092 is open. Full background on the advertised-address model is covered in the Kafka UI section above.
 
 ---
 
-## Getting Help
+## Running the test suites
 
-### Resources
+### Ecosystem compatibility harness (dual-broker oracle)
 
-- **Documentation**: `https://github.com/yourusername/kawasan/docs`
-- **GitHub Issues**: `https://github.com/yourusername/kawasan/issues`
-- **Discussions**: `https://github.com/yourusername/kawasan/discussions`
+`tests/ecosystem/` is the contract for "drop-in replacement for single-server Kafka". Every smoke test runs against **both** brokers — **Apache Kafka 4.2.0** (`apache/kafka:4.2.0`) as the behavioral oracle and **Kawasan** as the candidate — so the diff between PASS-on-Kafka and PASS-on-Kawasan answers "real bug or test bug?". It requires a working Docker host.
 
-### Reporting Issues
+```bash
+cd tests/ecosystem
+./scripts/run_all.sh kafka              # oracle baseline (expected all-PASS)
+./scripts/run_all.sh kawasan            # candidate (some checks may still be RED)
+./scripts/run_all.sh kawasan --keep-up  # leave the stack running for debugging
+```
 
-When reporting issues, include:
+`run_all.sh` selects the compose file (`docker-compose.kafka.yml` vs `docker-compose.kawasan.yml`), brings the broker up, runs the numbered smoke scripts in `scripts/` (`01_apicompat.sh` … `21_streams_eos.sh`, covering producer/idempotent/transactional paths, admin/ACLs, compaction, internal topics, cooperative-sticky rebalance, `kcat`, schema registry, Kafka UI, Kafka Connect, ksqlDB, durability, SASL/PLAIN, read-committed, and Streams EOS), and tears down. Exit `0` = all passed, `1` = at least one failed, `2` = usage error. The harness is allowed-to-fail today because the broker has known gaps; treat its status as a regression signal across changes.
 
-1. Kawasan version: `kawasan-broker --version`
-2. Operating system and version
-3. Configuration file (sanitized)
-4. Relevant logs
-5. Steps to reproduce
-6. Expected vs. actual behavior
+### Per-language client compatibility
 
----
+`tests/compatibility/` checks individual Kafka client libraries against a running Kawasan broker. The runner builds/starts a broker, runs each available test, and cleans up:
 
-**Document Version**: 1.0  
-**Kawasan Version**: 0.2.0-alpha  
-**Last Reviewed**: November 24, 2025
+```bash
+./scripts/run_compatibility_tests.sh
+```
+
+| Client | File | Status |
+|--------|------|--------|
+| Python (`kafka-python`) | `kafka_python_test.py` | Implemented (`pip3 install kafka-python`) |
+| Java | `JavaClientTest.java` | Placeholder |
+| Node.js (KafkaJS) | `kafkajs_test.js` | Placeholder |
+| Go (Sarama) | `sarama_test.go` | Placeholder |
+
+Each client test exercises connect → topic create → produce (100+) → consume/verify → offset commit → consumer-group behavior.
+
+### Unit and integration tests
+
+The C++ unit/integration suites are run via CTest (see [../README.md](../README.md) and [../CLAUDE.md](../CLAUDE.md)):
+
+```bash
+ctest --test-dir build --output-on-failure
+ctest --test-dir build -R KawasanBrokerErrorTest --output-on-failure
+```

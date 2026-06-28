@@ -8,7 +8,10 @@ metadata:
     component: broker
 spec:
   serviceName: kawasan-broker-headless
-  replicas: 3
+  # Multi-broker data replication is EXPERIMENTAL (acked data is not yet
+  # replicated to followers). Run a single replica for production; raise only
+  # for experimental cluster testing.
+  replicas: 1
   selector:
     matchLabels:
       app: kawasan

@@ -175,6 +175,7 @@ private:
         context.payload = std::move(buffer);
         context.frame_size_bytes = frame_buffer_.size();
         context.peer_identity = peer_identity_;
+        context.connection = &conn_state_;
 
         auto dispatch_result = server_.dispatchRequest(context);
         const bool close_after_write = dispatch_result.close_connection;
@@ -269,6 +270,9 @@ private:
     std::vector<uint8_t> frame_buffer_;
     std::string peer_identity_;
     std::chrono::steady_clock::time_point last_activity_;
+    // Per-connection state (authenticated principal, etc.). Lives for the
+    // lifetime of this session and is handed to each request via the context.
+    RequestDispatcher::ConnectionContext conn_state_;
 };
 
 bool TcpServer::isLocalhost(const std::string& host) {

@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -16,11 +17,23 @@ namespace kawasan::broker {
 
 class RequestDispatcher {
 public:
+    /// @brief Per-connection state that persists across requests on the same TCP
+    /// connection. Owned by the network session (TcpSession), so it lives and
+    /// dies with the connection — no broker-side map to leak or to let a reused
+    /// ip:port inherit a prior connection's identity. Carries the authenticated
+    /// SASL principal so authorization can be enforced on subsequent requests.
+    struct ConnectionContext {
+        std::optional<std::string> authenticated_principal;  // e.g. "User:alice"
+    };
+
     struct RequestContext {
         protocol::RequestHeader header;
         Buffer payload;
         size_t frame_size_bytes = 0;
         std::string peer_identity;
+        // Points to the owning connection's state (nullptr only in unit tests
+        // that build a context directly). Valid for the duration of dispatch.
+        ConnectionContext* connection = nullptr;
     };
 
     struct DispatchResult {

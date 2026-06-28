@@ -17,6 +17,7 @@ add_library(kawasan_broker OBJECT
     transaction_coordinator.cpp
     fetch_session_manager.cpp
     isolation_tracker.cpp
+    quota_manager.cpp
 )
 
 target_include_directories(kawasan_broker PUBLIC

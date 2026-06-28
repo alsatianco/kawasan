@@ -60,7 +60,8 @@ std::optional<int32_t> Config::getInt(const std::string& key) const {
     if (it == values_.end()) {
         return std::nullopt;
     }
-    return it->second.get<int32_t>();
+    // Coerce so env-substituted JSON values (which arrive as strings) parse.
+    return coerce<int32_t>(it->second);
 }
 
 std::optional<int64_t> Config::getLong(const std::string& key) const {
@@ -68,7 +69,7 @@ std::optional<int64_t> Config::getLong(const std::string& key) const {
     if (it == values_.end()) {
         return std::nullopt;
     }
-    return it->second.get<int64_t>();
+    return coerce<int64_t>(it->second);
 }
 
 std::optional<bool> Config::getBool(const std::string& key) const {
@@ -76,7 +77,7 @@ std::optional<bool> Config::getBool(const std::string& key) const {
     if (it == values_.end()) {
         return std::nullopt;
     }
-    return it->second.get<bool>();
+    return coerce<bool>(it->second);
 }
 
 void Config::set(const std::string& key, const nlohmann::json& value) {

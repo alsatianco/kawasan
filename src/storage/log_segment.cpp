@@ -159,7 +159,7 @@ void LogSegment::open() {
     Logger::info("Opened log segment at {} with base offset {}", path_, base_offset_);
 }
 
-Offset LogSegment::append(const RecordBatch& batch) {
+Offset LogSegment::append(const RecordBatch& batch, bool sync) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (closed_) {
@@ -172,10 +172,15 @@ Offset LogSegment::append(const RecordBatch& batch) {
     // Serialize the batch
     auto data = batch.serialize();
 
-    // Store in RocksDB with binary-encoded offset as key for proper numerical ordering
+    // Store in RocksDB with binary-encoded offset as key for proper numerical ordering.
+    // sync=true forces an fsync of the WAL before returning so an acknowledged
+    // produce survives a power loss / OS crash (default WriteOptions leaves
+    // sync=false, which only survives a process crash via the OS page cache).
+    rocksdb::WriteOptions write_opts;
+    write_opts.sync = sync;
     std::string key = encodeOffsetKey(offset);
     rocksdb::Status status =
-        db_->Put(rocksdb::WriteOptions(), key,
+        db_->Put(write_opts, key,
                  rocksdb::Slice(reinterpret_cast<const char*>(data.data()), data.size()));
 
     if (!status.ok()) {

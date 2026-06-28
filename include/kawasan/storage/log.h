@@ -15,6 +15,14 @@
 
 namespace kawasan::storage {
 
+/// @brief Durability mode for partition-log writes.
+/// kSync issues an fsync (RocksDB WriteOptions.sync=true) before a produce
+/// append returns, so an acknowledged record survives a power loss / OS
+/// crash. kAsync relies on the RocksDB WAL in the OS page cache (lower
+/// latency, but a machine crash before the next flush loses the tail).
+/// Default is kSync: the broker's at-least-once guarantee must be true.
+enum class FlushMode { kSync, kAsync };
+
 /// @brief Configuration for a log
 struct LogConfig {
     size_t segment_size = 1024 * 1024 * 1024;  // 1GB
@@ -23,6 +31,7 @@ struct LogConfig {
     int64_t retention_ms = 7 * 24 * 60 * 60 * 1000;  // 7 days
     bool cleanup_policy_compact = false;
     bool cleanup_policy_delete = true;
+    FlushMode flush_mode = FlushMode::kSync;
 
     /// @brief 0A.4: derive a LogConfig by applying Kafka-style topic configs on
     /// top of a base. Honored keys: cleanup.policy, retention.ms,
