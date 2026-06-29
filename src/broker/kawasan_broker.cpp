@@ -1840,36 +1840,46 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                     monitoring_manager_->metricsCollector()->incrementBytesIn(batch_bytes);
                 }
                 
-                // Update high watermark
-                replica_manager_->updateHighWatermark(tp, log->logEndOffset());
-                
-                // Handle acks=-1: wait for ISR replicas to acknowledge
-                if (acks == -1) {
-                    // Get current ISR for this partition
-                    auto isr = replica_manager_->getISR(tp);
-                    
-                    // In single-node mode, ISR only contains this broker, so no waiting needed
-                    // In multi-broker mode, we would:
-                    // 1. Track which replicas in ISR have acknowledged
-                    // 2. Wait for all ISR replicas to fetch up to base_offset + record_count
-                    // 3. Timeout if not all acknowledge within request.timeout.ms (default 30s)
-                    // 4. Return REQUEST_TIMED_OUT if timeout occurs
-                    
-                    // For now (single-node or leader-only), acks=-1 behaves like acks=1
-                    if (isr.size() > 1) {
-                        // TODO: Implement ISR wait logic for multi-broker
-                        // This would involve:
-                        // - Tracking follower fetch offsets
-                        // - Waiting with timeout
-                        // - Checking ISR membership
-                        Logger::warn("acks=-1 requested but ISR wait not yet implemented for multi-broker");
-                    }
-                }
-                
+                // Advance the high watermark from the ISR: HW = min(leader LEO,
+                // in-sync follower offsets). With only the leader in the ISR
+                // (single-node) this equals the LEO, identical to before.
+                replica_manager_->maybeAdvanceHighWatermark(tp);
+
                 partition_response.base_offset = base_offset;
                 partition_response.log_start_offset = log->logStartOffset();
                 partition_response.log_append_time = now_ms();
                 partition_response.error_code = ErrorCode::NONE;
+
+                // acks=-1 (all): the write is acknowledged only once every in-sync
+                // replica has it — i.e. the HW has advanced past this batch. With
+                // only the leader in the ISR the HW already covers it and this
+                // returns immediately. With followers, wait (bounded by the
+                // producer's timeout) for them to fetch up to this offset; if they
+                // don't, return REQUEST_TIMED_OUT rather than falsely acking.
+                if (acks == -1) {
+                    const auto isr = replica_manager_->getISR(tp);
+                    if (isr.size() > 1) {
+                        const Offset target = log->logEndOffset();
+                        int32_t timeout_ms = request.timeoutMs();
+                        if (timeout_ms <= 0 || timeout_ms > 30000) {
+                            timeout_ms = 30000;
+                        }
+                        const auto deadline = std::chrono::steady_clock::now() +
+                                              std::chrono::milliseconds(timeout_ms);
+                        auto committed =
+                            replica_manager_->isrCommittedOffset(tp).value_or(0);
+                        while (committed < target &&
+                               std::chrono::steady_clock::now() < deadline) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                            committed =
+                                replica_manager_->isrCommittedOffset(tp).value_or(0);
+                        }
+                        if (committed < target) {
+                            partition_response.error_code = ErrorCode::REQUEST_TIMED_OUT;
+                            has_error = true;
+                        }
+                    }
+                }
             } catch (const StorageException& ex) {
                 Logger::error("Storage error while appending to {}-{}: {}", topic_data.topic,
                               partition_data.partition, ex.what());
@@ -3375,7 +3385,13 @@ Buffer KawasanBroker::handleOffsetForLeaderEpoch(
                 pres.end_offset = -1;
             } else {
                 pres.error_code = ErrorCode::NONE;
-                pres.leader_epoch = 0;
+                // Report the tracked leader epoch (0 single-node; bumped on
+                // leadership change in a cluster) so clients using KIP-320
+                // fencing/truncation get a real value rather than a constant.
+                const TopicPartition tp{topic.name, pq.partition};
+                pres.leader_epoch = replica_manager_
+                                        ? replica_manager_->getLeaderEpoch(tp).value_or(0)
+                                        : 0;
                 pres.end_offset = log->logEndOffset();
             }
             tres.partitions.push_back(pres);

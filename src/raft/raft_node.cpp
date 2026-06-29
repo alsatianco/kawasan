@@ -182,13 +182,19 @@ RequestVoteResponse RaftNode::handleRequestVote(const RequestVoteRequest& reques
     std::lock_guard<std::mutex> lock(log_mutex_);
 
     RequestVoteResponse response;
-    response.term = current_term_;
     response.vote_granted = false;
 
-    // If request term is greater, become follower
+    // If request term is greater, become follower (advances current_term_).
     if (request.term > current_term_) {
         becomeFollower(request.term);
     }
+
+    // Report the term AFTER any advance above. Capturing it before becomeFollower
+    // was a correctness bug: a peer granting a vote to a higher-term candidate
+    // would echo its stale (lower) term, so the candidate's
+    // `response.term == election_term` check failed and the granted vote was
+    // never counted — the cluster could never elect a leader.
+    response.term = current_term_;
 
     // Don't grant vote if term is less
     if (request.term < current_term_) {
@@ -224,13 +230,16 @@ AppendEntriesResponse RaftNode::handleAppendEntries(const AppendEntriesRequest& 
     std::lock_guard<std::mutex> lock(log_mutex_);
 
     AppendEntriesResponse response;
-    response.term = current_term_;
     response.success = false;
 
-    // If request term is greater, become follower
+    // If request term is greater, become follower (advances current_term_).
     if (request.term > current_term_) {
         becomeFollower(request.term);
     }
+
+    // Report the term AFTER any advance, so the leader sees the follower's true
+    // current term (same stale-term fix as handleRequestVote).
+    response.term = current_term_;
 
     // Reject if term is less
     if (request.term < current_term_) {
@@ -519,10 +528,19 @@ void RaftNode::startElection() {
     vote_request.term = election_term;
     vote_request.candidate_id = id_;
     
-    std::lock_guard<std::mutex> lock(log_mutex_);
-    vote_request.last_log_index = log_.empty() ? 0 : log_.back().index;
-    vote_request.last_log_term = log_.empty() ? 0 : log_.back().term;
-    
+    {
+        // Read our log position under the lock, then RELEASE it before sending
+        // RequestVotes and waiting for responses below. Holding log_mutex_ across
+        // the election window is a deadlock: every peer's handleRequestVote /
+        // handleAppendEntries also takes log_mutex_, so while this candidate waits
+        // (~100ms) no peer could grant it a vote, and symmetrically. With all
+        // nodes doing this concurrently the cluster spins electing forever and
+        // never converges on a leader.
+        std::lock_guard<std::mutex> lock(log_mutex_);
+        vote_request.last_log_index = log_.empty() ? 0 : log_.back().index;
+        vote_request.last_log_term = log_.empty() ? 0 : log_.back().term;
+    }
+
     // Send RequestVote RPCs to all peers
     std::vector<std::future<raft::RequestVoteResponse>> responses;
     for (const auto& peer : peers_) {

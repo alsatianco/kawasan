@@ -38,6 +38,11 @@ add_executable(raft_protocol_test raft_protocol_test.cpp)
 target_link_libraries(raft_protocol_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME RaftProtocolTest COMMAND raft_protocol_test)
 
+# Raft election regression test (Phase B: stale-term vote-counting fix)
+add_executable(raft_election_test raft_election_test.cpp)
+target_link_libraries(raft_election_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME RaftElectionTest COMMAND raft_election_test)
+
 # Raft transport test
 add_executable(raft_transport_test raft_transport_test.cpp)
 target_link_libraries(raft_transport_test PRIVATE kawasan GTest::gtest GTest::gtest_main)

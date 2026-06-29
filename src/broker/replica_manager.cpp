@@ -1,5 +1,6 @@
 #include "kawasan/broker/replica_manager.h"
 
+#include <algorithm>
 #include <chrono>
 #include <spdlog/spdlog.h>
 
@@ -97,6 +98,72 @@ void ReplicaManager::updateHighWatermark(const TopicPartition& tp, Offset hw) {
     it->second.log->setHighWatermark(hw);
     spdlog::trace("Updated high watermark for {}-{} to {}",
                   tp.topic, tp.partition, hw);
+}
+
+Offset ReplicaManager::computeHighWatermarkLocked(const ReplicaInfo& info) const {
+    // HW starts at the leader's log-end-offset and is pulled back to the slowest
+    // in-sync follower. With only the leader in the ISR (single-node) the loop
+    // body never runs, so HW == leader LEO and behavior is unchanged.
+    Offset hw = info.log->logEndOffset();
+    for (BrokerId id : info.isr) {
+        if (id == local_broker_id_) {
+            continue;  // leader contributes its LEO, already the starting value
+        }
+        auto fit = info.follower_states.find(id);
+        const Offset follower_offset = (fit != info.follower_states.end())
+                                           ? fit->second.last_fetched_offset
+                                           : info.log->logStartOffset();
+        hw = std::min(hw, follower_offset);
+    }
+    return hw;
+}
+
+Offset ReplicaManager::maybeAdvanceHighWatermark(const TopicPartition& tp) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto it = replicas_.find(tp);
+    if (it == replicas_.end()) {
+        return 0;
+    }
+    const Offset new_hw = computeHighWatermarkLocked(it->second);
+    const Offset current_hw = it->second.log->highWatermark();
+    if (new_hw > current_hw) {
+        it->second.log->setHighWatermark(new_hw);
+        spdlog::trace("Advanced high watermark for {}-{} to {} (from {})",
+                      tp.topic, tp.partition, new_hw, current_hw);
+        return new_hw;
+    }
+    return current_hw;  // HW never moves backward
+}
+
+std::optional<Offset> ReplicaManager::isrCommittedOffset(const TopicPartition& tp) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = replicas_.find(tp);
+    if (it == replicas_.end()) {
+        return std::nullopt;
+    }
+    return computeHighWatermarkLocked(it->second);
+}
+
+std::optional<int32_t> ReplicaManager::getLeaderEpoch(const TopicPartition& tp) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = replicas_.find(tp);
+    if (it == replicas_.end()) {
+        return std::nullopt;
+    }
+    return it->second.leader_epoch;
+}
+
+std::optional<int32_t> ReplicaManager::bumpLeaderEpoch(const TopicPartition& tp) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = replicas_.find(tp);
+    if (it == replicas_.end()) {
+        return std::nullopt;
+    }
+    it->second.leader_epoch += 1;
+    spdlog::info("Leader epoch for {}-{} bumped to {}", tp.topic, tp.partition,
+                 it->second.leader_epoch);
+    return it->second.leader_epoch;
 }
 
 std::vector<BrokerId> ReplicaManager::getISR(const TopicPartition& tp) const {

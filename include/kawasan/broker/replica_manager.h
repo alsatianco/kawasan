@@ -62,6 +62,32 @@ public:
     /// @param hw The new high watermark
     void updateHighWatermark(const TopicPartition& tp, Offset hw);
 
+    /// @brief Gets the leader epoch for a partition (KIP-101). Starts at 0 when
+    /// the replica is first added and increments on each leadership change, so
+    /// clients can detect stale leadership and request log truncation points.
+    /// @return the current leader epoch, or nullopt if the partition isn't managed
+    std::optional<int32_t> getLeaderEpoch(const TopicPartition& tp) const;
+
+    /// @brief Increments the leader epoch for a partition (call on a leadership
+    /// change — election win or reassignment). Returns the new epoch, or nullopt
+    /// if the partition isn't managed.
+    std::optional<int32_t> bumpLeaderEpoch(const TopicPartition& tp);
+
+    /// @brief Recomputes and advances the high watermark from the ISR: the HW is
+    /// the minimum of the leader's log-end-offset and every in-sync follower's
+    /// last fetched offset. With only the leader in the ISR (single-node) this is
+    /// exactly the leader's LEO, so single-node behavior is unchanged. The HW
+    /// never moves backward. Returns the (possibly advanced) high watermark.
+    Offset maybeAdvanceHighWatermark(const TopicPartition& tp);
+
+    /// @brief The offset replicated to all in-sync replicas: min(leader LEO,
+    /// every in-sync follower's last fetched offset). This is the offset an
+    /// acks=all produce must wait for. With only the leader in the ISR it equals
+    /// the leader's LEO (so acks=all returns immediately). Returns nullopt if the
+    /// partition isn't managed. Unlike the high watermark, this is computed live
+    /// from ISR state and is not affected by the log's own HW bookkeeping.
+    std::optional<Offset> isrCommittedOffset(const TopicPartition& tp) const;
+
     /// @brief Gets the In-Sync Replicas for a partition
     /// @param tp The topic-partition
     /// @return Vector of broker IDs in the ISR
@@ -136,10 +162,18 @@ private:
         BrokerId leader;  // Leader broker ID (always this broker in single-node mode)
         std::vector<BrokerId> isr;  // In-Sync Replicas
         Offset fetch_offset = 0;  // Last fetched offset (for follower replicas)
-        
+        int32_t leader_epoch = 0;  // KIP-101: bumped on each leadership change
+
         // Leader-side tracking of follower states (only used when this broker is leader)
         std::map<BrokerId, FollowerState> follower_states;
     };
+
+    /// @brief Computes the ISR-derived high watermark for a replica (caller holds
+    /// mutex_). HW = min(leader LEO, min in-sync follower fetch offset). Followers
+    /// in the ISR with no recorded fetch state hold the HW at the log start until
+    /// they report progress, matching Kafka's "HW only advances past offsets all
+    /// in-sync replicas have" rule.
+    Offset computeHighWatermarkLocked(const ReplicaInfo& info) const;
 
     /// @brief Background thread for follower fetching
     void fetcherThreadLoop();

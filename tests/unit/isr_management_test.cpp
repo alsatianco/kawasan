@@ -293,4 +293,79 @@ TEST_F(ISRManagementTest, ISRCheckWithNoFollowerState) {
     EXPECT_EQ(new_isr[0], 0);
 }
 
+// --- Phase B: leader epoch tracking ---
+
+TEST_F(ISRManagementTest, LeaderEpochStartsAtZeroAndBumps) {
+    TopicPartition tp{"test-topic", 0};
+    auto log = createTestLog(tp.topic, tp.partition);
+    replica_manager_->addReplica(tp, log);
+
+    auto epoch = replica_manager_->getLeaderEpoch(tp);
+    ASSERT_TRUE(epoch.has_value());
+    EXPECT_EQ(*epoch, 0);
+
+    EXPECT_EQ(replica_manager_->bumpLeaderEpoch(tp).value_or(-1), 1);
+    EXPECT_EQ(replica_manager_->bumpLeaderEpoch(tp).value_or(-1), 2);
+    EXPECT_EQ(replica_manager_->getLeaderEpoch(tp).value_or(-1), 2);
+
+    // Unknown partition -> nullopt.
+    EXPECT_FALSE(replica_manager_->getLeaderEpoch(TopicPartition{"missing", 0}).has_value());
+    EXPECT_FALSE(replica_manager_->bumpLeaderEpoch(TopicPartition{"missing", 0}).has_value());
+}
+
+// --- Phase B: ISR-committed offset (basis for acks=all) ---
+
+namespace {
+void appendN(std::shared_ptr<kawasan::storage::Log>& log, int n) {
+    std::vector<kawasan::Record> records;
+    for (int i = 0; i < n; ++i) {
+        kawasan::Record rec;
+        rec.value = std::vector<uint8_t>{'v', static_cast<uint8_t>(i)};
+        rec.timestamp = 0;
+        records.push_back(rec);
+    }
+    log->append(records);
+}
+}  // namespace
+
+TEST_F(ISRManagementTest, IsrCommittedOffsetSingleReplicaIsLeo) {
+    TopicPartition tp{"test-topic", 0};
+    auto log = createTestLog(tp.topic, tp.partition);
+    replica_manager_->addReplica(tp, log);
+    appendN(log, 100);
+
+    // ISR is just the leader -> committed offset is the leader's LEO.
+    auto committed = replica_manager_->isrCommittedOffset(tp);
+    ASSERT_TRUE(committed.has_value());
+    EXPECT_EQ(*committed, 100);
+}
+
+TEST_F(ISRManagementTest, IsrCommittedOffsetHeldByLaggingFollower) {
+    TopicPartition tp{"test-topic", 0};
+    auto log = createTestLog(tp.topic, tp.partition);
+    replica_manager_->addReplica(tp, log);
+    appendN(log, 100);
+
+    replica_manager_->updateISR(tp, {0, 1});
+    replica_manager_->updateFollowerFetchOffset(tp, 1, 60);
+    // Committed is held back to the slowest in-sync follower.
+    EXPECT_EQ(replica_manager_->isrCommittedOffset(tp).value_or(-1), 60);
+
+    // Follower catches up -> committed advances to the LEO.
+    replica_manager_->updateFollowerFetchOffset(tp, 1, 100);
+    EXPECT_EQ(replica_manager_->isrCommittedOffset(tp).value_or(-1), 100);
+}
+
+TEST_F(ISRManagementTest, IsrCommittedOffsetFollowerWithNoStateHoldsAtLogStart) {
+    TopicPartition tp{"test-topic", 0};
+    auto log = createTestLog(tp.topic, tp.partition);
+    replica_manager_->addReplica(tp, log);
+    appendN(log, 100);
+
+    // A follower in the ISR that has never reported progress holds the committed
+    // offset at the log start (it is not safe to consider its data replicated).
+    replica_manager_->updateISR(tp, {0, 1});
+    EXPECT_EQ(replica_manager_->isrCommittedOffset(tp).value_or(-1), 0);
+}
+
 }  // namespace kawasan::broker
