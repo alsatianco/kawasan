@@ -3143,7 +3143,11 @@ BrokerMetadata KawasanBroker::localBrokerMetadata() const {
     broker.id = broker_id_;
     broker.host = advertised_host_;
     broker.port = port();
-    broker.rack = std::nullopt;
+    // Rack awareness: advertise broker.rack (Metadata v1+) so rack-aware
+    // clients can do nearest-replica fetch / rack-aware placement. Empty config
+    // means no rack (nullopt), matching Kafka's default.
+    const std::string rack = config_.get<std::string>("broker.rack", "");
+    broker.rack = rack.empty() ? std::nullopt : std::optional<std::string>(rack);
     return broker;
 }
 
