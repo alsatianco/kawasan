@@ -129,11 +129,9 @@ public:
     /// @brief Returns the commit index
     int64_t commitIndex() const { return commit_index_.load(); }
 
-    /// @brief Sets the commit callback
-    void setCommitCallback(
-        std::function<void(const LogEntry&)> callback) {
-        commit_callback_ = std::move(callback);
-    }
+    /// @brief Sets the commit callback. Taken under log_mutex_ (out-of-line) so
+    /// the apply thread never reads a torn std::function while it's being set.
+    void setCommitCallback(std::function<void(const LogEntry&)> callback);
 
 private:
     void electionThread();
@@ -145,7 +143,15 @@ private:
     void becomeLeader();
     void resetElectionTimeout();
     bool hasElectionTimedOut() const;
+    /// @brief Wakes the apply thread (a commit_index_ advance may be pending).
+    /// Heavy state-machine application no longer runs inline under log_mutex_.
     void applyCommittedEntries();
+    /// @brief Dedicated single-consumer thread that applies committed log
+    /// entries to the state machine (via commit_callback_) OFF log_mutex_, in
+    /// strict index order, exactly once. Copying entries out under the lock and
+    /// applying outside it keeps the heavy work (RocksDB log creation, metadata
+    /// persistence) from stalling Raft heartbeats/replication.
+    void applyThread();
     void updateCommitIndex();
 
     BrokerId id_;
@@ -167,6 +173,17 @@ private:
     std::atomic<bool> running_{false};
     std::thread election_thread_;
     std::thread heartbeat_thread_;
+
+    // Apply pipeline: a single dedicated thread applies committed entries to the
+    // state machine off log_mutex_ (see applyThread). apply_mutex_ guards ONLY
+    // the CV handshake and is NEVER held together with log_mutex_. apply_floor_
+    // is the highest index folded into an installed snapshot; entries at/below it
+    // are skipped (no callback) since the snapshot already captured that state.
+    std::thread apply_thread_;
+    mutable std::mutex apply_mutex_;
+    std::condition_variable apply_cv_;
+    std::atomic<bool> apply_running_{false};
+    std::atomic<int64_t> apply_floor_{0};
 
     // Phase 5.2: condition-variable-driven wake for the election thread.
     // Instead of polling every 10 ms (the §G10 "busy loop"), the election

@@ -98,17 +98,19 @@ void KawasanBroker::validateProductionConfig() const {
             "and terminate TLS at a proxy");
     }
 
-    // Multi-broker replication is experimental and RF>1 is forced to 1; in
-    // production refuse rather than silently weaken the durability contract.
-    if (config_.get<int>("default.replication.factor", 1) > 1) {
+    // Replication factor can't exceed the cluster size (number of brokers in
+    // raft.peers). In production, reject rather than silently clamp so the
+    // operator's durability intent isn't quietly weakened.
+    if (config_.get<int>("default.replication.factor", 1) > cluster_size_) {
         errors.emplace_back(
-            "default.replication.factor > 1 is not supported (multi-broker "
-            "replication is experimental and would be forced to 1); set it to 1");
+            "default.replication.factor exceeds the cluster size (" +
+            std::to_string(cluster_size_) +
+            " broker(s) in raft.peers); reduce it or add brokers");
     }
-    if (config_.get<int>("min.insync.replicas", 1) > 1) {
+    if (config_.get<int>("min.insync.replicas", 1) > cluster_size_) {
         errors.emplace_back(
-            "min.insync.replicas > 1 is inert on a single-node broker (only the "
-            "leader is in the ISR); set it to 1");
+            "min.insync.replicas exceeds the cluster size (" +
+            std::to_string(cluster_size_) + " broker(s)); reduce it or add brokers");
     }
 
     if (!errors.empty()) {
@@ -168,6 +170,16 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
         default_num_partitions_ = configured_partitions;
     }
 
+    // Cluster size = number of brokers listed in raft.peers (1 if single-node).
+    // Replication factor is capped at the cluster size — a topic can't have more
+    // replicas than there are brokers.
+    {
+        const std::string peers = config_.get<std::string>("raft.peers", "");
+        cluster_size_ = peers.empty()
+                            ? 1
+                            : 1 + static_cast<int>(std::count(peers.begin(), peers.end(), ','));
+    }
+
     int16_t configured_replication_factor =
         config_.get<int16_t>("default.replication.factor", 1);
     if (configured_replication_factor < 1) {
@@ -175,11 +187,11 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
             "Configured default.replication.factor={} is invalid; using 1",
             configured_replication_factor);
         configured_replication_factor = 1;
-    } else if (configured_replication_factor > 1) {
+    } else if (configured_replication_factor > cluster_size_) {
         Logger::warn(
-            "Replication factor {} is not supported; forcing to 1",
-            configured_replication_factor);
-        configured_replication_factor = 1;
+            "default.replication.factor {} exceeds cluster size {}; clamping to {}",
+            configured_replication_factor, cluster_size_, cluster_size_);
+        configured_replication_factor = static_cast<int16_t>(cluster_size_);
     }
     default_replication_factor_ = configured_replication_factor;
 
@@ -718,6 +730,13 @@ void KawasanBroker::start() {
 
     running_ = true;
 
+    // Start the controller-bootstrap loop. In single-node mode the internal
+    // topics were already created synchronously above (this broker is leader
+    // immediately), so the loop sees them and exits at once. In a multi-broker
+    // cluster it retries until a controller is elected and the topics exist.
+    bootstrap_stop_.store(false);
+    bootstrap_thread_ = std::thread(&KawasanBroker::controllerBootstrapLoop, this);
+
     // 0A.11: Mark the broker as healthy and ready for serving traffic.
     // Probes against /readiness and /liveness previously returned 503 forever
     // because these flags defaulted to false and were never flipped.
@@ -744,14 +763,32 @@ void KawasanBroker::stop() {
         monitoring_manager_->setBrokerHealthy(false);
     }
 
+    // Signal the controller-bootstrap loop to stop, but DON'T join it yet — it
+    // may be blocked in createTopic() awaiting a Raft commit. It is joined below
+    // after the metadata controller is stopped (which fulfills its pending
+    // promise), so the join can't hang.
+    bootstrap_stop_.store(true);
+    bootstrap_cv_.notify_all();
+
     stopServices();
 
+    // Stop Raft FIRST: this drains and joins its apply thread, so no further
+    // commit callbacks fire into the metadata controller. The controller and
+    // log_manager_ are still alive here, so a draining apply can complete.
+    if (raft_node_) {
+        raft_node_->stop();
+    }
+    // Now the callback target can be torn down safely. stop() also fulfills any
+    // still-pending replicateAndAwait promises with BROKER_NOT_AVAILABLE, which
+    // unblocks a bootstrap thread waiting on an uncommitted createTopic.
     if (metadata_controller_) {
         metadata_controller_->stop();
     }
 
-    if (raft_node_) {
-        raft_node_->stop();
+    // The bootstrap loop's in-flight createTopic (if any) has now returned, so
+    // it observes bootstrap_stop_ and exits; join is safe.
+    if (bootstrap_thread_.joinable()) {
+        bootstrap_thread_.join();
     }
 
     // Stop IO context
@@ -819,8 +856,21 @@ void KawasanBroker::initializeRaft() {
                         info.host = host;
                         info.port = port;
                         peers.push_back(info);
-                        Logger::info("Added Raft peer: id={}, host={}, port={}", 
+                        Logger::info("Added Raft peer: id={}, host={}, port={}",
                                    peer_id, host, port);
+
+                        // Seed cluster membership for replica assignment + Metadata.
+                        // raft.peers carries the Raft port; the Kafka listener port
+                        // is, by the convention used across all shipped configs and
+                        // the cluster harness, the Raft port minus one. (Per-broker
+                        // advertised addresses via a proper BrokerRegistration flow
+                        // are a follow-up.)
+                        BrokerMetadata peer_broker;
+                        peer_broker.id = peer_id;
+                        peer_broker.host = host;
+                        peer_broker.port = port - 1;
+                        peer_broker.rack = std::nullopt;
+                        cluster_brokers_.push_back(peer_broker);
                     }
                 } catch (const std::exception& e) {
                     Logger::warn("Failed to parse Raft peer '{}': {}", peer_str, e.what());
@@ -872,6 +922,18 @@ void KawasanBroker::initializeMetadata() {
     metadata_controller_->start();
     cluster_id_ = metadata_controller_->clusterId();
 
+    // Seed cluster membership (peers from raft.peers) so the metadata store knows
+    // all brokers: replica assignment can then spread partitions across them and
+    // Metadata responses advertise the whole cluster. The local broker is already
+    // registered by the store; this adds the peers. Empty in single-node mode.
+    for (const auto& peer : cluster_brokers_) {
+        metadata_controller_->registerBroker(peer);
+    }
+    if (!cluster_brokers_.empty()) {
+        Logger::info("Cluster membership seeded: {} brokers known",
+                     metadata_controller_->brokerCount());
+    }
+
     // Phase EX-9 (durability): on restart, pre-create Log objects for
     // every (topic, partition) that exists in the metadata store. This
     // closes a durability bug where post-restart ListOffsets / Fetch
@@ -900,69 +962,105 @@ void KawasanBroker::initializeMetadata() {
         }
     }
 
-    // Phase 3.1: create `__consumer_offsets` as a real Kafka topic. Now
-    // using the Kafka-default 50 partitions; OffsetCommit hashes the
-    // group_id (FNV-1a) to pick the target partition. This matches the
-    // Kafka convention so `kafka-consumer-groups.sh --describe` can find
-    // commits by reading a deterministic partition rather than scanning.
-    if (metadata_controller_) {
-        // Internal-topic partition counts are configurable. Each partition is a
-        // RocksDB instance, so Kafka's default of 50 means ~100 RocksDB handles
-        // (offsets + txn) opened at startup — heavy for a single-node broker and
-        // a file-descriptor hazard under tight ulimits. Default to a smaller,
-        // single-node-appropriate count; raise it for higher group/txn fan-out.
-        const int32_t offsets_partitions =
-            std::max(1, config_.get<int32_t>("offsets.topic.num.partitions", 16));
-        TopicSpecification spec;
-        spec.name = "__consumer_offsets";
-        spec.num_partitions = offsets_partitions;
-        spec.replication_factor = 1;
-        spec.configs["cleanup.policy"] = "compact";
-        spec.configs["segment.bytes"] = "104857600";
-        auto result = metadata_controller_->createTopic(spec);
-        if (result.error_code == ErrorCode::NONE) {
-            Logger::info("Created internal topic __consumer_offsets with {} partitions",
-                         offsets_partitions);
-        } else if (result.error_code == ErrorCode::TOPIC_ALREADY_EXISTS) {
-            Logger::debug("Internal topic __consumer_offsets already exists");
-        } else {
-            Logger::warn("Failed to create __consumer_offsets: {}",
-                         result.error_message);
-        }
-        // Capture the actual partition count (handles a pre-existing topic with
-        // a different count) so offset-commit routing uses the true modulus.
-        const auto offsets_md = metadata_controller_->describeTopics({"__consumer_offsets"});
-        if (!offsets_md.empty() && !offsets_md.front().partitions.empty()) {
-            offsets_topic_num_partitions_ =
-                static_cast<int32_t>(offsets_md.front().partitions.size());
-        }
+    // Ensure the internal topics exist. In single-node mode this broker is
+    // already the leader (RaftNode::start becomes leader immediately with no
+    // peers), so they are created synchronously here. In a multi-broker cluster
+    // no controller exists yet at startup, so this is a no-op until the
+    // controller-bootstrap loop (started in startServices) retries after a
+    // leader is elected.
+    ensureInternalTopics();
+}
 
-        // Phase 3.3: auto-create `__transaction_state`. Kafka uses 50
-        // partitions by default (same as `__consumer_offsets`) with
-        // compact policy. TransactionCoordinator (when fully
-        // implemented) writes commit/abort markers and PrepareCommit
-        // entries here. For now the topic exists so Java AdminClient
-        // probes and transactional producers don't see
-        // UNKNOWN_TOPIC_OR_PARTITION on initial setup.
-        const int32_t txn_partitions =
-            std::max(1, config_.get<int32_t>("transaction.state.topic.num.partitions", 16));
-        TopicSpecification txn_spec;
-        txn_spec.name = "__transaction_state";
-        txn_spec.num_partitions = txn_partitions;
-        txn_spec.replication_factor = 1;
-        txn_spec.configs["cleanup.policy"] = "compact";
-        txn_spec.configs["segment.bytes"] = "104857600";
-        txn_spec.configs["min.compaction.lag.ms"] = "0";
-        auto txn_result = metadata_controller_->createTopic(txn_spec);
-        if (txn_result.error_code == ErrorCode::NONE) {
-            Logger::info("Created internal topic __transaction_state with {} partitions",
-                         txn_partitions);
-        } else if (txn_result.error_code == ErrorCode::TOPIC_ALREADY_EXISTS) {
-            Logger::debug("Internal topic __transaction_state already exists");
-        } else {
-            Logger::warn("Failed to create __transaction_state: {}",
-                         txn_result.error_message);
+void KawasanBroker::ensureInternalTopics() {
+    if (!metadata_controller_) {
+        return;
+    }
+
+    auto topic_exists = [&](const std::string& name) {
+        const auto md = metadata_controller_->describeTopics({name});
+        return !md.empty() && !md.front().partitions.empty();
+    };
+
+    // If both already exist (created by whichever broker is the controller and
+    // replicated to us via Raft), record the offsets partition count and finish.
+    if (topic_exists("__consumer_offsets") && topic_exists("__transaction_state")) {
+        const auto md = metadata_controller_->describeTopics({"__consumer_offsets"});
+        offsets_topic_num_partitions_ =
+            static_cast<int32_t>(md.front().partitions.size());
+        internal_topics_ready_.store(true);
+        return;
+    }
+
+    // Only the active controller (Raft leader) can create topics. Non-leaders
+    // return quietly; the bootstrap loop retries once leadership is established.
+    if (raft_node_ && !raft_node_->isLeader()) {
+        return;
+    }
+
+    // Internal-topic partition counts are configurable. Each partition is a
+    // RocksDB instance, so Kafka's default of 50 (offsets + txn => ~100 DBs)
+    // is a file-descriptor hazard; default to a smaller single-node-appropriate
+    // count. Internal topics stay RF=1 for now (cross-broker replication of the
+    // metadata topics is part of the follower-fetcher work).
+    auto create_if_missing = [&](const std::string& name, int32_t partitions,
+                                 std::map<std::string, std::string> cfg) -> bool {
+        if (topic_exists(name)) {
+            return true;
         }
+        TopicSpecification spec;
+        spec.name = name;
+        spec.num_partitions = partitions;
+        spec.replication_factor = 1;
+        spec.configs = std::move(cfg);
+        const auto result = metadata_controller_->createTopic(spec);
+        if (result.error_code == ErrorCode::NONE) {
+            Logger::info("Created internal topic {} with {} partitions", name, partitions);
+            return true;
+        }
+        if (result.error_code == ErrorCode::TOPIC_ALREADY_EXISTS) {
+            return true;
+        }
+        Logger::debug("Deferred creating internal topic {}: {}", name,
+                      result.error_message);
+        return false;
+    };
+
+    const int32_t offsets_partitions =
+        std::max(1, config_.get<int32_t>("offsets.topic.num.partitions", 16));
+    const int32_t txn_partitions =
+        std::max(1, config_.get<int32_t>("transaction.state.topic.num.partitions", 16));
+
+    const bool offsets_ok = create_if_missing(
+        "__consumer_offsets", offsets_partitions,
+        {{"cleanup.policy", "compact"}, {"segment.bytes", "104857600"}});
+    const bool txn_ok = create_if_missing(
+        "__transaction_state", txn_partitions,
+        {{"cleanup.policy", "compact"},
+         {"segment.bytes", "104857600"},
+         {"min.compaction.lag.ms", "0"}});
+
+    // Capture the actual offsets partition count (handles a pre-existing topic
+    // with a different count) so offset-commit routing uses the true modulus.
+    const auto offsets_md = metadata_controller_->describeTopics({"__consumer_offsets"});
+    if (!offsets_md.empty() && !offsets_md.front().partitions.empty()) {
+        offsets_topic_num_partitions_ =
+            static_cast<int32_t>(offsets_md.front().partitions.size());
+    }
+    if (offsets_ok && txn_ok) {
+        internal_topics_ready_.store(true);
+    }
+}
+
+void KawasanBroker::controllerBootstrapLoop() {
+    while (!bootstrap_stop_.load() && !internal_topics_ready_.load()) {
+        try {
+            ensureInternalTopics();
+        } catch (const std::exception& ex) {
+            Logger::warn("ensureInternalTopics failed (will retry): {}", ex.what());
+        }
+        std::unique_lock<std::mutex> lock(bootstrap_mutex_);
+        bootstrap_cv_.wait_for(lock, std::chrono::milliseconds(500),
+                               [&] { return bootstrap_stop_.load(); });
     }
 }
 

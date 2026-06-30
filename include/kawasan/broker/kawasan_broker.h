@@ -2,7 +2,10 @@
 
 #include <atomic>
 #include <functional>
+#include <atomic>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -100,6 +103,18 @@ private:
     void initializeMetadata();
     void startServices();
     void stopServices();
+    /// @brief Idempotently ensures the internal topics (__consumer_offsets,
+    /// __transaction_state) exist. If they already exist (created by whichever
+    /// broker is the controller and replicated via Raft) it records the offsets
+    /// partition count and marks bootstrap complete. Otherwise, only the active
+    /// controller (Raft leader) creates them; non-leaders return quietly so the
+    /// bootstrap loop can retry. This decouples internal-topic creation from the
+    /// startup race where, in a multi-broker cluster, no controller exists yet.
+    void ensureInternalTopics();
+    /// @brief Background loop that calls ensureInternalTopics() until the
+    /// internal topics exist, then exits. Handles the multi-broker case where
+    /// leadership is established after startup.
+    void controllerBootstrapLoop();
     /// @brief When deployment.mode=production (or KAWASAN_DEPLOYMENT_MODE env),
     /// throws std::runtime_error on settings the broker cannot honor in
     /// production (TLS, RF>1, minISR>1) rather than silently degrading them.
@@ -236,8 +251,14 @@ private:
     storage::LogConfig log_config_;
 
     std::unique_ptr<storage::LogManager> log_manager_;
-    std::unique_ptr<raft::RaftNode> raft_node_;
+    // Declaration order matters for destruction: metadata_controller_ is the
+    // target of the Raft commit callback invoked by raft_node_'s apply thread,
+    // so raft_node_ MUST be destroyed first (its destructor joins the apply
+    // thread) while metadata_controller_ is still alive. Members destruct in
+    // reverse declaration order, hence metadata_controller_ is declared BEFORE
+    // raft_node_.
     std::unique_ptr<MetadataController> metadata_controller_;
+    std::unique_ptr<raft::RaftNode> raft_node_;
     std::unique_ptr<ReplicaManager> replica_manager_;
     std::shared_ptr<OffsetManager> offset_manager_;
     std::shared_ptr<GroupCoordinator> group_coordinator_;
@@ -288,6 +309,24 @@ private:
     bool authorizer_enabled_ = false;
     bool allow_everyone_if_no_acl_ = false;
     std::unordered_set<std::string> super_users_;
+
+    // Cluster membership derived from raft.peers at startup (self + peers).
+    // Empty in single-node mode. Seeded into the metadata store so replica
+    // assignment can spread partitions across brokers and Metadata responses
+    // advertise the whole cluster.
+    std::vector<BrokerMetadata> cluster_brokers_;
+
+    // Number of brokers in raft.peers (1 in single-node mode). Replication
+    // factor is capped at this — a topic can't have more replicas than brokers.
+    int cluster_size_ = 1;
+
+    // Controller-bootstrap state: a background thread ensures the internal topics
+    // exist once a controller is elected, fixing the multi-broker startup race.
+    std::atomic<bool> internal_topics_ready_{false};
+    std::atomic<bool> bootstrap_stop_{false};
+    std::thread bootstrap_thread_;
+    std::mutex bootstrap_mutex_;
+    std::condition_variable bootstrap_cv_;
 
     // Actual partition count of the `__consumer_offsets` topic, captured from
     // metadata after the topic is created/confirmed at startup. Used to route

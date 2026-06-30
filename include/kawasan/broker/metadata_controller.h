@@ -54,6 +54,13 @@ public:
     /// @brief Updates the metadata entry for this broker (host/port changes).
     void updateLocalBroker(const BrokerMetadata& broker) { store_.updateLocalBroker(broker); }
 
+    /// @brief Registers a cluster peer broker (idempotent), seeding membership
+    /// from raft.peers so replica assignment can spread across brokers.
+    void registerBroker(const BrokerMetadata& broker) { store_.registerBroker(broker); }
+
+    /// @brief Number of brokers known to the cluster membership.
+    size_t brokerCount() const { return store_.brokerCount(); }
+
     /// @brief Computes and returns a checksum of the current metadata state.
     std::string computeMetadataChecksum() const { return store_.computeChecksum(); }
 

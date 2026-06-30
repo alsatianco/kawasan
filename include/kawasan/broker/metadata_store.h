@@ -56,6 +56,15 @@ public:
     /// @brief Updates the broker entry for this node (persists change).
     void updateLocalBroker(const BrokerMetadata& broker);
 
+    /// @brief Registers (or updates) a cluster peer broker, keyed by id. Used to
+    /// seed cluster membership from raft.peers so replica assignment can spread
+    /// partitions across brokers and Metadata responses advertise the full
+    /// cluster. Idempotent.
+    void registerBroker(const BrokerMetadata& broker);
+
+    /// @brief Number of brokers currently known to the cluster membership.
+    size_t brokerCount() const;
+
     /// @brief Computes a checksum of all topics/partitions/configs.
     std::string computeChecksum() const;
 

@@ -98,6 +98,11 @@ void RaftNode::start() {
     openPersistence();
     loadPersistedState();
 
+    // Start the apply thread BEFORE anything can advance commit_index_ (incl. the
+    // single-node becomeLeader below), so committed entries are never stranded.
+    apply_running_ = true;
+    apply_thread_ = std::thread(&RaftNode::applyThread, this);
+
     // Start transport server
     transport_->start(raft_port_);
 
@@ -132,6 +137,19 @@ void RaftNode::stop() {
         }
         if (heartbeat_thread_.joinable()) {
             heartbeat_thread_.join();
+        }
+        // Stop the apply thread AFTER the producers (election/heartbeat threads)
+        // are joined, so commit_index_ can no longer advance. The worker drains
+        // any remaining committed entries (already durable in the Raft log) and
+        // exits. Joined here, before persist_db_ is closed, so a draining apply
+        // never touches torn-down state.
+        {
+            std::lock_guard<std::mutex> lk(apply_mutex_);
+            apply_running_ = false;
+        }
+        apply_cv_.notify_one();
+        if (apply_thread_.joinable()) {
+            apply_thread_.join();
         }
         // 0A.7: close persistent storage so another process (or this one
         // restarting) can re-open the directory without RocksDB LOCK errors.
@@ -434,14 +452,17 @@ InstallSnapshotResponse RaftNode::handleInstallSnapshot(
                 return e.index <= incoming_snapshot_->last_included_index;
             });
         log_.erase(new_end, log_.end());
-    }
 
-    // Advance commit and last_applied to the snapshot boundary.
-    if (commit_index_.load() < incoming_snapshot_->last_included_index) {
-        commit_index_ = incoming_snapshot_->last_included_index;
-    }
-    if (last_applied_.load() < incoming_snapshot_->last_included_index) {
-        last_applied_ = incoming_snapshot_->last_included_index;
+        // Advance the snapshot floor and the commit/applied counters together,
+        // all under log_mutex_, so the apply thread (which reads them under the
+        // same lock) skips the folded indices without ever applying onto a hole
+        // and without a non-monotonic last_applied_. apply_floor_ tells the
+        // worker "everything up to here is already captured by the snapshot —
+        // do not invoke the callback for it".
+        const int64_t lii = incoming_snapshot_->last_included_index;
+        if (apply_floor_.load() < lii) apply_floor_.store(lii);
+        if (commit_index_.load() < lii) commit_index_.store(lii);
+        if (last_applied_.load() < lii) last_applied_.store(lii);
     }
 
     // Snapshot bytes themselves are opaque to Raft; a real implementation
@@ -449,6 +470,7 @@ InstallSnapshotResponse RaftNode::handleInstallSnapshot(
     // our case). Phase 3.3 will populate that path.
 
     incoming_snapshot_.reset();
+    apply_cv_.notify_one();
     response.term = current_term_.load();
     return response;
 }
@@ -605,89 +627,102 @@ void RaftNode::sendHeartbeats() {
         return;
     }
     
-    std::lock_guard<std::mutex> lock(log_mutex_);
-    const int64_t log_size = static_cast<int64_t>(log_.size());
-    const int64_t current_term = current_term_.load();
-
-    // Send AppendEntries to all peers
-    for (auto& peer : peers_) {
+    // Phase 1: build per-peer AppendEntries requests while holding log_mutex_
+    // (read log state), then RELEASE the lock before doing any network I/O.
+    // Holding log_mutex_ across the RPC waits starved appendCommand and made
+    // replication flaky (entries past the first often never committed).
+    struct PendingSend {
+        BrokerId peer_id;
         raft::AppendEntriesRequest request;
-        request.term = current_term;
-        request.leader_id = id_;
-        request.prev_log_index = peer.next_index - 1;
-        request.prev_log_term =
-            (request.prev_log_index > 0 && request.prev_log_index <= log_size)
-                ? log_[static_cast<size_t>(request.prev_log_index - 1)].term
-                : 0;
-        request.leader_commit = commit_index_;
-
-        // Include entries that peer doesn't have (if any)
-        if (peer.next_index > 0 && peer.next_index <= log_size) {
-            size_t start = static_cast<size_t>(peer.next_index - 1);
-            for (size_t i = start; i < log_.size(); ++i) {
-                request.entries.push_back(log_[i]);
-            }
+    };
+    std::vector<PendingSend> sends;
+    int64_t current_term = 0;
+    {
+        std::lock_guard<std::mutex> lock(log_mutex_);
+        if (state_ != NodeState::LEADER) {
+            return;
         }
-
-        // Send RPC asynchronously
-        try {
-            auto response_future = transport_->sendAppendEntries(peer.id, request);
-            
-            // Process response asynchronously (don't block here)
-            // In a more sophisticated implementation, we'd use a callback or separate thread
-            // For now, we'll check the future status quickly
-            const auto timeout = std::chrono::milliseconds(10);
-            if (response_future.wait_for(timeout) == std::future_status::ready) {
-                try {
-                    auto response = response_future.get();
-                    
-                    // If peer has higher term, step down
-                    if (response.term > current_term) {
-                        Logger::info("Peer {} has higher term {}, stepping down", 
-                                    peer.id, response.term);
-                        becomeFollower(response.term);
-                        return;
-                    }
-                    
-                    if (response.success) {
-                        // Update peer's match_index and next_index
-                        peer.match_index = response.last_log_index;
-                        peer.next_index = response.last_log_index + 1;
-
-                        Logger::trace("AppendEntries to peer {} succeeded, match_index={}, next_index={}",
-                                     peer.id, peer.match_index, peer.next_index);
-
-                        // Update commit index if majority have replicated
-                        updateCommitIndex();
-                    } else {
-                        // Phase 5.2: use the follower's `last_log_index` as a
-                        // hint to jump directly to the divergence point instead
-                        // of decrementing by 1. Was O(N) catch-up on lagging
-                        // followers; now O(1) per failure. Even if the follower
-                        // reported 0 (empty log), we clamp to >=1 so the next
-                        // AppendEntries has a valid prev_log_index.
-                        const int64_t hint = response.last_log_index;
-                        const int64_t new_next = std::max<int64_t>(1, hint + 1);
-                        if (new_next < peer.next_index) {
-                            peer.next_index = new_next;
-                            Logger::debug(
-                                "AppendEntries to peer {} failed, jumping next_index to {} "
-                                "(follower last_log_index={})",
-                                peer.id, peer.next_index, hint);
-                        } else if (peer.next_index > 1) {
-                            // Hint didn't help (still ahead); fall back to
-                            // single-step backoff to make progress.
-                            peer.next_index--;
-                        }
-                    }
-                } catch (const std::exception& e) {
-                    Logger::warn("Error processing AppendEntries response from peer {}: {}", 
-                                peer.id, e.what());
+        current_term = current_term_.load();
+        const int64_t log_size = static_cast<int64_t>(log_.size());
+        for (auto& peer : peers_) {
+            raft::AppendEntriesRequest request;
+            request.term = current_term;
+            request.leader_id = id_;
+            request.prev_log_index = peer.next_index - 1;
+            request.prev_log_term =
+                (request.prev_log_index > 0 && request.prev_log_index <= log_size)
+                    ? log_[static_cast<size_t>(request.prev_log_index - 1)].term
+                    : 0;
+            request.leader_commit = commit_index_;
+            if (peer.next_index > 0 && peer.next_index <= log_size) {
+                for (size_t i = static_cast<size_t>(peer.next_index - 1); i < log_.size();
+                     ++i) {
+                    request.entries.push_back(log_[i]);
                 }
             }
-            // If timeout, just continue - will retry on next heartbeat
+            sends.push_back({peer.id, std::move(request)});
+        }
+    }
+
+    // Phase 2: send all RPCs (no lock held).
+    std::vector<std::pair<BrokerId, std::future<raft::AppendEntriesResponse>>> futures;
+    for (auto& send : sends) {
+        try {
+            futures.emplace_back(send.peer_id,
+                                 transport_->sendAppendEntries(send.peer_id, send.request));
         } catch (const std::exception& e) {
-            Logger::warn("Failed to send AppendEntries to peer {}: {}", peer.id, e.what());
+            Logger::warn("Failed to send AppendEntries to peer {}: {}", send.peer_id,
+                         e.what());
+        }
+    }
+
+    // Phase 3: collect responses (no lock held) within a bounded window, then
+    // apply each under a freshly-acquired lock.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    for (auto& [peer_id, fut] : futures) {
+        const auto remaining = deadline - std::chrono::steady_clock::now();
+        if (remaining <= std::chrono::milliseconds(0)) break;
+        if (fut.wait_for(remaining) != std::future_status::ready) continue;
+
+        raft::AppendEntriesResponse response;
+        try {
+            response = fut.get();
+        } catch (const std::exception& e) {
+            Logger::warn("Error processing AppendEntries response from peer {}: {}", peer_id,
+                         e.what());
+            continue;
+        }
+
+        std::lock_guard<std::mutex> lock(log_mutex_);
+        // Ignore stale responses if we are no longer the leader for this term.
+        if (state_ != NodeState::LEADER || current_term_.load() != current_term) {
+            return;
+        }
+        if (response.term > current_term) {
+            Logger::info("Peer {} has higher term {}, stepping down", peer_id, response.term);
+            becomeFollower(response.term);
+            return;
+        }
+        for (auto& peer : peers_) {
+            if (peer.id != peer_id) continue;
+            if (response.success) {
+                peer.match_index = response.last_log_index;
+                peer.next_index = response.last_log_index + 1;
+                Logger::trace("AppendEntries to peer {} succeeded, match_index={}",
+                              peer.id, peer.match_index);
+                updateCommitIndex();  // we hold log_mutex_, per its precondition
+            } else {
+                // Use the follower's last_log_index as a hint to jump to the
+                // divergence point (O(1) instead of decrement-by-one).
+                const int64_t hint = response.last_log_index;
+                const int64_t new_next = std::max<int64_t>(1, hint + 1);
+                if (new_next < peer.next_index) {
+                    peer.next_index = new_next;
+                } else if (peer.next_index > 1) {
+                    peer.next_index--;
+                }
+            }
+            break;
         }
     }
 }
@@ -745,15 +780,87 @@ bool RaftNode::hasElectionTimedOut() const {
     return elapsed >= election_timeout_;
 }
 
+void RaftNode::setCommitCallback(std::function<void(const LogEntry&)> callback) {
+    std::lock_guard<std::mutex> lock(log_mutex_);
+    commit_callback_ = std::move(callback);
+}
+
 void RaftNode::applyCommittedEntries() {
-    while (last_applied_ < commit_index_) {
-        last_applied_++;
-        const int64_t log_size = static_cast<int64_t>(log_.size());
-        if (last_applied_ <= log_size) {
-            const auto& entry = log_[static_cast<size_t>(last_applied_ - 1)];
-            if (commit_callback_) {
-                commit_callback_(entry);
+    // The heavy state-machine application now runs on the dedicated apply
+    // thread (applyThread), OFF log_mutex_. Callers (which hold log_mutex_)
+    // only need to wake it; the actual apply happens asynchronously. notify_one
+    // does not block and does not touch log_mutex_.
+    apply_cv_.notify_one();
+}
+
+void RaftNode::applyThread() {
+    while (true) {
+        {
+            std::unique_lock<std::mutex> wl(apply_mutex_);
+            // Timed wait: the producers advance commit_index_ (atomic) WITHOUT
+            // holding apply_mutex_, so an untimed wait could miss a wakeup. The
+            // 100ms cap guarantees the worker re-checks and drains regardless.
+            apply_cv_.wait_for(wl, std::chrono::milliseconds(100), [this] {
+                return !apply_running_.load() ||
+                       last_applied_.load() < commit_index_.load();
+            });
+        }
+
+        // Drain every currently-committed entry, one at a time, in index order.
+        while (true) {
+            LogEntry entry;
+            std::function<void(const LogEntry&)> cb;
+            int64_t idx = 0;
+            bool have_entry = false;
+            {
+                std::lock_guard<std::mutex> lk(log_mutex_);
+                int64_t from = last_applied_.load();
+                // Skip indices already captured by an installed snapshot.
+                if (apply_floor_.load() > from) {
+                    from = apply_floor_.load();
+                    last_applied_.store(from);
+                }
+                const int64_t to = commit_index_.load();
+                if (from >= to) break;  // fully drained
+                idx = from + 1;
+                const int64_t log_size = static_cast<int64_t>(log_.size());
+                if (idx > log_size) {
+                    // Entry isn't in memory — folded into a snapshot or
+                    // truncated after a prior apply. Advance with no callback.
+                    last_applied_.store(to);
+                    continue;
+                }
+                cb = commit_callback_;
+                if (!cb) {
+                    // Callback not installed yet (startup window): leave the
+                    // entry unapplied and re-wait (timed) until it's set.
+                    break;
+                }
+                entry = log_[static_cast<size_t>(idx - 1)];  // copy BY VALUE under lock
+                have_entry = true;
             }
+
+            if (have_entry) {
+                try {
+                    cb(entry);  // HEAVY work (RocksDB/metadata) — NO lock held
+                } catch (const std::exception& e) {
+                    Logger::error("commit_callback_ threw at index {}: {}", idx, e.what());
+                } catch (...) {
+                    Logger::error("commit_callback_ threw at index {}", idx);
+                }
+                // Advance last_applied_ UNDER log_mutex_, monotonically, never
+                // below the snapshot floor (the snapshot writer also raises both
+                // under log_mutex_, so they never go non-monotonic).
+                std::lock_guard<std::mutex> lk(log_mutex_);
+                const int64_t want = std::max(idx, apply_floor_.load());
+                if (want > last_applied_.load()) {
+                    last_applied_.store(want);
+                }
+            }
+        }
+
+        if (!apply_running_.load() && last_applied_.load() >= commit_index_.load()) {
+            return;  // stop requested and fully drained
         }
     }
 }
@@ -885,13 +992,17 @@ void RaftNode::truncateLogFrom(int64_t index) {
 }
 
 void RaftNode::updateCommitIndex() {
-    // This should be called by leader only
+    // PRECONDITION: the caller (sendHeartbeats) already holds log_mutex_. This
+    // function must NOT re-lock it — std::mutex is non-recursive, so re-locking
+    // here self-deadlocked the heartbeat thread the first time an AppendEntries
+    // succeeded, so commit_index_ never advanced and no command ever committed
+    // (createTopic/metadata writes hung forever in a multi-broker cluster).
+    // This should be called by leader only.
     if (state_ != NodeState::LEADER) {
         return;
     }
-    
+
     // Find the highest index that's been replicated to a majority
-    std::lock_guard<std::mutex> lock(log_mutex_);
     const int64_t log_size = static_cast<int64_t>(log_.size());
     
     for (int64_t n = log_size; n > commit_index_; --n) {

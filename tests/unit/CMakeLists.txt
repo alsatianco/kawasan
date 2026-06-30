@@ -43,6 +43,16 @@ add_executable(raft_election_test raft_election_test.cpp)
 target_link_libraries(raft_election_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME RaftElectionTest COMMAND raft_election_test)
 
+# Replica assignment test (Phase B: cross-broker RF>1 assignment)
+add_executable(replica_assignment_test replica_assignment_test.cpp)
+target_link_libraries(replica_assignment_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME ReplicaAssignmentTest COMMAND replica_assignment_test)
+
+# Raft apply-thread test (Phase B: commit-apply off the log mutex)
+add_executable(raft_apply_thread_test raft_apply_thread_test.cpp)
+target_link_libraries(raft_apply_thread_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME RaftApplyThreadTest COMMAND raft_apply_thread_test)
+
 # Raft transport test
 add_executable(raft_transport_test raft_transport_test.cpp)
 target_link_libraries(raft_transport_test PRIVATE kawasan GTest::gtest GTest::gtest_main)

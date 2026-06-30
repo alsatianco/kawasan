@@ -454,6 +454,22 @@ void MetadataStore::updateLocalBroker(const BrokerMetadata& broker) {
     persistLocked();
 }
 
+void MetadataStore::registerBroker(const BrokerMetadata& broker) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = std::find_if(brokers_.begin(), brokers_.end(),
+                           [&](const BrokerMetadata& b) { return b.id == broker.id; });
+    if (it == brokers_.end()) {
+        brokers_.push_back(broker);
+    } else {
+        *it = broker;  // refresh address if it changed
+    }
+}
+
+size_t MetadataStore::brokerCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return brokers_.size();
+}
+
 TopicOperationResult MetadataStore::validateCreateLocked(
     const TopicSpecification& spec) const {
     if (spec.name.empty()) {
