@@ -954,6 +954,12 @@ void KawasanBroker::initializeMetadata() {
                 // its segments via Log::loadSegments(); this is what
                 // restores prior records.
                 (void)log_manager_->getOrCreateLog(tm.name, pm.partition);
+                // Rebuild idempotent-producer state by replaying the persisted
+                // V2 batch headers (Kafka's fallback when no producer snapshot
+                // exists). Without this, a restart resets sequence tracking and
+                // an in-flight producer retry is seen as a new batch -> silent
+                // duplicate. The records themselves are already durable.
+                replayProducerStateFromLog(tm.name, pm.partition);
                 ++restored;
             }
         }
@@ -969,6 +975,43 @@ void KawasanBroker::initializeMetadata() {
     // controller-bootstrap loop (started in startServices) retries after a
     // leader is elected.
     ensureInternalTopics();
+}
+
+void KawasanBroker::replayProducerStateFromLog(const std::string& topic,
+                                               PartitionId partition) {
+    if (!producer_state_manager_ || !log_manager_) {
+        return;
+    }
+    auto* log = log_manager_->getLog(topic, partition);
+    if (!log) {
+        return;
+    }
+    const Offset end = log->logEndOffset();
+    Offset off = log->logStartOffset();
+    constexpr size_t kChunkBytes = 8 * 1024 * 1024;
+    while (off < end) {
+        auto batches = log->read(off, kChunkBytes);
+        if (batches.empty()) {
+            break;
+        }
+        Offset next = off;
+        for (const auto& batch : batches) {
+            const Offset base = batch.baseOffset();
+            const int32_t count = static_cast<int32_t>(batch.records().size());
+            if (base + count > next) {
+                next = base + count;
+            }
+            if (batch.producerId() >= 0 && count > 0) {
+                producer_state_manager_->recordAppend(
+                    topic, partition, batch.producerId(), batch.producerEpoch(),
+                    batch.baseSequence(), count, base);
+            }
+        }
+        if (next <= off) {
+            break;  // no forward progress; avoid an infinite loop
+        }
+        off = next;
+    }
 }
 
 void KawasanBroker::ensureInternalTopics() {
@@ -4407,6 +4450,32 @@ Buffer KawasanBroker::handleAddOffsetsToTxn(
     Logger::info("AddOffsetsToTxn: txn='{}' group='{}' pid={} epoch={}",
                  req.transactionalId(), req.groupId(),
                  req.producerId(), req.producerEpoch());
+
+    // S12: register the group's __consumer_offsets partition in the transaction
+    // so the subsequent TxnOffsetCommit's offsets are part of the txn and EndTxn
+    // emits a commit/abort marker to that partition (KIP-98 EOS). Previously this
+    // was a no-op that returned NONE without registering anything, so a Streams
+    // EOS commit silently skipped the offsets-partition step.
+    if (transaction_coordinator_ && !req.transactionalId().empty()) {
+        if (!transaction_coordinator_->describe(req.transactionalId()).has_value()) {
+            transaction_coordinator_->recordInitProducerId(
+                req.transactionalId(), req.producerId(), req.producerEpoch(),
+                /*timeout=*/60000);
+        }
+        // Route the group to its __consumer_offsets partition (same hash as
+        // offset-commit routing: Java String.hashCode of group_id, mod count).
+        int32_t h = 0;
+        for (unsigned char c : req.groupId()) {
+            h = 31 * h + static_cast<int32_t>(c);
+        }
+        const uint32_t parts =
+            static_cast<uint32_t>(std::max(1, offsets_topic_num_partitions_));
+        const int32_t target = static_cast<int32_t>(static_cast<uint32_t>(h) % parts);
+        transaction_coordinator_->addPartitions(
+            req.transactionalId(),
+            {{std::string("__consumer_offsets"), target}});
+    }
+
     protocol::AddOffsetsToTxnResponse resp;
     resp.setThrottleTimeMs(0);
     resp.setErrorCode(ErrorCode::NONE);

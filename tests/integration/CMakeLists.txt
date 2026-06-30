@@ -14,6 +14,10 @@ add_executable(internal_topic_fd_test internal_topic_fd_test.cpp)
 target_link_libraries(internal_topic_fd_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME InternalTopicFdTest COMMAND internal_topic_fd_test)
 
+add_executable(idempotent_replay_test idempotent_replay_test.cpp)
+target_link_libraries(idempotent_replay_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME IdempotentReplayTest COMMAND idempotent_replay_test)
+
 add_executable(production_config_test production_config_test.cpp)
 target_link_libraries(production_config_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME ProductionConfigTest COMMAND production_config_test)

@@ -111,6 +111,10 @@ private:
     /// bootstrap loop can retry. This decouples internal-topic creation from the
     /// startup race where, in a multi-broker cluster, no controller exists yet.
     void ensureInternalTopics();
+    /// @brief Rebuilds idempotent-producer state for one partition by replaying
+    /// its persisted record-batch headers into producer_state_manager_ at
+    /// startup (B3 — survives restart without a separate snapshot file).
+    void replayProducerStateFromLog(const std::string& topic, PartitionId partition);
     /// @brief Background loop that calls ensureInternalTopics() until the
     /// internal topics exist, then exits. Handles the multi-broker case where
     /// leadership is established after startup.
