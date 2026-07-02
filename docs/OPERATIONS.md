@@ -224,7 +224,7 @@ The handful of keys you adjust most often when operating a broker:
 
 **Durability behavior** (fixed, not configurable per request): message/log writes and consumer offset commits use synchronous RocksDB writes (`sync=true`) for at-least-once durability, with offset commits batched across partitions into a single `WriteBatch`; consumer-group metadata uses async writes (`sync=false`) protected by the RocksDB WAL.
 
-**Raft TLS is a known limitation.** The `raft.ssl.*` keys are parsed and validated at broker startup (`src/broker/kawasan_broker.cpp` around lines 176–190), so an invalid combination throws at boot. However, the Raft transport (`src/raft/raft_transport.{cpp,h}`) contains no SSL code, so **inter-broker Raft traffic is plaintext even when `raft.ssl.enabled=true`**. Do not rely on Raft TLS for confidentiality; isolate inter-broker traffic at the network layer instead.
+**Raft TLS is a known limitation.** The `raft.ssl.*` keys are parsed and validated at broker startup (`src/broker/kawasan_broker.cpp`), so an invalid combination throws at boot. However, the Raft transport (`src/raft/raft_transport.{cpp,h}`) contains no SSL code, so **inter-broker Raft traffic is plaintext even when `raft.ssl.enabled=true`**. Do not rely on Raft TLS for confidentiality; isolate inter-broker traffic at the network layer instead.
 
 ---
 

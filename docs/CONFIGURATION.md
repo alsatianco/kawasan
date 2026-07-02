@@ -8,6 +8,7 @@ Broker configuration-key reference for Kawasan. This page documents the file for
 - [Environment-variable substitution](#environment-variable-substitution)
 - [Which keys are actually honored](#which-keys-are-actually-honored)
 - [Identity](#identity)
+- [Topics and auto-creation](#topics-and-auto-creation)
 - [Network](#network)
 - [Storage paths](#storage-paths)
 - [Log segments and retention](#log-segments-and-retention)
@@ -69,6 +70,17 @@ Read in `src/broker/kawasan_broker.cpp`.
 | `advertised.host` | string | value of `host` | Honored | Hostname/IP returned to clients in Metadata responses. |
 | `port` | int | `9092` | Honored | Kafka protocol listener port (1–65535). |
 | `cluster.id` | string | `kawasan-cluster` | Honored | Initial cluster id; once metadata is persisted, the stored cluster id takes precedence. |
+| `broker.rack` | string | `""` (no rack) | Honored | Rack identifier advertised to clients (Metadata v1+ and DescribeCluster) for rack-aware fetch. Empty = no rack, matching Kafka's default. |
+
+## Topics and auto-creation
+
+Read in `src/broker/kawasan_broker.cpp`; also surfaced through DescribeConfigs.
+
+| Key | Type | Default | Status | Description |
+|-----|------|---------|--------|-------------|
+| `auto.create.topics.enable` | bool | `true` | Honored | Auto-create a topic on first produce/metadata/fetch (honored only when the client also allows auto-creation). Disable to require explicit CreateTopics. |
+| `num.partitions` | int | `1` | Honored | Default partition count for auto-created topics. Values `<= 0` fall back to 1. |
+| `delete.topic.enable` | bool | `true` | Inert | Accepted for Kafka tooling compatibility; DeleteTopics is always served regardless. |
 
 ## Network
 
@@ -232,13 +244,12 @@ These keys are present in the sample configs for Kafka tooling compatibility but
 | Producer / consumer | `max.request.size`, `fetch.min.bytes`, `fetch.max.wait.ms`, `compression.type` |
 | Groups / offsets | `group.initial.rebalance.delay.ms`, `group.min.session.timeout.ms`, `group.max.session.timeout.ms`, `group.retention.ms`, `offsets.retention.minutes`, `consumer.lag.metrics.enabled`, `consumer.lag.check.interval.ms` |
 | Monitoring | `monitoring.enabled`, `metrics.recording.level` |
-| Topics | `auto.create.topics.enable` (honored), `delete.topic.enable` (inert) |
 | Logging | `log.level` (set via `--log-level` flag), `log.format` (inert) |
 | ZooKeeper / TXN | `zookeeper.connect`, `zookeeper.connection.timeout.ms`, `background.threads`, `log.message.timestamp.type` |
 | TLS (Kafka protocol) | `ssl.cert.file`, `ssl.key.file`, `ssl.ca.file`, `ssl.key.password`, `ssl.client.auth`, `ssl.keystore.*`, `ssl.truststore.*`, `ssl.protocol`, `ssl.cipher.suites` |
 | Listeners | `listeners`, `advertised.listeners` (use `host`/`port` instead) |
 
-`auto.create.topics.enable` is honored (defaults `true`); `delete.topic.enable` is accepted but inert.
+Topic auto-creation keys (`auto.create.topics.enable`, `num.partitions`) are honored and documented under [Topics and auto-creation](#topics-and-auto-creation).
 
 ## Startup validation
 

@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgrade and operational procedures see [./OPERATIONS.md](./OPERATIONS.md); for the full protocol surface see [./api_coverage_matrix.md](./api_coverage_matrix.md).
 
+## [Unreleased]
+
+Single-node production-hardening and multi-broker metadata-plane fixes. The single-node broker is the primary supported mode; multi-broker replication remains not production-hardened (see Known Limitations).
+
+### Added
+
+- **Durable produce.** `log.durability` config (default `sync`) fsyncs each acknowledged produce before responding, so an acked record survives a power loss/OS crash; `async` keeps the prior WAL-buffered behavior. See [./CONFIGURATION.md](./CONFIGURATION.md).
+- **Production mode.** `deployment.mode=production` (or `KAWASAN_DEPLOYMENT_MODE`) fails fast at startup on settings the build cannot honor (TLS-implying `security.protocol`, `default.replication.factor > 1`, `min.insync.replicas > 1`) and refuses SASL/PLAIN "accept-any" when no credentials are configured.
+- **ACL enforcement (opt-in).** `authorizer.enabled` gates Produce/Fetch/Create/DeleteTopics against the ACL store, with `super.users` and `allow.everyone.if.no.acl.found`. ACLs were always stored; they are now enforceable.
+- **Per-client quotas (opt-in).** `quota.producer.default` / `quota.consumer.default` (bytes/sec; `0` = unlimited) return a real `throttle_time_ms` so well-behaved clients back off.
+- **SASL/SCRAM** (SHA-256/512) authentication alongside SASL/PLAIN, with constant-time credential comparison; the authenticated principal is carried per-connection and used by the ACL gate.
+- **Producer state survives restart.** Idempotent-producer dedup/epoch state is rebuilt at startup by replaying persisted record-batch headers (`KawasanBroker::replayProducerStateFromLog`), closing a silent-duplicate-on-restart gap.
+- **`broker.rack`** is advertised to clients (Metadata v1+/DescribeCluster) for rack-aware fetch.
+- **Rebuilt internal-topic partition counts.** `offsets.topic.num.partitions` / `transaction.state.topic.num.partitions` are configurable (default 16); each partition is a RocksDB instance, so the count drives the startup file-descriptor footprint.
+- Multi-broker metadata plane: Raft election/commit fixes (elections and commit now complete), commit-apply moved off the Raft lock, cross-broker replica assignment for RF > 1, and a controller-startup-race fix.
+
+### Changed
+
+- **`AddOffsetsToTxn`** now registers the group's `__consumer_offsets` partition into the transaction (previously a no-op returning `NONE`), so `TxnOffsetCommit` offsets participate in the transaction.
+- The durable high-watermark checkpoint is written atomically (temp file + fsync + rename).
+- `acks=all` waits (leader-side, with timeout) for the ISR-committed offset before acknowledging.
+
+### Known Limitations
+
+- **Client/broker TLS is not implemented** and **Raft inter-broker traffic is always plaintext** (`raft.ssl.*` is parsed/validated but not wired into the transport) — unchanged from 0.2.0-alpha.
+- **Follower record replication is a stub.** `ReplicaManager::fetchFromLeader` is a no-op (TODO), so followers do not yet copy partition data from the leader; multi-broker clustering is experimental. The metadata plane (election, ISR tracking, assignment) works, but a failover can lose data until the follower fetcher lands.
+- **Transactions are not durable across restart/failover.** Transaction-coordinator state is in-memory; `WRITE_TXN_MARKERS` (API 27) and full exactly-once delivery are incomplete.
+
 ## [0.2.0-alpha] - 2025-11-24
 
 ### Added
@@ -26,7 +54,7 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 - Raft transport layer (Boost.Asio) with connection pooling and retry, wired into `RaftNode` for elections and log replication.
 - Multi-broker configuration parsing (`broker.id`, `raft.peers`), round-robin replica assignment.
 - ISR (in-sync replica) tracking, replica-lag tracking (default max lag 10,000 messages), and ISR updates propagated over Raft.
-- Follower-fetch background thread; metadata consistency check tool (`tools/kawasan-metadata-check`); cluster bootstrap script (`scripts/start_cluster.sh`).
+- Follower-fetch background thread scaffold (the record-fetch step was a stub then and remains so — see the Unreleased Known Limitations); metadata consistency check tool (`tools/kawasan-metadata-check`); cluster bootstrap script (`scripts/start_cluster.sh`).
 
 #### Monitoring & Observability
 - `MetricsCollector` with 20+ metrics exported in Prometheus format at `/metrics`.
@@ -104,5 +132,6 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ---
 
+[Unreleased]: https://github.com/kawasan/kawasan/compare/v0.2.0-alpha...HEAD
 [0.2.0-alpha]: https://github.com/kawasan/kawasan/releases/tag/v0.2.0-alpha
 [0.1.0-alpha]: https://github.com/kawasan/kawasan/releases/tag/v0.1.0-alpha

@@ -41,9 +41,9 @@ Point the client's bootstrap server at the broker's host and port (default `loca
 
 ## Does it support TLS?
 
-For the **Kafka client protocol**, TLS is **not** implemented in this build: the TCP session uses a plain socket, and the broker deliberately refuses to start if `security.protocol=SSL` or `ssl.enabled=true` is set (`src/broker/kawasan_broker.cpp:152-173`) rather than silently serving plaintext on a "TLS" port. Use `security.protocol=PLAINTEXT` (terminate TLS at a proxy/load balancer if you need encryption in transit). Note that `config/broker.production.properties` ships with `security.protocol=SSL` / `ssl.enabled=true` defaults that will fail to start until you override them to PLAINTEXT.
+For the **Kafka client protocol**, TLS is **not** implemented in this build: the TCP session uses a plain socket, and the broker deliberately refuses to start if `security.protocol=SSL` or `ssl.enabled=true` is set (`src/broker/kawasan_broker.cpp`) rather than silently serving plaintext on a "TLS" port. Use `security.protocol=PLAINTEXT` (terminate TLS at a proxy/load balancer if you need encryption in transit). Note that `config/broker.production.properties` ships with `security.protocol=SSL` / `ssl.enabled=true` defaults that will fail to start until you override them to PLAINTEXT.
 
-For **inter-broker Raft traffic**, the `raft.ssl.*` keys are parsed and validated (`src/broker/kawasan_broker.cpp:176-190`), but they are not wired into the transport — `src/raft/raft_transport.{cpp,h}` contains no SSL code — so Raft traffic is **plaintext even when `raft.ssl.enabled=true`**.
+For **inter-broker Raft traffic**, the `raft.ssl.*` keys are parsed and validated (`src/broker/kawasan_broker.cpp`), but they are not wired into the transport — `src/raft/raft_transport.{cpp,h}` contains no SSL code — so Raft traffic is **plaintext even when `raft.ssl.enabled=true`**.
 
 ## Does it support SASL / authentication?
 
@@ -51,7 +51,7 @@ Yes, partially. SASL/PLAIN (credentials from `sasl.plain.credentials.file` or in
 
 ## Is it single-node or multi-broker today?
 
-The single-node broker is the primary, production-intended mode and is fully functional. Multi-broker Raft replication exists as infrastructure (ISR tracking, follower fetch, leader election, a 3-broker Docker Compose) but is **not** production-hardened — treat clustering as experimental and validate failover yourself before relying on it.
+The single-node broker is the primary, production-intended mode and is fully functional. Multi-broker Raft replication exists as infrastructure — leader election and metadata consensus work end-to-end, ISR is tracked, and a 3-broker Docker Compose ships — but it is **not** production-hardened. In particular the follower record-fetcher is still a stub (`ReplicaManager::fetchFromLeader` is a no-op with a TODO), so followers do not yet copy partition data from the leader; treat clustering as experimental and validate failover yourself before relying on it.
 
 ## Where is data stored?
 

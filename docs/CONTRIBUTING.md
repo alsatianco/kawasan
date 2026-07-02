@@ -124,7 +124,7 @@ These run against a live broker and validate the Kafka drop-in contract:
 
 **Good first issues:** documentation, additional unit tests, code cleanup/refactoring, and well-scoped bug fixes.
 
-**Larger efforts:** protocol-API coverage (see [./api_coverage_matrix.md](./api_coverage_matrix.md) for current support), the Streams and Connect surfaces, performance optimization, and security features. Multi-broker Raft replication exists but is **not** production-hardened — for example, `raft.ssl.*` keys are parsed and validated but are not wired into the transport (`src/raft/raft_transport.{cpp,h}` has no TLS), so inter-broker Raft traffic is plaintext even with `raft.ssl.enabled=true`. Hardening this path is a high-value area. The single-node broker is the primary, production-ready mode.
+**Larger efforts:** protocol-API coverage (see [./api_coverage_matrix.md](./api_coverage_matrix.md) for current support), the Streams task runtime and Connect REST surfaces, durable transactions, performance optimization, and security features. Multi-broker Raft replication exists but is **not** production-hardened — the metadata plane (election, ISR tracking, assignment) works, but the highest-value remaining gap is the **follower record-fetcher** (`ReplicaManager::fetchFromLeader` is a stub, so followers do not yet copy partition data from the leader). Separately, `raft.ssl.*` keys are parsed and validated but are not wired into the transport (`src/raft/raft_transport.{cpp,h}` has no TLS), so inter-broker Raft traffic is plaintext even with `raft.ssl.enabled=true`. Hardening these paths is high-value. The single-node broker is the primary, production-ready mode.
 
 ## Licensing
 
