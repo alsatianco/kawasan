@@ -4021,18 +4021,24 @@ Buffer KawasanBroker::handleDescribeTransactions(
     for (const auto& tid : req.transactionalIds()) {
         protocol::DescribeTransactionsResponse::State s;
         s.transactional_id = tid;
-        if (transaction_coordinator_) {
-            const auto opt = transaction_coordinator_->describe(tid);
-            if (opt.has_value()) {
-                s.error_code = ErrorCode::NONE;
-                s.state = TransactionCoordinator::stateName(opt->state);
-            } else {
-                s.error_code = ErrorCode::NONE;
-                s.state = "Empty";
+        s.error_code = ErrorCode::NONE;
+        s.state = "Empty";
+        const auto opt = transaction_coordinator_ ? transaction_coordinator_->describe(tid)
+                                                  : std::nullopt;
+        if (opt.has_value()) {
+            s.state = TransactionCoordinator::stateName(opt->state);
+            s.transaction_timeout_ms = opt->transaction_timeout_ms;
+            s.transaction_start_time_ms = opt->state_start_time_ms;
+            s.producer_id = opt->producer_id;
+            s.producer_epoch = opt->producer_epoch;
+            // Group the snapshot's flat (topic, partition) list per topic.
+            std::map<std::string, std::vector<int32_t>> by_topic;
+            for (const auto& [topic, partition] : opt->partitions) {
+                by_topic[topic].push_back(partition);
             }
-        } else {
-            s.error_code = ErrorCode::NONE;
-            s.state = "Empty";
+            for (auto& [topic, partitions] : by_topic) {
+                s.topics.push_back({topic, std::move(partitions)});
+            }
         }
         resp.addState(std::move(s));
     }

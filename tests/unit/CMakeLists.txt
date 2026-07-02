@@ -38,6 +38,11 @@ add_executable(log_max_timestamp_test log_max_timestamp_test.cpp)
 target_link_libraries(log_max_timestamp_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME LogMaxTimestampTest COMMAND log_max_timestamp_test)
 
+# Golden-bytes lock for the v0-flexible admin APIs (CM-2)
+add_executable(admin_stubs_wire_test admin_stubs_wire_test.cpp)
+target_link_libraries(admin_stubs_wire_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME AdminStubsWireTest COMMAND admin_stubs_wire_test)
+
 # Quota manager test (Phase A6: client byte-rate throttling)
 add_executable(quota_manager_test quota_manager_test.cpp)
 target_link_libraries(quota_manager_test PRIVATE kawasan GTest::gtest GTest::gtest_main)

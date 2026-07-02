@@ -30,6 +30,7 @@ Single-node production-hardening and multi-broker metadata-plane fixes. The sing
 
 ### Fixed
 
+- **Wire format of DescribeProducers (61), DescribeTransactions (65), ListTransactions (66), and AlterPartition (56)** now uses flexible encoding (compact strings/arrays + tagged fields) as the Kafka spec requires for these v0-flexible APIs — previously the bodies were non-flexible while the headers were flexible, so Java AdminClient/kafka-ui would fail to parse them. `DescribeTransactions` additionally gained the missing v0 schema fields (`transaction_start_time_ms`, per-transaction topic/partition list, INT16 producer epoch) and now populates real coordinator data; `AlterPartition` gained its full v0 request/response codec (previously decoded nothing). Golden-bytes tests (`AdminStubsWireTest`) lock the layouts.
 - **Compaction can no longer touch the active segment**, structurally: `LogSegment::deleteBatchAt` refuses destructive ops while its segment is active (previously the only protection was the shape of `Log::cleanup()`'s loop bound), guarded by a concurrent compaction-vs-produce stress test.
 - **`ListOffsets` MAX_TIMESTAMP (-3) excludes control batches** — transaction COMMIT/ABORT markers carry wall-clock timestamps and previously could win the scan, pointing consumers at a marker instead of a data record.
 
