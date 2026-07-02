@@ -28,6 +28,16 @@ add_executable(log_durability_test log_durability_test.cpp)
 target_link_libraries(log_durability_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME LogDurabilityTest COMMAND log_durability_test)
 
+# Log compaction active-segment guard + concurrency stress (P2)
+add_executable(log_compaction_race_test log_compaction_race_test.cpp)
+target_link_libraries(log_compaction_race_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME LogCompactionRaceTest COMMAND log_compaction_race_test)
+
+# ListOffsets MAX_TIMESTAMP backend: control batches excluded (P2 rider)
+add_executable(log_max_timestamp_test log_max_timestamp_test.cpp)
+target_link_libraries(log_max_timestamp_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME LogMaxTimestampTest COMMAND log_max_timestamp_test)
+
 # Quota manager test (Phase A6: client byte-rate throttling)
 add_executable(quota_manager_test quota_manager_test.cpp)
 target_link_libraries(quota_manager_test PRIVATE kawasan GTest::gtest GTest::gtest_main)

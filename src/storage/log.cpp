@@ -41,7 +41,8 @@ LogConfig LogConfig::fromMap(const std::map<std::string, std::string>& configs,
             // trim whitespace
             auto first = token.find_first_not_of(" \t");
             auto last = token.find_last_not_of(" \t");
-            if (first == std::string::npos) continue;
+            if (first == std::string::npos)
+                continue;
             token = token.substr(first, last - first + 1);
             if (token == "delete") {
                 result.cleanup_policy_delete = true;
@@ -203,11 +204,13 @@ std::vector<uint8_t> Log::readRaw(Offset start_offset, size_t max_bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<uint8_t> out;
     for (const auto& segment : segments_) {
-        if (out.size() >= max_bytes) break;
+        if (out.size() >= max_bytes)
+            break;
         const Offset seg_base = segment->baseOffset();
         const Offset seg_next = segment->nextOffset();
         const Offset effective_start = std::max(start_offset, seg_base);
-        if (effective_start >= seg_next) continue;
+        if (effective_start >= seg_next)
+            continue;
 
         const size_t remaining = max_bytes - out.size();
         auto bytes = segment->readRaw(effective_start, remaining);
@@ -283,6 +286,29 @@ void Log::close() {
     closed_ = true;
 }
 
+std::optional<std::pair<Offset, int64_t>> Log::maxTimestampOffset() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::optional<std::pair<Offset, int64_t>> best;
+    for (const auto& segment : segments_) {
+        std::vector<RecordBatch> batches;
+        try {
+            batches = segment->read(segment->baseOffset(), std::numeric_limits<size_t>::max());
+        } catch (const std::exception& ex) {
+            Logger::warn("maxTimestampOffset read failed for {}: {}", segment->path(), ex.what());
+            continue;  // best-effort scan; a partial answer is OK
+        }
+        for (const auto& batch : batches) {
+            if (batch.isControlBatch()) {
+                continue;  // txn markers carry wall-clock timestamps; never the answer
+            }
+            if (!best || batch.maxTimestamp() > best->second) {
+                best = std::make_pair(batch.baseOffset(), batch.maxTimestamp());
+            }
+        }
+    }
+    return best;
+}
+
 void Log::maybeRoll() {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -298,7 +324,8 @@ Offset Log::truncatePrefix(Offset new_start_offset) {
     // Clamp upper bound to the next-to-be-written offset. Truncating past the
     // log end is a no-op (we never invent a non-existent start offset).
     const Offset end = endOffsetUnlocked();
-    if (new_start_offset > end) new_start_offset = end;
+    if (new_start_offset > end)
+        new_start_offset = end;
     if (new_start_offset <= startOffsetUnlocked()) {
         return startOffsetUnlocked();
     }
@@ -421,18 +448,17 @@ void Log::cleanup() {
             auto& segment = segments_[idx];
             std::vector<RecordBatch> batches;
             try {
-                batches = segment->read(segment->baseOffset(),
-                                        std::numeric_limits<size_t>::max());
+                batches = segment->read(segment->baseOffset(), std::numeric_limits<size_t>::max());
             } catch (const std::exception& ex) {
-                Logger::warn("Compaction pass1 read failed for {}: {}",
-                             segment->path(), ex.what());
+                Logger::warn("Compaction pass1 read failed for {}: {}", segment->path(), ex.what());
                 continue;
             }
             for (const auto& batch : batches) {
                 const Offset base = batch.baseOffset();
                 const auto& records = batch.records();
                 for (size_t i = 0; i < records.size(); ++i) {
-                    if (!records[i].key) continue;
+                    if (!records[i].key)
+                        continue;
                     std::string key(records[i].key->begin(), records[i].key->end());
                     const Offset rec_offset = base + static_cast<Offset>(i);
                     auto it = latest_offset.find(key);
@@ -444,17 +470,21 @@ void Log::cleanup() {
         }
 
         // Pass 2: drop batches in non-active segments whose every record is
-        // superseded.
+        // superseded. The loop bound already excludes the newest segment;
+        // the isActive() check makes the invariant hold even if the bound or
+        // the segment list shape changes (deleteBatchAt refuses as a final
+        // backstop).
         size_t deleted_batches = 0;
         for (size_t idx = 0; idx + 1 < segments_.size(); ++idx) {
             auto& segment = segments_[idx];
+            if (segment->isActive()) {
+                continue;
+            }
             std::vector<RecordBatch> batches;
             try {
-                batches = segment->read(segment->baseOffset(),
-                                        std::numeric_limits<size_t>::max());
+                batches = segment->read(segment->baseOffset(), std::numeric_limits<size_t>::max());
             } catch (const std::exception& ex) {
-                Logger::warn("Compaction pass2 read failed for {}: {}",
-                             segment->path(), ex.what());
+                Logger::warn("Compaction pass2 read failed for {}: {}", segment->path(), ex.what());
                 continue;
             }
             for (const auto& batch : batches) {
@@ -491,12 +521,10 @@ void Log::cleanup() {
         }
 
         if (deleted_batches > 0) {
-            Logger::info(
-                "Compaction for {}-{}: dropped {} batch(es) across {} segment(s); "
-                "{} unique keys retained",
-                topic_, partition_, deleted_batches,
-                segments_.size() > 0 ? segments_.size() - 1 : 0,
-                latest_offset.size());
+            Logger::info("Compaction for {}-{}: dropped {} batch(es) across {} segment(s); "
+                         "{} unique keys retained",
+                         topic_, partition_, deleted_batches,
+                         segments_.size() > 0 ? segments_.size() - 1 : 0, latest_offset.size());
             modified = true;
         }
     }
@@ -532,19 +560,25 @@ void Log::loadSegments() {
     for (const auto& [base_offset, path] : segment_paths) {
         segments_.push_back(std::make_unique<LogSegment>(base_offset, path));
     }
+    if (!segments_.empty()) {
+        segments_.back()->setActive(true);
+    }
 }
 
 void Log::rollNewSegment() {
     Offset base_offset = endOffsetUnlocked();
-    std::string segment_path =
-        log_dir_ + "/" + std::to_string(base_offset);
+    std::string segment_path = log_dir_ + "/" + std::to_string(base_offset);
 
+    if (!segments_.empty()) {
+        segments_.back()->setActive(false);
+    }
     segments_.push_back(std::make_unique<LogSegment>(base_offset, segment_path));
+    segments_.back()->setActive(true);
     last_roll_time_ = now();
     last_roll_time_initialized_ = true;
     persistCheckpointLocked();
-    Logger::info("Rolled new segment for topic {} partition {} at offset {}", topic_,
-                 partition_, base_offset);
+    Logger::info("Rolled new segment for topic {} partition {} at offset {}", topic_, partition_,
+                 base_offset);
 }
 
 LogSegment* Log::activeSegment() {
@@ -565,8 +599,8 @@ bool Log::shouldRollForTime() const {
     if (config_.segment_ms <= 0 || !last_roll_time_initialized_) {
         return false;
     }
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now() - last_roll_time_);
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now() - last_roll_time_);
     return elapsed.count() >= config_.segment_ms;
 }
 
@@ -601,10 +635,9 @@ void Log::loadCheckpoint() {
         std::tie(stored_start, stored_end, stored_hw) = *checkpoint;
 
         if (stored_start != start || stored_end != end) {
-            Logger::warn(
-                "Checkpoint mismatch for {}-{} (stored start={}, end={}, actual "
-                "start={}, end={}) - updating checkpoint",
-                topic_, partition_, stored_start, stored_end, start, end);
+            Logger::warn("Checkpoint mismatch for {}-{} (stored start={}, end={}, actual "
+                         "start={}, end={}) - updating checkpoint",
+                         topic_, partition_, stored_start, stored_end, start, end);
         }
 
         const Offset clamped_hw = std::clamp(stored_hw, start, end);
@@ -620,8 +653,8 @@ void Log::persistCheckpointLocked() const {
     const Offset start = startOffsetUnlocked();
     const Offset end = endOffsetUnlocked();
     const std::string path = checkpointPath();
-    Logger::debug("Persisting checkpoint for {}-{} start={} end={} hw={}", topic_,
-                  partition_, start, end, high_watermark_);
+    Logger::debug("Persisting checkpoint for {}-{} start={} end={} hw={}", topic_, partition_,
+                  start, end, high_watermark_);
     fs::create_directories(log_dir_);
 
     // Crash-safe write: render the payload, write to a temp file, fsync it, then
@@ -649,7 +682,8 @@ void Log::persistCheckpointLocked() const {
     while (remaining > 0) {
         const ssize_t n = ::write(fd, buf, remaining);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             Logger::error("Failed to write checkpoint for {}-{}: {}", topic_, partition_,
                           std::strerror(errno));
             write_ok = false;
@@ -710,8 +744,8 @@ std::optional<std::tuple<Offset, Offset, Offset>> Log::readCheckpointFromDisk() 
                 saw_hw = true;
             }
         } catch (const std::exception& ex) {
-            Logger::warn("Invalid checkpoint entry '{}' for {}-{}: {}", line, topic_,
-                         partition_, ex.what());
+            Logger::warn("Invalid checkpoint entry '{}' for {}-{}: {}", line, topic_, partition_,
+                         ex.what());
         }
     }
 
@@ -728,8 +762,7 @@ std::string Log::checkpointPath() const {
 
 void Log::setHighWatermark(Offset offset) {
     std::lock_guard<std::mutex> lock(mutex_);
-    const Offset clamped =
-        std::clamp(offset, startOffsetUnlocked(), endOffsetUnlocked());
+    const Offset clamped = std::clamp(offset, startOffsetUnlocked(), endOffsetUnlocked());
     high_watermark_ = clamped;
     persistCheckpointLocked();
 }

@@ -28,6 +28,11 @@ Single-node production-hardening and multi-broker metadata-plane fixes. The sing
 - The durable high-watermark checkpoint is written atomically (temp file + fsync + rename).
 - `acks=all` waits (leader-side, with timeout) for the ISR-committed offset before acknowledging.
 
+### Fixed
+
+- **Compaction can no longer touch the active segment**, structurally: `LogSegment::deleteBatchAt` refuses destructive ops while its segment is active (previously the only protection was the shape of `Log::cleanup()`'s loop bound), guarded by a concurrent compaction-vs-produce stress test.
+- **`ListOffsets` MAX_TIMESTAMP (-3) excludes control batches** — transaction COMMIT/ABORT markers carry wall-clock timestamps and previously could win the scan, pointing consumers at a marker instead of a data record.
+
 ### Known Limitations
 
 - **Client/broker TLS is not implemented** and **Raft inter-broker traffic is always plaintext** (`raft.ssl.*` is parsed/validated but not wired into the transport) — unchanged from 0.2.0-alpha.

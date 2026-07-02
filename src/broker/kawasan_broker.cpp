@@ -2594,36 +2594,15 @@ RequestDispatcher::HandlerResult KawasanBroker::handleListOffsets(
                     partition_response.offset = log->logStartOffset();
                     partition_response.timestamp = partition.timestamp;
                 } else if (partition.timestamp == -3) {
-                    // Phase 1.5 / v7: MAX_TIMESTAMP — offset of the record
-                    // with the highest timestamp. Scan all batches and
-                    // pick the one whose max_timestamp is greatest. We
-                    // return its base_offset since a per-record offset
-                    // would require per-record timestamp tracking.
-                    Offset best_offset = log->logStartOffset();
-                    int64_t best_ts = INT64_MIN;
-                    try {
-                        Offset cur = log->logStartOffset();
-                        const Offset end = log->logEndOffset();
-                        while (cur < end) {
-                            auto batches = log->read(cur, /*max_bytes=*/64 * 1024);
-                            if (batches.empty()) break;
-                            Offset next = cur;
-                            for (const auto& batch : batches) {
-                                if (batch.maxTimestamp() > best_ts) {
-                                    best_ts = batch.maxTimestamp();
-                                    best_offset = batch.baseOffset();
-                                }
-                                next = batch.baseOffset() +
-                                       static_cast<Offset>(batch.records().size());
-                            }
-                            if (next <= cur) break;
-                            cur = next;
-                        }
-                    } catch (...) {
-                        // Best-effort scan; partial answer is OK.
-                    }
-                    partition_response.offset = best_offset;
-                    partition_response.timestamp = best_ts == INT64_MIN ? -1 : best_ts;
+                    // Phase 1.5 / v7: MAX_TIMESTAMP — offset of the data
+                    // batch with the highest timestamp (control batches
+                    // excluded). We return its base_offset since a
+                    // per-record offset would require per-record timestamp
+                    // tracking.
+                    auto best = log->maxTimestampOffset();
+                    partition_response.offset =
+                        best ? best->first : log->logStartOffset();
+                    partition_response.timestamp = best ? best->second : -1;
                 } else {
                     // Phase 1.5: timestamp-based offset lookup via batch
                     // scan. Returns the first batch whose first_timestamp

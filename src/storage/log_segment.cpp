@@ -1,13 +1,14 @@
 #include "kawasan/storage/log_segment.h"
 
+#include <rocksdb/cache.h>
 #include <rocksdb/db.h>
+#include <rocksdb/filter_policy.h>
 #include <rocksdb/options.h>
 #include <rocksdb/table.h>
-#include <rocksdb/cache.h>
-#include <rocksdb/filter_policy.h>
+
+#include <cstring>
 #include <memory>
 #include <utility>
-#include <cstring>
 
 #include "kawasan/common/error.h"
 #include "kawasan/common/logger.h"
@@ -18,15 +19,11 @@ namespace kawasan::storage {
 static std::string encodeOffsetKey(Offset offset) {
     // Use big-endian 64-bit encoding to ensure numerical ordering in RocksDB
     uint64_t u_offset = static_cast<uint64_t>(offset);
-    uint64_t be_offset = 
-        ((u_offset & 0xFF00000000000000ULL) >> 56) |
-        ((u_offset & 0x00FF000000000000ULL) >> 40) |
-        ((u_offset & 0x0000FF0000000000ULL) >> 24) |
-        ((u_offset & 0x000000FF00000000ULL) >> 8)  |
-        ((u_offset & 0x00000000FF000000ULL) << 8)  |
-        ((u_offset & 0x0000000000FF0000ULL) << 24) |
-        ((u_offset & 0x000000000000FF00ULL) << 40) |
-        ((u_offset & 0x00000000000000FFULL) << 56);
+    uint64_t be_offset =
+        ((u_offset & 0xFF00000000000000ULL) >> 56) | ((u_offset & 0x00FF000000000000ULL) >> 40) |
+        ((u_offset & 0x0000FF0000000000ULL) >> 24) | ((u_offset & 0x000000FF00000000ULL) >> 8) |
+        ((u_offset & 0x00000000FF000000ULL) << 8) | ((u_offset & 0x0000000000FF0000ULL) << 24) |
+        ((u_offset & 0x000000000000FF00ULL) << 40) | ((u_offset & 0x00000000000000FFULL) << 56);
     return std::string(reinterpret_cast<const char*>(&be_offset), sizeof(be_offset));
 }
 
@@ -41,15 +38,11 @@ static Offset decodeOffsetKey(const std::string& key) {
     }
     uint64_t be_offset;
     std::memcpy(&be_offset, key.data(), sizeof(be_offset));
-    uint64_t u_offset = 
-        ((be_offset & 0xFF00000000000000ULL) >> 56) |
-        ((be_offset & 0x00FF000000000000ULL) >> 40) |
-        ((be_offset & 0x0000FF0000000000ULL) >> 24) |
-        ((be_offset & 0x000000FF00000000ULL) >> 8)  |
-        ((be_offset & 0x00000000FF000000ULL) << 8)  |
-        ((be_offset & 0x0000000000FF0000ULL) << 24) |
-        ((be_offset & 0x000000000000FF00ULL) << 40) |
-        ((be_offset & 0x00000000000000FFULL) << 56);
+    uint64_t u_offset =
+        ((be_offset & 0xFF00000000000000ULL) >> 56) | ((be_offset & 0x00FF000000000000ULL) >> 40) |
+        ((be_offset & 0x0000FF0000000000ULL) >> 24) | ((be_offset & 0x000000FF00000000ULL) >> 8) |
+        ((be_offset & 0x00000000FF000000ULL) << 8) | ((be_offset & 0x0000000000FF0000ULL) << 24) |
+        ((be_offset & 0x000000000000FF00ULL) << 40) | ((be_offset & 0x00000000000000FFULL) << 56);
     return static_cast<Offset>(u_offset);
 }
 
@@ -66,6 +59,7 @@ LogSegment::LogSegment(LogSegment&& other) noexcept {
     next_offset_ = other.next_offset_;
     size_bytes_ = other.size_bytes_;
     closed_ = other.closed_;
+    active_ = other.active_;
     other.closed_ = true;
 }
 
@@ -81,6 +75,7 @@ LogSegment& LogSegment::operator=(LogSegment&& other) noexcept {
     next_offset_ = other.next_offset_;
     size_bytes_ = other.size_bytes_;
     closed_ = other.closed_;
+    active_ = other.active_;
     other.closed_ = true;
     return *this;
 }
@@ -121,7 +116,7 @@ void LogSegment::open() {
     rocksdb::BlockBasedTableOptions table_opts;
     table_opts.block_cache = sharedBlockCache();
     table_opts.filter_policy.reset(rocksdb::NewBloomFilterPolicy(/*bits_per_key=*/10,
-                                                                /*use_block_based=*/false));
+                                                                 /*use_block_based=*/false));
     table_opts.cache_index_and_filter_blocks = true;
     options.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_opts));
 
@@ -163,8 +158,7 @@ Offset LogSegment::append(const RecordBatch& batch, bool sync) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (closed_) {
-        throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR,
-                               "Cannot append to closed segment");
+        throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR, "Cannot append to closed segment");
     }
 
     Offset offset = next_offset_;
@@ -179,9 +173,8 @@ Offset LogSegment::append(const RecordBatch& batch, bool sync) {
     rocksdb::WriteOptions write_opts;
     write_opts.sync = sync;
     std::string key = encodeOffsetKey(offset);
-    rocksdb::Status status =
-        db_->Put(write_opts, key,
-                 rocksdb::Slice(reinterpret_cast<const char*>(data.data()), data.size()));
+    rocksdb::Status status = db_->Put(
+        write_opts, key, rocksdb::Slice(reinterpret_cast<const char*>(data.data()), data.size()));
 
     if (!status.ok()) {
         throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR,
@@ -227,7 +220,8 @@ std::vector<uint8_t> LogSegment::readRaw(Offset start_offset, size_t max_bytes) 
     std::lock_guard<std::mutex> lock(mutex_);
 
     std::vector<uint8_t> out;
-    if (max_bytes == 0) return out;
+    if (max_bytes == 0)
+        return out;
 
     std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(rocksdb::ReadOptions()));
     std::string start_key = encodeOffsetKey(start_offset);
@@ -255,11 +249,9 @@ std::vector<uint8_t> LogSegment::readRaw(Offset start_offset, size_t max_bytes) 
         // is at a fixed offset, but parsing it correctly requires care.
         // We fall back to a single deserialize per batch on this path
         // only for the boundary check; downstream gets the raw bytes.
-        std::vector<uint8_t> bytes(value.data(),
-                                   value.data() + value.size());
+        std::vector<uint8_t> bytes(value.data(), value.data() + value.size());
         auto batch_check = RecordBatch::deserialize(bytes);
-        const Offset batch_end =
-            batch_base + static_cast<Offset>(batch_check.records().size());
+        const Offset batch_end = batch_base + static_cast<Offset>(batch_check.records().size());
         if (batch_end <= start_offset) {
             it->Next();
             continue;
@@ -351,13 +343,28 @@ void LogSegment::close() {
     }
 }
 
+void LogSegment::setActive(bool active) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    active_ = active;
+}
+
+bool LogSegment::isActive() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return active_;
+}
+
 bool LogSegment::deleteBatchAt(Offset base) {
     // Phase 3.2: drop the batch at the given offset. Used by Log::cleanup()
     // for cleanup.policy=compact. The deletion is per-batch (the granularity
     // of our RocksDB key scheme); compaction code is expected to only call
     // this for batches that have no records worth keeping.
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!db_ || closed_) return false;
+    if (!db_ || closed_)
+        return false;
+    if (active_) {
+        Logger::warn("Refusing deleteBatchAt({}) on the active segment at {}", base, path_);
+        return false;
+    }
 
     std::string key = encodeOffsetKey(base);
     std::string existing;

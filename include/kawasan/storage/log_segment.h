@@ -76,10 +76,19 @@ public:
 
     /// @brief Phase 3.2: streaming compaction support.
     /// Delete the batch keyed at `base` (compaction's "drop this batch" op).
-    /// Safe to call while the active segment is held by another writer;
-    /// callers must coordinate so the active segment isn't compacted.
+    /// Refuses (returns false) while this segment is marked active — the
+    /// active segment is append-only until rolled, so no caller can compact
+    /// live produce data regardless of its own loop bounds.
     /// Returns true if a batch was actually removed.
     bool deleteBatchAt(Offset base);
+
+    /// @brief Marks this segment as the log's active (append) segment.
+    /// The owning Log keeps exactly the newest segment active; destructive
+    /// per-batch ops (deleteBatchAt) refuse while the flag is set.
+    void setActive(bool active);
+
+    /// @brief Returns whether this segment is the active (append) segment.
+    bool isActive() const;
 
 private:
     void open();
@@ -91,6 +100,7 @@ private:
     Offset next_offset_;
     size_t size_bytes_ = 0;
     bool closed_ = false;
+    bool active_ = false;
 };
 
 }  // namespace kawasan::storage

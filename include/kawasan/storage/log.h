@@ -25,9 +25,9 @@ enum class FlushMode { kSync, kAsync };
 
 /// @brief Configuration for a log
 struct LogConfig {
-    size_t segment_size = 1024 * 1024 * 1024;  // 1GB
-    int64_t segment_ms = -1;                    // Time-based rolling (disabled by default)
-    int64_t retention_bytes = -1;               // -1 = unlimited
+    size_t segment_size = 1024 * 1024 * 1024;        // 1GB
+    int64_t segment_ms = -1;                         // Time-based rolling (disabled by default)
+    int64_t retention_bytes = -1;                    // -1 = unlimited
     int64_t retention_ms = 7 * 24 * 60 * 60 * 1000;  // 7 days
     bool cleanup_policy_compact = false;
     bool cleanup_policy_delete = true;
@@ -106,6 +106,14 @@ public:
 
     /// @brief Returns the partition ID
     PartitionId partition() const { return partition_; }
+
+    /// @brief Backend for ListOffsets MAX_TIMESTAMP (-3): the base offset and
+    /// max timestamp of the data batch with the highest timestamp. Control
+    /// batches (transaction COMMIT/ABORT markers) are excluded — their
+    /// wall-clock timestamps must never win the scan. Returns nullopt when
+    /// the log holds no data batches. O(n) over batches until a timestamp
+    /// index (.timeindex analog) lands.
+    std::optional<std::pair<Offset, int64_t>> maxTimestampOffset();
 
     /// @brief Rolls a new segment if needed
     void maybeRoll();
