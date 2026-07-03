@@ -88,10 +88,15 @@ Read in `src/broker/kawasan_broker.cpp`; also surfaced through DescribeConfigs.
 |-----|------|---------|--------|-------------|
 | `network.io_threads` | int | hardware concurrency (≥1) | Honored | TCP server I/O thread count. Values `<= 0` fall back to the hardware default. |
 | `network.max_frame_bytes` | long | `16777216` (16 MiB) | Honored | Maximum accepted request frame size. |
+| `network.tcp_nodelay` | bool | `true` | Honored | Sets `TCP_NODELAY` on accepted client sockets (disables Nagle; Kafka parity). |
+| `network.tcp_keepalive` | bool | `true` | Honored | Sets `SO_KEEPALIVE` on accepted client sockets so half-open peers are detected. |
+| `network.socket_send_buffer_bytes` | int | `0` (OS default) | Honored | `SO_SNDBUF` for accepted client sockets; `0` keeps the kernel default. |
+| `network.socket_recv_buffer_bytes` | int | `0` (OS default) | Honored | `SO_RCVBUF` for accepted client sockets; `0` keeps the kernel default. |
+| `network.idle_connection_timeout_seconds` | long | `600` | Honored | Idle client connections are closed after this long; reap interval is `clamp(timeout/2, 5s, 60s)`. `0` disables reaping. |
 | `num.network.threads` | int | `8` | Inert | Accepted; only range-validated. Use `network.io_threads`. |
 | `num.io.threads` | int | `8` | Inert | Accepted; only range-validated. |
-| `socket.send.buffer.bytes` | int | `102400` | Inert | Accepted; not applied. |
-| `socket.receive.buffer.bytes` | int | `102400` | Inert | Accepted; not applied. |
+| `socket.send.buffer.bytes` | int | `102400` | Inert | Accepted; not applied — use `network.socket_send_buffer_bytes` (the shipped configs carry small values that would shrink kernel defaults if honored). |
+| `socket.receive.buffer.bytes` | int | `102400` | Inert | Accepted; not applied — use `network.socket_recv_buffer_bytes`. |
 | `socket.request.max.bytes` | int | `104857600` | Inert | Accepted; frame cap is `network.max_frame_bytes`. |
 
 ## Storage paths

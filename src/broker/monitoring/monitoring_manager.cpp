@@ -10,7 +10,7 @@ namespace kawasan::broker::monitoring {
 
 MonitoringManager::MonitoringManager(const std::string& host, int port)
     : http_server_(std::make_unique<HttpServer>(host, port)),
-      metrics_collector_(std::make_unique<MetricsCollector>()) {
+      metrics_collector_(std::make_shared<MetricsCollector>()) {
     
     // Register HTTP handlers
     http_server_->registerHandler("/health", 

@@ -1128,9 +1128,22 @@ void KawasanBroker::startServices() {
     server_tls_config.key_password = tls_config_.key_password;
     server_tls_config.verify_client = tls_config_.requiresClientAuth();
 
+    // Kernel-level socket tuning + idle reaping, operator-configurable.
+    network::SocketTuning socket_tuning;
+    socket_tuning.no_delay = config_.get<bool>("network.tcp_nodelay", true);
+    socket_tuning.keep_alive = config_.get<bool>("network.tcp_keepalive", true);
+    socket_tuning.send_buffer_bytes =
+        config_.get<int32_t>("network.socket_send_buffer_bytes", 0);
+    socket_tuning.recv_buffer_bytes =
+        config_.get<int32_t>("network.socket_recv_buffer_bytes", 0);
+    const auto idle_timeout = std::chrono::seconds(
+        config_.get<int64_t>("network.idle_connection_timeout_seconds", 600));
+
     tcp_server_ = std::make_unique<network::TcpServer>(
         host_, port_, static_cast<size_t>(configured_threads), max_frame_bytes,
-        request_dispatcher_, nullptr, std::chrono::seconds(600), server_tls_config);
+        request_dispatcher_,
+        monitoring_manager_ ? monitoring_manager_->sharedMetricsCollector() : nullptr,
+        idle_timeout, server_tls_config, socket_tuning);
     tcp_server_->start();
     port_ = tcp_server_->listeningPort();
 

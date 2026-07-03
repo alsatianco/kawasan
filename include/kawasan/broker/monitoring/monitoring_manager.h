@@ -29,6 +29,10 @@ public:
     /// @brief Get the metrics collector
     MetricsCollector* metricsCollector() { return metrics_collector_.get(); }
 
+    /// @brief Shared handle for subsystems (e.g. TcpServer) that may outlive
+    /// a single scrape but not the manager itself.
+    std::shared_ptr<MetricsCollector> sharedMetricsCollector() { return metrics_collector_; }
+
     /// @brief Set broker health status
     void setBrokerHealthy(bool healthy) { broker_healthy_ = healthy; }
 
@@ -42,8 +46,8 @@ private:
     HttpResponse handleMetrics(const HttpRequest& request);
 
     std::unique_ptr<HttpServer> http_server_;
-    std::unique_ptr<MetricsCollector> metrics_collector_;
-    
+    std::shared_ptr<MetricsCollector> metrics_collector_;
+
     bool broker_healthy_ = false;
     bool broker_ready_ = false;
 };

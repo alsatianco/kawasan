@@ -11,6 +11,10 @@
 
 namespace kawasan::broker::monitoring {
 
+/// @brief Why a client connection was closed — the label set of
+/// kawasan_connections_closed_total.
+enum class ConnectionCloseReason { kNormal, kIdleTimeout, kProtocolError, kIoError };
+
 /// @brief Metrics collector for Prometheus exposition
 class MetricsCollector {
 public:
@@ -24,6 +28,8 @@ public:
     void incrementBytesOut(int64_t bytes);
     void incrementRequestsTotal(const std::string& api_key);
     void incrementRequestErrors(const std::string& api_key);
+    void incrementConnectionsCreated();
+    void incrementConnectionClosed(ConnectionCloseReason reason);
 
     // Gauge metrics
     void setActiveConnections(int64_t count);
@@ -39,8 +45,8 @@ public:
     void recordRequestLatency(const std::string& api_key, double milliseconds);
 
     // Consumer lag metrics
-    void setConsumerLag(const std::string& group, const std::string& topic, 
-                       int32_t partition, int64_t lag);
+    void setConsumerLag(const std::string& group, const std::string& topic, int32_t partition,
+                        int64_t lag);
     std::unordered_map<std::string, int64_t> getConsumerLagMetrics() const;
 
     /// @brief Export metrics in Prometheus text format
@@ -54,7 +60,9 @@ public:
     using TransactionProvider = std::function<std::string()>;
     using GroupProvider = std::function<std::string()>;
     using LogCleanerProvider = std::function<std::string()>;
-    void setProducerStateProvider(ProducerStateProvider p) { producer_state_provider_ = std::move(p); }
+    void setProducerStateProvider(ProducerStateProvider p) {
+        producer_state_provider_ = std::move(p);
+    }
     void setFetchSessionProvider(FetchSessionProvider p) { fetch_session_provider_ = std::move(p); }
     void setTransactionProvider(TransactionProvider p) { transaction_provider_ = std::move(p); }
     void setGroupProvider(GroupProvider p) { group_provider_ = std::move(p); }
@@ -64,9 +72,9 @@ private:
     struct HistogramBucket {
         std::atomic<uint64_t> count{0};
         double upper_bound;
-        
+
         HistogramBucket(double ub) : count(0), upper_bound(ub) {}
-        HistogramBucket(const HistogramBucket& other) 
+        HistogramBucket(const HistogramBucket& other)
             : count(other.count.load()), upper_bound(other.upper_bound) {}
         HistogramBucket& operator=(const HistogramBucket&) = delete;
     };
@@ -84,7 +92,12 @@ private:
     std::atomic<int64_t> messages_consumed_{0};
     std::atomic<int64_t> bytes_in_{0};
     std::atomic<int64_t> bytes_out_{0};
-    
+    std::atomic<int64_t> connections_created_{0};
+    std::atomic<int64_t> connections_closed_normal_{0};
+    std::atomic<int64_t> connections_closed_idle_timeout_{0};
+    std::atomic<int64_t> connections_closed_protocol_error_{0};
+    std::atomic<int64_t> connections_closed_io_error_{0};
+
     // Gauge metrics
     std::atomic<int64_t> active_connections_{0};
     std::atomic<int64_t> topic_count_{0};
@@ -118,7 +131,7 @@ private:
     LogCleanerProvider log_cleaner_provider_;
 
     std::string formatHistogram(const std::string& name, const std::string& help,
-                               const Histogram& hist, const std::string& labels = "") const;
+                                const Histogram& hist, const std::string& labels = "") const;
 };
 
 }  // namespace kawasan::broker::monitoring

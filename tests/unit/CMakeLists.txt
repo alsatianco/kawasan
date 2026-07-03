@@ -43,6 +43,11 @@ add_executable(admin_stubs_wire_test admin_stubs_wire_test.cpp)
 target_link_libraries(admin_stubs_wire_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME AdminStubsWireTest COMMAND admin_stubs_wire_test)
 
+# Socket tuning on accepted connections (P3)
+add_executable(tcp_socket_tuning_test tcp_socket_tuning_test.cpp)
+target_link_libraries(tcp_socket_tuning_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME TcpSocketTuningTest COMMAND tcp_socket_tuning_test)
+
 # Quota manager test (Phase A6: client byte-rate throttling)
 add_executable(quota_manager_test quota_manager_test.cpp)
 target_link_libraries(quota_manager_test PRIVATE kawasan GTest::gtest GTest::gtest_main)

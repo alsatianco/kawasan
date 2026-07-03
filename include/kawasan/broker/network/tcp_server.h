@@ -1,6 +1,10 @@
 #pragma once
 
 #include <atomic>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/ssl.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -9,15 +13,13 @@
 #include <unordered_map>
 #include <vector>
 
-#include <boost/asio/io_context.hpp>
-#include <boost/asio/ip/tcp.hpp>
-#include <boost/asio/ssl.hpp>
-#include <boost/asio/steady_timer.hpp>
-
 #include "kawasan/broker/request_dispatcher.h"
 #include "kawasan/common/types.h"
 
-namespace kawasan::broker::monitoring { class MetricsCollector; }
+namespace kawasan::broker::monitoring {
+class MetricsCollector;
+enum class ConnectionCloseReason;
+}  // namespace kawasan::broker::monitoring
 
 namespace kawasan::broker::network {
 
@@ -31,15 +33,30 @@ struct TlsConfig {
     bool verify_client = false;
 };
 
-/// @brief TCP server that accepts Kafka protocol connections and emits UNSUPPORTED_VERSION responses.
+/// @brief Kernel-level tuning applied to every accepted client socket.
+/// Kafka parity: TCP_NODELAY on (Nagle adds delayed-ACK stalls to small
+/// request/response round-trips), SO_KEEPALIVE on (detect half-open peers),
+/// and operator-configurable SO_SNDBUF/SO_RCVBUF (0 = keep the OS default).
+struct SocketTuning {
+    bool no_delay = true;
+    bool keep_alive = true;
+    int32_t send_buffer_bytes = 0;
+    int32_t recv_buffer_bytes = 0;
+};
+
+/// @brief Applies SocketTuning to a connected socket. Failures are logged
+/// and non-fatal — a socket that cannot be tuned still serves traffic.
+void applySocketTuning(boost::asio::ip::tcp::socket& socket, const SocketTuning& tuning);
+
+/// @brief TCP server that accepts Kafka protocol connections and emits UNSUPPORTED_VERSION
+/// responses.
 class TcpServer {
 public:
-    TcpServer(std::string host, int32_t port, size_t io_threads,
-              size_t max_frame_size_bytes,
+    TcpServer(std::string host, int32_t port, size_t io_threads, size_t max_frame_size_bytes,
               std::shared_ptr<RequestDispatcher> dispatcher,
               std::shared_ptr<kawasan::broker::monitoring::MetricsCollector> metrics = nullptr,
               std::chrono::seconds idle_timeout = std::chrono::seconds(600),
-              TlsConfig tls_config = TlsConfig{});
+              TlsConfig tls_config = TlsConfig{}, SocketTuning socket_tuning = SocketTuning{});
     ~TcpServer();
 
     TcpServer(const TcpServer&) = delete;
@@ -61,8 +78,7 @@ private:
     void doAccept(tcp::acceptor* acceptor);
     std::vector<tcp::endpoint> resolveEndpoints();
     static bool isLocalhost(const std::string& host);
-    RequestDispatcher::DispatchResult dispatchRequest(
-        RequestDispatcher::RequestContext context);
+    RequestDispatcher::DispatchResult dispatchRequest(RequestDispatcher::RequestContext context);
     void trackSession(const std::shared_ptr<TcpSession>& session);
     void untrackSession(TcpSession* session);
     void startIdleCheckTimer();
@@ -70,6 +86,7 @@ private:
     void recordBytesIn(int64_t bytes);
     void recordBytesOut(int64_t bytes);
     void recordConnectionError();
+    void recordConnectionClosed(kawasan::broker::monitoring::ConnectionCloseReason reason);
 
     std::string raw_host_;
     std::string host_;
@@ -86,6 +103,8 @@ private:
     // TLS support
     TlsConfig tls_config_;
     std::unique_ptr<boost::asio::ssl::context> ssl_context_;
+
+    SocketTuning socket_tuning_;
 
     mutable std::mutex state_mutex_;
     boost::asio::io_context io_context_;

@@ -21,6 +21,7 @@ Single-node production-hardening and multi-broker metadata-plane fixes. The sing
 - **`broker.rack`** is advertised to clients (Metadata v1+/DescribeCluster) for rack-aware fetch.
 - **Rebuilt internal-topic partition counts.** `offsets.topic.num.partitions` / `transaction.state.topic.num.partitions` are configurable (default 16); each partition is a RocksDB instance, so the count drives the startup file-descriptor footprint.
 - Multi-broker metadata plane: Raft election/commit fixes (elections and commit now complete), commit-apply moved off the Raft lock, cross-broker replica assignment for RF > 1, and a controller-startup-race fix.
+- **Socket tuning + connection lifecycle metrics.** Accepted client sockets get `TCP_NODELAY` and `SO_KEEPALIVE` by default plus configurable kernel buffers (`network.tcp_nodelay`, `network.tcp_keepalive`, `network.socket_send_buffer_bytes`, `network.socket_recv_buffer_bytes`); the idle-connection timeout is configurable (`network.idle_connection_timeout_seconds`, reap interval now adaptive). New Prometheus counters `kawasan_connections_created_total` and `kawasan_connections_closed_total{reason=normal|idle_timeout|protocol_error|io_error}`; the TCP server is now actually wired to the metrics collector (bytes/connection gauges previously never updated).
 
 ### Changed
 

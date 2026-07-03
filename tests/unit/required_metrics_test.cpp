@@ -4,12 +4,12 @@
 
 #include <gtest/gtest.h>
 
+#include <regex>
+
 #include "kawasan/broker/fetch_session_manager.h"
 #include "kawasan/broker/monitoring/metrics_collector.h"
 #include "kawasan/broker/producer_state_manager.h"
 #include "kawasan/broker/transaction_coordinator.h"
-
-#include <regex>
 
 namespace {
 
@@ -22,7 +22,8 @@ bool hasMetric(const std::string& text, const std::string& name) {
     const std::regex r("^# TYPE " + name + "[ \\t]");
     std::istringstream iss(text);
     for (std::string line; std::getline(iss, line);) {
-        if (std::regex_search(line, r)) return true;
+        if (std::regex_search(line, r))
+            return true;
     }
     return false;
 }
@@ -43,9 +44,11 @@ TEST(RequiredMetricsTest, AllSubsystemMetricsExposed) {
     mc.setProducerStateProvider([&]() {
         auto m = psm.getMetrics();
         std::ostringstream oss;
-        oss << "# HELP kawasan_producer_state_entries x\n# TYPE kawasan_producer_state_entries gauge\n"
+        oss << "# HELP kawasan_producer_state_entries x\n# TYPE kawasan_producer_state_entries "
+               "gauge\n"
             << "kawasan_producer_state_entries " << m.entries << "\n\n"
-            << "# HELP kawasan_producer_state_evictions_total x\n# TYPE kawasan_producer_state_evictions_total counter\n"
+            << "# HELP kawasan_producer_state_evictions_total x\n# TYPE "
+               "kawasan_producer_state_evictions_total counter\n"
             << "kawasan_producer_state_evictions_total " << m.evictions_total << "\n\n"
             << "# HELP kawasan_producer_id_count x\n# TYPE kawasan_producer_id_count gauge\n"
             << "kawasan_producer_id_count " << m.producer_id_count << "\n\n";
@@ -56,22 +59,28 @@ TEST(RequiredMetricsTest, AllSubsystemMetricsExposed) {
         std::ostringstream oss;
         oss << "# HELP kawasan_fetch_session_count x\n# TYPE kawasan_fetch_session_count gauge\n"
             << "kawasan_fetch_session_count " << m.session_count << "\n\n"
-            << "# HELP kawasan_fetch_session_evictions_total x\n# TYPE kawasan_fetch_session_evictions_total counter\n"
+            << "# HELP kawasan_fetch_session_evictions_total x\n# TYPE "
+               "kawasan_fetch_session_evictions_total counter\n"
             << "kawasan_fetch_session_evictions_total " << m.evictions_total << "\n\n"
-            << "# HELP kawasan_incremental_fetch_session_hit_ratio x\n# TYPE kawasan_incremental_fetch_session_hit_ratio gauge\n"
+            << "# HELP kawasan_incremental_fetch_session_hit_ratio x\n# TYPE "
+               "kawasan_incremental_fetch_session_hit_ratio gauge\n"
             << "kawasan_incremental_fetch_session_hit_ratio " << m.incremental_hit_ratio << "\n\n";
         return oss.str();
     });
     mc.setTransactionProvider([&]() {
         auto m = tc.getMetrics();
         std::ostringstream oss;
-        oss << "# HELP kawasan_transactions_in_progress x\n# TYPE kawasan_transactions_in_progress gauge\n"
+        oss << "# HELP kawasan_transactions_in_progress x\n# TYPE kawasan_transactions_in_progress "
+               "gauge\n"
             << "kawasan_transactions_in_progress " << m.in_progress << "\n\n"
-            << "# HELP kawasan_transaction_commits_total x\n# TYPE kawasan_transaction_commits_total counter\n"
+            << "# HELP kawasan_transaction_commits_total x\n# TYPE "
+               "kawasan_transaction_commits_total counter\n"
             << "kawasan_transaction_commits_total " << m.commits_total << "\n\n"
-            << "# HELP kawasan_transaction_aborts_total x\n# TYPE kawasan_transaction_aborts_total counter\n"
+            << "# HELP kawasan_transaction_aborts_total x\n# TYPE kawasan_transaction_aborts_total "
+               "counter\n"
             << "kawasan_transaction_aborts_total " << m.aborts_total << "\n\n"
-            << "# HELP kawasan_transaction_state_loads_total x\n# TYPE kawasan_transaction_state_loads_total counter\n"
+            << "# HELP kawasan_transaction_state_loads_total x\n# TYPE "
+               "kawasan_transaction_state_loads_total counter\n"
             << "kawasan_transaction_state_loads_total " << m.state_loads_total << "\n\n";
         return oss.str();
     });
@@ -115,6 +124,30 @@ TEST(RequiredMetricsTest, FetchSessionHitRatio) {
     EXPECT_EQ(m.incremental_hits_total, 3);
     EXPECT_EQ(m.incremental_misses_total, 1);
     EXPECT_DOUBLE_EQ(m.incremental_hit_ratio, 0.75);
+}
+
+// P3: connection lifecycle metrics — operators must be able to tell WHY
+// connections close (idle reaping vs protocol errors vs IO errors) to
+// diagnose churn.
+TEST(RequiredMetricsTest, ConnectionLifecycleMetricsExposed) {
+    MetricsCollector mc;
+    mc.incrementConnectionsCreated();
+    mc.incrementConnectionClosed(kawasan::broker::monitoring::ConnectionCloseReason::kNormal);
+    mc.incrementConnectionClosed(kawasan::broker::monitoring::ConnectionCloseReason::kIdleTimeout);
+    mc.incrementConnectionClosed(
+        kawasan::broker::monitoring::ConnectionCloseReason::kProtocolError);
+    mc.incrementConnectionClosed(kawasan::broker::monitoring::ConnectionCloseReason::kIoError);
+
+    const std::string out = mc.exportPrometheus();
+    EXPECT_TRUE(hasMetric(out, "kawasan_connections_created_total"));
+    EXPECT_TRUE(hasMetric(out, "kawasan_connections_closed_total"));
+    EXPECT_NE(out.find("kawasan_connections_closed_total{reason=\"normal\"} 1"), std::string::npos);
+    EXPECT_NE(out.find("kawasan_connections_closed_total{reason=\"idle_timeout\"} 1"),
+              std::string::npos);
+    EXPECT_NE(out.find("kawasan_connections_closed_total{reason=\"protocol_error\"} 1"),
+              std::string::npos);
+    EXPECT_NE(out.find("kawasan_connections_closed_total{reason=\"io_error\"} 1"),
+              std::string::npos);
 }
 
 TEST(RequiredMetricsTest, TransactionInProgressCount) {
