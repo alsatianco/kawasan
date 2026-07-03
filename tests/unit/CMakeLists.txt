@@ -53,6 +53,11 @@ add_executable(decode_bounds_test decode_bounds_test.cpp)
 target_link_libraries(decode_bounds_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME DecodeBoundsTest COMMAND decode_bounds_test)
 
+# Compressed-batch re-serialization round-trip (compressed-fetch interop fix)
+add_executable(record_batch_compression_test record_batch_compression_test.cpp)
+target_link_libraries(record_batch_compression_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME RecordBatchCompressionTest COMMAND record_batch_compression_test)
+
 # Quota manager test (Phase A6: client byte-rate throttling)
 add_executable(quota_manager_test quota_manager_test.cpp)
 target_link_libraries(quota_manager_test PRIVATE kawasan GTest::gtest GTest::gtest_main)

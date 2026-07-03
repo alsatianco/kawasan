@@ -1,12 +1,12 @@
 #include "kawasan/storage/record_batch.h"
 
 #include <arpa/inet.h>
+#include <snappy.h>
+#include <zlib.h>
+#include <zstd.h>
 
 #include <cstring>
 #include <stdexcept>
-#include <zlib.h>
-#include <snappy.h>
-#include <zstd.h>
 
 #include "kawasan/common/logger.h"
 #include "kawasan/storage/lz4_decoder.h"
@@ -60,6 +60,7 @@ public:
         }
     }
     uint32_t lookup(uint8_t b) const { return table_[b]; }
+
 private:
     uint32_t table_[256]{};
 };
@@ -135,8 +136,7 @@ void RecordBatch::encode(Buffer& buffer) const {
         local.writeBytes(record_payload.data(), record_payload.size());
     }
 
-    const int32_t batch_length =
-        static_cast<int32_t>(local.size() - body_start);
+    const int32_t batch_length = static_cast<int32_t>(local.size() - body_start);
 
     auto* raw = local.data();
     const int32_t net_length = htonl(batch_length);
@@ -154,7 +154,7 @@ void RecordBatch::decode(Buffer& buffer) {
     const size_t start_pos = buffer.position();
     base_offset_ = buffer.readInt64();
     batch_length_ = buffer.readInt32();
-    
+
     // Peek at the magic byte to determine format
     // For magic v2: partition_leader_epoch (4) + magic (1) = offset 5
     // For magic v1: crc (4) + magic (1) = offset 5
@@ -163,9 +163,9 @@ void RecordBatch::decode(Buffer& buffer) {
         throw std::runtime_error("Buffer too small to read magic byte");
     }
     const int8_t peek_magic = static_cast<int8_t>(buffer.data()[magic_offset]);
-    
+
     size_t records_bytes = 0;
-    
+
     if (peek_magic == 2) {
         // Magic v2: Record Batch format (Kafka 0.11+)
         partition_leader_epoch_ = buffer.readInt32();
@@ -179,21 +179,18 @@ void RecordBatch::decode(Buffer& buffer) {
         // magic=1, crc=4 → 21).
         const size_t crc_data_start = start_pos + 21;
         if (batch_length_ < 9) {
-            throw std::runtime_error(
-                "Invalid batch_length=" + std::to_string(batch_length_) + " (too short for CRC)");
+            throw std::runtime_error("Invalid batch_length=" + std::to_string(batch_length_) +
+                                     " (too short for CRC)");
         }
         const size_t crc_data_length = static_cast<size_t>(batch_length_) - 9;
         if (crc_data_start + crc_data_length > buffer.size()) {
-            throw std::runtime_error(
-                "Batch truncated: CRC-covered region extends past buffer");
+            throw std::runtime_error("Batch truncated: CRC-covered region extends past buffer");
         }
         // 0A.1: validate with CRC-32C (Kafka v2 standard).
-        const uint32_t computed_crc =
-            crc32c(buffer.data() + crc_data_start, crc_data_length);
+        const uint32_t computed_crc = crc32c(buffer.data() + crc_data_start, crc_data_length);
         if (computed_crc != crc_) {
-            Logger::warn(
-                "RecordBatch CRC mismatch (wire={:#x}, computed={:#x}, batch_length={})",
-                crc_, computed_crc, batch_length_);
+            Logger::warn("RecordBatch CRC mismatch (wire={:#x}, computed={:#x}, batch_length={})",
+                         crc_, computed_crc, batch_length_);
             throw std::runtime_error("RecordBatch CRC check failed");
         }
 
@@ -204,15 +201,16 @@ void RecordBatch::decode(Buffer& buffer) {
         producer_id_ = buffer.readInt64();
         producer_epoch_ = buffer.readInt16();
         base_sequence_ = buffer.readInt32();
-        
+
         // Read the records count (INT32)
         const int32_t records_count = buffer.readInt32();
         Logger::debug("RecordBatch has {} records", records_count);
         if (records_count < 0) {
             throw std::runtime_error("Invalid negative records count");
         }
-        
-        const size_t header_bytes = buffer.position() - (start_pos + sizeof(int64_t) + sizeof(int32_t));
+
+        const size_t header_bytes =
+            buffer.position() - (start_pos + sizeof(int64_t) + sizeof(int32_t));
         if (static_cast<int64_t>(header_bytes) > batch_length_) {
             throw std::runtime_error("Invalid batch length");
         }
@@ -222,8 +220,7 @@ void RecordBatch::decode(Buffer& buffer) {
         // but a MessageSet may contain many.  Throw here so that callers like
         // deserializeFromProduceRequest() fall through to the correct MessageSet
         // loop that handles multiple messages.
-        throw std::runtime_error("Legacy MessageSet format (magic=" +
-                                 std::to_string(peek_magic) +
+        throw std::runtime_error("Legacy MessageSet format (magic=" + std::to_string(peek_magic) +
                                  ") requires MessageSet parser");
     } else {
         Logger::error("Unsupported magic byte version: {}", static_cast<int>(peek_magic));
@@ -231,10 +228,12 @@ void RecordBatch::decode(Buffer& buffer) {
     }
 
     // For v2, continue reading the records from the batch
-    Logger::debug("Before reading records: buffer.remaining()={}, records_bytes={}, buffer.position()={}, buffer.size()={}",
+    Logger::debug("Before reading records: buffer.remaining()={}, records_bytes={}, "
+                  "buffer.position()={}, buffer.size()={}",
                   buffer.remaining(), records_bytes, buffer.position(), buffer.size());
     if (buffer.remaining() < records_bytes) {
-        Logger::error("Buffer underflow: remaining={} < needed={}", buffer.remaining(), records_bytes);
+        Logger::error("Buffer underflow: remaining={} < needed={}", buffer.remaining(),
+                      records_bytes);
         throw std::runtime_error("Buffer underflow");
     }
 
@@ -278,15 +277,13 @@ void RecordBatch::decode(Buffer& buffer) {
         decompressed = std::move(out);
     } else if (compression == CompressionType::SNAPPY) {
         size_t uncompressed_len = 0;
-        if (!snappy::GetUncompressedLength(
-                reinterpret_cast<const char*>(records_payload.data()), records_payload.size(),
-                &uncompressed_len)) {
+        if (!snappy::GetUncompressedLength(reinterpret_cast<const char*>(records_payload.data()),
+                                           records_payload.size(), &uncompressed_len)) {
             throw std::runtime_error("Invalid Snappy payload");
         }
         std::vector<char> out(uncompressed_len);
-        if (!snappy::RawUncompress(
-                reinterpret_cast<const char*>(records_payload.data()), records_payload.size(),
-                out.data())) {
+        if (!snappy::RawUncompress(reinterpret_cast<const char*>(records_payload.data()),
+                                   records_payload.size(), out.data())) {
             throw std::runtime_error("Snappy decompression failed");
         }
         decompressed.assign(out.begin(), out.end());
@@ -306,8 +303,8 @@ void RecordBatch::decode(Buffer& buffer) {
                              ? records_payload.size() * 8 + 65536
                              : static_cast<size_t>(content_size);
         std::vector<uint8_t> out(out_cap);
-        size_t dsize = ZSTD_decompress(out.data(), out.size(), records_payload.data(),
-                                       records_payload.size());
+        size_t dsize =
+            ZSTD_decompress(out.data(), out.size(), records_payload.data(), records_payload.size());
         if (ZSTD_isError(dsize)) {
             throw std::runtime_error(std::string("ZSTD decompression failed: ") +
                                      ZSTD_getErrorName(dsize));
@@ -333,17 +330,17 @@ void RecordBatch::decode(Buffer& buffer) {
         Logger::debug("First 16 bytes of records payload: {}", hex);
     }
     while (rec_buffer.remaining() > 0) {
-        Logger::debug("Reading record: rec_buffer.remaining()={}, position={}", 
+        Logger::debug("Reading record: rec_buffer.remaining()={}, position={}",
                       rec_buffer.remaining(), rec_buffer.position());
         const int32_t record_length = rec_buffer.readVarInt();
-        Logger::debug("Read record_length={}, rec_buffer.remaining()={}", 
-                      record_length, rec_buffer.remaining());
+        Logger::debug("Read record_length={}, rec_buffer.remaining()={}", record_length,
+                      rec_buffer.remaining());
         if (record_length < 0) {
             throw std::runtime_error("Negative record length");
         }
         if (rec_buffer.remaining() < static_cast<size_t>(record_length)) {
-            Logger::error("Buffer underflow: rec_buffer.remaining()={} < record_length={}", 
-                         rec_buffer.remaining(), record_length);
+            Logger::error("Buffer underflow: rec_buffer.remaining()={} < record_length={}",
+                          rec_buffer.remaining(), record_length);
             throw std::runtime_error("Buffer underflow");
         }
 
@@ -420,10 +417,9 @@ RecordBatch RecordBatch::deserializeFromProduceRequest(const std::vector<uint8_t
         Logger::debug("Attempting to parse as v2 RecordBatch directly");
         return deserialize(data);
     } catch (const std::exception& ex) {
-        Logger::debug(
-            "Produce payload did not decode as a full RecordBatch: {}. Falling back to "
-            "MessageSet parsing.",
-            ex.what());
+        Logger::debug("Produce payload did not decode as a full RecordBatch: {}. Falling back to "
+                      "MessageSet parsing.",
+                      ex.what());
     }
 
     Buffer buffer(data);
@@ -435,7 +431,7 @@ RecordBatch RecordBatch::deserializeFromProduceRequest(const std::vector<uint8_t
     //   - magic 0/1: simple message (crc + magic + attributes + key + value)
     //   - magic 2: complete v2 RecordBatch (crc + magic + attributes + ... + records)
     Logger::info("Parsing MessageSet format from produce request");
-    
+
     // Debug: print first 64 bytes
     if (data.size() >= 64) {
         std::string hex;
@@ -490,8 +486,9 @@ RecordBatch RecordBatch::deserializeFromProduceRequest(const std::vector<uint8_t
             // producer_id (8) + producer_epoch (2) + base_sequence (4) + record_count (4) + records
 
             // Debug logging
-            Logger::debug("Parsing v2 RecordBatch: message_size={}, position after crc+magic+attr={}", 
-                         message_size, buffer.position() - msg_start);
+            Logger::debug(
+                "Parsing v2 RecordBatch: message_size={}, position after crc+magic+attr={}",
+                message_size, buffer.position() - msg_start);
 
             batch.last_offset_delta_ = buffer.readInt32();
             batch.first_timestamp_ = buffer.readInt64();
@@ -501,8 +498,8 @@ RecordBatch RecordBatch::deserializeFromProduceRequest(const std::vector<uint8_t
             batch.base_sequence_ = buffer.readInt32();
 
             const int32_t record_count = buffer.readInt32();
-            Logger::debug("Read record_count={}, position={}, bytes_consumed={}", 
-                         record_count, buffer.position(), buffer.position() - msg_start);
+            Logger::debug("Read record_count={}, position={}, bytes_consumed={}", record_count,
+                          buffer.position(), buffer.position() - msg_start);
             if (record_count < 0) {
                 throw std::runtime_error("Invalid record count in v2 message");
             }
@@ -522,7 +519,8 @@ RecordBatch RecordBatch::deserializeFromProduceRequest(const std::vector<uint8_t
                 decompressed = std::move(records_payload);
             } else if (compression == CompressionType::GZIP) {
                 z_stream strm{};
-                strm.next_in = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(records_payload.data()));
+                strm.next_in =
+                    const_cast<Bytef*>(reinterpret_cast<const Bytef*>(records_payload.data()));
                 strm.avail_in = static_cast<uInt>(records_payload.size());
                 if (inflateInit2(&strm, 15 + 32) != Z_OK) {
                     throw std::runtime_error("Failed to initialize zlib inflater");
@@ -549,14 +547,13 @@ RecordBatch RecordBatch::deserializeFromProduceRequest(const std::vector<uint8_t
             } else if (compression == CompressionType::SNAPPY) {
                 size_t uncompressed_len = 0;
                 if (!snappy::GetUncompressedLength(
-                        reinterpret_cast<const char*>(records_payload.data()), records_payload.size(),
-                        &uncompressed_len)) {
+                        reinterpret_cast<const char*>(records_payload.data()),
+                        records_payload.size(), &uncompressed_len)) {
                     throw std::runtime_error("Invalid Snappy payload");
                 }
                 std::vector<char> out(uncompressed_len);
-                if (!snappy::RawUncompress(
-                        reinterpret_cast<const char*>(records_payload.data()), records_payload.size(),
-                        out.data())) {
+                if (!snappy::RawUncompress(reinterpret_cast<const char*>(records_payload.data()),
+                                           records_payload.size(), out.data())) {
                     throw std::runtime_error("Snappy decompression failed");
                 }
                 decompressed.assign(out.begin(), out.end());
@@ -675,8 +672,8 @@ RecordBatch RecordBatch::deserializeFromProduceRequest(const std::vector<uint8_t
             // Verify we consumed exactly message_size bytes
             const size_t bytes_consumed = buffer.position() - msg_start;
             if (bytes_consumed != static_cast<size_t>(message_size)) {
-                Logger::warn("Message size mismatch: expected {}, consumed {} bytes",
-                             message_size, bytes_consumed);
+                Logger::warn("Message size mismatch: expected {}, consumed {} bytes", message_size,
+                             bytes_consumed);
             }
 
             // Create record
@@ -744,6 +741,67 @@ void RecordBatch::updateDerivedFields() {
     }
 }
 
+namespace {
+
+// Compress a raw records payload per the batch codec. Mirrors the decoders in
+// RecordBatch::decode so a re-serialized batch's payload matches the
+// compression bits in its attributes (an uncompressed payload under a
+// compressed attribute makes strict clients like librdkafka drop the batch).
+std::vector<uint8_t> compressPayload(CompressionType codec, const std::vector<uint8_t>& raw) {
+    switch (codec) {
+        case CompressionType::NONE:
+            return raw;
+        case CompressionType::GZIP: {
+            z_stream strm{};
+            if (deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 + 16, 8,
+                             Z_DEFAULT_STRATEGY) != Z_OK) {
+                throw std::runtime_error("Failed to initialize zlib deflater");
+            }
+            strm.next_in = const_cast<Bytef*>(raw.data());
+            strm.avail_in = static_cast<uInt>(raw.size());
+            std::vector<uint8_t> out;
+            constexpr size_t kChunk = 64 * 1024;
+            int ret = Z_OK;
+            do {
+                size_t prev = out.size();
+                out.resize(prev + kChunk);
+                strm.next_out = reinterpret_cast<Bytef*>(out.data() + prev);
+                strm.avail_out = static_cast<uInt>(kChunk);
+                ret = deflate(&strm, Z_FINISH);
+                if (ret == Z_STREAM_ERROR) {
+                    deflateEnd(&strm);
+                    throw std::runtime_error("zlib stream error during deflate");
+                }
+                out.resize(prev + (kChunk - strm.avail_out));
+            } while (ret != Z_STREAM_END);
+            deflateEnd(&strm);
+            return out;
+        }
+        case CompressionType::SNAPPY: {
+            std::string out;
+            snappy::Compress(reinterpret_cast<const char*>(raw.data()), raw.size(), &out);
+            return std::vector<uint8_t>(out.begin(), out.end());
+        }
+        case CompressionType::LZ4:
+            return encodeKafkaLz4Frame(raw);
+        case CompressionType::ZSTD: {
+            const size_t bound = ZSTD_compressBound(raw.size());
+            std::vector<uint8_t> out(bound);
+            const size_t written =
+                ZSTD_compress(out.data(), out.size(), raw.data(), raw.size(), /*level=*/3);
+            if (ZSTD_isError(written)) {
+                throw std::runtime_error(std::string("ZSTD compression failed: ") +
+                                         ZSTD_getErrorName(written));
+            }
+            out.resize(written);
+            return out;
+        }
+    }
+    throw std::runtime_error("Unsupported compression type on encode");
+}
+
+}  // namespace
+
 std::vector<uint8_t> RecordBatch::encodeRecords() const {
     Buffer buffer;
     if (records_.empty()) {
@@ -767,8 +825,8 @@ std::vector<uint8_t> RecordBatch::encodeRecords() const {
         for (const auto& header : record.headers) {
             record_buffer.writeVarInt(static_cast<int32_t>(header.key.size()));
             if (!header.key.empty()) {
-                record_buffer.writeBytes(
-                    reinterpret_cast<const uint8_t*>(header.key.data()), header.key.size());
+                record_buffer.writeBytes(reinterpret_cast<const uint8_t*>(header.key.data()),
+                                         header.key.size());
             }
             writeVarBytes(record_buffer, header.value);
         }
@@ -779,12 +837,13 @@ std::vector<uint8_t> RecordBatch::encodeRecords() const {
         }
     }
 
-    return buffer.takeVector();
+    // Compress the assembled records payload to match the batch's codec bits;
+    // NONE returns the bytes unchanged.
+    return compressPayload(compressionType(), buffer.takeVector());
 }
 
 // Phase EX-10: build a control batch (commit/abort marker for a txn).
-RecordBatch RecordBatch::makeControlBatch(int64_t producer_id,
-                                          int16_t producer_epoch,
+RecordBatch RecordBatch::makeControlBatch(int64_t producer_id, int16_t producer_epoch,
                                           Offset base_offset, bool committed,
                                           Timestamp timestamp_ms) {
     RecordBatch batch;

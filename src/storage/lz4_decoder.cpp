@@ -1,11 +1,12 @@
 #include "kawasan/storage/lz4_decoder.h"
 
+#include <lz4.h>
+#include <lz4frame.h>
+
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
-
-#include <lz4.h>
 
 namespace kawasan::storage {
 
@@ -154,8 +155,7 @@ std::vector<uint8_t> decodeKafkaLz4Frame(const std::vector<uint8_t>& payload) {
             }
             output.insert(output.end(), scratch.begin(), scratch.begin() + decoded);
         } else {
-            output.insert(output.end(), reader.currentPtr(),
-                          reader.currentPtr() + block_header);
+            output.insert(output.end(), reader.currentPtr(), reader.currentPtr() + block_header);
         }
         reader.skip(block_header);
 
@@ -165,6 +165,19 @@ std::vector<uint8_t> decodeKafkaLz4Frame(const std::vector<uint8_t>& payload) {
     }
 
     return output;
+}
+
+std::vector<uint8_t> encodeKafkaLz4Frame(const std::vector<uint8_t>& payload) {
+    const size_t bound = LZ4F_compressFrameBound(payload.size(), nullptr);
+    std::vector<uint8_t> out(bound);
+    const size_t written =
+        LZ4F_compressFrame(out.data(), out.size(), payload.data(), payload.size(), nullptr);
+    if (LZ4F_isError(written)) {
+        throw std::runtime_error(std::string("LZ4 frame compression failed: ") +
+                                 LZ4F_getErrorName(written));
+    }
+    out.resize(written);
+    return out;
 }
 
 }  // namespace kawasan::storage

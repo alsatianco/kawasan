@@ -32,6 +32,11 @@ public:
     void setPartitionLeaderEpoch(int32_t epoch) { partition_leader_epoch_ = epoch; }
     void setMagic(int8_t magic) { magic_ = magic; }
     void setAttributes(int16_t attributes) { attributes_ = attributes; }
+    /// @brief Sets the batch compression codec (low 3 bits of attributes).
+    void setCompressionType(CompressionType codec) {
+        attributes_ =
+            static_cast<int16_t>((attributes_ & ~0x07) | (static_cast<int16_t>(codec) & 0x07));
+    }
     void setFirstTimestamp(Timestamp ts) { first_timestamp_ = ts; }
     void setMaxTimestamp(Timestamp ts) { max_timestamp_ = ts; }
     void setProducerId(int64_t id) { producer_id_ = id; }
@@ -50,7 +55,7 @@ public:
     std::vector<uint8_t> serialize() const;
     static RecordBatch deserialize(const std::vector<uint8_t>& data);
     static RecordBatch deserialize(Buffer& buffer);
-    
+
     // Deserialize from produce request format (without base_offset/batch_length prefix)
     static RecordBatch deserializeFromProduceRequest(const std::vector<uint8_t>& data);
 
@@ -72,10 +77,8 @@ public:
     /// @param base_offset    The offset this control batch will be appended at.
     /// @param committed      true for COMMIT marker, false for ABORT.
     /// @param timestamp_ms   Wall-clock timestamp (typically now()).
-    static RecordBatch makeControlBatch(int64_t producer_id,
-                                        int16_t producer_epoch,
-                                        Offset base_offset, bool committed,
-                                        Timestamp timestamp_ms);
+    static RecordBatch makeControlBatch(int64_t producer_id, int16_t producer_epoch,
+                                        Offset base_offset, bool committed, Timestamp timestamp_ms);
 
 private:
     void updateDerivedFields();
