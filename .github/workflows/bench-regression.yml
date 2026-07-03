@@ -22,7 +22,7 @@ jobs:
             libboost-all-dev librocksdb-dev libsnappy-dev liblz4-dev libzstd-dev \
             libfmt-dev libspdlog-dev libgtest-dev nlohmann-json3-dev \
             libssl-dev python3-pip
-          pip install kafka-python
+          pip install kafka-python confluent-kafka
 
       - name: Build (Release)
         run: |
@@ -34,7 +34,11 @@ jobs:
           ./build/tools/kawasan-broker --config config/broker.dev.properties > /tmp/k-bench.log 2>&1 &
           BPID=$!
           sleep 5
-          python3 bench/produce_perf.py --records 1000000 --record-size 1024 > /tmp/bench-result.json
+          # Single-producer confluent (librdkafka) run — the stable gate
+          # scenario recorded in bench/baseline.json. The concurrency sweep in
+          # bench/run_suite.sh is diagnostic-only (see baseline _note).
+          python3 bench/produce_perf.py --records 1000000 --record-size 1024 \
+            --producers 1 --client confluent > /tmp/bench-result.json
           kill -9 $BPID
           cat /tmp/bench-result.json
 

@@ -1,9 +1,34 @@
-{
-  "_note": "Phase EX-11 baseline. Replace by running `python3 bench/produce_perf.py > bench/baseline.json` against a known-good build. The CI bench-regression job alerts on >10% delta from these numbers.",
-  "records": 100000,
-  "record_size": 1024,
-  "throughput_mb_s": 80.0,
-  "p50_ms": 5.0,
-  "p95_ms": 15.0,
-  "p99_ms": 50.0
-}
+[
+  {
+    "_note": "Measured baseline (P1), regenerate with bench/run_suite.sh. check_regression.py keys scenarios by benchmark/client/producers/consumers and alerts on >10% delta. Numbers are environment-specific (compare only within the same env). Recorded with log.durability=async; the fsync-durable produce number is lower and is what track P8 (group-commit) targets. Multi-producer/consumer sweep scenarios are diagnostic-only (threaded Python load gens are GIL-bound and collapse before the broker does) and are deliberately NOT recorded here as gates.",
+    "benchmark": "produce",
+    "client": "confluent",
+    "producers": 1,
+    "record_size": 1024,
+    "throughput_mb_s": 100.21,
+    "msg_per_s": 102617.1,
+    "p50_ms": 13.096,
+    "p95_ms": 14.993,
+    "p99_ms": 26.482,
+    "env": {
+      "cpu_model": "Apple M3 Pro",
+      "cpu_count": 11,
+      "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+      "git_sha": "0d47d26"
+    }
+  },
+  {
+    "benchmark": "consume",
+    "client": "confluent",
+    "consumers": 1,
+    "record_size": 1024,
+    "throughput_mb_s": 774.27,
+    "msg_per_s": 792848.1,
+    "env": {
+      "cpu_model": "Apple M3 Pro",
+      "cpu_count": 11,
+      "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+      "git_sha": "0d47d26"
+    }
+  }
+]

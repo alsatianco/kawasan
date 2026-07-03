@@ -29,6 +29,10 @@ Single-node production-hardening and multi-broker metadata-plane fixes. The sing
 - The durable high-watermark checkpoint is written atomically (temp file + fsync + rename).
 - `acks=all` waits (leader-side, with timeout) for the ISR-committed offset before acknowledging.
 
+### Added
+
+- **Benchmark methodology overhaul.** `bench/` now has a librdkafka (confluent-kafka) load path alongside kafka-python, a consume benchmark (`consume_perf.py`), a produce/consume concurrency sweep (`run_suite.sh`), and an environment fingerprint (CPU/platform/git-sha) in every result. `bench/baseline.json` is re-recorded from real measurements (single-node, async durability: ~100 MB/s / ~102k msg/s produce, ~774 MB/s consume on an M3 Pro) with explicit caveats; `check_regression.py` gains an A/B same-runner mode (`--base`/`--head`) and scenario-keyed JSONL comparison.
+
 ### Fixed
 
 - **Compressed topics were unreadable by strict clients (e.g. librdkafka).** When re-serializing a produced batch for storage, `RecordBatch::encodeRecords()` wrote the records payload **uncompressed** while the batch header still advertised the client's codec (snappy/lz4/zstd/gzip), so a consumer read **zero** records from any compressed topic (uncompressed worked). `encodeRecords()` now compresses the payload to match the codec bits; verified end-to-end (librdkafka produce+consume, all five codecs) and by `RecordBatchCompressionTest`.
