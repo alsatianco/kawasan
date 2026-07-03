@@ -20,3 +20,17 @@ target_link_libraries(fuzz_request_header PRIVATE kawasan)
 
 add_executable(fuzz_record_batch fuzz_record_batch.cpp)
 target_link_libraries(fuzz_record_batch PRIVATE kawasan)
+
+# P13: request-body parsers + codec frames — every externally-reachable
+# decoder gets a driver.
+add_executable(fuzz_produce_request fuzz_produce_request.cpp)
+target_link_libraries(fuzz_produce_request PRIVATE kawasan)
+
+add_executable(fuzz_fetch_request fuzz_fetch_request.cpp)
+target_link_libraries(fuzz_fetch_request PRIVATE kawasan)
+
+add_executable(fuzz_metadata_request fuzz_metadata_request.cpp)
+target_link_libraries(fuzz_metadata_request PRIVATE kawasan)
+
+add_executable(fuzz_compression fuzz_compression.cpp)
+target_link_libraries(fuzz_compression PRIVATE kawasan)

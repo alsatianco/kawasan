@@ -49,6 +49,14 @@ if(KAWASAN_ENABLE_TSAN)
     add_link_options(-fsanitize=thread)
 endif()
 
+# P13: instrument the WHOLE build with libFuzzer coverage (no main-link) so
+# fuzz drivers get coverage feedback from the library code under test, not
+# just from the driver TU. The drivers themselves add -fsanitize=fuzzer
+# (tests/fuzz/CMakeLists.txt) to link libFuzzer's main.
+if(KAWASAN_BUILD_FUZZ)
+    add_compile_options(-fsanitize=fuzzer-no-link -fno-omit-frame-pointer)
+endif()
+
 # Find dependencies
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)

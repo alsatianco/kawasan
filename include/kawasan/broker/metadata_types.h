@@ -24,6 +24,16 @@ struct TopicOperationResult {
     std::string error_message;
     TopicMetadata topic_metadata;
     bool has_metadata = false;
+
+    /// @brief Error-result shorthand. (Partial designated initializers of
+    /// this struct trip -Wmissing-designated-field-initializers on newer
+    /// clang; use this instead.)
+    static TopicOperationResult failure(ErrorCode code, std::string message) {
+        TopicOperationResult result;
+        result.error_code = code;
+        result.error_message = std::move(message);
+        return result;
+    }
 };
 
 /// @brief Metadata command types replicated via Raft.
@@ -47,4 +57,3 @@ struct MetadataCommand {
 };
 
 }  // namespace kawasan::broker
-

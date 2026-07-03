@@ -48,6 +48,11 @@ add_executable(tcp_socket_tuning_test tcp_socket_tuning_test.cpp)
 target_link_libraries(tcp_socket_tuning_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME TcpSocketTuningTest COMMAND tcp_socket_tuning_test)
 
+# Decoder array-length bounds (P13 — OOM-DoS guard found by fuzzing)
+add_executable(decode_bounds_test decode_bounds_test.cpp)
+target_link_libraries(decode_bounds_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME DecodeBoundsTest COMMAND decode_bounds_test)
+
 # Quota manager test (Phase A6: client byte-rate throttling)
 add_executable(quota_manager_test quota_manager_test.cpp)
 target_link_libraries(quota_manager_test PRIVATE kawasan GTest::gtest GTest::gtest_main)

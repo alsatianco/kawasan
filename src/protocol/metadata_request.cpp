@@ -30,8 +30,10 @@ void MetadataRequest::encode(Buffer& buffer, int16_t api_version) const {
                 buffer.writeCompactNullableString(topic);
                 buffer.writeEmptyTaggedFields();
             } else {
-                if (flex) buffer.writeCompactString(topic);
-                else buffer.writeString(topic);
+                if (flex)
+                    buffer.writeCompactString(topic);
+                else
+                    buffer.writeString(topic);
             }
         }
     }
@@ -46,32 +48,24 @@ void MetadataRequest::encode(Buffer& buffer, int16_t api_version) const {
         buffer.writeInt8(include_topic_authorized_operations_ ? 1 : 0);
     }
 
-    if (flex) buffer.writeEmptyTaggedFields();
+    if (flex)
+        buffer.writeEmptyTaggedFields();
 }
 
 void MetadataRequest::decode(Buffer& buffer, int16_t api_version) {
     const bool flex = api_version >= 9;
 
     topics_.clear();
-    int32_t topic_count;
-    if (flex) {
-        const uint32_t raw = buffer.readUnsignedVarInt();
-        topic_count = (raw == 0) ? -1 : static_cast<int32_t>(raw - 1);
-    } else {
-        topic_count = buffer.readInt32();
-    }
-    if (topic_count >= 0) {
-        topics_.reserve(topic_count);
-        for (int32_t i = 0; i < topic_count; ++i) {
-            if (api_version >= 10) {
-                (void)buffer.readBytes(16);  // topic_id UUID, ignored for now
-                auto name = buffer.readCompactNullableString();
-                topics_.push_back(name.value_or(""));
-                buffer.skipTaggedFields();
-            } else {
-                topics_.push_back(flex ? buffer.readCompactString()
-                                       : buffer.readString());
-            }
+    const int32_t topic_count = buffer.readArrayLength(flex);
+    topics_.reserve(topic_count);
+    for (int32_t i = 0; i < topic_count; ++i) {
+        if (api_version >= 10) {
+            (void)buffer.readBytes(16);  // topic_id UUID, ignored for now
+            auto name = buffer.readCompactNullableString();
+            topics_.push_back(name.value_or(""));
+            buffer.skipTaggedFields();
+        } else {
+            topics_.push_back(flex ? buffer.readCompactString() : buffer.readString());
         }
     }
 
@@ -85,7 +79,8 @@ void MetadataRequest::decode(Buffer& buffer, int16_t api_version) {
         include_topic_authorized_operations_ = (buffer.readInt8() != 0);
     }
 
-    if (flex) buffer.skipTaggedFields();
+    if (flex)
+        buffer.skipTaggedFields();
 }
 
 size_t MetadataRequest::size(int16_t api_version) const {
@@ -94,8 +89,10 @@ size_t MetadataRequest::size(int16_t api_version) const {
     for (const auto& topic : topics_) {
         result += sizeof(int16_t) + topic.size();
     }
-    if (api_version >= 4) result += sizeof(int8_t);
-    if (api_version >= 8) result += sizeof(int8_t) * 2;
+    if (api_version >= 4)
+        result += sizeof(int8_t);
+    if (api_version >= 8)
+        result += sizeof(int8_t) * 2;
     return result;
 }
 
@@ -114,22 +111,27 @@ void MetadataResponse::encode(Buffer& buffer, int16_t api_version) const {
     }
     for (const auto& broker : brokers_) {
         buffer.writeInt32(broker.id);
-        if (flex) buffer.writeCompactString(broker.host);
-        else buffer.writeString(broker.host);
+        if (flex)
+            buffer.writeCompactString(broker.host);
+        else
+            buffer.writeString(broker.host);
         buffer.writeInt32(broker.port);
         if (api_version >= 1) {
-            if (flex) buffer.writeCompactNullableString(broker.rack);
-            else buffer.writeNullableString(broker.rack);
+            if (flex)
+                buffer.writeCompactNullableString(broker.rack);
+            else
+                buffer.writeNullableString(broker.rack);
         }
-        if (flex) buffer.writeEmptyTaggedFields();
+        if (flex)
+            buffer.writeEmptyTaggedFields();
     }
 
     if (api_version >= 2) {
         if (flex) {
             // cluster_id is NULLABLE on v9+
-            buffer.writeCompactNullableString(
-                cluster_id_.empty() ? std::optional<std::string>{}
-                                    : std::optional<std::string>(cluster_id_));
+            buffer.writeCompactNullableString(cluster_id_.empty()
+                                                  ? std::optional<std::string>{}
+                                                  : std::optional<std::string>(cluster_id_));
         } else {
             buffer.writeString(cluster_id_);
         }
@@ -146,8 +148,10 @@ void MetadataResponse::encode(Buffer& buffer, int16_t api_version) const {
     }
     for (const auto& topic : topics_) {
         buffer.writeInt16(static_cast<int16_t>(topic.error_code));
-        if (flex) buffer.writeCompactString(topic.name);
-        else buffer.writeString(topic.name);
+        if (flex)
+            buffer.writeCompactString(topic.name);
+        else
+            buffer.writeString(topic.name);
         if (api_version >= 10) {
             buffer.writeBytes(topic.topic_id.data(), topic.topic_id.size());
         }
@@ -164,37 +168,44 @@ void MetadataResponse::encode(Buffer& buffer, int16_t api_version) const {
             buffer.writeInt16(static_cast<int16_t>(partition.error_code));
             buffer.writeInt32(partition.partition);
             buffer.writeInt32(partition.leader);
-            if (api_version >= 7) buffer.writeInt32(partition.leader_epoch);
+            if (api_version >= 7)
+                buffer.writeInt32(partition.leader_epoch);
 
             if (flex) {
                 buffer.writeCompactArrayLen(static_cast<int32_t>(partition.replicas.size()));
             } else {
                 buffer.writeInt32(static_cast<int32_t>(partition.replicas.size()));
             }
-            for (auto replica : partition.replicas) buffer.writeInt32(replica);
+            for (auto replica : partition.replicas)
+                buffer.writeInt32(replica);
 
             if (flex) {
                 buffer.writeCompactArrayLen(static_cast<int32_t>(partition.isr.size()));
             } else {
                 buffer.writeInt32(static_cast<int32_t>(partition.isr.size()));
             }
-            for (auto isr_broker : partition.isr) buffer.writeInt32(isr_broker);
+            for (auto isr_broker : partition.isr)
+                buffer.writeInt32(isr_broker);
 
             if (api_version >= 5) {
                 if (flex) {
-                    buffer.writeCompactArrayLen(static_cast<int32_t>(partition.offline_replicas.size()));
+                    buffer.writeCompactArrayLen(
+                        static_cast<int32_t>(partition.offline_replicas.size()));
                 } else {
                     buffer.writeInt32(static_cast<int32_t>(partition.offline_replicas.size()));
                 }
-                for (auto offline : partition.offline_replicas) buffer.writeInt32(offline);
+                for (auto offline : partition.offline_replicas)
+                    buffer.writeInt32(offline);
             }
-            if (flex) buffer.writeEmptyTaggedFields();
+            if (flex)
+                buffer.writeEmptyTaggedFields();
         }
 
         if (api_version >= 8) {
             buffer.writeInt32(topic.topic_authorized_operations);
         }
-        if (flex) buffer.writeEmptyTaggedFields();
+        if (flex)
+            buffer.writeEmptyTaggedFields();
     }
 
     if (api_version >= 8 && api_version <= 10) {
@@ -203,7 +214,8 @@ void MetadataResponse::encode(Buffer& buffer, int16_t api_version) const {
         buffer.writeInt32(0);
     }
 
-    if (flex) buffer.writeEmptyTaggedFields();
+    if (flex)
+        buffer.writeEmptyTaggedFields();
 }
 
 void MetadataResponse::decode(Buffer& buffer, int16_t api_version) {
@@ -220,10 +232,11 @@ void MetadataResponse::decode(Buffer& buffer, int16_t api_version) {
         brokers_[i].host = flex ? buffer.readCompactString() : buffer.readString();
         brokers_[i].port = buffer.readInt32();
         if (api_version >= 1) {
-            brokers_[i].rack = flex ? buffer.readCompactNullableString()
-                                    : buffer.readNullableString();
+            brokers_[i].rack =
+                flex ? buffer.readCompactNullableString() : buffer.readNullableString();
         }
-        if (flex) buffer.skipTaggedFields();
+        if (flex)
+            buffer.skipTaggedFields();
     }
 
     if (api_version >= 2) {
@@ -258,69 +271,85 @@ void MetadataResponse::decode(Buffer& buffer, int16_t api_version) {
             partition.error_code = static_cast<ErrorCode>(buffer.readInt16());
             partition.partition = buffer.readInt32();
             partition.leader = buffer.readInt32();
-            if (api_version >= 7) partition.leader_epoch = buffer.readInt32();
+            if (api_version >= 7)
+                partition.leader_epoch = buffer.readInt32();
 
             int32_t rc = flex ? buffer.readCompactArrayLen() : buffer.readInt32();
             partition.replicas.resize(rc < 0 ? 0 : rc);
-            for (int32_t k = 0; k < rc; ++k) partition.replicas[k] = buffer.readInt32();
+            for (int32_t k = 0; k < rc; ++k)
+                partition.replicas[k] = buffer.readInt32();
 
             int32_t isr = flex ? buffer.readCompactArrayLen() : buffer.readInt32();
             partition.isr.resize(isr < 0 ? 0 : isr);
-            for (int32_t k = 0; k < isr; ++k) partition.isr[k] = buffer.readInt32();
+            for (int32_t k = 0; k < isr; ++k)
+                partition.isr[k] = buffer.readInt32();
 
             if (api_version >= 5) {
                 int32_t oc = flex ? buffer.readCompactArrayLen() : buffer.readInt32();
                 partition.offline_replicas.resize(oc < 0 ? 0 : oc);
-                for (int32_t k = 0; k < oc; ++k) partition.offline_replicas[k] = buffer.readInt32();
+                for (int32_t k = 0; k < oc; ++k)
+                    partition.offline_replicas[k] = buffer.readInt32();
             }
-            if (flex) buffer.skipTaggedFields();
+            if (flex)
+                buffer.skipTaggedFields();
         }
 
         if (api_version >= 8) {
             topics_[i].topic_authorized_operations = buffer.readInt32();
         }
-        if (flex) buffer.skipTaggedFields();
+        if (flex)
+            buffer.skipTaggedFields();
     }
 
     if (api_version >= 8 && api_version <= 10) {
         (void)buffer.readInt32();  // cluster_authorized_operations
     }
 
-    if (flex) buffer.skipTaggedFields();
+    if (flex)
+        buffer.skipTaggedFields();
 }
 
 size_t MetadataResponse::size(int16_t api_version) const {
     // Approximate.
     size_t result = 0;
-    if (api_version >= 3) result += sizeof(int32_t);
+    if (api_version >= 3)
+        result += sizeof(int32_t);
     result += sizeof(int32_t);
     for (const auto& broker : brokers_) {
         result += sizeof(int32_t) + sizeof(int16_t) + broker.host.size() + sizeof(int32_t);
         if (api_version >= 1) {
             result += sizeof(int16_t);
-            if (broker.rack) result += broker.rack->size();
+            if (broker.rack)
+                result += broker.rack->size();
         }
     }
-    if (api_version >= 2) result += sizeof(int16_t) + cluster_id_.size();
-    if (api_version >= 1) result += sizeof(int32_t);
+    if (api_version >= 2)
+        result += sizeof(int16_t) + cluster_id_.size();
+    if (api_version >= 1)
+        result += sizeof(int32_t);
     result += sizeof(int32_t);
     for (const auto& topic : topics_) {
         result += sizeof(int16_t) + sizeof(int16_t) + topic.name.size();
-        if (api_version >= 10) result += 16;
-        if (api_version >= 1) result += sizeof(int8_t);
+        if (api_version >= 10)
+            result += 16;
+        if (api_version >= 1)
+            result += sizeof(int8_t);
         result += sizeof(int32_t);
         for (const auto& partition : topic.partitions) {
             result += sizeof(int16_t) + sizeof(int32_t) * 2;
-            if (api_version >= 7) result += sizeof(int32_t);
+            if (api_version >= 7)
+                result += sizeof(int32_t);
             result += sizeof(int32_t) + partition.replicas.size() * sizeof(int32_t);
             result += sizeof(int32_t) + partition.isr.size() * sizeof(int32_t);
             if (api_version >= 5) {
                 result += sizeof(int32_t) + partition.offline_replicas.size() * sizeof(int32_t);
             }
         }
-        if (api_version >= 8) result += sizeof(int32_t);
+        if (api_version >= 8)
+            result += sizeof(int32_t);
     }
-    if (api_version >= 8 && api_version <= 10) result += sizeof(int32_t);
+    if (api_version >= 8 && api_version <= 10)
+        result += sizeof(int32_t);
     return result;
 }
 

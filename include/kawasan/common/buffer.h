@@ -76,9 +76,7 @@ public:
         writeInt8(static_cast<int8_t>(value & 0x7F));
     }
 
-    void writeVarInt(int32_t value) {
-        writeUnsignedVarInt(encodeZigZag32(value));
-    }
+    void writeVarInt(int32_t value) { writeUnsignedVarInt(encodeZigZag32(value)); }
 
     void writeUnsignedVarLong(uint64_t value) {
         while (value > 0x7F) {
@@ -88,9 +86,7 @@ public:
         writeInt8(static_cast<int8_t>(value & 0x7F));
     }
 
-    void writeVarLong(int64_t value) {
-        writeUnsignedVarLong(encodeZigZag64(value));
-    }
+    void writeVarLong(int64_t value) { writeUnsignedVarLong(encodeZigZag64(value)); }
 
     // ============================================================
     // 0A.5: Flexible-versions encoding (KIP-482).
@@ -204,6 +200,25 @@ public:
         return static_cast<int32_t>(raw - 1);
     }
 
+    /// @brief Read an array length (compact or classic INT32) and validate it
+    /// against the bytes left in the buffer. Every array element occupies at
+    /// least one wire byte, so a declared count larger than `remaining()` is
+    /// provably malformed — rejecting it here prevents a hostile length field
+    /// from driving an unbounded reserve()/resize() (a trivial OOM DoS).
+    /// Returns a non-negative element count (a null/absent array yields 0).
+    int32_t readArrayLength(bool flexible) {
+        const int32_t count = flexible ? readCompactArrayLen() : readInt32();
+        if (count <= 0) {
+            return 0;
+        }
+        if (static_cast<size_t>(count) > remaining()) {
+            throw std::runtime_error("Array length " + std::to_string(count) +
+                                     " exceeds remaining buffer (" + std::to_string(remaining()) +
+                                     " bytes)");
+        }
+        return count;
+    }
+
     /// @brief Read and discard the tagged-fields trailer. We do not currently
     /// surface tagged-field values to handlers; any future per-API tag handling
     /// should specialize this call.
@@ -271,8 +286,7 @@ public:
 
     std::vector<uint8_t> readBytes(size_t size) {
         checkAvailable(size);
-        std::vector<uint8_t> result(data_.begin() + read_pos_,
-                                     data_.begin() + read_pos_ + size);
+        std::vector<uint8_t> result(data_.begin() + read_pos_, data_.begin() + read_pos_ + size);
         read_pos_ += size;
         return result;
     }
@@ -310,9 +324,7 @@ public:
         return value;
     }
 
-    int32_t readVarInt() {
-        return decodeZigZag32(readUnsignedVarInt());
-    }
+    int32_t readVarInt() { return decodeZigZag32(readUnsignedVarInt()); }
 
     uint64_t readUnsignedVarLong() {
         uint64_t value = 0;
@@ -331,9 +343,7 @@ public:
         return value;
     }
 
-    int64_t readVarLong() {
-        return decodeZigZag64(readUnsignedVarLong());
-    }
+    int64_t readVarLong() { return decodeZigZag64(readUnsignedVarLong()); }
 
     // Buffer management
     size_t size() const { return data_.size(); }

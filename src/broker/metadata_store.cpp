@@ -5,12 +5,11 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <nlohmann/json.hpp>
 #include <optional>
 #include <random>
 #include <sstream>
 #include <utility>
-
-#include <nlohmann/json.hpp>
 
 #include "kawasan/common/error.h"
 #include "kawasan/common/logger.h"
@@ -60,14 +59,14 @@ TopicMetadata buildTopicMetadata(const TopicSpecification& spec,
             PartitionMetadata pm;
             pm.error_code = ErrorCode::NONE;
             pm.partition = partition;
-            
+
             if (partition < static_cast<int32_t>(spec.assignments.size())) {
                 pm.replicas = spec.assignments[partition];
             } else {
                 // Fallback if assignments incomplete
                 pm.replicas = {local_broker_id};
             }
-            
+
             // First replica is the leader
             pm.leader = pm.replicas.empty() ? local_broker_id : pm.replicas[0];
             pm.leader_epoch = 0;
@@ -81,7 +80,7 @@ TopicMetadata buildTopicMetadata(const TopicSpecification& spec,
 
     // Auto-assign replicas using round-robin
     const int16_t replication_factor = spec.replication_factor;
-    
+
     // If only one broker or replication factor is 1, assign all to local broker
     if (brokers.size() == 1 || replication_factor == 1) {
         for (int32_t partition = 0; partition < spec.num_partitions; ++partition) {
@@ -104,25 +103,26 @@ TopicMetadata buildTopicMetadata(const TopicSpecification& spec,
     for (const auto& broker : brokers) {
         broker_ids.push_back(broker.id);
     }
-    
+
     // Sort broker IDs for deterministic assignment
     std::sort(broker_ids.begin(), broker_ids.end());
-    
+
     for (int32_t partition = 0; partition < spec.num_partitions; ++partition) {
         PartitionMetadata pm;
         pm.error_code = ErrorCode::NONE;
         pm.partition = partition;
-        
+
         // Round-robin assignment: start at partition % num_brokers
         size_t start_index = partition % broker_ids.size();
-        
+
         // Assign replicas
         pm.replicas.clear();
-        for (int16_t i = 0; i < replication_factor && i < static_cast<int16_t>(broker_ids.size()); ++i) {
+        for (int16_t i = 0; i < replication_factor && i < static_cast<int16_t>(broker_ids.size());
+             ++i) {
             size_t broker_index = (start_index + i) % broker_ids.size();
             pm.replicas.push_back(broker_ids[broker_index]);
         }
-        
+
         // First replica is the leader
         pm.leader = pm.replicas.empty() ? local_broker_id : pm.replicas[0];
         pm.leader_epoch = 0;
@@ -131,7 +131,7 @@ TopicMetadata buildTopicMetadata(const TopicSpecification& spec,
         pm.offline_replicas.clear();
         metadata.partitions.push_back(std::move(pm));
     }
-    
+
     return metadata;
 }
 
@@ -154,16 +154,14 @@ PartitionMetadata partitionFromJson(const nlohmann::json& j) {
     metadata.leader_epoch = j.value("leader_epoch", 0);
     metadata.replicas = j.at("replicas").get<std::vector<int32_t>>();
     metadata.isr = j.at("isr").get<std::vector<int32_t>>();
-    metadata.offline_replicas =
-        j.value("offline_replicas", std::vector<int32_t>{});
+    metadata.offline_replicas = j.value("offline_replicas", std::vector<int32_t>{});
     return metadata;
 }
 
 }  // namespace
 
 MetadataStore::MetadataStore(std::string metadata_dir, std::string cluster_id,
-                             const BrokerMetadata& local_broker,
-                             storage::LogManager* log_manager)
+                             const BrokerMetadata& local_broker, storage::LogManager* log_manager)
     : metadata_dir_(std::move(metadata_dir)),
       metadata_file_(metadata_dir_ + "/" + kMetadataFileName),
       cluster_id_(std::move(cluster_id)),
@@ -185,7 +183,7 @@ void MetadataStore::load() {
     std::ifstream in(metadata_file_);
     if (!in.is_open()) {
         throw KawasanException(ErrorCode::KAFKA_STORAGE_ERROR,
-                              "Failed to open metadata file " + metadata_file_);
+                               "Failed to open metadata file " + metadata_file_);
     }
 
     nlohmann::json json;
@@ -213,16 +211,13 @@ void MetadataStore::load() {
             TopicState state;
             state.metadata.error_code = ErrorCode::NONE;
             state.metadata.name = topic_json.at("name").get<std::string>();
-            state.metadata.is_internal =
-                topic_json.value("is_internal", false);
+            state.metadata.is_internal = topic_json.value("is_internal", false);
             state.metadata.partitions.clear();
             for (const auto& partition_json : topic_json.at("partitions")) {
-                state.metadata.partitions.push_back(
-                    partitionFromJson(partition_json));
+                state.metadata.partitions.push_back(partitionFromJson(partition_json));
             }
             if (topic_json.contains("configs")) {
-                state.configs =
-                    topic_json.at("configs").get<std::map<std::string, std::string>>();
+                state.configs = topic_json.at("configs").get<std::map<std::string, std::string>>();
             }
             topics_[state.metadata.name] = std::move(state);
         }
@@ -235,8 +230,7 @@ void MetadataStore::load() {
     if (log_manager_) {
         for (const auto& [name, state] : topics_) {
             if (!state.configs.empty()) {
-                log_manager_->setTopicConfig(
-                    name, storage::LogConfig::fromMap(state.configs));
+                log_manager_->setTopicConfig(name, storage::LogConfig::fromMap(state.configs));
             }
         }
     }
@@ -259,16 +253,14 @@ TopicOperationResult MetadataStore::applyCreate(const TopicSpecification& spec) 
     // 0A.4: register the per-topic LogConfig (cleanup.policy, retention, etc.)
     // BEFORE creating the partition logs so the per-topic config takes effect.
     if (log_manager_) {
-        log_manager_->setTopicConfig(
-            spec.name, storage::LogConfig::fromMap(spec.configs));
+        log_manager_->setTopicConfig(spec.name, storage::LogConfig::fromMap(spec.configs));
         for (const auto& partition : state.metadata.partitions) {
             log_manager_->getOrCreateLog(spec.name, partition.partition);
         }
     }
 
     persistLocked();
-    Logger::info("Created topic {} with {} partitions", spec.name,
-                 spec.num_partitions);
+    Logger::info("Created topic {} with {} partitions", spec.name, spec.num_partitions);
 
     TopicOperationResult result;
     result.error_code = ErrorCode::NONE;
@@ -282,9 +274,8 @@ TopicOperationResult MetadataStore::applyDelete(const std::string& topic_name) {
 
     auto it = topics_.find(topic_name);
     if (it == topics_.end()) {
-        return TopicOperationResult{
-            .error_code = ErrorCode::UNKNOWN_TOPIC_OR_PARTITION,
-            .error_message = "Topic does not exist"};
+        return TopicOperationResult::failure(ErrorCode::UNKNOWN_TOPIC_OR_PARTITION,
+                                             "Topic does not exist");
     }
 
     for (const auto& partition : it->second.metadata.partitions) {
@@ -302,23 +293,22 @@ TopicOperationResult MetadataStore::applyDelete(const std::string& topic_name) {
     return result;
 }
 
-TopicOperationResult MetadataStore::applyIncreasePartitions(
-    const std::string& topic_name, int32_t new_total_count) {
+TopicOperationResult MetadataStore::applyIncreasePartitions(const std::string& topic_name,
+                                                            int32_t new_total_count) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     auto it = topics_.find(topic_name);
     if (it == topics_.end()) {
-        return TopicOperationResult{
-            .error_code = ErrorCode::UNKNOWN_TOPIC_OR_PARTITION,
-            .error_message = "Topic does not exist"};
+        return TopicOperationResult::failure(ErrorCode::UNKNOWN_TOPIC_OR_PARTITION,
+                                             "Topic does not exist");
     }
 
     auto& metadata = it->second.metadata;
     const int32_t current_count = static_cast<int32_t>(metadata.partitions.size());
     if (new_total_count <= current_count) {
-        return TopicOperationResult{
-            .error_code = ErrorCode::INVALID_PARTITIONS,
-            .error_message = "Topic already has at least the requested partition count"};
+        return TopicOperationResult::failure(
+            ErrorCode::INVALID_PARTITIONS,
+            "Topic already has at least the requested partition count");
     }
 
     // Build assignments for the new partitions. We follow Kafka semantics:
@@ -346,8 +336,7 @@ TopicOperationResult MetadataStore::applyIncreasePartitions(
         } else {
             const size_t start_index = static_cast<size_t>(partition) % broker_ids.size();
             for (int16_t i = 0;
-                 i < replication_factor && i < static_cast<int16_t>(broker_ids.size());
-                 ++i) {
+                 i < replication_factor && i < static_cast<int16_t>(broker_ids.size()); ++i) {
                 const size_t broker_index = (start_index + i) % broker_ids.size();
                 pm.replicas.push_back(broker_ids[broker_index]);
             }
@@ -362,8 +351,8 @@ TopicOperationResult MetadataStore::applyIncreasePartitions(
     }
 
     persistLocked();
-    Logger::info("Increased partitions for topic {} from {} to {}",
-                 topic_name, current_count, new_total_count);
+    Logger::info("Increased partitions for topic {} from {} to {}", topic_name, current_count,
+                 new_total_count);
 
     TopicOperationResult result;
     result.error_code = ErrorCode::NONE;
@@ -372,17 +361,15 @@ TopicOperationResult MetadataStore::applyIncreasePartitions(
     return result;
 }
 
-TopicOperationResult MetadataStore::applyUpdateISR(
-    const std::string& topic_name,
-    PartitionId partition_id,
-    const std::vector<BrokerId>& isr) {
+TopicOperationResult MetadataStore::applyUpdateISR(const std::string& topic_name,
+                                                   PartitionId partition_id,
+                                                   const std::vector<BrokerId>& isr) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     auto it = topics_.find(topic_name);
     if (it == topics_.end()) {
-        return TopicOperationResult{
-            .error_code = ErrorCode::UNKNOWN_TOPIC_OR_PARTITION,
-            .error_message = "Topic does not exist"};
+        return TopicOperationResult::failure(ErrorCode::UNKNOWN_TOPIC_OR_PARTITION,
+                                             "Topic does not exist");
     }
 
     bool partition_found = false;
@@ -395,14 +382,12 @@ TopicOperationResult MetadataStore::applyUpdateISR(
     }
 
     if (!partition_found) {
-        return TopicOperationResult{
-            .error_code = ErrorCode::UNKNOWN_TOPIC_OR_PARTITION,
-            .error_message = "Partition does not exist"};
+        return TopicOperationResult::failure(ErrorCode::UNKNOWN_TOPIC_OR_PARTITION,
+                                             "Partition does not exist");
     }
 
     persistLocked();
-    Logger::info("Updated ISR for {}-{}, new ISR size: {}", 
-                 topic_name, partition_id, isr.size());
+    Logger::info("Updated ISR for {}-{}, new ISR size: {}", topic_name, partition_id, isr.size());
 
     TopicOperationResult result;
     result.error_code = ErrorCode::NONE;
@@ -470,46 +455,40 @@ size_t MetadataStore::brokerCount() const {
     return brokers_.size();
 }
 
-TopicOperationResult MetadataStore::validateCreateLocked(
-    const TopicSpecification& spec) const {
+TopicOperationResult MetadataStore::validateCreateLocked(const TopicSpecification& spec) const {
     if (spec.name.empty()) {
-        return TopicOperationResult{
-            .error_code = ErrorCode::INVALID_TOPIC_EXCEPTION,
-            .error_message = "Topic name must not be empty"};
+        return TopicOperationResult::failure(ErrorCode::INVALID_TOPIC_EXCEPTION,
+                                             "Topic name must not be empty");
     }
     if (topics_.contains(spec.name)) {
-        return TopicOperationResult{
-            .error_code = ErrorCode::TOPIC_ALREADY_EXISTS,
-            .error_message = "Topic already exists"};
+        return TopicOperationResult::failure(ErrorCode::TOPIC_ALREADY_EXISTS,
+                                             "Topic already exists");
     }
     if (spec.num_partitions <= 0) {
-        return TopicOperationResult{
-            .error_code = ErrorCode::INVALID_PARTITIONS,
-            .error_message = "num_partitions must be > 0"};
+        return TopicOperationResult::failure(ErrorCode::INVALID_PARTITIONS,
+                                             "num_partitions must be > 0");
     }
     if (spec.replication_factor <= 0) {
-        return TopicOperationResult{
-            .error_code = ErrorCode::INVALID_REPLICATION_FACTOR,
-            .error_message = "replication_factor must be > 0"};
+        return TopicOperationResult::failure(ErrorCode::INVALID_REPLICATION_FACTOR,
+                                             "replication_factor must be > 0");
     }
     if (spec.replication_factor > static_cast<int16_t>(brokers_.size())) {
-        return TopicOperationResult{
-            .error_code = ErrorCode::INVALID_REPLICATION_FACTOR,
-            .error_message = "replication_factor cannot be greater than the number of available brokers"};
+        return TopicOperationResult::failure(
+            ErrorCode::INVALID_REPLICATION_FACTOR,
+            "replication_factor cannot be greater than the number of available brokers");
     }
     // Manual assignments are now supported
     if (!spec.assignments.empty()) {
         // Validate manual assignments
         if (static_cast<int32_t>(spec.assignments.size()) != spec.num_partitions) {
-            return TopicOperationResult{
-                .error_code = ErrorCode::INVALID_REPLICA_ASSIGNMENT,
-                .error_message = "assignments size must match num_partitions"};
+            return TopicOperationResult::failure(ErrorCode::INVALID_REPLICA_ASSIGNMENT,
+                                                 "assignments size must match num_partitions");
         }
         for (const auto& replicas : spec.assignments) {
             if (replicas.empty()) {
-                return TopicOperationResult{
-                    .error_code = ErrorCode::INVALID_REPLICA_ASSIGNMENT,
-                    .error_message = "each partition must have at least one replica"};
+                return TopicOperationResult::failure(
+                    ErrorCode::INVALID_REPLICA_ASSIGNMENT,
+                    "each partition must have at least one replica");
             }
             for (BrokerId broker_id : replicas) {
                 bool found = false;
@@ -520,10 +499,10 @@ TopicOperationResult MetadataStore::validateCreateLocked(
                     }
                 }
                 if (!found) {
-                    return TopicOperationResult{
-                        .error_code = ErrorCode::INVALID_REPLICA_ASSIGNMENT,
-                        .error_message = "replica assignment references unknown broker ID: " + 
-                                       std::to_string(broker_id)};
+                    return TopicOperationResult::failure(
+                        ErrorCode::INVALID_REPLICA_ASSIGNMENT,
+                        "replica assignment references unknown broker ID: " +
+                            std::to_string(broker_id));
                 }
             }
         }
@@ -576,18 +555,18 @@ void MetadataStore::persistLocked() const {
     std::ofstream out(metadata_file_);
     if (!out.is_open()) {
         throw KawasanException(ErrorCode::KAFKA_STORAGE_ERROR,
-                              "Failed to persist metadata to " + metadata_file_);
+                               "Failed to persist metadata to " + metadata_file_);
     }
     out << json.dump(2);
 }
 
 std::string MetadataStore::computeChecksum() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    
+
     // Build a canonical JSON representation for checksum computation
     nlohmann::json json;
     json["cluster_id"] = cluster_id_;
-    
+
     // Add topics in sorted order for deterministic checksum
     json["topics"] = nlohmann::json::array();
     std::vector<std::string> topic_names;
@@ -596,13 +575,13 @@ std::string MetadataStore::computeChecksum() const {
         topic_names.push_back(name);
     }
     std::sort(topic_names.begin(), topic_names.end());
-    
+
     for (const auto& name : topic_names) {
         const auto& state = topics_.at(name);
         nlohmann::json topic_json;
         topic_json["name"] = name;
         topic_json["is_internal"] = state.metadata.is_internal;
-        
+
         // Add partitions in sorted order
         topic_json["partitions"] = nlohmann::json::array();
         for (const auto& partition : state.metadata.partitions) {
@@ -615,23 +594,23 @@ std::string MetadataStore::computeChecksum() const {
             part_json["offline_replicas"] = partition.offline_replicas;
             topic_json["partitions"].push_back(std::move(part_json));
         }
-        
+
         // Add configs in sorted order
         if (!state.configs.empty()) {
             topic_json["configs"] = state.configs;
         }
-        
+
         json["topics"].push_back(std::move(topic_json));
     }
-    
+
     // Compute SHA-256 hash of the canonical JSON
     std::string canonical = json.dump();
-    
+
     // Simple hash computation using std::hash for now
     // In production, should use proper SHA-256
     std::hash<std::string> hasher;
     size_t hash_value = hasher(canonical);
-    
+
     // Convert to hex string
     std::stringstream ss;
     ss << std::hex << std::setfill('0') << std::setw(16) << hash_value;
