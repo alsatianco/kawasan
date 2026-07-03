@@ -34,6 +34,12 @@ add_executable(transactional_recovery_test transactional_recovery_test.cpp)
 target_link_libraries(transactional_recovery_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME TransactionalRecoveryTest COMMAND transactional_recovery_test)
 
+# M1: durable transaction state (__transaction_state persist + replay) across
+# a simulated restart, covering each crash point in the txn lifecycle.
+add_executable(transaction_state_recovery_test transaction_state_recovery_test.cpp)
+target_link_libraries(transaction_state_recovery_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME TransactionStateRecoveryTest COMMAND transaction_state_recovery_test)
+
 add_executable(produce_acks_test produce_acks_test.cpp)
 target_link_libraries(produce_acks_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME ProduceAcksTest COMMAND produce_acks_test)

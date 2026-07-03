@@ -58,8 +58,12 @@ public:
 
     /// @brief Appends records to the log
     /// @param records The records to append
+    /// @param force_sync If true, fsync this append regardless of the log's
+    ///        flush mode — used for durability-critical internal state such as
+    ///        __transaction_state, which must survive a power loss even when
+    ///        the broker's data durability is `async`.
     /// @return The offset of the first appended record
-    Offset append(const std::vector<Record>& records);
+    Offset append(const std::vector<Record>& records, bool force_sync = false);
 
     /// @brief Appends a fully-formed RecordBatch, preserving its
     /// V2 header attributes (isControl, isTransactional, producer_id,

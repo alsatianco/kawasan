@@ -1,6 +1,6 @@
-#include <gtest/gtest.h>
-
 #include "kawasan/broker/transaction_coordinator.h"
+
+#include <gtest/gtest.h>
 
 using kawasan::broker::TransactionCoordinator;
 using State = TransactionCoordinator::State;
@@ -41,7 +41,8 @@ TEST(TransactionCoordinatorTest, CommitTxnTransitionsToCompleteCommit) {
     TransactionCoordinator tc;
     tc.recordInitProducerId("txn-1", 100, 0, 60000);
     tc.addPartitions("txn-1", {{"topic-a", 0}, {"topic-a", 1}});
-    auto participating = tc.commitTxn("txn-1");
+    auto participating = tc.prepareCommit("txn-1");
+    tc.completeCommit("txn-1");
     EXPECT_EQ(participating.size(), 2u);
     auto snap = tc.describe("txn-1");
     EXPECT_EQ(snap->state, State::CompleteCommit);
@@ -53,7 +54,8 @@ TEST(TransactionCoordinatorTest, AbortTxnTransitionsToCompleteAbort) {
     TransactionCoordinator tc;
     tc.recordInitProducerId("txn-1", 100, 0, 60000);
     tc.addPartitions("txn-1", {{"topic-a", 0}});
-    auto participating = tc.abortTxn("txn-1");
+    auto participating = tc.prepareAbort("txn-1");
+    tc.completeAbort("txn-1");
     EXPECT_EQ(participating.size(), 1u);
     auto snap = tc.describe("txn-1");
     EXPECT_EQ(snap->state, State::CompleteAbort);
@@ -64,7 +66,8 @@ TEST(TransactionCoordinatorTest, NewTxnAfterCommit) {
     TransactionCoordinator tc;
     tc.recordInitProducerId("txn-1", 100, 0, 60000);
     tc.addPartitions("txn-1", {{"topic-a", 0}});
-    tc.commitTxn("txn-1");
+    tc.prepareCommit("txn-1");
+    tc.completeCommit("txn-1");
 
     tc.addPartitions("txn-1", {{"topic-b", 0}, {"topic-b", 1}});
     auto snap = tc.describe("txn-1");
@@ -81,7 +84,8 @@ TEST(TransactionCoordinatorTest, StateFilterInList) {
 
     tc.recordInitProducerId("txn-commit", 3, 0, 60000);
     tc.addPartitions("txn-commit", {{"t", 1}});
-    tc.commitTxn("txn-commit");
+    tc.prepareCommit("txn-commit");
+    tc.completeCommit("txn-commit");
 
     auto ongoing = tc.list({"Ongoing"}, {});
     EXPECT_EQ(ongoing.size(), 1u);
@@ -125,7 +129,8 @@ TEST(TransactionCoordinatorTest, StagedOffsetsClearedOnAbort) {
     offs.push_back({"grp-1", "input", 0, 99, "meta"});
     tc.stagePendingOffsets("txn-1", std::move(offs));
 
-    tc.abortTxn("txn-1");
+    tc.prepareAbort("txn-1");
+    tc.completeAbort("txn-1");
 
     // Abort must have discarded the staged offsets.
     auto drained = tc.drainPendingOffsets("txn-1");

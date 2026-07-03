@@ -58,6 +58,11 @@ add_executable(record_batch_compression_test record_batch_compression_test.cpp)
 target_link_libraries(record_batch_compression_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME RecordBatchCompressionTest COMMAND record_batch_compression_test)
 
+# Transaction state manager serialize/route + coordinator two-phase (M1)
+add_executable(transaction_state_manager_test transaction_state_manager_test.cpp)
+target_link_libraries(transaction_state_manager_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME TransactionStateManagerTest COMMAND transaction_state_manager_test)
+
 # Quota manager test (Phase A6: client byte-rate throttling)
 add_executable(quota_manager_test quota_manager_test.cpp)
 target_link_libraries(quota_manager_test PRIVATE kawasan GTest::gtest GTest::gtest_main)

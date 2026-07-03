@@ -1,37 +1,48 @@
 #include "kawasan/broker/kawasan_broker.h"
 
+#include <zlib.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <limits>
+#include <map>
+#include <nlohmann/json.hpp>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
-#include <zlib.h>
 
-#include "kawasan/broker/replica_manager.h"
-#include "kawasan/common/error.h"
-#include "kawasan/common/logger.h"
-#include "kawasan/protocol/api_versions.h"
-#include "kawasan/protocol/create_topics_request.h"
-#include "kawasan/protocol/delete_topics_request.h"
-#include "kawasan/protocol/describe_cluster_request.h"
 #include "kawasan/broker/acl_store.h"
 #include "kawasan/broker/fetch_session_manager.h"
 #include "kawasan/broker/isolation_tracker.h"
 #include "kawasan/broker/producer_state_manager.h"
 #include "kawasan/broker/quota_manager.h"
+#include "kawasan/broker/replica_manager.h"
 #include "kawasan/broker/scram_auth.h"
 #include "kawasan/broker/transaction_coordinator.h"
-#include "kawasan/protocol/txn_request.h"
+#include "kawasan/broker/transaction_state_manager.h"
+#include "kawasan/common/error.h"
+#include "kawasan/common/logger.h"
+#include "kawasan/protocol/admin_misc_requests.h"
+#include "kawasan/protocol/admin_stubs.h"
+#include "kawasan/protocol/alter_configs_request.h"
+#include "kawasan/protocol/api_versions.h"
+#include "kawasan/protocol/create_topics_request.h"
+#include "kawasan/protocol/delete_topics_request.h"
+#include "kawasan/protocol/describe_cluster_request.h"
 #include "kawasan/protocol/describe_configs_request.h"
 #include "kawasan/protocol/describe_groups_request.h"
 #include "kawasan/protocol/fetch_request.h"
 #include "kawasan/protocol/find_coordinator_request.h"
 #include "kawasan/protocol/heartbeat_request.h"
+#include "kawasan/protocol/incremental_alter_configs_request.h"
+#include "kawasan/protocol/init_producer_id_request.h"
 #include "kawasan/protocol/join_group_request.h"
 #include "kawasan/protocol/leave_group_request.h"
 #include "kawasan/protocol/list_groups_request.h"
@@ -39,42 +50,30 @@
 #include "kawasan/protocol/metadata_request.h"
 #include "kawasan/protocol/offset_commit_request.h"
 #include "kawasan/protocol/offset_fetch_request.h"
-#include "kawasan/protocol/produce_request.h"
-#include "kawasan/protocol/sync_group_request.h"
-#include "kawasan/protocol/init_producer_id_request.h"
 #include "kawasan/protocol/offset_for_leader_epoch_request.h"
-#include "kawasan/protocol/alter_configs_request.h"
-#include "kawasan/protocol/incremental_alter_configs_request.h"
-#include "kawasan/protocol/admin_misc_requests.h"
-#include "kawasan/protocol/admin_stubs.h"
+#include "kawasan/protocol/produce_request.h"
 #include "kawasan/protocol/sasl_request.h"
+#include "kawasan/protocol/sync_group_request.h"
+#include "kawasan/protocol/txn_request.h"
 #include "kawasan/storage/record_batch.h"
-
-#include <algorithm>
-#include <sstream>
-
-#include <filesystem>
-#include <fstream>
-#include <map>
-
-#include <nlohmann/json.hpp>
 
 namespace kawasan::broker {
 
 namespace {
 constexpr int16_t kMetadataMaxVersion = 12;  // Phase 1.2
-constexpr int16_t kProduceMaxVersion = 9;  // Phase 1.3
-constexpr int16_t kFetchMaxVersion = 12;  // Phase 1.4 (v13 wire-format ready; advertise stays at v12 — librdkafka still rejects)
-constexpr int16_t kListOffsetsMaxVersion = 7;  // Phase 1.5
+constexpr int16_t kProduceMaxVersion = 9;    // Phase 1.3
+constexpr int16_t kFetchMaxVersion =
+    12;  // Phase 1.4 (v13 wire-format ready; advertise stays at v12 — librdkafka still rejects)
+constexpr int16_t kListOffsetsMaxVersion = 7;      // Phase 1.5
 constexpr int16_t kFindCoordinatorMaxVersion = 4;  // Phase 1.6
-constexpr int16_t kJoinGroupMaxVersion = 9;  // Phase 1.7
-constexpr int16_t kSyncGroupMaxVersion = 5;  // Phase 1.8
-constexpr int16_t kHeartbeatMaxVersion = 4;  // Phase 1.9
-constexpr int16_t kLeaveGroupMaxVersion = 5;  // Phase 1.10
-constexpr int16_t kOffsetCommitMaxVersion = 8;  // Phase 1.11
-constexpr int16_t kOffsetFetchMaxVersion = 8;  // Phase 1.12 (v8 multi-group supported)
-constexpr int16_t kDescribeGroupsMaxVersion = 5;  // Phase 1.13
-constexpr int16_t kListGroupsMaxVersion = 4;  // Phase 1.14
+constexpr int16_t kJoinGroupMaxVersion = 9;        // Phase 1.7
+constexpr int16_t kSyncGroupMaxVersion = 5;        // Phase 1.8
+constexpr int16_t kHeartbeatMaxVersion = 4;        // Phase 1.9
+constexpr int16_t kLeaveGroupMaxVersion = 5;       // Phase 1.10
+constexpr int16_t kOffsetCommitMaxVersion = 8;     // Phase 1.11
+constexpr int16_t kOffsetFetchMaxVersion = 8;      // Phase 1.12 (v8 multi-group supported)
+constexpr int16_t kDescribeGroupsMaxVersion = 5;   // Phase 1.13
+constexpr int16_t kListGroupsMaxVersion = 4;       // Phase 1.14
 }  // namespace
 
 void KawasanBroker::validateProductionConfig() const {
@@ -102,21 +101,19 @@ void KawasanBroker::validateProductionConfig() const {
     // raft.peers). In production, reject rather than silently clamp so the
     // operator's durability intent isn't quietly weakened.
     if (config_.get<int>("default.replication.factor", 1) > cluster_size_) {
-        errors.emplace_back(
-            "default.replication.factor exceeds the cluster size (" +
-            std::to_string(cluster_size_) +
-            " broker(s) in raft.peers); reduce it or add brokers");
+        errors.emplace_back("default.replication.factor exceeds the cluster size (" +
+                            std::to_string(cluster_size_) +
+                            " broker(s) in raft.peers); reduce it or add brokers");
     }
     if (config_.get<int>("min.insync.replicas", 1) > cluster_size_) {
-        errors.emplace_back(
-            "min.insync.replicas exceeds the cluster size (" +
-            std::to_string(cluster_size_) + " broker(s)); reduce it or add brokers");
+        errors.emplace_back("min.insync.replicas exceeds the cluster size (" +
+                            std::to_string(cluster_size_) +
+                            " broker(s)); reduce it or add brokers");
     }
 
     if (!errors.empty()) {
-        std::string msg =
-            "deployment.mode=production but the configuration requests capabilities "
-            "this build cannot honor:";
+        std::string msg = "deployment.mode=production but the configuration requests capabilities "
+                          "this build cannot honor:";
         for (const auto& e : errors) {
             msg += "\n  - " + e;
         }
@@ -125,9 +122,8 @@ void KawasanBroker::validateProductionConfig() const {
     Logger::info("Production-mode config validation passed");
 }
 
-bool KawasanBroker::authorize(const RequestDispatcher::RequestContext& context,
-                              int8_t operation, int8_t resource_type,
-                              const std::string& resource_name) const {
+bool KawasanBroker::authorize(const RequestDispatcher::RequestContext& context, int8_t operation,
+                              int8_t resource_type, const std::string& resource_name) const {
     if (!authorizer_enabled_) {
         return true;  // enforcement opted out — preserve pre-authorizer behavior
     }
@@ -144,9 +140,8 @@ bool KawasanBroker::authorize(const RequestDispatcher::RequestContext& context,
     if (colon != std::string::npos) {
         host = host.substr(0, colon);
     }
-    return acl_store_ && acl_store_->authorize(principal, operation, resource_type,
-                                               resource_name, host,
-                                               allow_everyone_if_no_acl_);
+    return acl_store_ && acl_store_->authorize(principal, operation, resource_type, resource_name,
+                                               host, allow_everyone_if_no_acl_);
 }
 
 KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
@@ -156,15 +151,11 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
     port_ = config_.get<int32_t>("port", 9092);
     cluster_id_ = config_.get<std::string>("cluster.id", "kawasan-cluster");
 
-    auto_create_topics_enabled_ =
-        config_.get<bool>("auto.create.topics.enable", true);
+    auto_create_topics_enabled_ = config_.get<bool>("auto.create.topics.enable", true);
 
-    const int32_t configured_partitions =
-        config_.get<int32_t>("num.partitions", 1);
+    const int32_t configured_partitions = config_.get<int32_t>("num.partitions", 1);
     if (configured_partitions <= 0) {
-        Logger::warn(
-            "Configured num.partitions={} is invalid; using 1",
-            configured_partitions);
+        Logger::warn("Configured num.partitions={} is invalid; using 1", configured_partitions);
         default_num_partitions_ = 1;
     } else {
         default_num_partitions_ = configured_partitions;
@@ -175,22 +166,18 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
     // replicas than there are brokers.
     {
         const std::string peers = config_.get<std::string>("raft.peers", "");
-        cluster_size_ = peers.empty()
-                            ? 1
-                            : 1 + static_cast<int>(std::count(peers.begin(), peers.end(), ','));
+        cluster_size_ =
+            peers.empty() ? 1 : 1 + static_cast<int>(std::count(peers.begin(), peers.end(), ','));
     }
 
-    int16_t configured_replication_factor =
-        config_.get<int16_t>("default.replication.factor", 1);
+    int16_t configured_replication_factor = config_.get<int16_t>("default.replication.factor", 1);
     if (configured_replication_factor < 1) {
-        Logger::warn(
-            "Configured default.replication.factor={} is invalid; using 1",
-            configured_replication_factor);
+        Logger::warn("Configured default.replication.factor={} is invalid; using 1",
+                     configured_replication_factor);
         configured_replication_factor = 1;
     } else if (configured_replication_factor > cluster_size_) {
-        Logger::warn(
-            "default.replication.factor {} exceeds cluster size {}; clamping to {}",
-            configured_replication_factor, cluster_size_, cluster_size_);
+        Logger::warn("default.replication.factor {} exceeds cluster size {}; clamping to {}",
+                     configured_replication_factor, cluster_size_, cluster_size_);
         configured_replication_factor = static_cast<int16_t>(cluster_size_);
     }
     default_replication_factor_ = configured_replication_factor;
@@ -199,8 +186,7 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
     metadata_dir_ = config_.get<std::string>("metadata.dir", log_dir_ + "/meta");
 
     storage::LogConfig configured_log;
-    const auto default_segment_bytes =
-        static_cast<int64_t>(configured_log.segment_size);
+    const auto default_segment_bytes = static_cast<int64_t>(configured_log.segment_size);
     const int64_t configured_segment_bytes =
         config_.get<int64_t>("log.segment.bytes", default_segment_bytes);
     if (configured_segment_bytes > 0) {
@@ -218,8 +204,7 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
     }
     configured_log.segment_ms = roll_ms;
 
-    int64_t retention_ms =
-        config_.get<int64_t>("log.retention.ms", configured_log.retention_ms);
+    int64_t retention_ms = config_.get<int64_t>("log.retention.ms", configured_log.retention_ms);
     if (retention_ms <= 0) {
         const int64_t retention_hours = config_.get<int64_t>("log.retention.hours", -1);
         if (retention_hours > 0) {
@@ -251,12 +236,11 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
     }
 
     log_config_ = configured_log;
-    
+
     // Parse TLS configuration for Kafka protocol
     std::string security_protocol = config_.get<std::string>("security.protocol", "PLAINTEXT");
-    tls_config_.enabled = (security_protocol == "SSL") || 
-                          config_.get<bool>("ssl.enabled", false);
-    
+    tls_config_.enabled = (security_protocol == "SSL") || config_.get<bool>("ssl.enabled", false);
+
     if (tls_config_.enabled) {
         // Until TcpSession wraps its socket in boost::asio::ssl::stream and
         // performs async_handshake(), accepting ssl.enabled=true would produce a
@@ -294,34 +278,34 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
     // Authorization (ACL enforcement). Off by default so deployments with no
     // ACLs behave exactly as before; opt in with authorizer.enabled=true.
     authorizer_enabled_ = config_.get<bool>("authorizer.enabled", false);
-    allow_everyone_if_no_acl_ =
-        config_.get<bool>("allow.everyone.if.no.acl.found", false);
+    allow_everyone_if_no_acl_ = config_.get<bool>("allow.everyone.if.no.acl.found", false);
     {
         const std::string supers = config_.get<std::string>("super.users", "");
         size_t start = 0;
         while (start < supers.size()) {
             size_t sep = supers.find(';', start);
-            if (sep == std::string::npos) sep = supers.size();
+            if (sep == std::string::npos)
+                sep = supers.size();
             std::string p = supers.substr(start, sep - start);
             // trim surrounding whitespace
             const auto b = p.find_first_not_of(" \t");
             const auto e = p.find_last_not_of(" \t");
-            if (b != std::string::npos) super_users_.insert(p.substr(b, e - b + 1));
+            if (b != std::string::npos)
+                super_users_.insert(p.substr(b, e - b + 1));
             start = sep + 1;
         }
     }
     if (authorizer_enabled_) {
-        Logger::info(
-            "Authorizer ENABLED (allow.everyone.if.no.acl.found={}, {} super.user(s))",
-            allow_everyone_if_no_acl_, super_users_.size());
+        Logger::info("Authorizer ENABLED (allow.everyone.if.no.acl.found={}, {} super.user(s))",
+                     allow_everyone_if_no_acl_, super_users_.size());
     }
 
     // Client quotas (per-client byte-rate throttling). Disabled by default
     // (bytes/sec <= 0). When set, an over-quota client gets a throttle_time_ms
     // in its response so it backs off, protecting the broker from noisy clients.
-    quota_manager_ = std::make_unique<QuotaManager>(
-        config_.get<int64_t>("quota.producer.default", 0),
-        config_.get<int64_t>("quota.consumer.default", 0));
+    quota_manager_ =
+        std::make_unique<QuotaManager>(config_.get<int64_t>("quota.producer.default", 0),
+                                       config_.get<int64_t>("quota.consumer.default", 0));
     if (quota_manager_->producerQuotaEnabled() || quota_manager_->consumerQuotaEnabled()) {
         Logger::info("Client quotas ENABLED (producer={} B/s, consumer={} B/s)",
                      config_.get<int64_t>("quota.producer.default", 0),
@@ -330,24 +314,23 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
 
     // Parse TLS configuration for Raft inter-broker communication
     raft_tls_config_.enabled = config_.get<bool>("raft.ssl.enabled", false);
-    
+
     if (raft_tls_config_.enabled) {
         raft_tls_config_.cert_file = config_.get<std::string>("raft.ssl.cert.file", "");
         raft_tls_config_.key_file = config_.get<std::string>("raft.ssl.key.file", "");
         raft_tls_config_.key_password = config_.get<std::string>("raft.ssl.key.password", "");
         raft_tls_config_.ca_file = config_.get<std::string>("raft.ssl.ca.file", "");
-        
+
         if (!raft_tls_config_.isValid()) {
             throw std::runtime_error(
                 "Raft TLS is enabled but certificate or key file paths are not specified");
         }
-        
-        Logger::info("TLS enabled for Raft protocol (cert: {})",
-                    raft_tls_config_.cert_file);
+
+        Logger::info("TLS enabled for Raft protocol (cert: {})", raft_tls_config_.cert_file);
     } else {
         Logger::info("TLS disabled for Raft protocol (using PLAINTEXT)");
     }
-    
+
     // Phase 4.2a: Load SASL/PLAIN credentials. Two sources, checked in
     // order:
     //   1. `sasl.plain.credentials.file` — path to a text file with one
@@ -357,54 +340,51 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
     // empty and the handler falls back to "accept any non-empty creds"
     // (dev mode).
     {
-        const auto creds_file =
-            config_.getString("sasl.plain.credentials.file").value_or("");
+        const auto creds_file = config_.getString("sasl.plain.credentials.file").value_or("");
         if (!creds_file.empty()) {
             std::ifstream ifs(creds_file);
             if (!ifs) {
                 throw std::runtime_error(
-                    "sasl.plain.credentials.file configured but cannot be opened: " +
-                    creds_file);
+                    "sasl.plain.credentials.file configured but cannot be opened: " + creds_file);
             }
             std::string line;
             while (std::getline(ifs, line)) {
-                if (line.empty() || line[0] == '#') continue;
+                if (line.empty() || line[0] == '#')
+                    continue;
                 const auto colon = line.find(':');
-                if (colon == std::string::npos) continue;
+                if (colon == std::string::npos)
+                    continue;
                 auto user = line.substr(0, colon);
                 auto pass = line.substr(colon + 1);
                 if (!user.empty() && !pass.empty()) {
                     sasl_plain_creds_.emplace(std::move(user), std::move(pass));
                 }
             }
-            Logger::info("SASL PLAIN: loaded {} credential(s) from {}",
-                         sasl_plain_creds_.size(), creds_file);
+            Logger::info("SASL PLAIN: loaded {} credential(s) from {}", sasl_plain_creds_.size(),
+                         creds_file);
         }
-        const auto inline_creds =
-            config_.getString("sasl.plain.users").value_or("");
+        const auto inline_creds = config_.getString("sasl.plain.users").value_or("");
         if (!inline_creds.empty()) {
             try {
                 auto j = nlohmann::json::parse(inline_creds);
                 if (j.is_object()) {
                     for (auto it = j.begin(); it != j.end(); ++it) {
                         if (it.value().is_string()) {
-                            sasl_plain_creds_.emplace(it.key(),
-                                                      it.value().get<std::string>());
+                            sasl_plain_creds_.emplace(it.key(), it.value().get<std::string>());
                         }
                     }
                     Logger::info("SASL PLAIN: total {} credential(s) after inline merge",
                                  sasl_plain_creds_.size());
                 }
             } catch (const std::exception& e) {
-                throw std::runtime_error(
-                    std::string("sasl.plain.users JSON parse error: ") + e.what());
+                throw std::runtime_error(std::string("sasl.plain.users JSON parse error: ") +
+                                         e.what());
             }
         }
         if (sasl_plain_creds_.empty()) {
-            Logger::warn(
-                "SASL PLAIN: no credentials configured — accepting any non-empty "
-                "user/password (dev mode). Set sasl.plain.credentials.file or "
-                "sasl.plain.users for production.");
+            Logger::warn("SASL PLAIN: no credentials configured — accepting any non-empty "
+                         "user/password (dev mode). Set sasl.plain.credentials.file or "
+                         "sasl.plain.users for production.");
         }
     }
 
@@ -413,51 +393,47 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
     // plaintext password at startup; a production deployment should ship
     // pre-computed credentials in the file instead of plaintexts.
     {
-        const auto scram_file =
-            config_.getString("sasl.scram.credentials.file").value_or("");
+        const auto scram_file = config_.getString("sasl.scram.credentials.file").value_or("");
         if (!scram_file.empty()) {
             std::ifstream ifs(scram_file);
             if (!ifs) {
                 throw std::runtime_error(
-                    "sasl.scram.credentials.file configured but cannot be opened: " +
-                    scram_file);
+                    "sasl.scram.credentials.file configured but cannot be opened: " + scram_file);
             }
             std::string line;
             while (std::getline(ifs, line)) {
-                if (line.empty() || line[0] == '#') continue;
+                if (line.empty() || line[0] == '#')
+                    continue;
                 const auto colon = line.find(':');
-                if (colon == std::string::npos) continue;
+                if (colon == std::string::npos)
+                    continue;
                 auto user = line.substr(0, colon);
                 auto pass = line.substr(colon + 1);
                 if (!user.empty() && !pass.empty()) {
-                    sasl_scram_creds_.emplace(
-                        std::move(user), ScramCredentials::fromPassword(pass));
+                    sasl_scram_creds_.emplace(std::move(user),
+                                              ScramCredentials::fromPassword(pass));
                 }
             }
         }
-        const auto inline_scram =
-            config_.getString("sasl.scram.users").value_or("");
+        const auto inline_scram = config_.getString("sasl.scram.users").value_or("");
         if (!inline_scram.empty()) {
             try {
                 auto j = nlohmann::json::parse(inline_scram);
                 if (j.is_object()) {
                     for (auto it = j.begin(); it != j.end(); ++it) {
                         if (it.value().is_string()) {
-                            sasl_scram_creds_.emplace(
-                                it.key(),
-                                ScramCredentials::fromPassword(
-                                    it.value().get<std::string>()));
+                            sasl_scram_creds_.emplace(it.key(), ScramCredentials::fromPassword(
+                                                                    it.value().get<std::string>()));
                         }
                     }
                 }
             } catch (const std::exception& e) {
-                throw std::runtime_error(
-                    std::string("sasl.scram.users JSON parse error: ") + e.what());
+                throw std::runtime_error(std::string("sasl.scram.users JSON parse error: ") +
+                                         e.what());
             }
         }
         if (!sasl_scram_creds_.empty()) {
-            Logger::info("SASL SCRAM-SHA-256: loaded {} credential(s)",
-                         sasl_scram_creds_.size());
+            Logger::info("SASL SCRAM-SHA-256: loaded {} credential(s)", sasl_scram_creds_.size());
         }
     }
 
@@ -466,12 +442,11 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
     // is 5 minutes; expose via `log.cleaner.interval.ms` so dev/test configs
     // can observe compaction within a short window.
     {
-        const int64_t cleanup_ms =
-            config_.get<int64_t>("log.cleaner.interval.ms", 300000);
+        const int64_t cleanup_ms = config_.get<int64_t>("log.cleaner.interval.ms", 300000);
         log_manager_->setCleanupIntervalMs(cleanup_ms);
     }
     replica_manager_ = std::make_unique<ReplicaManager>();
-    
+
     // Initialize OffsetManager with persistent storage
     const std::string offset_db_path = log_dir_ + "/consumer_offsets";
     offset_manager_ = std::make_shared<OffsetManager>(offset_db_path);
@@ -493,14 +468,12 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
 
     // Phase EX-10: IsolationTracker for read_committed support.
     isolation_tracker_ = std::make_unique<IsolationTracker>();
-    
+
     // Initialize monitoring and metrics
     std::string monitoring_host = config_.get<std::string>("monitoring.host", "0.0.0.0");
     int monitoring_port = config_.get<int>("monitoring.port", 9094);
-    monitoring_manager_ = std::make_unique<monitoring::MonitoringManager>(
-        monitoring_host,
-        monitoring_port
-    );
+    monitoring_manager_ =
+        std::make_unique<monitoring::MonitoringManager>(monitoring_host, monitoring_port);
     // Use raw pointer from monitoring_manager for metrics_collector_
     // The monitoring_manager owns the MetricsCollector lifecycle
     auto* raw_metrics_collector = monitoring_manager_->metricsCollector();
@@ -510,12 +483,15 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
     // to the broker's owned subsystems (broker outlives MetricsCollector).
     raw_metrics_collector->setProducerStateProvider([this]() {
         std::ostringstream oss;
-        if (!producer_state_manager_) return std::string{};
+        if (!producer_state_manager_)
+            return std::string{};
         auto m = producer_state_manager_->getMetrics();
-        oss << "# HELP kawasan_producer_state_entries Tracked (topic,partition,producer_id) entries\n"
+        oss << "# HELP kawasan_producer_state_entries Tracked (topic,partition,producer_id) "
+               "entries\n"
             << "# TYPE kawasan_producer_state_entries gauge\n"
             << "kawasan_producer_state_entries " << m.entries << "\n\n"
-            << "# HELP kawasan_producer_state_evictions_total Entries evicted from the producer state map\n"
+            << "# HELP kawasan_producer_state_evictions_total Entries evicted from the producer "
+               "state map\n"
             << "# TYPE kawasan_producer_state_evictions_total counter\n"
             << "kawasan_producer_state_evictions_total " << m.evictions_total << "\n\n"
             << "# HELP kawasan_producer_id_count Distinct active producer_ids\n"
@@ -525,7 +501,8 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
     });
     raw_metrics_collector->setFetchSessionProvider([this]() {
         std::ostringstream oss;
-        if (!fetch_session_manager_) return std::string{};
+        if (!fetch_session_manager_)
+            return std::string{};
         auto m = fetch_session_manager_->getMetrics();
         oss << "# HELP kawasan_fetch_session_count Active fetch sessions\n"
             << "# TYPE kawasan_fetch_session_count gauge\n"
@@ -533,14 +510,16 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
             << "# HELP kawasan_fetch_session_evictions_total Sessions evicted due to idle timeout\n"
             << "# TYPE kawasan_fetch_session_evictions_total counter\n"
             << "kawasan_fetch_session_evictions_total " << m.evictions_total << "\n\n"
-            << "# HELP kawasan_incremental_fetch_session_hit_ratio Fraction of fetches served by an existing session\n"
+            << "# HELP kawasan_incremental_fetch_session_hit_ratio Fraction of fetches served by "
+               "an existing session\n"
             << "# TYPE kawasan_incremental_fetch_session_hit_ratio gauge\n"
             << "kawasan_incremental_fetch_session_hit_ratio " << m.incremental_hit_ratio << "\n\n";
         return oss.str();
     });
     raw_metrics_collector->setTransactionProvider([this]() {
         std::ostringstream oss;
-        if (!transaction_coordinator_) return std::string{};
+        if (!transaction_coordinator_)
+            return std::string{};
         auto m = transaction_coordinator_->getMetrics();
         oss << "# HELP kawasan_transactions_in_progress Transactions currently in Ongoing state\n"
             << "# TYPE kawasan_transactions_in_progress gauge\n"
@@ -551,7 +530,8 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
             << "# HELP kawasan_transaction_aborts_total Aborted transactions\n"
             << "# TYPE kawasan_transaction_aborts_total counter\n"
             << "kawasan_transaction_aborts_total " << m.aborts_total << "\n\n"
-            << "# HELP kawasan_transaction_state_loads_total InitProducerId invocations (state machine loads)\n"
+            << "# HELP kawasan_transaction_state_loads_total InitProducerId invocations (state "
+               "machine loads)\n"
             << "# TYPE kawasan_transaction_state_loads_total counter\n"
             << "kawasan_transaction_state_loads_total " << m.state_loads_total << "\n\n";
         return oss.str();
@@ -561,16 +541,16 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
 
     // Initialize GroupCoordinator with OffsetManager, LogManager, and MetricsCollector
     group_coordinator_ = std::make_shared<GroupCoordinator>(
-        offset_manager_,
-        log_manager_.get(),
-        std::shared_ptr<monitoring::MetricsCollector>(raw_metrics_collector, [](monitoring::MetricsCollector*){})
-    );
+        offset_manager_, log_manager_.get(),
+        std::shared_ptr<monitoring::MetricsCollector>(raw_metrics_collector,
+                                                      [](monitoring::MetricsCollector*) {}));
 
     // Phase EX-1: wire GroupCoordinator + LogCleaner providers (must
     // come after group_coordinator_ + log_manager_ are constructed).
     raw_metrics_collector->setGroupProvider([this]() {
         std::ostringstream oss;
-        if (!group_coordinator_) return std::string{};
+        if (!group_coordinator_)
+            return std::string{};
         auto m = group_coordinator_->getMetrics();
         oss << "# HELP kawasan_group_member_timeout_total Members evicted for missed heartbeats\n"
             << "# TYPE kawasan_group_member_timeout_total counter\n"
@@ -580,21 +560,23 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
         oss << "# HELP kawasan_group_rebalances_total Per-group rebalance count\n"
             << "# TYPE kawasan_group_rebalances_total counter\n";
         for (const auto& g : m.groups) {
-            oss << "kawasan_group_rebalances_total{group=\"" << g.group_id
-                << "\"} " << g.rebalances_total << "\n";
+            oss << "kawasan_group_rebalances_total{group=\"" << g.group_id << "\"} "
+                << g.rebalances_total << "\n";
         }
-        oss << "\n# HELP kawasan_group_state Group state machine kind (1 = currently in this state)\n"
+        oss << "\n# HELP kawasan_group_state Group state machine kind (1 = currently in this "
+               "state)\n"
             << "# TYPE kawasan_group_state gauge\n";
         for (const auto& g : m.groups) {
-            oss << "kawasan_group_state{group=\"" << g.group_id
-                << "\",state=\"" << g.state << "\"} 1\n";
+            oss << "kawasan_group_state{group=\"" << g.group_id << "\",state=\"" << g.state
+                << "\"} 1\n";
         }
         oss << "\n";
         return oss.str();
     });
     raw_metrics_collector->setLogCleanerProvider([this]() {
         std::ostringstream oss;
-        if (!log_manager_) return std::string{};
+        if (!log_manager_)
+            return std::string{};
         auto m = log_manager_->getCleanerMetrics();
         oss << "# HELP kawasan_log_cleaner_running 1 if a cleanup pass is currently active\n"
             << "# TYPE kawasan_log_cleaner_running gauge\n"
@@ -602,28 +584,30 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
             << "# HELP kawasan_log_cleaner_compactions_total Cleanup passes executed\n"
             << "# TYPE kawasan_log_cleaner_compactions_total counter\n"
             << "kawasan_log_cleaner_compactions_total " << m.compactions_total << "\n\n"
-            << "# HELP kawasan_log_cleaner_dedupe_buffer_utilization Last cleanup pass's OffsetMap size (unique keys)\n"
+            << "# HELP kawasan_log_cleaner_dedupe_buffer_utilization Last cleanup pass's OffsetMap "
+               "size (unique keys)\n"
             << "# TYPE kawasan_log_cleaner_dedupe_buffer_utilization gauge\n"
-            << "kawasan_log_cleaner_dedupe_buffer_utilization " << m.dedupe_buffer_utilization << "\n\n";
+            << "kawasan_log_cleaner_dedupe_buffer_utilization " << m.dedupe_buffer_utilization
+            << "\n\n";
         if (!m.partition_dirty_ratios.empty()) {
-            oss << "# HELP kawasan_log_cleaner_dirty_ratio Per-partition fraction of log eligible for compaction\n"
+            oss << "# HELP kawasan_log_cleaner_dirty_ratio Per-partition fraction of log eligible "
+                   "for compaction\n"
                 << "# TYPE kawasan_log_cleaner_dirty_ratio gauge\n";
             for (const auto& r : m.partition_dirty_ratios) {
-                oss << "kawasan_log_cleaner_dirty_ratio{topic=\"" << r.topic
-                    << "\",partition=\"" << r.partition
-                    << "\"} " << r.dirty_ratio << "\n";
+                oss << "kawasan_log_cleaner_dirty_ratio{topic=\"" << r.topic << "\",partition=\""
+                    << r.partition << "\"} " << r.dirty_ratio << "\n";
             }
             oss << "\n";
         }
         return oss.str();
     });
-    
+
     // Load persisted group state from storage
     group_coordinator_->loadGroupsFromStorage();
-    
+
     // Start background cleanup thread for expired groups and timed-out members
     group_coordinator_->startCleanupThread();
-    
+
     request_metrics_ = std::make_shared<metrics::RequestMetrics>();
     request_dispatcher_ = std::make_shared<RequestDispatcher>(request_metrics_);
     supported_api_versions_ = {
@@ -639,7 +623,7 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
         {protocol::ApiKey::JOIN_GROUP, 0, kJoinGroupMaxVersion},
         {protocol::ApiKey::SYNC_GROUP, 0, kSyncGroupMaxVersion},
         {protocol::ApiKey::HEARTBEAT, 0, kHeartbeatMaxVersion},
-    {protocol::ApiKey::LEAVE_GROUP, 0, kLeaveGroupMaxVersion},
+        {protocol::ApiKey::LEAVE_GROUP, 0, kLeaveGroupMaxVersion},
         {protocol::ApiKey::CREATE_TOPICS, 0, 7},  // Phase 1.15
         {protocol::ApiKey::DELETE_TOPICS, 0, 6},  // Phase 1.16: v6 topic-id form supported
         {protocol::ApiKey::PRODUCE, 0, kProduceMaxVersion},
@@ -821,34 +805,34 @@ void KawasanBroker::initializeRaft() {
     // Format: "raft.peers=0:localhost:9093,1:localhost:9094,2:localhost:9095"
     std::vector<raft::PeerInfo> peers;
     bool found_self_in_peers = false;
-    
+
     const std::string peers_str = config_.get<std::string>("raft.peers", "");
     if (!peers_str.empty()) {
         // Split by comma
         size_t start = 0;
         size_t end = peers_str.find(',');
-        
+
         while (start < peers_str.length()) {
-            std::string peer_str = (end == std::string::npos) 
-                ? peers_str.substr(start)
-                : peers_str.substr(start, end - start);
-            
+            std::string peer_str = (end == std::string::npos)
+                                       ? peers_str.substr(start)
+                                       : peers_str.substr(start, end - start);
+
             // Parse "broker_id:host:port"
             size_t first_colon = peer_str.find(':');
             size_t second_colon = peer_str.find(':', first_colon + 1);
-            
+
             if (first_colon != std::string::npos && second_colon != std::string::npos) {
                 try {
                     int peer_id = std::stoi(peer_str.substr(0, first_colon));
-                    std::string host = peer_str.substr(first_colon + 1, 
-                                                       second_colon - first_colon - 1);
+                    std::string host =
+                        peer_str.substr(first_colon + 1, second_colon - first_colon - 1);
                     int port = std::stoi(peer_str.substr(second_colon + 1));
-                    
+
                     // Check if this is the current broker
                     if (peer_id == broker_id_) {
                         found_self_in_peers = true;
-                        Logger::info("Found current broker (id={}) in peers list: {}:{}",
-                                   peer_id, host, port);
+                        Logger::info("Found current broker (id={}) in peers list: {}:{}", peer_id,
+                                     host, port);
                     } else {
                         // Add other peers for Raft communication
                         raft::PeerInfo info;
@@ -856,8 +840,8 @@ void KawasanBroker::initializeRaft() {
                         info.host = host;
                         info.port = port;
                         peers.push_back(info);
-                        Logger::info("Added Raft peer: id={}, host={}, port={}",
-                                   peer_id, host, port);
+                        Logger::info("Added Raft peer: id={}, host={}, port={}", peer_id, host,
+                                     port);
 
                         // Seed cluster membership for replica assignment + Metadata.
                         // raft.peers carries the Raft port; the Kafka listener port
@@ -876,39 +860,42 @@ void KawasanBroker::initializeRaft() {
                     Logger::warn("Failed to parse Raft peer '{}': {}", peer_str, e.what());
                 }
             }
-            
-            if (end == std::string::npos) break;
+
+            if (end == std::string::npos)
+                break;
             start = end + 1;
             end = peers_str.find(',', start);
         }
-        
+
         // Validate that broker.id is in the peers list
         if (!found_self_in_peers) {
-            Logger::error("broker.id={} is not present in raft.peers list: {}",
-                        broker_id_, peers_str);
-            throw std::runtime_error(
-                "Configuration error: broker.id must be present in raft.peers list when raft.peers is configured");
+            Logger::error("broker.id={} is not present in raft.peers list: {}", broker_id_,
+                          peers_str);
+            throw std::runtime_error("Configuration error: broker.id must be present in raft.peers "
+                                     "list when raft.peers is configured");
         }
     }
-    
+
     // Get Raft port from config (default: 9093)
     int raft_port = config_.get<int>("raft.port", 9093);
-    
+
     // Create RaftNode with io_context
     // 0A.7: persist Raft state under {metadata_dir}/raft so current_term,
     // voted_for, and log entries survive process restart (required for
     // multi-node Raft safety; harmless in single-node mode).
     const std::string raft_data_dir = metadata_dir_ + "/raft";
-    raft_node_ = std::make_unique<raft::RaftNode>(broker_id_, peers, io_context_,
-                                                  raft_port, raft_data_dir);
+    raft_node_ =
+        std::make_unique<raft::RaftNode>(broker_id_, peers, io_context_, raft_port, raft_data_dir);
     raft_node_->start();
 
     if (peers.empty()) {
-        Logger::info("Initialized Raft node for broker {} in single-node mode (no peers configured)", 
-                    broker_id_);
+        Logger::info(
+            "Initialized Raft node for broker {} in single-node mode (no peers configured)",
+            broker_id_);
     } else {
-        Logger::info("Initialized Raft node for broker {} on port {} with {} peer(s) in multi-broker mode", 
-                    broker_id_, raft_port, peers.size());
+        Logger::info(
+            "Initialized Raft node for broker {} on port {} with {} peer(s) in multi-broker mode",
+            broker_id_, raft_port, peers.size());
     }
 }
 
@@ -968,6 +955,22 @@ void KawasanBroker::initializeMetadata() {
         }
     }
 
+    // M1: on a RESTART, __transaction_state already exists in the metadata
+    // store and its logs were reopened above. Construct the state manager and
+    // replay it here — independent of controller leadership, which isn't
+    // established yet (ensureInternalTopics below is a no-op until then) and
+    // must not gate recovery. This runs before the broker serves traffic, so
+    // restored transactions hold their LSO before any client can fetch.
+    if (metadata_controller_ && log_manager_ && !transaction_state_manager_) {
+        const auto txn_md = metadata_controller_->describeTopics({"__transaction_state"});
+        if (!txn_md.empty() && !txn_md.front().partitions.empty()) {
+            txn_state_num_partitions_ = static_cast<int32_t>(txn_md.front().partitions.size());
+            transaction_state_manager_ = std::make_unique<TransactionStateManager>(
+                log_manager_.get(), txn_state_num_partitions_);
+            replayTransactionStateFromLog();
+        }
+    }
+
     // Ensure the internal topics exist. In single-node mode this broker is
     // already the leader (RaftNode::start becomes leader immediately with no
     // peers), so they are created synchronously here. In a multi-broker cluster
@@ -977,8 +980,165 @@ void KawasanBroker::initializeMetadata() {
     ensureInternalTopics();
 }
 
-void KawasanBroker::replayProducerStateFromLog(const std::string& topic,
-                                               PartitionId partition) {
+void KawasanBroker::replayTransactionStateFromLog() {
+    if (!transaction_state_manager_ || !transaction_coordinator_)
+        return;
+    const auto snapshots = transaction_state_manager_->loadAll();
+    if (snapshots.empty())
+        return;
+
+    size_t restored = 0, in_flight = 0, redriven = 0;
+    for (const auto& snap : snapshots) {
+        transaction_coordinator_->restore(snap);
+        ++restored;
+        const bool ongoing_or_prepare =
+            snap.state == TransactionCoordinator::State::Ongoing ||
+            snap.state == TransactionCoordinator::State::PrepareCommit ||
+            snap.state == TransactionCoordinator::State::PrepareAbort;
+        if (ongoing_or_prepare && isolation_tracker_) {
+            for (const auto& tp : snap.partitions) {
+                if (tp.first_offset >= 0) {
+                    isolation_tracker_->recordInFlightTxn(snap.producer_id, tp.topic, tp.partition,
+                                                          tp.first_offset);
+                }
+            }
+            ++in_flight;
+        }
+        // Re-drive a transaction that crashed mid-EndTxn (Prepare persisted,
+        // Complete not yet). This is what guarantees "no frozen LSO": a
+        // half-finished commit/abort is completed at startup.
+        if (snap.state == TransactionCoordinator::State::PrepareCommit ||
+            snap.state == TransactionCoordinator::State::PrepareAbort) {
+            const bool committed = snap.state == TransactionCoordinator::State::PrepareCommit;
+            finishTxnCompletion(snap.transactional_id, snap.producer_id, snap.producer_epoch,
+                                committed, snap.partitions, snap.pending_offsets,
+                                /*is_replay=*/true);
+            ++redriven;
+        }
+    }
+    Logger::info("Replayed {} transaction(s) from __transaction_state ({} in-flight "
+                 "re-armed, {} re-driven to completion)",
+                 restored, in_flight, redriven);
+}
+
+void KawasanBroker::persistTxnState(const std::string& transactional_id) {
+    if (!transaction_state_manager_ || !transaction_coordinator_)
+        return;
+    auto snap = transaction_coordinator_->describe(transactional_id);
+    if (snap.has_value()) {
+        transaction_state_manager_->persist(*snap);
+    }
+}
+
+void KawasanBroker::finishTxnCompletion(
+    const std::string& transactional_id, int64_t producer_id, int16_t producer_epoch,
+    bool committed, const std::vector<TransactionCoordinator::TxnPartition>& participating,
+    const std::vector<TransactionCoordinator::PendingOffset>& pending_offsets, bool is_replay) {
+    // Emit a control marker (COMMIT/ABORT) on each participating partition so
+    // read_committed consumers can detect the boundary. On replay we guard
+    // against double-emission: if a marker for this producer already exists
+    // at/after the txn's first_offset, skip it.
+    if (log_manager_) {
+        const Timestamp now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::system_clock::now().time_since_epoch())
+                                     .count();
+        for (const auto& tp : participating) {
+            auto* log = log_manager_->getOrCreateLog(tp.topic, tp.partition);
+            if (!log)
+                continue;
+            if (is_replay && tp.first_offset >= 0 &&
+                logHasControlBatchForProducer(log, producer_id, tp.first_offset)) {
+                continue;  // marker already durable before the crash
+            }
+            const Offset base_offset = log->logEndOffset();
+            auto control_batch = storage::RecordBatch::makeControlBatch(
+                producer_id, producer_epoch, base_offset, committed, now_ms);
+            try {
+                log->appendBatch(std::move(control_batch));
+            } catch (const std::exception& ex) {
+                Logger::warn("Failed to emit control record on {}-{}: {}", tp.topic, tp.partition,
+                             ex.what());
+            }
+        }
+    }
+
+    // On commit, apply staged consumer-group offsets to the OffsetManager.
+    if (committed && offset_manager_ && !pending_offsets.empty()) {
+        std::unordered_map<std::string, std::vector<OffsetManager::OffsetCommitData>> by_group;
+        for (const auto& po : pending_offsets) {
+            OffsetManager::OffsetCommitData d;
+            d.topic = po.topic;
+            d.partition = po.partition;
+            d.offset = po.offset;
+            d.metadata = po.metadata;
+            by_group[po.group_id].push_back(std::move(d));
+        }
+        for (auto& [group_id, data] : by_group) {
+            try {
+                offset_manager_->commitOffsetBatch(group_id, data);
+            } catch (const std::exception& ex) {
+                Logger::warn("EndTxn(commit) failed to apply staged offsets for '{}': {}", group_id,
+                             ex.what());
+            }
+        }
+    }
+
+    // Update the isolation tracker: commit releases the LSO hold; abort moves
+    // each first_offset into the aborted-transactions ring.
+    if (isolation_tracker_) {
+        std::vector<std::pair<std::string, int32_t>> pairs;
+        pairs.reserve(participating.size());
+        for (const auto& tp : participating)
+            pairs.emplace_back(tp.topic, tp.partition);
+        if (committed) {
+            isolation_tracker_->commitInFlightTxns(pairs, producer_id);
+        } else {
+            isolation_tracker_->abortInFlightTxns(pairs, producer_id);
+        }
+    }
+
+    // Transition to Complete* and persist the terminal snapshot.
+    if (transaction_coordinator_) {
+        if (committed) {
+            transaction_coordinator_->completeCommit(transactional_id);
+        } else {
+            transaction_coordinator_->completeAbort(transactional_id);
+        }
+    }
+    persistTxnState(transactional_id);
+}
+
+bool KawasanBroker::logHasControlBatchForProducer(storage::Log* log, int64_t producer_id,
+                                                  Offset from_offset) {
+    if (!log)
+        return false;
+    const Offset end = log->logEndOffset();
+    Offset off = std::max<Offset>(from_offset, log->logStartOffset());
+    constexpr size_t kChunkBytes = 4 * 1024 * 1024;
+    while (off < end) {
+        std::vector<storage::RecordBatch> batches;
+        try {
+            batches = log->read(off, kChunkBytes);
+        } catch (const std::exception&) {
+            return false;
+        }
+        if (batches.empty())
+            break;
+        Offset next = off;
+        for (const auto& batch : batches) {
+            next = std::max(next, batch.baseOffset() + static_cast<Offset>(batch.records().size()));
+            if (batch.isControlBatch() && batch.producerId() == producer_id) {
+                return true;
+            }
+        }
+        if (next <= off)
+            break;
+        off = next;
+    }
+    return false;
+}
+
+void KawasanBroker::replayProducerStateFromLog(const std::string& topic, PartitionId partition) {
     if (!producer_state_manager_ || !log_manager_) {
         return;
     }
@@ -1002,9 +1162,9 @@ void KawasanBroker::replayProducerStateFromLog(const std::string& topic,
                 next = base + count;
             }
             if (batch.producerId() >= 0 && count > 0) {
-                producer_state_manager_->recordAppend(
-                    topic, partition, batch.producerId(), batch.producerEpoch(),
-                    batch.baseSequence(), count, base);
+                producer_state_manager_->recordAppend(topic, partition, batch.producerId(),
+                                                      batch.producerEpoch(), batch.baseSequence(),
+                                                      count, base);
             }
         }
         if (next <= off) {
@@ -1028,8 +1188,7 @@ void KawasanBroker::ensureInternalTopics() {
     // replicated to us via Raft), record the offsets partition count and finish.
     if (topic_exists("__consumer_offsets") && topic_exists("__transaction_state")) {
         const auto md = metadata_controller_->describeTopics({"__consumer_offsets"});
-        offsets_topic_num_partitions_ =
-            static_cast<int32_t>(md.front().partitions.size());
+        offsets_topic_num_partitions_ = static_cast<int32_t>(md.front().partitions.size());
         internal_topics_ready_.store(true);
         return;
     }
@@ -1063,8 +1222,7 @@ void KawasanBroker::ensureInternalTopics() {
         if (result.error_code == ErrorCode::TOPIC_ALREADY_EXISTS) {
             return true;
         }
-        Logger::debug("Deferred creating internal topic {}: {}", name,
-                      result.error_message);
+        Logger::debug("Deferred creating internal topic {}: {}", name, result.error_message);
         return false;
     };
 
@@ -1073,21 +1231,32 @@ void KawasanBroker::ensureInternalTopics() {
     const int32_t txn_partitions =
         std::max(1, config_.get<int32_t>("transaction.state.topic.num.partitions", 16));
 
-    const bool offsets_ok = create_if_missing(
-        "__consumer_offsets", offsets_partitions,
-        {{"cleanup.policy", "compact"}, {"segment.bytes", "104857600"}});
-    const bool txn_ok = create_if_missing(
-        "__transaction_state", txn_partitions,
-        {{"cleanup.policy", "compact"},
-         {"segment.bytes", "104857600"},
-         {"min.compaction.lag.ms", "0"}});
+    const bool offsets_ok =
+        create_if_missing("__consumer_offsets", offsets_partitions,
+                          {{"cleanup.policy", "compact"}, {"segment.bytes", "104857600"}});
+    const bool txn_ok = create_if_missing("__transaction_state", txn_partitions,
+                                          {{"cleanup.policy", "compact"},
+                                           {"segment.bytes", "104857600"},
+                                           {"min.compaction.lag.ms", "0"}});
 
     // Capture the actual offsets partition count (handles a pre-existing topic
     // with a different count) so offset-commit routing uses the true modulus.
     const auto offsets_md = metadata_controller_->describeTopics({"__consumer_offsets"});
     if (!offsets_md.empty() && !offsets_md.front().partitions.empty()) {
-        offsets_topic_num_partitions_ =
-            static_cast<int32_t>(offsets_md.front().partitions.size());
+        offsets_topic_num_partitions_ = static_cast<int32_t>(offsets_md.front().partitions.size());
+    }
+    // M1: capture the actual __transaction_state partition count and construct
+    // the state manager so txn-state routing (write + replay) agrees on the
+    // modulus. Route by transactional_id hash % this count.
+    const auto txn_md = metadata_controller_->describeTopics({"__transaction_state"});
+    if (!txn_md.empty() && !txn_md.front().partitions.empty()) {
+        txn_state_num_partitions_ = static_cast<int32_t>(txn_md.front().partitions.size());
+    } else {
+        txn_state_num_partitions_ = txn_partitions;
+    }
+    if (txn_ok && log_manager_ && !transaction_state_manager_) {
+        transaction_state_manager_ = std::make_unique<TransactionStateManager>(
+            log_manager_.get(), txn_state_num_partitions_);
     }
     if (offsets_ok && txn_ok) {
         internal_topics_ready_.store(true);
@@ -1116,8 +1285,8 @@ void KawasanBroker::startServices() {
         configured_threads = static_cast<int32_t>(default_threads);
     }
 
-    const size_t max_frame_bytes = static_cast<size_t>(
-        config_.get<int64_t>("network.max_frame_bytes", 16 * 1024 * 1024));
+    const size_t max_frame_bytes =
+        static_cast<size_t>(config_.get<int64_t>("network.max_frame_bytes", 16 * 1024 * 1024));
 
     // Prepare TLS config for TCP server
     network::TlsConfig server_tls_config;
@@ -1132,18 +1301,15 @@ void KawasanBroker::startServices() {
     network::SocketTuning socket_tuning;
     socket_tuning.no_delay = config_.get<bool>("network.tcp_nodelay", true);
     socket_tuning.keep_alive = config_.get<bool>("network.tcp_keepalive", true);
-    socket_tuning.send_buffer_bytes =
-        config_.get<int32_t>("network.socket_send_buffer_bytes", 0);
-    socket_tuning.recv_buffer_bytes =
-        config_.get<int32_t>("network.socket_recv_buffer_bytes", 0);
-    const auto idle_timeout = std::chrono::seconds(
-        config_.get<int64_t>("network.idle_connection_timeout_seconds", 600));
+    socket_tuning.send_buffer_bytes = config_.get<int32_t>("network.socket_send_buffer_bytes", 0);
+    socket_tuning.recv_buffer_bytes = config_.get<int32_t>("network.socket_recv_buffer_bytes", 0);
+    const auto idle_timeout =
+        std::chrono::seconds(config_.get<int64_t>("network.idle_connection_timeout_seconds", 600));
 
     tcp_server_ = std::make_unique<network::TcpServer>(
-        host_, port_, static_cast<size_t>(configured_threads), max_frame_bytes,
-        request_dispatcher_,
-        monitoring_manager_ ? monitoring_manager_->sharedMetricsCollector() : nullptr,
-        idle_timeout, server_tls_config, socket_tuning);
+        host_, port_, static_cast<size_t>(configured_threads), max_frame_bytes, request_dispatcher_,
+        monitoring_manager_ ? monitoring_manager_->sharedMetricsCollector() : nullptr, idle_timeout,
+        server_tls_config, socket_tuning);
     tcp_server_->start();
     port_ = tcp_server_->listeningPort();
 
@@ -1449,40 +1615,26 @@ void KawasanBroker::registerProtocolHandlers() {
                 return buildEmptyErrorResponse(ctx);
             });
     };
-    reg_admin(protocol::ApiKey::DESCRIBE_LOG_DIRS, 0, 0,
-              &KawasanBroker::handleDescribeLogDirs);
+    reg_admin(protocol::ApiKey::DESCRIBE_LOG_DIRS, 0, 0, &KawasanBroker::handleDescribeLogDirs);
     reg_admin(protocol::ApiKey::ALTER_REPLICA_LOG_DIRS, 0, 0,
               &KawasanBroker::handleAlterReplicaLogDirs);
-    reg_admin(protocol::ApiKey::ELECT_LEADERS, 0, 1,
-              &KawasanBroker::handleElectLeaders);
-    reg_admin(protocol::ApiKey::DELETE_RECORDS, 0, 0,
-              &KawasanBroker::handleDeleteRecords);
-    reg_admin(protocol::ApiKey::DELETE_GROUPS, 0, 0,
-              &KawasanBroker::handleDeleteGroups);
-    reg_admin(protocol::ApiKey::OFFSET_DELETE, 0, 0,
-              &KawasanBroker::handleOffsetDelete);
-    reg_admin(protocol::ApiKey::CREATE_PARTITIONS, 0, 0,
-              &KawasanBroker::handleCreatePartitions);
-    reg_admin(protocol::ApiKey::DESCRIBE_PRODUCERS, 0, 0,
-              &KawasanBroker::handleDescribeProducers);
-    reg_admin(protocol::ApiKey::LIST_TRANSACTIONS, 0, 0,
-              &KawasanBroker::handleListTransactions);
+    reg_admin(protocol::ApiKey::ELECT_LEADERS, 0, 1, &KawasanBroker::handleElectLeaders);
+    reg_admin(protocol::ApiKey::DELETE_RECORDS, 0, 0, &KawasanBroker::handleDeleteRecords);
+    reg_admin(protocol::ApiKey::DELETE_GROUPS, 0, 0, &KawasanBroker::handleDeleteGroups);
+    reg_admin(protocol::ApiKey::OFFSET_DELETE, 0, 0, &KawasanBroker::handleOffsetDelete);
+    reg_admin(protocol::ApiKey::CREATE_PARTITIONS, 0, 0, &KawasanBroker::handleCreatePartitions);
+    reg_admin(protocol::ApiKey::DESCRIBE_PRODUCERS, 0, 0, &KawasanBroker::handleDescribeProducers);
+    reg_admin(protocol::ApiKey::LIST_TRANSACTIONS, 0, 0, &KawasanBroker::handleListTransactions);
     reg_admin(protocol::ApiKey::DESCRIBE_TRANSACTIONS, 0, 0,
               &KawasanBroker::handleDescribeTransactions);
-    reg_admin(protocol::ApiKey::ALTER_PARTITION, 0, 0,
-              &KawasanBroker::handleAlterPartition);
-    reg_admin(protocol::ApiKey::DESCRIBE_ACLS, 0, 0,
-              &KawasanBroker::handleDescribeAcls);
-    reg_admin(protocol::ApiKey::CREATE_ACLS, 0, 0,
-              &KawasanBroker::handleCreateAcls);
-    reg_admin(protocol::ApiKey::DELETE_ACLS, 0, 0,
-              &KawasanBroker::handleDeleteAcls);
+    reg_admin(protocol::ApiKey::ALTER_PARTITION, 0, 0, &KawasanBroker::handleAlterPartition);
+    reg_admin(protocol::ApiKey::DESCRIBE_ACLS, 0, 0, &KawasanBroker::handleDescribeAcls);
+    reg_admin(protocol::ApiKey::CREATE_ACLS, 0, 0, &KawasanBroker::handleCreateAcls);
+    reg_admin(protocol::ApiKey::DELETE_ACLS, 0, 0, &KawasanBroker::handleDeleteAcls);
 
     // Phase 4.2a: SASL PLAIN.
-    reg_admin(protocol::ApiKey::SASL_HANDSHAKE, 0, 1,
-              &KawasanBroker::handleSaslHandshake);
-    reg_admin(protocol::ApiKey::SASL_AUTHENTICATE, 0, 1,
-              &KawasanBroker::handleSaslAuthenticate);
+    reg_admin(protocol::ApiKey::SASL_HANDSHAKE, 0, 1, &KawasanBroker::handleSaslHandshake);
+    reg_admin(protocol::ApiKey::SASL_AUTHENTICATE, 0, 1, &KawasanBroker::handleSaslAuthenticate);
 
     // Phase 3.3 scaffolding: transactional APIs. Advertised v0 only —
     // sufficient for kafka-python and librdkafka to negotiate; higher
@@ -1490,17 +1642,13 @@ void KawasanBroker::registerProtocolHandlers() {
     // but our flex-header path handles correctly.
     reg_admin(protocol::ApiKey::ADD_PARTITIONS_TO_TXN, 0, 0,
               &KawasanBroker::handleAddPartitionsToTxn);
-    reg_admin(protocol::ApiKey::ADD_OFFSETS_TO_TXN, 0, 0,
-              &KawasanBroker::handleAddOffsetsToTxn);
-    reg_admin(protocol::ApiKey::END_TXN, 0, 0,
-              &KawasanBroker::handleEndTxn);
-    reg_admin(protocol::ApiKey::TXN_OFFSET_COMMIT, 0, 0,
-              &KawasanBroker::handleTxnOffsetCommit);
+    reg_admin(protocol::ApiKey::ADD_OFFSETS_TO_TXN, 0, 0, &KawasanBroker::handleAddOffsetsToTxn);
+    reg_admin(protocol::ApiKey::END_TXN, 0, 0, &KawasanBroker::handleEndTxn);
+    reg_admin(protocol::ApiKey::TXN_OFFSET_COMMIT, 0, 0, &KawasanBroker::handleTxnOffsetCommit);
 }
 
-Buffer KawasanBroker::encodeResponse(
-    const RequestDispatcher::RequestContext& context,
-    const std::function<void(Buffer&)>& writer) const {
+Buffer KawasanBroker::encodeResponse(const RequestDispatcher::RequestContext& context,
+                                     const std::function<void(Buffer&)>& writer) const {
     Buffer buffer;
     // Use isFlexibleResponseHeader() for response header, which may differ from request header
     protocol::ResponseHeader header(context.header.correlationId(),
@@ -1512,39 +1660,41 @@ Buffer KawasanBroker::encodeResponse(
 
 Buffer KawasanBroker::handleApiVersions(RequestDispatcher::RequestContext& context) {
     protocol::ApiVersionsRequest request;
-    
+
     // Defensively decode the request - if decoding fails, return error response
     // instead of letting exception propagate and close connection
     try {
         request.decode(context.payload, context.header.apiVersion());
-        
+
         // Validate client software fields for API version 3+ (KIP-511)
         if (context.header.apiVersion() >= 3) {
             const auto& name = request.clientSoftwareName();
             const auto& version = request.clientSoftwareVersion();
-            
+
             // Validate that the fields only contain allowed characters
             if (!protocol::isValidClientSoftwareString(name)) {
-                Logger::warn("Invalid client.software.name from {}: '{}' contains invalid characters",
-                             context.peer_identity, name);
+                Logger::warn(
+                    "Invalid client.software.name from {}: '{}' contains invalid characters",
+                    context.peer_identity, name);
                 return buildApiVersionsError(context, ErrorCode::INVALID_REQUEST,
                                              context.header.apiVersion());
             }
-            
+
             if (!protocol::isValidClientSoftwareString(version)) {
-                Logger::warn("Invalid client.software.version from {}: '{}' contains invalid characters",
-                             context.peer_identity, version);
+                Logger::warn(
+                    "Invalid client.software.version from {}: '{}' contains invalid characters",
+                    context.peer_identity, version);
                 return buildApiVersionsError(context, ErrorCode::INVALID_REQUEST,
                                              context.header.apiVersion());
             }
-            
+
             // Log client software info for debugging
             Logger::info("API versions request from {}: client='{}' version='{}'",
                          context.peer_identity, name, version);
         }
     } catch (const ProtocolException& ex) {
-        Logger::warn("Failed to decode API versions request from {}: {}",
-                     context.peer_identity, ex.what());
+        Logger::warn("Failed to decode API versions request from {}: {}", context.peer_identity,
+                     ex.what());
         // Return error response but don't close connection
         return buildApiVersionsError(context, ErrorCode::INVALID_REQUEST,
                                      context.header.apiVersion());
@@ -1555,29 +1705,24 @@ Buffer KawasanBroker::handleApiVersions(RequestDispatcher::RequestContext& conte
         return buildApiVersionsError(context, ErrorCode::INVALID_REQUEST,
                                      context.header.apiVersion());
     }
-    
+
     protocol::ApiVersionsResponse response;
     response.setErrorCode(ErrorCode::NONE);
     response.setThrottleTimeMs(0);
     response.setApiVersions(supported_api_versions_);
-    const int16_t response_version =
-        std::clamp<int16_t>(context.header.apiVersion(), 0, 4);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, response_version);
-    });
+    const int16_t response_version = std::clamp<int16_t>(context.header.apiVersion(), 0, 4);
+    return encodeResponse(context,
+                          [&](Buffer& buffer) { response.encode(buffer, response_version); });
 }
 
-Buffer KawasanBroker::buildApiVersionsError(
-    const RequestDispatcher::RequestContext& context, ErrorCode code,
-    int16_t response_version) const {
+Buffer KawasanBroker::buildApiVersionsError(const RequestDispatcher::RequestContext& context,
+                                            ErrorCode code, int16_t response_version) const {
     protocol::ApiVersionsResponse response;
     response.setErrorCode(code);
     response.setThrottleTimeMs(0);
     response.setApiVersions(supported_api_versions_);
     const int16_t version = std::clamp<int16_t>(response_version, 0, 4);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 Buffer KawasanBroker::handleMetadata(RequestDispatcher::RequestContext& context) {
@@ -1604,8 +1749,7 @@ Buffer KawasanBroker::handleMetadata(RequestDispatcher::RequestContext& context)
                 auto_create_topics_enabled_ && request.allowAutoTopicCreation();
             topics.reserve(request.topics().size());
             for (const auto& topic_name : request.topics()) {
-                auto [metadata_opt, error_code] =
-                    getTopicMetadata(topic_name, allow_auto_create);
+                auto [metadata_opt, error_code] = getTopicMetadata(topic_name, allow_auto_create);
                 if (metadata_opt.has_value()) {
                     topics.push_back(*metadata_opt);
                 } else {
@@ -1620,8 +1764,8 @@ Buffer KawasanBroker::handleMetadata(RequestDispatcher::RequestContext& context)
     } else {
         const auto fallback = buildDefaultTopicMetadata();
         const auto& requested = request.topics();
-        if (requested.empty() || std::find(requested.begin(), requested.end(),
-                                           fallback.name) != requested.end()) {
+        if (requested.empty() ||
+            std::find(requested.begin(), requested.end(), fallback.name) != requested.end()) {
             topics.push_back(fallback);
         }
     }
@@ -1629,14 +1773,11 @@ Buffer KawasanBroker::handleMetadata(RequestDispatcher::RequestContext& context)
 
     const int16_t version =
         std::clamp<int16_t>(context.header.apiVersion(), 0, kMetadataMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
-Buffer KawasanBroker::buildMetadataError(
-    const RequestDispatcher::RequestContext& context, ErrorCode code,
-    int16_t response_version) const {
+Buffer KawasanBroker::buildMetadataError(const RequestDispatcher::RequestContext& context,
+                                         ErrorCode code, int16_t response_version) const {
     protocol::MetadataResponse response;
     response.setThrottleTimeMs(0);
     const std::string cluster_id =
@@ -1650,11 +1791,8 @@ Buffer KawasanBroker::buildMetadataError(
     error_topic.is_internal = true;
     response.setTopics({error_topic});
 
-    const int16_t version =
-        std::clamp<int16_t>(response_version, 0, kMetadataMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    const int16_t version = std::clamp<int16_t>(response_version, 0, kMetadataMaxVersion);
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 Buffer KawasanBroker::handleCreateTopics(RequestDispatcher::RequestContext& context) {
@@ -1701,14 +1839,11 @@ Buffer KawasanBroker::handleCreateTopics(RequestDispatcher::RequestContext& cont
 
     const int16_t version =
         std::clamp<int16_t>(context.header.apiVersion(), 0, static_cast<int16_t>(7));  // Phase 1.15
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
-Buffer KawasanBroker::buildCreateTopicsError(
-    const RequestDispatcher::RequestContext& context, ErrorCode code,
-    int16_t response_version) const {
+Buffer KawasanBroker::buildCreateTopicsError(const RequestDispatcher::RequestContext& context,
+                                             ErrorCode code, int16_t response_version) const {
     protocol::CreateTopicsResponse response;
     response.setThrottleTimeMs(0);
     protocol::CreatableTopicResult result;
@@ -1719,9 +1854,7 @@ Buffer KawasanBroker::buildCreateTopicsError(
 
     const int16_t version =
         std::clamp<int16_t>(response_version, 0, static_cast<int16_t>(7));  // Phase 1.15
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 Buffer KawasanBroker::handleDeleteTopics(RequestDispatcher::RequestContext& context) {
@@ -1784,14 +1917,11 @@ Buffer KawasanBroker::handleDeleteTopics(RequestDispatcher::RequestContext& cont
 
     const int16_t version =
         std::clamp<int16_t>(context.header.apiVersion(), 0, static_cast<int16_t>(6));  // Phase 1.16
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
-Buffer KawasanBroker::buildDeleteTopicsError(
-    const RequestDispatcher::RequestContext& context, ErrorCode code,
-    int16_t response_version) const {
+Buffer KawasanBroker::buildDeleteTopicsError(const RequestDispatcher::RequestContext& context,
+                                             ErrorCode code, int16_t response_version) const {
     protocol::DeleteTopicsResponse response;
     response.setThrottleTimeMs(0);
     protocol::DeletableTopicResult result;
@@ -1802,23 +1932,21 @@ Buffer KawasanBroker::buildDeleteTopicsError(
 
     const int16_t version =
         std::clamp<int16_t>(response_version, 0, static_cast<int16_t>(6));  // Phase 1.16
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
     RequestDispatcher::RequestContext& context) {
     auto start_time = std::chrono::steady_clock::now();
-    
+
     protocol::ProduceRequest request;
     request.decode(context.payload, context.header.apiVersion());
 
     const int16_t acks = request.acks();
     if (acks != -1 && acks != 0 && acks != 1) {
         RequestDispatcher::HandlerResult invalid_acks;
-        invalid_acks.payload = buildProduceError(
-            context, ErrorCode::INVALID_REQUIRED_ACKS, context.header.apiVersion());
+        invalid_acks.payload = buildProduceError(context, ErrorCode::INVALID_REQUIRED_ACKS,
+                                                 context.header.apiVersion());
         invalid_acks.close_connection = false;
         return invalid_acks;
     }
@@ -1829,8 +1957,7 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
     int32_t produce_throttle_ms = 0;
     if (quota_manager_) {
         produce_throttle_ms = quota_manager_->recordAndThrottleMs(
-            QuotaManager::Type::kProducer, context.header.clientId(),
-            context.frame_size_bytes);
+            QuotaManager::Type::kProducer, context.header.clientId(), context.frame_size_bytes);
     }
     response.setThrottleTimeMs(produce_throttle_ms);
 
@@ -1883,11 +2010,11 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
             }
 
             const auto& topic_metadata = topic_metadata_opt.value();
-            auto partition_it = std::find_if(
-                topic_metadata.partitions.begin(), topic_metadata.partitions.end(),
-                [&](const PartitionMetadata& metadata) {
-                    return metadata.partition == partition_data.partition;
-                });
+            auto partition_it =
+                std::find_if(topic_metadata.partitions.begin(), topic_metadata.partitions.end(),
+                             [&](const PartitionMetadata& metadata) {
+                                 return metadata.partition == partition_data.partition;
+                             });
 
             if (partition_it == topic_metadata.partitions.end()) {
                 partition_response.error_code = ErrorCode::UNKNOWN_TOPIC_OR_PARTITION;
@@ -1911,13 +2038,12 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
             }
 
             try {
-                storage::RecordBatch batch =
-                    storage::RecordBatch::deserializeFromProduceRequest(partition_data.record_batch);
+                storage::RecordBatch batch = storage::RecordBatch::deserializeFromProduceRequest(
+                    partition_data.record_batch);
                 auto* log =
                     log_manager_->getOrCreateLog(topic_data.topic, partition_data.partition);
                 if (!log) {
-                    throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR,
-                                           "Failed to create log");
+                    throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR, "Failed to create log");
                 }
 
                 // Register replica with ReplicaManager if not already registered
@@ -1925,7 +2051,7 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                 if (!replica_manager_->isLeader(tp)) {
                     // Create a shared_ptr wrapper for the log (LogManager owns the actual log)
                     // We use a non-owning shared_ptr to track it in ReplicaManager
-                    std::shared_ptr<storage::Log> log_ptr(log, [](storage::Log*){});
+                    std::shared_ptr<storage::Log> log_ptr(log, [](storage::Log*) {});
                     replica_manager_->addReplica(tp, log_ptr);
                 }
 
@@ -1933,9 +2059,8 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                 // producers (producer_id < 0), check() returns NONE.
                 if (producer_state_manager_ && batch.producerId() >= 0) {
                     auto chk = producer_state_manager_->check(
-                        topic_data.topic, partition_data.partition,
-                        batch.producerId(), batch.producerEpoch(),
-                        batch.baseSequence(),
+                        topic_data.topic, partition_data.partition, batch.producerId(),
+                        batch.producerEpoch(), batch.baseSequence(),
                         static_cast<int32_t>(batch.records().size()));
                     if (chk.error == ErrorCode::DUPLICATE_SEQUENCE_NUMBER) {
                         // Duplicate retry: return the original base_offset
@@ -1945,19 +2070,19 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                         partition_response.log_start_offset = log->logStartOffset();
                         partition_response.log_append_time = now_ms();
                         partition_response.error_code = ErrorCode::NONE;
-                        Logger::info("Produce dedup: {}-{} pid={} epoch={} seq={} → DUPLICATE returning offset={}",
-                                     topic_data.topic, partition_data.partition,
-                                     batch.producerId(), batch.producerEpoch(),
-                                     batch.baseSequence(), chk.duplicate_offset);
+                        Logger::info("Produce dedup: {}-{} pid={} epoch={} seq={} → DUPLICATE "
+                                     "returning offset={}",
+                                     topic_data.topic, partition_data.partition, batch.producerId(),
+                                     batch.producerEpoch(), batch.baseSequence(),
+                                     chk.duplicate_offset);
                         topic_response.partitions.push_back(partition_response);
                         continue;
                     }
                     if (chk.error != ErrorCode::NONE) {
                         partition_response.error_code = chk.error;
                         Logger::warn("Produce rejected: {}-{} pid={} epoch={} seq={} → error={}",
-                                     topic_data.topic, partition_data.partition,
-                                     batch.producerId(), batch.producerEpoch(),
-                                     batch.baseSequence(),
+                                     topic_data.topic, partition_data.partition, batch.producerId(),
+                                     batch.producerEpoch(), batch.baseSequence(),
                                      static_cast<int16_t>(chk.error));
                         topic_response.partitions.push_back(partition_response);
                         has_error = true;
@@ -1981,19 +2106,18 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                 // Phase 2.1: record successful append for dedup.
                 if (producer_state_manager_ && saved_pid >= 0) {
                     producer_state_manager_->recordAppend(
-                        topic_data.topic, partition_data.partition,
-                        saved_pid, saved_epoch, saved_base_seq,
-                        static_cast<int32_t>(record_count),
-                        base_offset);
+                        topic_data.topic, partition_data.partition, saved_pid, saved_epoch,
+                        saved_base_seq, static_cast<int32_t>(record_count), base_offset);
                 }
-                
+
                 // Update metrics: track messages produced and bytes
                 if (monitoring_manager_ && monitoring_manager_->metricsCollector()) {
-                    monitoring_manager_->metricsCollector()->incrementMessagesProduced(record_count);
+                    monitoring_manager_->metricsCollector()->incrementMessagesProduced(
+                        record_count);
                     size_t batch_bytes = partition_data.record_batch.size();
                     monitoring_manager_->metricsCollector()->incrementBytesIn(batch_bytes);
                 }
-                
+
                 // Advance the high watermark from the ISR: HW = min(leader LEO,
                 // in-sync follower offsets). With only the leader in the ISR
                 // (single-node) this equals the LEO, identical to before.
@@ -2020,13 +2144,10 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                         }
                         const auto deadline = std::chrono::steady_clock::now() +
                                               std::chrono::milliseconds(timeout_ms);
-                        auto committed =
-                            replica_manager_->isrCommittedOffset(tp).value_or(0);
-                        while (committed < target &&
-                               std::chrono::steady_clock::now() < deadline) {
+                        auto committed = replica_manager_->isrCommittedOffset(tp).value_or(0);
+                        while (committed < target && std::chrono::steady_clock::now() < deadline) {
                             std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                            committed =
-                                replica_manager_->isrCommittedOffset(tp).value_or(0);
+                            committed = replica_manager_->isrCommittedOffset(tp).value_or(0);
                         }
                         if (committed < target) {
                             partition_response.error_code = ErrorCode::REQUEST_TIMED_OUT;
@@ -2049,8 +2170,7 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                         hex_dump.push_back(' ');
                     }
                     char buf[4];
-                    std::snprintf(buf, sizeof(buf), "%02x",
-                                  static_cast<unsigned int>(raw[i]));
+                    std::snprintf(buf, sizeof(buf), "%02x", static_cast<unsigned int>(raw[i]));
                     hex_dump.append(buf);
                 }
                 Logger::warn(
@@ -2067,16 +2187,14 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
         response.addTopic(topic_response);
     }
 
-    const int16_t version =
-        std::clamp<int16_t>(context.header.apiVersion(), 0, kProduceMaxVersion);
+    const int16_t version = std::clamp<int16_t>(context.header.apiVersion(), 0, kProduceMaxVersion);
     RequestDispatcher::HandlerResult result;
     result.suppress_response = (acks == 0 && !has_error);
     if (!result.suppress_response) {
-        result.payload = encodeResponse(context, [&](Buffer& buffer) {
-            response.encode(buffer, version);
-        });
+        result.payload =
+            encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
     }
-    
+
     // Record produce latency
     if (monitoring_manager_ && monitoring_manager_->metricsCollector()) {
         auto end_time = std::chrono::steady_clock::now();
@@ -2087,13 +2205,12 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
             monitoring_manager_->metricsCollector()->incrementRequestErrors("Produce");
         }
     }
-    
+
     return result;
 }
 
-Buffer KawasanBroker::buildProduceError(
-    const RequestDispatcher::RequestContext& context, ErrorCode code,
-    int16_t response_version) const {
+Buffer KawasanBroker::buildProduceError(const RequestDispatcher::RequestContext& context,
+                                        ErrorCode code, int16_t response_version) const {
     protocol::ProduceResponse response;
     response.setThrottleTimeMs(0);
     protocol::ProduceTopicResponse topic_response;
@@ -2107,17 +2224,14 @@ Buffer KawasanBroker::buildProduceError(
     topic_response.partitions.push_back(partition_response);
     response.addTopic(topic_response);
 
-    const int16_t version =
-        std::clamp<int16_t>(response_version, 0, kProduceMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    const int16_t version = std::clamp<int16_t>(response_version, 0, kProduceMaxVersion);
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
     RequestDispatcher::RequestContext& context) {
     const auto start_time = std::chrono::steady_clock::now();
-    
+
     protocol::FetchRequest request;
     request.decode(context.payload, context.header.apiVersion());
 
@@ -2253,11 +2367,11 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
                 }
 
                 const auto& topic_metadata = *topic_metadata_opt;
-                auto partition_it = std::find_if(
-                    topic_metadata.partitions.begin(), topic_metadata.partitions.end(),
-                    [&](const PartitionMetadata& metadata) {
-                        return metadata.partition == partition.partition;
-                    });
+                auto partition_it =
+                    std::find_if(topic_metadata.partitions.begin(), topic_metadata.partitions.end(),
+                                 [&](const PartitionMetadata& metadata) {
+                                     return metadata.partition == partition.partition;
+                                 });
 
                 if (partition_it == topic_metadata.partitions.end()) {
                     partition_response.error_code = ErrorCode::UNKNOWN_TOPIC_OR_PARTITION;
@@ -2304,14 +2418,14 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
                 TopicPartition tp{lookup_name, partition.partition};
                 if (!replica_manager_->isLeader(tp)) {
                     // Create a non-owning shared_ptr wrapper
-                    std::shared_ptr<storage::Log> log_ptr(log, [](storage::Log*){});
+                    std::shared_ptr<storage::Log> log_ptr(log, [](storage::Log*) {});
                     replica_manager_->addReplica(tp, log_ptr);
                 }
 
                 const Offset log_start = log->logStartOffset();
                 const Offset log_end = log->logEndOffset();
                 partition_response.log_start_offset = log_start;
-                
+
                 // Get high watermark from ReplicaManager (falls back to log's HW if not found)
                 auto hw_opt = replica_manager_->getHighWatermark(tp);
                 const Offset high_watermark = hw_opt.value_or(log->highWatermark());
@@ -2321,9 +2435,9 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
                 // transactional batches) or HWM if none. read_committed
                 // consumers will only see records up to this offset.
                 const Offset lso = isolation_tracker_
-                    ? isolation_tracker_->lastStableOffset(
-                        lookup_name, partition.partition, high_watermark)
-                    : high_watermark;
+                                       ? isolation_tracker_->lastStableOffset(
+                                             lookup_name, partition.partition, high_watermark)
+                                       : high_watermark;
                 partition_response.last_stable_offset = lso;
 
                 // Phase EX-10: populate aborted_transactions list. The
@@ -2341,11 +2455,13 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
                     }
                 }
 
-                // Allow fetch_offset == log_end (returns empty data), reject only if strictly beyond
+                // Allow fetch_offset == log_end (returns empty data), reject only if strictly
+                // beyond
                 if (partition.fetch_offset < log_start || partition.fetch_offset > log_end) {
-                    Logger::warn("Fetch offset {} out of range for {}-{} (log_start={}, log_end={})",
-                                 partition.fetch_offset, lookup_name, partition.partition,
-                                 log_start, log_end);
+                    Logger::warn(
+                        "Fetch offset {} out of range for {}-{} (log_start={}, log_end={})",
+                        partition.fetch_offset, lookup_name, partition.partition, log_start,
+                        log_end);
                     partition_response.error_code = ErrorCode::OFFSET_OUT_OF_RANGE;
                     finalize_partition(0);
                     continue;
@@ -2353,8 +2469,8 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
 
                 size_t effective_cap = remaining_request_bytes;
                 if (partition.partition_max_bytes > 0) {
-                    effective_cap = std::min(
-                        effective_cap, static_cast<size_t>(partition.partition_max_bytes));
+                    effective_cap =
+                        std::min(effective_cap, static_cast<size_t>(partition.partition_max_bytes));
                 }
 
                 if (effective_cap == 0) {
@@ -2375,8 +2491,7 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
                     // whose base_offset is past LSO (those are in-flight
                     // transactional records the consumer must not see).
                     const bool read_committed = request.isolationLevel() == 1;
-                    const bool use_raw =
-                        context.header.apiVersion() >= 4 && !read_committed;
+                    const bool use_raw = context.header.apiVersion() >= 4 && !read_committed;
                     std::vector<uint8_t> serialized;
                     size_t total_messages_for_metrics = 0;
                     if (use_raw) {
@@ -2400,7 +2515,8 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
                             std::vector<storage::RecordBatch> kept;
                             kept.reserve(batches.size());
                             for (auto& b : batches) {
-                                if (b.baseOffset() >= lso) continue;
+                                if (b.baseOffset() >= lso)
+                                    continue;
                                 kept.push_back(std::move(b));
                             }
                             batches = std::move(kept);
@@ -2420,7 +2536,8 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
                         }
 
                         if (monitoring_manager_ && monitoring_manager_->metricsCollector()) {
-                            monitoring_manager_->metricsCollector()->incrementMessagesConsumed(total_messages_for_metrics);
+                            monitoring_manager_->metricsCollector()->incrementMessagesConsumed(
+                                total_messages_for_metrics);
                             monitoring_manager_->metricsCollector()->incrementBytesOut(batch_bytes);
                         }
 
@@ -2458,15 +2575,14 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
     int32_t resp_session_id = 0;
     int16_t session_error = 0;
     if (context.header.apiVersion() >= 7 && fetch_session_manager_) {
-        auto v = fetch_session_manager_->validate(request.sessionId(),
-                                                  request.sessionEpoch());
+        auto v = fetch_session_manager_->validate(request.sessionId(), request.sessionEpoch());
         if (v.is_error) {
             session_error = v.error;
         } else {
             resp_session_id = v.session_id;
             if (v.is_new_session) {
-                Logger::info("Fetch: allocated session_id={} for client {}",
-                             v.session_id, context.peer_identity);
+                Logger::info("Fetch: allocated session_id={} for client {}", v.session_id,
+                             context.peer_identity);
             }
         }
     }
@@ -2479,9 +2595,8 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
         const int16_t version =
             std::clamp<int16_t>(context.header.apiVersion(), 0, kFetchMaxVersion);
         RequestDispatcher::HandlerResult result;
-        result.payload = encodeResponse(context, [&](Buffer& buffer) {
-            response.encode(buffer, version);
-        });
+        result.payload =
+            encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
         result.close_connection = false;
         return result;
     }
@@ -2507,8 +2622,8 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now() - start_time)
                                 .count();
-    int32_t fetch_throttle_ms = static_cast<int32_t>(
-        std::min<int64_t>(elapsed_ms, std::numeric_limits<int32_t>::max()));
+    int32_t fetch_throttle_ms =
+        static_cast<int32_t>(std::min<int64_t>(elapsed_ms, std::numeric_limits<int32_t>::max()));
     // Consumer quota: record the fetched bytes; if the client is over its
     // configured rate, raise the throttle so it backs off. No-op when the
     // consumer quota is disabled (the default), preserving prior behavior.
@@ -2519,13 +2634,11 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
     }
     response.setThrottleTimeMs(fetch_throttle_ms);
 
-    const int16_t version =
-        std::clamp<int16_t>(context.header.apiVersion(), 0, kFetchMaxVersion);
+    const int16_t version = std::clamp<int16_t>(context.header.apiVersion(), 0, kFetchMaxVersion);
     RequestDispatcher::HandlerResult result;
-    result.payload = encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
-    
+    result.payload =
+        encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
+
     // Record fetch latency and request metrics
     if (monitoring_manager_ && monitoring_manager_->metricsCollector()) {
         auto end_time = std::chrono::steady_clock::now();
@@ -2533,13 +2646,12 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
         monitoring_manager_->metricsCollector()->recordFetchLatency(duration_ms);
         monitoring_manager_->metricsCollector()->incrementRequestsTotal("Fetch");
     }
-    
+
     return result;
 }
 
-Buffer KawasanBroker::buildFetchError(
-    const RequestDispatcher::RequestContext& context, ErrorCode code,
-    int16_t response_version) const {
+Buffer KawasanBroker::buildFetchError(const RequestDispatcher::RequestContext& context,
+                                      ErrorCode code, int16_t response_version) const {
     protocol::FetchResponse response;
     response.setThrottleTimeMs(0);
     protocol::FetchTopicResponse topic_response;
@@ -2554,11 +2666,8 @@ Buffer KawasanBroker::buildFetchError(
     topic_response.partitions.push_back(partition_response);
     response.addTopic(topic_response);
 
-    const int16_t version =
-        std::clamp<int16_t>(response_version, 0, kFetchMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    const int16_t version = std::clamp<int16_t>(response_version, 0, kFetchMaxVersion);
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 RequestDispatcher::HandlerResult KawasanBroker::handleListOffsets(
@@ -2566,9 +2675,8 @@ RequestDispatcher::HandlerResult KawasanBroker::handleListOffsets(
     protocol::ListOffsetsRequest request;
     request.decode(context.payload, context.header.apiVersion());
 
-    Logger::debug("ListOffsets v{}: replica_id={}, {} topics",
-                  context.header.apiVersion(), request.replicaId(),
-                  request.topics().size());
+    Logger::debug("ListOffsets v{}: replica_id={}, {} topics", context.header.apiVersion(),
+                  request.replicaId(), request.topics().size());
 
     protocol::ListOffsetsResponse response;
     response.setThrottleTimeMs(0);
@@ -2613,8 +2721,7 @@ RequestDispatcher::HandlerResult KawasanBroker::handleListOffsets(
                     // per-record offset would require per-record timestamp
                     // tracking.
                     auto best = log->maxTimestampOffset();
-                    partition_response.offset =
-                        best ? best->first : log->logStartOffset();
+                    partition_response.offset = best ? best->first : log->logStartOffset();
                     partition_response.timestamp = best ? best->second : -1;
                 } else {
                     // Phase 1.5: timestamp-based offset lookup via batch
@@ -2630,7 +2737,8 @@ RequestDispatcher::HandlerResult KawasanBroker::handleListOffsets(
                         const Offset end = log->logEndOffset();
                         while (cur < end) {
                             auto batches = log->read(cur, /*max_bytes=*/64 * 1024);
-                            if (batches.empty()) break;
+                            if (batches.empty())
+                                break;
                             Offset next = cur;
                             bool done = false;
                             for (const auto& batch : batches) {
@@ -2643,8 +2751,10 @@ RequestDispatcher::HandlerResult KawasanBroker::handleListOffsets(
                                 next = batch.baseOffset() +
                                        static_cast<Offset>(batch.records().size());
                             }
-                            if (done) break;
-                            if (next <= cur) break;
+                            if (done)
+                                break;
+                            if (next <= cur)
+                                break;
                             cur = next;
                         }
                     } catch (...) {
@@ -2661,8 +2771,8 @@ RequestDispatcher::HandlerResult KawasanBroker::handleListOffsets(
 
                 partition_response.error_code = ErrorCode::NONE;
             } catch (const std::exception& ex) {
-                Logger::error("Error getting offsets for {}-{}: {}", 
-                              topic.topic, partition.partition, ex.what());
+                Logger::error("Error getting offsets for {}-{}: {}", topic.topic,
+                              partition.partition, ex.what());
                 partition_response.error_code = ErrorCode::KAFKA_STORAGE_ERROR;
             }
 
@@ -2675,26 +2785,22 @@ RequestDispatcher::HandlerResult KawasanBroker::handleListOffsets(
     const int16_t version =
         std::clamp<int16_t>(context.header.apiVersion(), 0, kListOffsetsMaxVersion);
 
-    Logger::debug("ListOffsets response: {} topics",
-                  response.topics().size());
+    Logger::debug("ListOffsets response: {} topics", response.topics().size());
     for (const auto& t : response.topics()) {
         for (const auto& p : t.partitions) {
-            Logger::debug("  {}-{}: offset={}, error={}",
-                          t.topic, p.partition, p.offset,
+            Logger::debug("  {}-{}: offset={}, error={}", t.topic, p.partition, p.offset,
                           static_cast<int16_t>(p.error_code));
         }
     }
 
     RequestDispatcher::HandlerResult result;
-    result.payload = encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    result.payload =
+        encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
     return result;
 }
 
-Buffer KawasanBroker::buildListOffsetsError(
-    const RequestDispatcher::RequestContext& context, ErrorCode code,
-    int16_t response_version) const {
+Buffer KawasanBroker::buildListOffsetsError(const RequestDispatcher::RequestContext& context,
+                                            ErrorCode code, int16_t response_version) const {
     protocol::ListOffsetsResponse response;
     response.setThrottleTimeMs(0);
     protocol::ListOffsetsTopicResponse topic_response;
@@ -2708,11 +2814,8 @@ Buffer KawasanBroker::buildListOffsetsError(
     topic_response.partitions.push_back(partition_response);
     response.addTopic(topic_response);
 
-    const int16_t version =
-        std::clamp<int16_t>(response_version, 0, kListOffsetsMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    const int16_t version = std::clamp<int16_t>(response_version, 0, kListOffsetsMaxVersion);
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 RequestDispatcher::HandlerResult KawasanBroker::handleFindCoordinator(
@@ -2720,8 +2823,8 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFindCoordinator(
     protocol::FindCoordinatorRequest request;
     request.decode(context.payload, context.header.apiVersion());
 
-    Logger::info("FindCoordinator request for {} key(s) (first: {})",
-                 request.keys().size(), request.key());
+    Logger::info("FindCoordinator request for {} key(s) (first: {})", request.keys().size(),
+                 request.key());
 
     // In a single-broker setup, this broker is always the coordinator.
     protocol::FindCoordinatorResponse response;
@@ -2747,15 +2850,13 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFindCoordinator(
     const int16_t version =
         std::clamp<int16_t>(context.header.apiVersion(), 0, kFindCoordinatorMaxVersion);
     RequestDispatcher::HandlerResult result;
-    result.payload = encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    result.payload =
+        encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
     return result;
 }
 
-Buffer KawasanBroker::buildFindCoordinatorError(
-    const RequestDispatcher::RequestContext& context, ErrorCode code,
-    int16_t response_version) const {
+Buffer KawasanBroker::buildFindCoordinatorError(const RequestDispatcher::RequestContext& context,
+                                                ErrorCode code, int16_t response_version) const {
     protocol::FindCoordinatorResponse response;
     response.setThrottleTimeMs(0);
     response.setErrorCode(code);
@@ -2764,11 +2865,8 @@ Buffer KawasanBroker::buildFindCoordinatorError(
     response.setHost("");
     response.setPort(0);
 
-    const int16_t version =
-        std::clamp<int16_t>(response_version, 0, kFindCoordinatorMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    const int16_t version = std::clamp<int16_t>(response_version, 0, kFindCoordinatorMaxVersion);
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 Buffer KawasanBroker::handleJoinGroup(RequestDispatcher::RequestContext& context) {
@@ -2777,8 +2875,8 @@ Buffer KawasanBroker::handleJoinGroup(RequestDispatcher::RequestContext& context
 
     // 0A.10: forward the real client identity so DescribeGroups returns
     // something useful instead of "unknown".
-    const auto result = group_coordinator_->handleJoinGroup(
-        request, context.header.clientId(), context.peer_identity);
+    const auto result = group_coordinator_->handleJoinGroup(request, context.header.clientId(),
+                                                            context.peer_identity);
 
     protocol::JoinGroupResponse response;
     response.setErrorCode(result.error);
@@ -2802,14 +2900,11 @@ Buffer KawasanBroker::handleJoinGroup(RequestDispatcher::RequestContext& context
 
     const int16_t version =
         std::clamp<int16_t>(context.header.apiVersion(), 0, kJoinGroupMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
-Buffer KawasanBroker::buildJoinGroupError(
-    const RequestDispatcher::RequestContext& context, ErrorCode code,
-    int16_t response_version) const {
+Buffer KawasanBroker::buildJoinGroupError(const RequestDispatcher::RequestContext& context,
+                                          ErrorCode code, int16_t response_version) const {
     protocol::JoinGroupResponse response;
     response.setErrorCode(code);
     response.setGenerationId(0);
@@ -2818,11 +2913,8 @@ Buffer KawasanBroker::buildJoinGroupError(
     response.setMemberId("");
     response.setMembers({});
 
-    const int16_t version =
-        std::clamp<int16_t>(response_version, 0, kJoinGroupMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    const int16_t version = std::clamp<int16_t>(response_version, 0, kJoinGroupMaxVersion);
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 Buffer KawasanBroker::handleSyncGroup(RequestDispatcher::RequestContext& context) {
@@ -2835,8 +2927,8 @@ Buffer KawasanBroker::handleSyncGroup(RequestDispatcher::RequestContext& context
 
     const auto result = group_coordinator_->handleSyncGroup(request);
 
-    Logger::info("SyncGroup response: error={} assignment_size={}",
-                 static_cast<int>(result.error), result.assignment.size());
+    Logger::info("SyncGroup response: error={} assignment_size={}", static_cast<int>(result.error),
+                 result.assignment.size());
 
     protocol::SyncGroupResponse response;
     response.setErrorCode(result.error);
@@ -2851,23 +2943,17 @@ Buffer KawasanBroker::handleSyncGroup(RequestDispatcher::RequestContext& context
 
     const int16_t version =
         std::clamp<int16_t>(context.header.apiVersion(), 0, kSyncGroupMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
-Buffer KawasanBroker::buildSyncGroupError(
-    const RequestDispatcher::RequestContext& context, ErrorCode code,
-    int16_t response_version) const {
+Buffer KawasanBroker::buildSyncGroupError(const RequestDispatcher::RequestContext& context,
+                                          ErrorCode code, int16_t response_version) const {
     protocol::SyncGroupResponse response;
     response.setErrorCode(code);
     response.setAssignment({});
 
-    const int16_t version =
-        std::clamp<int16_t>(response_version, 0, kSyncGroupMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    const int16_t version = std::clamp<int16_t>(response_version, 0, kSyncGroupMaxVersion);
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 Buffer KawasanBroker::handleHeartbeat(RequestDispatcher::RequestContext& context) {
@@ -2881,22 +2967,16 @@ Buffer KawasanBroker::handleHeartbeat(RequestDispatcher::RequestContext& context
 
     const int16_t version =
         std::clamp<int16_t>(context.header.apiVersion(), 0, kHeartbeatMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
-Buffer KawasanBroker::buildHeartbeatError(
-    const RequestDispatcher::RequestContext& context, ErrorCode code,
-    int16_t response_version) const {
+Buffer KawasanBroker::buildHeartbeatError(const RequestDispatcher::RequestContext& context,
+                                          ErrorCode code, int16_t response_version) const {
     protocol::HeartbeatResponse response;
     response.setErrorCode(code);
 
-    const int16_t version =
-        std::clamp<int16_t>(response_version, 0, kHeartbeatMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    const int16_t version = std::clamp<int16_t>(response_version, 0, kHeartbeatMaxVersion);
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 Buffer KawasanBroker::handleLeaveGroup(RequestDispatcher::RequestContext& context) {
@@ -2924,22 +3004,16 @@ Buffer KawasanBroker::handleLeaveGroup(RequestDispatcher::RequestContext& contex
 
     const int16_t version =
         std::clamp<int16_t>(context.header.apiVersion(), 0, kLeaveGroupMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
-Buffer KawasanBroker::buildLeaveGroupError(
-    const RequestDispatcher::RequestContext& context, ErrorCode code,
-    int16_t response_version) const {
+Buffer KawasanBroker::buildLeaveGroupError(const RequestDispatcher::RequestContext& context,
+                                           ErrorCode code, int16_t response_version) const {
     protocol::LeaveGroupResponse response;
     response.setErrorCode(code);
 
-    const int16_t version =
-        std::clamp<int16_t>(response_version, 0, kLeaveGroupMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    const int16_t version = std::clamp<int16_t>(response_version, 0, kLeaveGroupMaxVersion);
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 Buffer KawasanBroker::handleOffsetCommit(RequestDispatcher::RequestContext& context) {
@@ -2947,7 +3021,8 @@ Buffer KawasanBroker::handleOffsetCommit(RequestDispatcher::RequestContext& cont
     request.decode(context.payload, context.header.apiVersion());
 
     Logger::info("OffsetCommit request: group='{}' generation={} member='{}' {} topics",
-                 request.groupId(), request.generationId(), request.memberId(), request.topics().size());
+                 request.groupId(), request.generationId(), request.memberId(),
+                 request.topics().size());
 
     ErrorCode overall_error = ErrorCode::NONE;
     const auto topics = group_coordinator_->handleOffsetCommit(request, overall_error);
@@ -2983,8 +3058,8 @@ Buffer KawasanBroker::handleOffsetCommit(RequestDispatcher::RequestContext& cont
                 for (const auto& p : t.partitions) {
                     Record r;
                     r.timestamp = now_ms;
-                    const std::string key = request.groupId() + "|" + t.topic +
-                                            "|" + std::to_string(p.partition);
+                    const std::string key =
+                        request.groupId() + "|" + t.topic + "|" + std::to_string(p.partition);
                     r.key = std::vector<uint8_t>(key.begin(), key.end());
                     const std::string value = std::to_string(p.offset) + "|" + p.metadata;
                     r.value = std::vector<uint8_t>(value.begin(), value.end());
@@ -3009,14 +3084,11 @@ Buffer KawasanBroker::handleOffsetCommit(RequestDispatcher::RequestContext& cont
     // what the client requested).
     const int16_t version =
         std::clamp<int16_t>(context.header.apiVersion(), 0, kOffsetCommitMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
-Buffer KawasanBroker::buildOffsetCommitError(
-    const RequestDispatcher::RequestContext& context, ErrorCode code,
-    int16_t response_version) const {
+Buffer KawasanBroker::buildOffsetCommitError(const RequestDispatcher::RequestContext& context,
+                                             ErrorCode code, int16_t response_version) const {
     protocol::OffsetCommitResponse response;
     protocol::OffsetCommitResponse::Partition partition;
     partition.error = code;
@@ -3024,11 +3096,8 @@ Buffer KawasanBroker::buildOffsetCommitError(
     topic.partitions.push_back(partition);
     response.setTopics({topic});
 
-    const int16_t version =
-        std::clamp<int16_t>(response_version, 0, kOffsetCommitMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    const int16_t version = std::clamp<int16_t>(response_version, 0, kOffsetCommitMaxVersion);
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 Buffer KawasanBroker::handleOffsetFetch(RequestDispatcher::RequestContext& context) {
@@ -3058,49 +3127,38 @@ Buffer KawasanBroker::handleOffsetFetch(RequestDispatcher::RequestContext& conte
             rg.error_code = group_error;
             rg.topics = topics;
             response.addGroup(std::move(rg));
-            Logger::info("OffsetFetch v{}: group='{}' returned {} topics (error={})",
-                         api_v, g.group_id, topics.size(),
-                         static_cast<int>(group_error));
+            Logger::info("OffsetFetch v{}: group='{}' returned {} topics (error={})", api_v,
+                         g.group_id, topics.size(), static_cast<int>(group_error));
         }
-        const int16_t version =
-            std::clamp<int16_t>(api_v, 0, kOffsetFetchMaxVersion);
-        return encodeResponse(context, [&](Buffer& buffer) {
-            response.encode(buffer, version);
-        });
+        const int16_t version = std::clamp<int16_t>(api_v, 0, kOffsetFetchMaxVersion);
+        return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
     }
 
     // Legacy v0–v7 single-group form.
-    Logger::info("OffsetFetch request for group '{}', {} topics",
-                  request.groupId(), request.topics().size());
+    Logger::info("OffsetFetch request for group '{}', {} topics", request.groupId(),
+                 request.topics().size());
 
     ErrorCode overall_error = ErrorCode::NONE;
     const auto topics = group_coordinator_->handleOffsetFetch(request, overall_error);
 
     Logger::info("OffsetFetch response: overall_error={} {} topics",
-                  static_cast<int>(overall_error), topics.size());
+                 static_cast<int>(overall_error), topics.size());
 
     response.setErrorCode(overall_error);
     response.setTopics(topics);
 
-    const int16_t version =
-        std::clamp<int16_t>(api_v, 0, kOffsetFetchMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    const int16_t version = std::clamp<int16_t>(api_v, 0, kOffsetFetchMaxVersion);
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
-Buffer KawasanBroker::buildOffsetFetchError(
-    const RequestDispatcher::RequestContext& context, ErrorCode code,
-    int16_t response_version) const {
+Buffer KawasanBroker::buildOffsetFetchError(const RequestDispatcher::RequestContext& context,
+                                            ErrorCode code, int16_t response_version) const {
     protocol::OffsetFetchResponse response;
     response.setErrorCode(code);
     response.setTopics({});
 
-    const int16_t version =
-        std::clamp<int16_t>(response_version, 0, kOffsetFetchMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    const int16_t version = std::clamp<int16_t>(response_version, 0, kOffsetFetchMaxVersion);
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 std::vector<BrokerMetadata> KawasanBroker::buildBrokerMetadata() const {
@@ -3158,8 +3216,7 @@ std::pair<std::optional<TopicMetadata>, ErrorCode> KawasanBroker::getTopicMetada
     }
 
     const ErrorCode lookup_error =
-        topics.empty() ? ErrorCode::UNKNOWN_TOPIC_OR_PARTITION
-                       : topics.front().error_code;
+        topics.empty() ? ErrorCode::UNKNOWN_TOPIC_OR_PARTITION : topics.front().error_code;
 
     if (!allow_auto_create || lookup_error != ErrorCode::UNKNOWN_TOPIC_OR_PARTITION) {
         return {std::nullopt, lookup_error};
@@ -3170,8 +3227,7 @@ std::pair<std::optional<TopicMetadata>, ErrorCode> KawasanBroker::getTopicMetada
     spec.num_partitions = std::max<int32_t>(1, default_num_partitions_);
     spec.replication_factor = std::max<int16_t>(1, default_replication_factor_);
 
-    Logger::info("Auto-creating topic '{}' with {} partition(s)", spec.name,
-                 spec.num_partitions);
+    Logger::info("Auto-creating topic '{}' with {} partition(s)", spec.name, spec.num_partitions);
     auto create_result = metadata_controller_->createTopic(spec);
     if (create_result.error_code != ErrorCode::NONE &&
         create_result.error_code != ErrorCode::TOPIC_ALREADY_EXISTS) {
@@ -3210,24 +3266,18 @@ Buffer KawasanBroker::handleDescribeGroups(RequestDispatcher::RequestContext& co
 
     const int16_t version =
         std::clamp<int16_t>(context.header.apiVersion(), 0, kDescribeGroupsMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
-Buffer KawasanBroker::buildDescribeGroupsError(
-    const RequestDispatcher::RequestContext& context, ErrorCode code,
-    int16_t response_version) const {
+Buffer KawasanBroker::buildDescribeGroupsError(const RequestDispatcher::RequestContext& context,
+                                               ErrorCode code, int16_t response_version) const {
     protocol::DescribeGroupsResponse response;
     response.setThrottleTimeMs(0);
     response.setGroups({});
     (void)code;  // Error code not used in error response for this API
 
-    const int16_t version =
-        std::clamp<int16_t>(response_version, 0, kDescribeGroupsMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    const int16_t version = std::clamp<int16_t>(response_version, 0, kDescribeGroupsMaxVersion);
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 Buffer KawasanBroker::handleListGroups(RequestDispatcher::RequestContext& context) {
@@ -3245,24 +3295,18 @@ Buffer KawasanBroker::handleListGroups(RequestDispatcher::RequestContext& contex
 
     const int16_t version =
         std::clamp<int16_t>(context.header.apiVersion(), 0, kListGroupsMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
-Buffer KawasanBroker::buildListGroupsError(
-    const RequestDispatcher::RequestContext& context, ErrorCode code,
-    int16_t response_version) const {
+Buffer KawasanBroker::buildListGroupsError(const RequestDispatcher::RequestContext& context,
+                                           ErrorCode code, int16_t response_version) const {
     protocol::ListGroupsResponse response;
     response.setErrorCode(code);
     response.setThrottleTimeMs(0);
     response.setGroups({});
 
-    const int16_t version =
-        std::clamp<int16_t>(response_version, 0, kListGroupsMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    const int16_t version = std::clamp<int16_t>(response_version, 0, kListGroupsMaxVersion);
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 Buffer KawasanBroker::handleDescribeConfigs(RequestDispatcher::RequestContext& context) {
@@ -3285,7 +3329,7 @@ Buffer KawasanBroker::handleDescribeConfigs(RequestDispatcher::RequestContext& c
         if (resource.resource_type == protocol::ConfigResourceType::BROKER) {
             // Broker configs
             std::vector<protocol::ConfigEntry> configs;
-            
+
             protocol::ConfigEntry log_dir_config;
             log_dir_config.name = "log.dirs";
             log_dir_config.value = log_dir_;
@@ -3322,7 +3366,7 @@ Buffer KawasanBroker::handleDescribeConfigs(RequestDispatcher::RequestContext& c
         } else if (resource.resource_type == protocol::ConfigResourceType::TOPIC) {
             // Topic configs - return basic defaults
             std::vector<protocol::ConfigEntry> configs;
-            
+
             protocol::ConfigEntry retention_config;
             retention_config.name = "retention.ms";
             retention_config.value = std::to_string(log_config_.retention_ms);
@@ -3346,14 +3390,11 @@ Buffer KawasanBroker::handleDescribeConfigs(RequestDispatcher::RequestContext& c
     }
 
     const int16_t version = std::clamp<int16_t>(context.header.apiVersion(), 0, 4);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
-Buffer KawasanBroker::buildDescribeConfigsError(
-    const RequestDispatcher::RequestContext& context, ErrorCode code,
-    int16_t response_version) const {
+Buffer KawasanBroker::buildDescribeConfigsError(const RequestDispatcher::RequestContext& context,
+                                                ErrorCode code, int16_t response_version) const {
     protocol::DescribeConfigsResponse response;
     response.setThrottleTimeMs(0);
 
@@ -3363,9 +3404,7 @@ Buffer KawasanBroker::buildDescribeConfigsError(
     response.addResult(error_result);
 
     const int16_t version = std::clamp<int16_t>(response_version, 0, 4);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 Buffer KawasanBroker::handleDescribeCluster(RequestDispatcher::RequestContext& context) {
@@ -3377,7 +3416,7 @@ Buffer KawasanBroker::handleDescribeCluster(RequestDispatcher::RequestContext& c
     protocol::DescribeClusterResponse response;
     response.setThrottleTimeMs(0);
     response.setErrorCode(ErrorCode::NONE);
-    
+
     const std::string cluster_id =
         metadata_controller_ ? metadata_controller_->clusterId() : cluster_id_;
     Logger::info("DescribeCluster: cluster_id='{}' (length={})", cluster_id, cluster_id.size());
@@ -3393,14 +3432,11 @@ Buffer KawasanBroker::handleDescribeCluster(RequestDispatcher::RequestContext& c
 
     // Phase 1.17: DescribeCluster now supports v0..v1; clamp accordingly.
     const int16_t version = std::clamp<int16_t>(context.header.apiVersion(), 0, 1);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
-Buffer KawasanBroker::buildDescribeClusterError(
-    const RequestDispatcher::RequestContext& context, ErrorCode code,
-    int16_t response_version) const {
+Buffer KawasanBroker::buildDescribeClusterError(const RequestDispatcher::RequestContext& context,
+                                                ErrorCode code, int16_t response_version) const {
     protocol::DescribeClusterResponse response;
     response.setThrottleTimeMs(0);
     response.setErrorCode(code);
@@ -3413,9 +3449,7 @@ Buffer KawasanBroker::buildDescribeClusterError(
     response.setBrokers(buildBrokerMetadata());
 
     const int16_t version = std::clamp<int16_t>(response_version, 0, 1);  // Phase 1.17
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 int64_t KawasanBroker::allocateNextProducerId() {
@@ -3453,8 +3487,7 @@ Buffer KawasanBroker::handleInitProducerId(RequestDispatcher::RequestContext& co
     request.decode(context.payload, context.header.apiVersion());
 
     Logger::info("InitProducerId request from {}: transactional_id='{}' timeout={}ms",
-                 context.peer_identity,
-                 request.transactionalId().value_or("<null>"),
+                 context.peer_identity, request.transactionalId().value_or("<null>"),
                  request.transactionTimeoutMs());
 
     const int64_t producer_id = allocateNextProducerId();
@@ -3469,35 +3502,28 @@ Buffer KawasanBroker::handleInitProducerId(RequestDispatcher::RequestContext& co
     // TransactionCoordinator so subsequent DescribeTransactions /
     // ListTransactions can see it. Non-transactional InitProducerId
     // (transactional_id null) skips this — no txn ID to track.
-    if (transaction_coordinator_ && request.transactionalId().has_value()
-        && !request.transactionalId()->empty()) {
-        transaction_coordinator_->recordInitProducerId(
-            *request.transactionalId(), producer_id, /*epoch=*/0,
-            request.transactionTimeoutMs());
+    if (transaction_coordinator_ && request.transactionalId().has_value() &&
+        !request.transactionalId()->empty()) {
+        transaction_coordinator_->recordInitProducerId(*request.transactionalId(), producer_id,
+                                                       /*epoch=*/0, request.transactionTimeoutMs());
     }
 
     const int16_t version = std::clamp<int16_t>(context.header.apiVersion(), 0, 4);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
-Buffer KawasanBroker::buildInitProducerIdError(
-    const RequestDispatcher::RequestContext& context, ErrorCode code,
-    int16_t response_version) const {
+Buffer KawasanBroker::buildInitProducerIdError(const RequestDispatcher::RequestContext& context,
+                                               ErrorCode code, int16_t response_version) const {
     protocol::InitProducerIdResponse response;
     response.setThrottleTimeMs(0);
     response.setErrorCode(code);
     response.setProducerId(-1);
     response.setProducerEpoch(-1);
     const int16_t version = std::clamp<int16_t>(response_version, 0, 4);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
-Buffer KawasanBroker::handleOffsetForLeaderEpoch(
-    RequestDispatcher::RequestContext& context) {
+Buffer KawasanBroker::handleOffsetForLeaderEpoch(RequestDispatcher::RequestContext& context) {
     protocol::OffsetForLeaderEpochRequest request;
     request.decode(context.payload, context.header.apiVersion());
 
@@ -3514,8 +3540,7 @@ Buffer KawasanBroker::handleOffsetForLeaderEpoch(
             // requested an epoch > 0 we still answer with 0 (truncation never
             // happens for a persistent single-leader log). Return UNKNOWN
             // if the partition doesn't exist.
-            auto* log =
-                log_manager_ ? log_manager_->getLog(topic.name, pq.partition) : nullptr;
+            auto* log = log_manager_ ? log_manager_->getLog(topic.name, pq.partition) : nullptr;
             if (log == nullptr) {
                 pres.error_code = ErrorCode::UNKNOWN_TOPIC_OR_PARTITION;
                 pres.leader_epoch = -1;
@@ -3526,9 +3551,8 @@ Buffer KawasanBroker::handleOffsetForLeaderEpoch(
                 // leadership change in a cluster) so clients using KIP-320
                 // fencing/truncation get a real value rather than a constant.
                 const TopicPartition tp{topic.name, pq.partition};
-                pres.leader_epoch = replica_manager_
-                                        ? replica_manager_->getLeaderEpoch(tp).value_or(0)
-                                        : 0;
+                pres.leader_epoch =
+                    replica_manager_ ? replica_manager_->getLeaderEpoch(tp).value_or(0) : 0;
                 pres.end_offset = log->logEndOffset();
             }
             tres.partitions.push_back(pres);
@@ -3537,9 +3561,7 @@ Buffer KawasanBroker::handleOffsetForLeaderEpoch(
     }
 
     const int16_t version = std::clamp<int16_t>(context.header.apiVersion(), 0, 4);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 Buffer KawasanBroker::buildOffsetForLeaderEpochError(
@@ -3556,9 +3578,7 @@ Buffer KawasanBroker::buildOffsetForLeaderEpochError(
     tres.partitions.push_back(pres);
     response.addTopic(std::move(tres));
     const int16_t version = std::clamp<int16_t>(response_version, 0, 4);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 Buffer KawasanBroker::handleAlterConfigs(RequestDispatcher::RequestContext& context) {
@@ -3580,13 +3600,13 @@ Buffer KawasanBroker::handleAlterConfigs(RequestDispatcher::RequestContext& cont
             // we never persist when set.
             std::map<std::string, std::string> cfg;
             for (const auto& e : res.configs) {
-                if (e.value.has_value()) cfg[e.name] = *e.value;
+                if (e.value.has_value())
+                    cfg[e.name] = *e.value;
             }
             if (!request.validateOnly() && log_manager_) {
-                log_manager_->setTopicConfig(
-                    res.resource_name, storage::LogConfig::fromMap(cfg));
-                Logger::info("AlterConfigs: topic '{}' updated with {} configs",
-                             res.resource_name, cfg.size());
+                log_manager_->setTopicConfig(res.resource_name, storage::LogConfig::fromMap(cfg));
+                Logger::info("AlterConfigs: topic '{}' updated with {} configs", res.resource_name,
+                             cfg.size());
             }
         } else if (res.resource_type == protocol::ConfigResourceType::BROKER) {
             // Broker-resource alteration is accepted but not persisted to the
@@ -3600,14 +3620,11 @@ Buffer KawasanBroker::handleAlterConfigs(RequestDispatcher::RequestContext& cont
     }
 
     const int16_t version = std::clamp<int16_t>(context.header.apiVersion(), 0, 2);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
-Buffer KawasanBroker::buildAlterConfigsError(
-    const RequestDispatcher::RequestContext& context, ErrorCode code,
-    int16_t response_version) const {
+Buffer KawasanBroker::buildAlterConfigsError(const RequestDispatcher::RequestContext& context,
+                                             ErrorCode code, int16_t response_version) const {
     protocol::AlterConfigsResponse response;
     response.setThrottleTimeMs(0);
     protocol::AlterConfigsResponse::ResourceResult rr;
@@ -3615,13 +3632,10 @@ Buffer KawasanBroker::buildAlterConfigsError(
     rr.resource_type = protocol::ConfigResourceType::UNKNOWN;
     response.addResult(std::move(rr));
     const int16_t version = std::clamp<int16_t>(response_version, 0, 2);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
-Buffer KawasanBroker::handleIncrementalAlterConfigs(
-    RequestDispatcher::RequestContext& context) {
+Buffer KawasanBroker::handleIncrementalAlterConfigs(RequestDispatcher::RequestContext& context) {
     protocol::IncrementalAlterConfigsRequest request;
     request.decode(context.payload, context.header.apiVersion());
 
@@ -3659,8 +3673,10 @@ Buffer KawasanBroker::handleIncrementalAlterConfigs(
             for (const auto& c : res.configs) {
                 switch (c.op) {
                     case Op::SET:
-                        if (c.value.has_value()) cfg[c.name] = *c.value;
-                        else cfg.erase(c.name);
+                        if (c.value.has_value())
+                            cfg[c.name] = *c.value;
+                        else
+                            cfg.erase(c.name);
                         break;
                     case Op::DELETE:
                         cfg.erase(c.name);
@@ -3672,7 +3688,8 @@ Buffer KawasanBroker::handleIncrementalAlterConfigs(
                         if (it != cfg.end()) {
                             std::stringstream ss(it->second);
                             std::string tok;
-                            while (std::getline(ss, tok, ',')) parts.push_back(tok);
+                            while (std::getline(ss, tok, ','))
+                                parts.push_back(tok);
                         }
                         if (c.value.has_value()) {
                             if (c.op == Op::APPEND) {
@@ -3684,7 +3701,8 @@ Buffer KawasanBroker::handleIncrementalAlterConfigs(
                         }
                         std::string joined;
                         for (size_t i = 0; i < parts.size(); ++i) {
-                            if (i > 0) joined.push_back(',');
+                            if (i > 0)
+                                joined.push_back(',');
                             joined += parts[i];
                         }
                         cfg[c.name] = joined;
@@ -3693,8 +3711,7 @@ Buffer KawasanBroker::handleIncrementalAlterConfigs(
                 }
             }
             if (!request.validateOnly()) {
-                log_manager_->setTopicConfig(
-                    res.resource_name, storage::LogConfig::fromMap(cfg));
+                log_manager_->setTopicConfig(res.resource_name, storage::LogConfig::fromMap(cfg));
                 Logger::info("IncrementalAlterConfigs: topic '{}' applied {} ops",
                              res.resource_name, res.configs.size());
             }
@@ -3708,9 +3725,7 @@ Buffer KawasanBroker::handleIncrementalAlterConfigs(
     }
 
     const int16_t version = std::clamp<int16_t>(context.header.apiVersion(), 0, 1);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 Buffer KawasanBroker::buildIncrementalAlterConfigsError(
@@ -3723,9 +3738,7 @@ Buffer KawasanBroker::buildIncrementalAlterConfigsError(
     rr.resource_type = protocol::ConfigResourceType::UNKNOWN;
     response.addResult(std::move(rr));
     const int16_t version = std::clamp<int16_t>(response_version, 0, 1);
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, version);
-    });
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 // Phase 4.1: shared trivial error builder.
@@ -3734,8 +3747,7 @@ Buffer KawasanBroker::buildEmptyErrorResponse(
     return encodeResponse(context, [&](Buffer& /*buffer*/) {});
 }
 
-Buffer KawasanBroker::handleDescribeLogDirs(
-    RequestDispatcher::RequestContext& context) {
+Buffer KawasanBroker::handleDescribeLogDirs(RequestDispatcher::RequestContext& context) {
     protocol::DescribeLogDirsRequest request;
     request.decode(context.payload, context.header.apiVersion());
 
@@ -3760,13 +3772,11 @@ Buffer KawasanBroker::handleDescribeLogDirs(
     }
     response.addLogDir(std::move(info));
 
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, context.header.apiVersion());
-    });
+    return encodeResponse(
+        context, [&](Buffer& buffer) { response.encode(buffer, context.header.apiVersion()); });
 }
 
-Buffer KawasanBroker::handleAlterReplicaLogDirs(
-    RequestDispatcher::RequestContext& context) {
+Buffer KawasanBroker::handleAlterReplicaLogDirs(RequestDispatcher::RequestContext& context) {
     protocol::AlterReplicaLogDirsRequest request;
     request.decode(context.payload, context.header.apiVersion());
 
@@ -3781,13 +3791,11 @@ Buffer KawasanBroker::handleAlterReplicaLogDirs(
             response.addResult(std::move(r));
         }
     }
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, context.header.apiVersion());
-    });
+    return encodeResponse(
+        context, [&](Buffer& buffer) { response.encode(buffer, context.header.apiVersion()); });
 }
 
-Buffer KawasanBroker::handleElectLeaders(
-    RequestDispatcher::RequestContext& context) {
+Buffer KawasanBroker::handleElectLeaders(RequestDispatcher::RequestContext& context) {
     protocol::ElectLeadersRequest request;
     request.decode(context.payload, context.header.apiVersion());
 
@@ -3805,13 +3813,11 @@ Buffer KawasanBroker::handleElectLeaders(
         }
         response.addTopic(std::move(tr));
     }
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, context.header.apiVersion());
-    });
+    return encodeResponse(
+        context, [&](Buffer& buffer) { response.encode(buffer, context.header.apiVersion()); });
 }
 
-Buffer KawasanBroker::handleDeleteRecords(
-    RequestDispatcher::RequestContext& context) {
+Buffer KawasanBroker::handleDeleteRecords(RequestDispatcher::RequestContext& context) {
     protocol::DeleteRecordsRequest request;
     request.decode(context.payload, context.header.apiVersion());
 
@@ -3838,20 +3844,18 @@ Buffer KawasanBroker::handleDeleteRecords(
                 }
                 pr.low_watermark = log->truncatePrefix(target);
                 pr.error_code = ErrorCode::NONE;
-                Logger::info("DeleteRecords: {}-{} truncated to low_watermark={}",
-                             t.topic, p.partition, pr.low_watermark);
+                Logger::info("DeleteRecords: {}-{} truncated to low_watermark={}", t.topic,
+                             p.partition, pr.low_watermark);
             }
             tr.partitions.push_back(pr);
         }
         response.addTopic(std::move(tr));
     }
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, context.header.apiVersion());
-    });
+    return encodeResponse(
+        context, [&](Buffer& buffer) { response.encode(buffer, context.header.apiVersion()); });
 }
 
-Buffer KawasanBroker::handleDeleteGroups(
-    RequestDispatcher::RequestContext& context) {
+Buffer KawasanBroker::handleDeleteGroups(RequestDispatcher::RequestContext& context) {
     protocol::DeleteGroupsRequest request;
     request.decode(context.payload, context.header.apiVersion());
 
@@ -3872,13 +3876,11 @@ Buffer KawasanBroker::handleDeleteGroups(
         }
         response.addResult(std::move(r));
     }
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, context.header.apiVersion());
-    });
+    return encodeResponse(
+        context, [&](Buffer& buffer) { response.encode(buffer, context.header.apiVersion()); });
 }
 
-Buffer KawasanBroker::handleOffsetDelete(
-    RequestDispatcher::RequestContext& context) {
+Buffer KawasanBroker::handleOffsetDelete(RequestDispatcher::RequestContext& context) {
     protocol::OffsetDeleteRequest request;
     request.decode(context.payload, context.header.apiVersion());
 
@@ -3903,22 +3905,20 @@ Buffer KawasanBroker::handleOffsetDelete(
                 }
             } catch (const std::exception& ex) {
                 pr.error_code = ErrorCode::KAFKA_STORAGE_ERROR;
-                Logger::error("OffsetDelete failed for {}/{}-{}: {}",
-                              request.groupId(), t.topic, p.partition, ex.what());
+                Logger::error("OffsetDelete failed for {}/{}-{}: {}", request.groupId(), t.topic,
+                              p.partition, ex.what());
             }
             tr.partitions.push_back(pr);
         }
         response.addTopic(std::move(tr));
     }
-    Logger::info("OffsetDelete: group='{}' processed {} topic(s)",
-                 request.groupId(), request.topics().size());
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, context.header.apiVersion());
-    });
+    Logger::info("OffsetDelete: group='{}' processed {} topic(s)", request.groupId(),
+                 request.topics().size());
+    return encodeResponse(
+        context, [&](Buffer& buffer) { response.encode(buffer, context.header.apiVersion()); });
 }
 
-Buffer KawasanBroker::handleCreatePartitions(
-    RequestDispatcher::RequestContext& context) {
+Buffer KawasanBroker::handleCreatePartitions(RequestDispatcher::RequestContext& context) {
     protocol::CreatePartitionsRequest request;
     request.decode(context.payload, context.header.apiVersion());
 
@@ -3944,19 +3944,17 @@ Buffer KawasanBroker::handleCreatePartitions(
             }
         }
 
-        Logger::info("CreatePartitions: topic='{}' new_count={} -> error={}",
-                     t.topic, t.count, static_cast<int16_t>(r.error_code));
+        Logger::info("CreatePartitions: topic='{}' new_count={} -> error={}", t.topic, t.count,
+                     static_cast<int16_t>(r.error_code));
         response.addResult(std::move(r));
     }
-    return encodeResponse(context, [&](Buffer& buffer) {
-        response.encode(buffer, context.header.apiVersion());
-    });
+    return encodeResponse(
+        context, [&](Buffer& buffer) { response.encode(buffer, context.header.apiVersion()); });
 }
 
 // ---------- Phase 4.1 stubs (each populates an empty-but-valid response) ----------
 
-Buffer KawasanBroker::handleDescribeProducers(
-    RequestDispatcher::RequestContext& context) {
+Buffer KawasanBroker::handleDescribeProducers(RequestDispatcher::RequestContext& context) {
     protocol::DescribeProducersRequest req;
     req.decode(context.payload, context.header.apiVersion());
     protocol::DescribeProducersResponse resp;
@@ -3973,8 +3971,7 @@ Buffer KawasanBroker::handleDescribeProducers(
             pr.partition = p;
             pr.error_code = ErrorCode::NONE;
             if (producer_state_manager_) {
-                for (const auto& ap :
-                     producer_state_manager_->listProducers(t.topic, p)) {
+                for (const auto& ap : producer_state_manager_->listProducers(t.topic, p)) {
                     protocol::DescribeProducersResponse::ActiveProducer entry;
                     entry.producer_id = ap.producer_id;
                     entry.producer_epoch = ap.producer_epoch;
@@ -3989,13 +3986,11 @@ Buffer KawasanBroker::handleDescribeProducers(
         }
         resp.addTopic(std::move(tr));
     }
-    return encodeResponse(context, [&](Buffer& buf) {
-        resp.encode(buf, context.header.apiVersion());
-    });
+    return encodeResponse(context,
+                          [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
 }
 
-Buffer KawasanBroker::handleListTransactions(
-    RequestDispatcher::RequestContext& context) {
+Buffer KawasanBroker::handleListTransactions(RequestDispatcher::RequestContext& context) {
     protocol::ListTransactionsRequest req;
     req.decode(context.payload, context.header.apiVersion());
     protocol::ListTransactionsResponse resp;
@@ -4004,8 +3999,8 @@ Buffer KawasanBroker::handleListTransactions(
     // Phase 4.1l: enumerate known transactional IDs from the
     // TransactionCoordinator with optional state/producer_id filters.
     if (transaction_coordinator_) {
-        const auto txns = transaction_coordinator_->list(req.stateFilters(),
-                                                         req.producerIdFilters());
+        const auto txns =
+            transaction_coordinator_->list(req.stateFilters(), req.producerIdFilters());
         for (const auto& t : txns) {
             protocol::ListTransactionsResponse::TxnState s;
             s.transactional_id = t.transactional_id;
@@ -4015,13 +4010,11 @@ Buffer KawasanBroker::handleListTransactions(
         }
         Logger::info("ListTransactions: returned {} txn(s)", txns.size());
     }
-    return encodeResponse(context, [&](Buffer& buf) {
-        resp.encode(buf, context.header.apiVersion());
-    });
+    return encodeResponse(context,
+                          [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
 }
 
-Buffer KawasanBroker::handleDescribeTransactions(
-    RequestDispatcher::RequestContext& context) {
+Buffer KawasanBroker::handleDescribeTransactions(RequestDispatcher::RequestContext& context) {
     protocol::DescribeTransactionsRequest req;
     req.decode(context.payload, context.header.apiVersion());
     protocol::DescribeTransactionsResponse resp;
@@ -4036,8 +4029,8 @@ Buffer KawasanBroker::handleDescribeTransactions(
         s.transactional_id = tid;
         s.error_code = ErrorCode::NONE;
         s.state = "Empty";
-        const auto opt = transaction_coordinator_ ? transaction_coordinator_->describe(tid)
-                                                  : std::nullopt;
+        const auto opt =
+            transaction_coordinator_ ? transaction_coordinator_->describe(tid) : std::nullopt;
         if (opt.has_value()) {
             s.state = TransactionCoordinator::stateName(opt->state);
             s.transaction_timeout_ms = opt->transaction_timeout_ms;
@@ -4046,8 +4039,8 @@ Buffer KawasanBroker::handleDescribeTransactions(
             s.producer_epoch = opt->producer_epoch;
             // Group the snapshot's flat (topic, partition) list per topic.
             std::map<std::string, std::vector<int32_t>> by_topic;
-            for (const auto& [topic, partition] : opt->partitions) {
-                by_topic[topic].push_back(partition);
+            for (const auto& tp : opt->partitions) {
+                by_topic[tp.topic].push_back(tp.partition);
             }
             for (auto& [topic, partitions] : by_topic) {
                 s.topics.push_back({topic, std::move(partitions)});
@@ -4055,25 +4048,21 @@ Buffer KawasanBroker::handleDescribeTransactions(
         }
         resp.addState(std::move(s));
     }
-    return encodeResponse(context, [&](Buffer& buf) {
-        resp.encode(buf, context.header.apiVersion());
-    });
+    return encodeResponse(context,
+                          [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
 }
 
-Buffer KawasanBroker::handleAlterPartition(
-    RequestDispatcher::RequestContext& context) {
+Buffer KawasanBroker::handleAlterPartition(RequestDispatcher::RequestContext& context) {
     protocol::AlterPartitionRequest req;
     req.decode(context.payload, context.header.apiVersion());
     protocol::AlterPartitionResponse resp;
     resp.setThrottleTimeMs(0);
     resp.setErrorCode(ErrorCode::NONE);
-    return encodeResponse(context, [&](Buffer& buf) {
-        resp.encode(buf, context.header.apiVersion());
-    });
+    return encodeResponse(context,
+                          [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
 }
 
-Buffer KawasanBroker::handleDescribeAcls(
-    RequestDispatcher::RequestContext& context) {
+Buffer KawasanBroker::handleDescribeAcls(RequestDispatcher::RequestContext& context) {
     protocol::DescribeAclsRequest req;
     req.decode(context.payload, context.header.apiVersion());
     protocol::DescribeAclsResponse resp;
@@ -4097,8 +4086,10 @@ Buffer KawasanBroker::handleDescribeAcls(
             std::string name;
             int8_t pt;
             bool operator<(const ResKey& o) const {
-                if (rt != o.rt) return rt < o.rt;
-                if (name != o.name) return name < o.name;
+                if (rt != o.rt)
+                    return rt < o.rt;
+                if (name != o.name)
+                    return name < o.name;
                 return pt < o.pt;
             }
         };
@@ -4123,13 +4114,11 @@ Buffer KawasanBroker::handleDescribeAcls(
         }
         Logger::info("DescribeAcls: returned {} resource(s)", grouped.size());
     }
-    return encodeResponse(context, [&](Buffer& buf) {
-        resp.encode(buf, context.header.apiVersion());
-    });
+    return encodeResponse(context,
+                          [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
 }
 
-Buffer KawasanBroker::handleCreateAcls(
-    RequestDispatcher::RequestContext& context) {
+Buffer KawasanBroker::handleCreateAcls(RequestDispatcher::RequestContext& context) {
     protocol::CreateAclsRequest req;
     req.decode(context.payload, context.header.apiVersion());
     protocol::CreateAclsResponse resp;
@@ -4157,16 +4146,13 @@ Buffer KawasanBroker::handleCreateAcls(
         }
         resp.addResult(std::move(r));
     }
-    Logger::info("CreateAcls: stored {} binding(s); total={}",
-                 req.creations.size(),
+    Logger::info("CreateAcls: stored {} binding(s); total={}", req.creations.size(),
                  acl_store_ ? acl_store_->size() : 0);
-    return encodeResponse(context, [&](Buffer& buf) {
-        resp.encode(buf, context.header.apiVersion());
-    });
+    return encodeResponse(context,
+                          [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
 }
 
-Buffer KawasanBroker::handleDeleteAcls(
-    RequestDispatcher::RequestContext& context) {
+Buffer KawasanBroker::handleDeleteAcls(RequestDispatcher::RequestContext& context) {
     protocol::DeleteAclsRequest req;
     req.decode(context.payload, context.header.apiVersion());
     protocol::DeleteAclsResponse resp;
@@ -4204,18 +4190,15 @@ Buffer KawasanBroker::handleDeleteAcls(
         }
         resp.addFilterResult(std::move(fr));
     }
-    Logger::info("DeleteAcls: processed {} filter(s); total remaining={}",
-                 req.filters.size(),
+    Logger::info("DeleteAcls: processed {} filter(s); total remaining={}", req.filters.size(),
                  acl_store_ ? acl_store_->size() : 0);
-    return encodeResponse(context, [&](Buffer& buf) {
-        resp.encode(buf, context.header.apiVersion());
-    });
+    return encodeResponse(context,
+                          [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
 }
 
 // ---------- Phase 4.2a: SASL PLAIN ----------
 
-Buffer KawasanBroker::handleSaslHandshake(
-    RequestDispatcher::RequestContext& context) {
+Buffer KawasanBroker::handleSaslHandshake(RequestDispatcher::RequestContext& context) {
     protocol::SaslHandshakeRequest req;
     req.decode(context.payload, context.header.apiVersion());
 
@@ -4227,28 +4210,27 @@ Buffer KawasanBroker::handleSaslHandshake(
     const auto& mech = req.mechanism();
     if (mech == "PLAIN" || mech == "SCRAM-SHA-256" || mech == "SCRAM-SHA-512") {
         resp.setErrorCode(ErrorCode::NONE);
-        Logger::info("SaslHandshake: accepted mechanism '{}' for {}",
-                     mech, context.peer_identity);
+        Logger::info("SaslHandshake: accepted mechanism '{}' for {}", mech, context.peer_identity);
         // Phase 4.2b: stash a fresh SCRAM session for this peer so the
         // subsequent SaslAuthenticate messages have somewhere to track
         // state. PLAIN doesn't need session state.
         if (mech == "SCRAM-SHA-256" || mech == "SCRAM-SHA-512") {
             std::lock_guard<std::mutex> lock(sasl_session_mutex_);
-            const auto algo = (mech == "SCRAM-SHA-512") ? ScramAlgorithm::kSha512
-                                                        : ScramAlgorithm::kSha256;
+            const auto algo =
+                (mech == "SCRAM-SHA-512") ? ScramAlgorithm::kSha512 : ScramAlgorithm::kSha256;
             sasl_sessions_[context.peer_identity] =
                 std::make_unique<ScramAuthenticator>(sasl_scram_creds_, algo);
         }
     } else {
         // Kafka error code 33 = UNSUPPORTED_SASL_MECHANISM.
         resp.setErrorCode(static_cast<ErrorCode>(33));
-        Logger::warn("SaslHandshake: rejected mechanism '{}' (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512 supported)",
+        Logger::warn("SaslHandshake: rejected mechanism '{}' (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512 "
+                     "supported)",
                      mech);
     }
 
-    return encodeResponse(context, [&](Buffer& buf) {
-        resp.encode(buf, context.header.apiVersion());
-    });
+    return encodeResponse(context,
+                          [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
 }
 
 // Constant-time string comparison: iterates the full maximum length regardless
@@ -4266,8 +4248,7 @@ static bool constantTimeEquals(const std::string& a, const std::string& b) {
     return diff == 0;
 }
 
-Buffer KawasanBroker::handleSaslAuthenticate(
-    RequestDispatcher::RequestContext& context) {
+Buffer KawasanBroker::handleSaslAuthenticate(RequestDispatcher::RequestContext& context) {
     protocol::SaslAuthenticateRequest req;
     req.decode(context.payload, context.header.apiVersion());
 
@@ -4293,8 +4274,7 @@ Buffer KawasanBroker::handleSaslAuthenticate(
                 if (auth->authenticated()) {
                     resp.setSessionLifetimeMs(0);
                     if (context.connection) {
-                        context.connection->authenticated_principal =
-                            "User:" + auth->username();
+                        context.connection->authenticated_principal = "User:" + auth->username();
                     }
                     Logger::info("SaslAuthenticate: SCRAM completed for user '{}' from {}",
                                  auth->username(), context.peer_identity);
@@ -4302,9 +4282,8 @@ Buffer KawasanBroker::handleSaslAuthenticate(
                 }
             }
             lock.unlock();
-            return encodeResponse(context, [&](Buffer& buf) {
-                resp.encode(buf, context.header.apiVersion());
-            });
+            return encodeResponse(
+                context, [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
         }
     }
 
@@ -4322,10 +4301,15 @@ Buffer KawasanBroker::handleSaslAuthenticate(
         std::vector<std::string> parts;
         std::string current;
         for (uint8_t b : bytes) {
-            if (b == 0) { parts.push_back(std::move(current)); current.clear(); }
-            else { current.push_back(static_cast<char>(b)); }
+            if (b == 0) {
+                parts.push_back(std::move(current));
+                current.clear();
+            } else {
+                current.push_back(static_cast<char>(b));
+            }
         }
-        if (!current.empty()) parts.push_back(std::move(current));
+        if (!current.empty())
+            parts.push_back(std::move(current));
         std::string username, password;
         if (parts.size() >= 3) {
             username = parts[1];
@@ -4345,8 +4329,8 @@ Buffer KawasanBroker::handleSaslAuthenticate(
             auto it = sasl_plain_creds_.find(username);
             const std::string& expected =
                 (it != sasl_plain_creds_.end()) ? it->second : password;  // dummy on miss
-            const bool ok = (it != sasl_plain_creds_.end()) &&
-                            constantTimeEquals(expected, password);
+            const bool ok =
+                (it != sasl_plain_creds_.end()) && constantTimeEquals(expected, password);
             if (ok) {
                 resp.setErrorCode(ErrorCode::NONE);
                 resp.setSessionLifetimeMs(0);
@@ -4357,19 +4341,20 @@ Buffer KawasanBroker::handleSaslAuthenticate(
             } else {
                 resp.setErrorCode(static_cast<ErrorCode>(58));  // SASL_AUTHENTICATION_FAILED
                 resp.setErrorMessage("Invalid credentials");
-                Logger::warn("SaslAuthenticate: PLAIN user='{}' rejected (unknown user or bad password)",
-                             username);
+                Logger::warn(
+                    "SaslAuthenticate: PLAIN user='{}' rejected (unknown user or bad password)",
+                    username);
             }
         } else if (production_mode_) {
             // No credentials configured in production is a misconfiguration:
             // refuse rather than authenticate anyone. (In dev we accept below.)
             resp.setErrorCode(static_cast<ErrorCode>(58));  // SASL_AUTHENTICATION_FAILED
-            resp.setErrorMessage(
-                "SASL/PLAIN requires configured credentials in production "
-                "(set sasl.plain.credentials.file or sasl.plain.users)");
+            resp.setErrorMessage("SASL/PLAIN requires configured credentials in production "
+                                 "(set sasl.plain.credentials.file or sasl.plain.users)");
             Logger::warn(
                 "SaslAuthenticate: PLAIN rejected for user='{}' — no credentials configured "
-                "(production mode)", username);
+                "(production mode)",
+                username);
         } else {
             // Dev mode: no credentials configured → accept any non-empty pair.
             resp.setErrorCode(ErrorCode::NONE);
@@ -4377,55 +4362,63 @@ Buffer KawasanBroker::handleSaslAuthenticate(
             if (context.connection) {
                 context.connection->authenticated_principal = "User:" + username;
             }
-            Logger::info("SaslAuthenticate: PLAIN user='{}' accepted (dev mode — no sasl.plain.users)",
-                         username);
+            Logger::info(
+                "SaslAuthenticate: PLAIN user='{}' accepted (dev mode — no sasl.plain.users)",
+                username);
         }
     }
 
-    return encodeResponse(context, [&](Buffer& buf) {
-        resp.encode(buf, context.header.apiVersion());
-    });
+    return encodeResponse(context,
+                          [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
 }
 
 // ---------- Phase 3.3 scaffolding: transactional APIs ----------
 
-Buffer KawasanBroker::handleAddPartitionsToTxn(
-    RequestDispatcher::RequestContext& context) {
+Buffer KawasanBroker::handleAddPartitionsToTxn(RequestDispatcher::RequestContext& context) {
     protocol::AddPartitionsToTxnRequest req;
     req.decode(context.payload, context.header.apiVersion());
     Logger::info("AddPartitionsToTxn: transactional_id='{}' pid={} epoch={} {} topics",
-                 req.transactionalId(), req.producerId(), req.producerEpoch(),
-                 req.topics().size());
+                 req.transactionalId(), req.producerId(), req.producerEpoch(), req.topics().size());
     // Phase 3.3: register the txn in the coordinator (idempotent — if
     // already registered, it stays) and record the participating
     // partitions so EndTxn can later emit control records to them.
     if (transaction_coordinator_ && !req.transactionalId().empty()) {
         // Don't reset state if the txn is already known.
         if (!transaction_coordinator_->describe(req.transactionalId()).has_value()) {
-            transaction_coordinator_->recordInitProducerId(
-                req.transactionalId(), req.producerId(), req.producerEpoch(),
-                /*timeout=*/60000);
+            transaction_coordinator_->recordInitProducerId(req.transactionalId(), req.producerId(),
+                                                           req.producerEpoch(),
+                                                           /*timeout=*/60000);
         }
-        std::vector<std::pair<std::string, int32_t>> partitions;
+        // M1: capture each partition's first_offset (current log end) so it
+        // can be persisted and replayed to re-arm the LSO hold after a crash.
+        std::vector<TransactionCoordinator::TxnPartition> partitions;
         for (const auto& t : req.topics()) {
             for (int32_t p : t.partitions) {
-                partitions.emplace_back(t.topic, p);
+                int64_t first_offset = -1;
+                if (log_manager_) {
+                    auto* log = log_manager_->getOrCreateLog(t.topic, p);
+                    if (log)
+                        first_offset = log->logEndOffset();
+                }
+                partitions.push_back({t.topic, p, first_offset});
             }
         }
         transaction_coordinator_->addPartitions(req.transactionalId(), partitions);
 
-        // Phase EX-10: register each partition in the isolation tracker
-        // with the current log_end_offset as the txn's first_offset.
-        // This is what LSO will hold consumers behind until EndTxn lands.
-        if (isolation_tracker_ && log_manager_) {
-            for (const auto& [topic, p] : partitions) {
-                auto* log = log_manager_->getOrCreateLog(topic, p);
-                if (log) {
-                    isolation_tracker_->recordInFlightTxn(
-                        req.producerId(), topic, p, log->logEndOffset());
+        // Phase EX-10: register each partition in the isolation tracker with
+        // that first_offset. This is what LSO will hold consumers behind
+        // until EndTxn lands.
+        if (isolation_tracker_) {
+            for (const auto& tp : partitions) {
+                if (tp.first_offset >= 0) {
+                    isolation_tracker_->recordInFlightTxn(req.producerId(), tp.topic, tp.partition,
+                                                          tp.first_offset);
                 }
             }
         }
+        // M1: persist the updated Ongoing snapshot so a mid-transaction
+        // restart can rebuild txns_ and re-arm the LSO holds.
+        persistTxnState(req.transactionalId());
     }
     protocol::AddPartitionsToTxnResponse resp;
     resp.setThrottleTimeMs(0);
@@ -4440,18 +4433,15 @@ Buffer KawasanBroker::handleAddPartitionsToTxn(
         }
         resp.addTopic(std::move(tr));
     }
-    return encodeResponse(context, [&](Buffer& buf) {
-        resp.encode(buf, context.header.apiVersion());
-    });
+    return encodeResponse(context,
+                          [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
 }
 
-Buffer KawasanBroker::handleAddOffsetsToTxn(
-    RequestDispatcher::RequestContext& context) {
+Buffer KawasanBroker::handleAddOffsetsToTxn(RequestDispatcher::RequestContext& context) {
     protocol::AddOffsetsToTxnRequest req;
     req.decode(context.payload, context.header.apiVersion());
-    Logger::info("AddOffsetsToTxn: txn='{}' group='{}' pid={} epoch={}",
-                 req.transactionalId(), req.groupId(),
-                 req.producerId(), req.producerEpoch());
+    Logger::info("AddOffsetsToTxn: txn='{}' group='{}' pid={} epoch={}", req.transactionalId(),
+                 req.groupId(), req.producerId(), req.producerEpoch());
 
     // S12: register the group's __consumer_offsets partition in the transaction
     // so the subsequent TxnOffsetCommit's offsets are part of the txn and EndTxn
@@ -4460,9 +4450,9 @@ Buffer KawasanBroker::handleAddOffsetsToTxn(
     // EOS commit silently skipped the offsets-partition step.
     if (transaction_coordinator_ && !req.transactionalId().empty()) {
         if (!transaction_coordinator_->describe(req.transactionalId()).has_value()) {
-            transaction_coordinator_->recordInitProducerId(
-                req.transactionalId(), req.producerId(), req.producerEpoch(),
-                /*timeout=*/60000);
+            transaction_coordinator_->recordInitProducerId(req.transactionalId(), req.producerId(),
+                                                           req.producerEpoch(),
+                                                           /*timeout=*/60000);
         }
         // Route the group to its __consumer_offsets partition (same hash as
         // offset-commit routing: Java String.hashCode of group_id, mod count).
@@ -4470,143 +4460,71 @@ Buffer KawasanBroker::handleAddOffsetsToTxn(
         for (unsigned char c : req.groupId()) {
             h = 31 * h + static_cast<int32_t>(c);
         }
-        const uint32_t parts =
-            static_cast<uint32_t>(std::max(1, offsets_topic_num_partitions_));
+        const uint32_t parts = static_cast<uint32_t>(std::max(1, offsets_topic_num_partitions_));
         const int32_t target = static_cast<int32_t>(static_cast<uint32_t>(h) % parts);
-        transaction_coordinator_->addPartitions(
-            req.transactionalId(),
-            {{std::string("__consumer_offsets"), target}});
+        // first_offset = -1: the __consumer_offsets partition gets a control
+        // marker at EndTxn but is not an LSO hold for data consumers.
+        transaction_coordinator_->addPartitions(req.transactionalId(),
+                                                {{std::string("__consumer_offsets"), target, -1}});
+        // M1: persist so the added offsets-partition survives a restart.
+        persistTxnState(req.transactionalId());
     }
 
     protocol::AddOffsetsToTxnResponse resp;
     resp.setThrottleTimeMs(0);
     resp.setErrorCode(ErrorCode::NONE);
-    return encodeResponse(context, [&](Buffer& buf) {
-        resp.encode(buf, context.header.apiVersion());
-    });
+    return encodeResponse(context,
+                          [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
 }
 
-Buffer KawasanBroker::handleEndTxn(
-    RequestDispatcher::RequestContext& context) {
+Buffer KawasanBroker::handleEndTxn(RequestDispatcher::RequestContext& context) {
     protocol::EndTxnRequest req;
     req.decode(context.payload, context.header.apiVersion());
-    Logger::info("EndTxn: txn='{}' pid={} epoch={} committed={}",
-                 req.transactionalId(), req.producerId(),
-                 req.producerEpoch(), req.committed());
-    // Phase 3.3 + EX-10: drive the txn state machine and emit control
-    // records to participating partitions.
+    Logger::info("EndTxn: txn='{}' pid={} epoch={} committed={}", req.transactionalId(),
+                 req.producerId(), req.producerEpoch(), req.committed());
+    // Phase 3.3 + EX-10 + M1: two-phase, crash-safe txn completion. The
+    // ordering is the durability contract: persist Prepare{Commit,Abort}
+    // BEFORE emitting control markers, complete + persist Complete AFTER.
+    // A crash between the two leaves a Prepare* snapshot that startup replay
+    // re-drives to completion (finishTxnCompletion).
     if (transaction_coordinator_ && !req.transactionalId().empty()) {
-        std::vector<std::pair<std::string, int32_t>> participating;
-        // Phase EX-6: drain pending offsets BEFORE the txn state
-        // transition so the snapshot still has them. On commit we apply
-        // them; on abort drainPendingOffsets returns an empty vector
-        // (abortTxn already discarded them) so this is a no-op.
-        auto staged_offsets = transaction_coordinator_->drainPendingOffsets(
-            req.transactionalId());
-        if (req.committed()) {
-            participating = transaction_coordinator_->commitTxn(req.transactionalId());
-            Logger::info("EndTxn(commit): txn='{}' committed across {} partitions, "
-                         "applying {} staged offsets",
-                         req.transactionalId(), participating.size(),
-                         staged_offsets.size());
-            // Phase EX-6: apply staged offsets to OffsetManager only
-            // on commit. Grouped by group_id for the OffsetManager
-            // batch API. Abort path is a no-op.
-            if (offset_manager_ && !staged_offsets.empty()) {
-                std::unordered_map<std::string, std::vector<OffsetManager::OffsetCommitData>>
-                    by_group;
-                for (auto& po : staged_offsets) {
-                    OffsetManager::OffsetCommitData d;
-                    d.topic = po.topic;
-                    d.partition = po.partition;
-                    d.offset = po.offset;
-                    d.metadata = po.metadata;
-                    by_group[po.group_id].push_back(std::move(d));
-                }
-                for (auto& [group_id, data] : by_group) {
-                    try {
-                        offset_manager_->commitOffsetBatch(group_id, data);
-                    } catch (const std::exception& ex) {
-                        Logger::warn(
-                            "EndTxn(commit) failed to apply staged offsets "
-                            "for group '{}': {}", group_id, ex.what());
-                    }
-                }
-            }
-        } else {
-            participating = transaction_coordinator_->abortTxn(req.transactionalId());
-            Logger::info("EndTxn(abort): txn='{}' aborted across {} partitions, "
-                         "discarding {} staged offsets",
-                         req.transactionalId(), participating.size(),
-                         staged_offsets.size());
-        }
-
-        // Phase EX-10: emit a control RecordBatch (COMMIT or ABORT
-        // marker) on each participating partition so consumers with
-        // read_committed isolation can detect the boundary.
-        if (log_manager_) {
-            const Timestamp now_ms =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch())
-                    .count();
-            for (const auto& [topic, partition] : participating) {
-                auto* log = log_manager_->getOrCreateLog(topic, partition);
-                if (!log) continue;
-                const Offset base_offset = log->logEndOffset();
-                auto control_batch = storage::RecordBatch::makeControlBatch(
-                    req.producerId(), req.producerEpoch(),
-                    base_offset, req.committed(), now_ms);
-                try {
-                    // Append the full batch — preserving the isControl
-                    // and isTransactional attribute bits, producer_id,
-                    // and producer_epoch. A read_committed consumer uses
-                    // these to identify and skip transaction boundary
-                    // markers and aborted records (KIP-98).
-                    log->appendBatch(std::move(control_batch));
-                } catch (const std::exception& ex) {
-                    Logger::warn(
-                        "Failed to emit control record on {}-{}: {}",
-                        topic, partition, ex.what());
-                }
-            }
-        }
-
-        // Phase EX-10: update the isolation tracker. Commit releases
-        // the LSO hold; abort moves the txn's first_offset into the
-        // aborted-transactions ring.
-        if (isolation_tracker_) {
+        auto snap = transaction_coordinator_->describe(req.transactionalId());
+        if (snap.has_value()) {
+            std::vector<TransactionCoordinator::TxnPartition> participating;
             if (req.committed()) {
-                isolation_tracker_->commitInFlightTxns(participating,
-                                                       req.producerId());
+                participating = transaction_coordinator_->prepareCommit(req.transactionalId());
             } else {
-                isolation_tracker_->abortInFlightTxns(participating,
-                                                      req.producerId());
+                participating = transaction_coordinator_->prepareAbort(req.transactionalId());
             }
+            // Step 1: persist the Prepare snapshot (durable before markers).
+            persistTxnState(req.transactionalId());
+
+            // Step 2: complete the transaction (emit markers, apply/discard
+            // offsets, update the isolation tracker). Shared with replay.
+            finishTxnCompletion(req.transactionalId(), req.producerId(), req.producerEpoch(),
+                                req.committed(), participating, snap->pending_offsets,
+                                /*is_replay=*/false);
         }
     }
     protocol::EndTxnResponse resp;
     resp.setThrottleTimeMs(0);
     resp.setErrorCode(ErrorCode::NONE);
-    return encodeResponse(context, [&](Buffer& buf) {
-        resp.encode(buf, context.header.apiVersion());
-    });
+    return encodeResponse(context,
+                          [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
 }
 
-Buffer KawasanBroker::handleTxnOffsetCommit(
-    RequestDispatcher::RequestContext& context) {
+Buffer KawasanBroker::handleTxnOffsetCommit(RequestDispatcher::RequestContext& context) {
     protocol::TxnOffsetCommitRequest req;
     req.decode(context.payload, context.header.apiVersion());
     Logger::info("TxnOffsetCommit: txn='{}' group='{}' pid={} epoch={} {} topics",
-                 req.transactionalId(), req.groupId(),
-                 req.producerId(), req.producerEpoch(),
+                 req.transactionalId(), req.groupId(), req.producerId(), req.producerEpoch(),
                  req.topics().size());
     // Phase EX-6: stage the offsets in the transactional context. They
     // are applied to OffsetManager only on EndTxn(commit=true) and
     // discarded on EndTxn(commit=false). This makes consumer-group
     // offset commits truly transactional (KIP-447) — required for
     // Streams EOS v2 semantics.
-    if (transaction_coordinator_ && !req.transactionalId().empty()
-        && !req.groupId().empty()) {
+    if (transaction_coordinator_ && !req.transactionalId().empty() && !req.groupId().empty()) {
         std::vector<TransactionCoordinator::PendingOffset> staged;
         for (const auto& t : req.topics()) {
             for (const auto& p : t.partitions) {
@@ -4619,8 +4537,7 @@ Buffer KawasanBroker::handleTxnOffsetCommit(
                 staged.push_back(std::move(po));
             }
         }
-        transaction_coordinator_->stagePendingOffsets(req.transactionalId(),
-                                                      std::move(staged));
+        transaction_coordinator_->stagePendingOffsets(req.transactionalId(), std::move(staged));
     } else if (offset_manager_ && !req.groupId().empty()) {
         // Fallback: if no transactional context is provided, treat
         // this like a plain OffsetCommit. This preserves the old
@@ -4656,9 +4573,8 @@ Buffer KawasanBroker::handleTxnOffsetCommit(
         }
         resp.addTopic(std::move(tr));
     }
-    return encodeResponse(context, [&](Buffer& buf) {
-        resp.encode(buf, context.header.apiVersion());
-    });
+    return encodeResponse(context,
+                          [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
 }
 
 }  // namespace kawasan::broker

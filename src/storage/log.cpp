@@ -149,7 +149,7 @@ Log& Log::operator=(Log&& other) noexcept {
     return *this;
 }
 
-Offset Log::append(const std::vector<Record>& records) {
+Offset Log::append(const std::vector<Record>& records, bool force_sync) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (records.empty()) {
@@ -172,8 +172,11 @@ Offset Log::append(const std::vector<Record>& records) {
         segment = activeSegment();
     }
 
-    // Append to active segment
-    Offset offset = segment->append(batch, config_.flush_mode == FlushMode::kSync);
+    // Append to active segment. force_sync overrides the log's flush mode so a
+    // durability-critical caller (e.g. __transaction_state) fsyncs even when
+    // the broker's data durability is async.
+    const bool sync = force_sync || config_.flush_mode == FlushMode::kSync;
+    Offset offset = segment->append(batch, sync);
 
     // Update high watermark (simplified - in reality this is managed by replication)
     high_watermark_ = segment->nextOffset();

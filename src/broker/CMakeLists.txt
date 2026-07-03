@@ -15,6 +15,7 @@ add_library(kawasan_broker OBJECT
     scram_auth.cpp
     acl_store.cpp
     transaction_coordinator.cpp
+    transaction_state_manager.cpp
     fetch_session_manager.cpp
     isolation_tracker.cpp
     quota_manager.cpp

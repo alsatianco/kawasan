@@ -1,9 +1,9 @@
 #pragma once
 
 #include <atomic>
-#include <functional>
-#include <atomic>
+#include <boost/asio.hpp>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -14,8 +14,6 @@
 #include <utility>
 #include <vector>
 
-#include <boost/asio.hpp>
-
 #include "kawasan/broker/group_coordinator.h"
 #include "kawasan/broker/metadata_controller.h"
 #include "kawasan/broker/metrics/request_metrics.h"
@@ -25,6 +23,7 @@
 #include "kawasan/broker/offset_manager.h"
 #include "kawasan/broker/replica_manager.h"
 #include "kawasan/broker/request_dispatcher.h"
+#include "kawasan/broker/transaction_coordinator.h"
 #include "kawasan/common/buffer.h"
 #include "kawasan/common/config.h"
 #include "kawasan/common/types.h"
@@ -42,15 +41,14 @@ struct TlsConfig {
     std::string key_password;
     std::string ca_file;
     std::string client_auth = "none";  // none, requested, required
-    
+
     bool isValid() const {
-        if (!enabled) return true;
+        if (!enabled)
+            return true;
         return !cert_file.empty() && !key_file.empty();
     }
-    
-    bool requiresClientAuth() const {
-        return client_auth == "required";
-    }
+
+    bool requiresClientAuth() const { return client_auth == "required"; }
 };
 
 /// @brief Main Kafka broker class
@@ -94,9 +92,7 @@ public:
     /// @brief Number of currently-open partition logs (a proxy for the storage
     /// file-descriptor footprint, since each log is backed by RocksDB). Exposed
     /// for the FD-budget test and operational observability.
-    size_t openLogCount() const {
-        return log_manager_ ? log_manager_->openLogCount() : 0;
-    }
+    size_t openLogCount() const { return log_manager_ ? log_manager_->openLogCount() : 0; }
 
 private:
     void initializeRaft();
@@ -115,6 +111,25 @@ private:
     /// its persisted record-batch headers into producer_state_manager_ at
     /// startup (B3 — survives restart without a separate snapshot file).
     void replayProducerStateFromLog(const std::string& topic, PartitionId partition);
+    /// @brief M1: rebuilds TransactionCoordinator + IsolationTracker state at
+    /// startup by replaying persisted snapshots from __transaction_state, and
+    /// re-drives any transaction left in a Prepare* state to completion.
+    void replayTransactionStateFromLog();
+    /// @brief M1: persist the current snapshot of `transactional_id` to
+    /// __transaction_state (no-op if the state manager isn't ready).
+    void persistTxnState(const std::string& transactional_id);
+    /// @brief M1: shared completion path for EndTxn and crash-recovery replay.
+    /// Emits control markers on participating partitions (idempotently when
+    /// is_replay=true), applies/discards staged offsets, updates the isolation
+    /// tracker, transitions the coordinator to Complete*, and persists it.
+    void finishTxnCompletion(
+        const std::string& transactional_id, int64_t producer_id, int16_t producer_epoch,
+        bool committed, const std::vector<TransactionCoordinator::TxnPartition>& participating,
+        const std::vector<TransactionCoordinator::PendingOffset>& pending_offsets, bool is_replay);
+    /// @brief M1: true if the partition log already holds a control batch for
+    /// `producer_id` at/after `from_offset` — the idempotency guard that stops
+    /// crash-recovery re-drive from writing a duplicate marker.
+    bool logHasControlBatchForProducer(storage::Log* log, int64_t producer_id, Offset from_offset);
     /// @brief Background loop that calls ensureInternalTopics() until the
     /// internal topics exist, then exits. Handles the multi-broker case where
     /// leadership is established after startup.
@@ -132,57 +147,57 @@ private:
     bool authorize(const RequestDispatcher::RequestContext& context, int8_t operation,
                    int8_t resource_type, const std::string& resource_name) const;
     void registerProtocolHandlers();
-    Buffer encodeResponse(
-        const RequestDispatcher::RequestContext& context,
-        const std::function<void(Buffer&)>& writer) const;
+    Buffer encodeResponse(const RequestDispatcher::RequestContext& context,
+                          const std::function<void(Buffer&)>& writer) const;
     Buffer handleApiVersions(RequestDispatcher::RequestContext& context);
-    Buffer buildApiVersionsError(const RequestDispatcher::RequestContext& context,
-                                 ErrorCode code, int16_t response_version) const;
+    Buffer buildApiVersionsError(const RequestDispatcher::RequestContext& context, ErrorCode code,
+                                 int16_t response_version) const;
     Buffer handleMetadata(RequestDispatcher::RequestContext& context);
-    Buffer buildMetadataError(const RequestDispatcher::RequestContext& context,
-                              ErrorCode code, int16_t response_version) const;
+    Buffer buildMetadataError(const RequestDispatcher::RequestContext& context, ErrorCode code,
+                              int16_t response_version) const;
     Buffer handleCreateTopics(RequestDispatcher::RequestContext& context);
-    Buffer buildCreateTopicsError(const RequestDispatcher::RequestContext& context,
-                                  ErrorCode code, int16_t response_version) const;
+    Buffer buildCreateTopicsError(const RequestDispatcher::RequestContext& context, ErrorCode code,
+                                  int16_t response_version) const;
     Buffer handleDeleteTopics(RequestDispatcher::RequestContext& context);
-    Buffer buildDeleteTopicsError(const RequestDispatcher::RequestContext& context,
-                                  ErrorCode code, int16_t response_version) const;
+    Buffer buildDeleteTopicsError(const RequestDispatcher::RequestContext& context, ErrorCode code,
+                                  int16_t response_version) const;
     RequestDispatcher::HandlerResult handleProduce(RequestDispatcher::RequestContext& context);
-    Buffer buildProduceError(const RequestDispatcher::RequestContext& context,
-                             ErrorCode code, int16_t response_version) const;
+    Buffer buildProduceError(const RequestDispatcher::RequestContext& context, ErrorCode code,
+                             int16_t response_version) const;
     RequestDispatcher::HandlerResult handleFetch(RequestDispatcher::RequestContext& context);
-    Buffer buildFetchError(const RequestDispatcher::RequestContext& context,
-                           ErrorCode code, int16_t response_version) const;
+    Buffer buildFetchError(const RequestDispatcher::RequestContext& context, ErrorCode code,
+                           int16_t response_version) const;
     RequestDispatcher::HandlerResult handleListOffsets(RequestDispatcher::RequestContext& context);
-    Buffer buildListOffsetsError(const RequestDispatcher::RequestContext& context,
-                                 ErrorCode code, int16_t response_version) const;
-    RequestDispatcher::HandlerResult handleFindCoordinator(RequestDispatcher::RequestContext& context);
+    Buffer buildListOffsetsError(const RequestDispatcher::RequestContext& context, ErrorCode code,
+                                 int16_t response_version) const;
+    RequestDispatcher::HandlerResult handleFindCoordinator(
+        RequestDispatcher::RequestContext& context);
     Buffer buildFindCoordinatorError(const RequestDispatcher::RequestContext& context,
                                      ErrorCode code, int16_t response_version) const;
     Buffer handleJoinGroup(RequestDispatcher::RequestContext& context);
-    Buffer buildJoinGroupError(const RequestDispatcher::RequestContext& context,
-                               ErrorCode code, int16_t response_version) const;
+    Buffer buildJoinGroupError(const RequestDispatcher::RequestContext& context, ErrorCode code,
+                               int16_t response_version) const;
     Buffer handleSyncGroup(RequestDispatcher::RequestContext& context);
-    Buffer buildSyncGroupError(const RequestDispatcher::RequestContext& context,
-                               ErrorCode code, int16_t response_version) const;
+    Buffer buildSyncGroupError(const RequestDispatcher::RequestContext& context, ErrorCode code,
+                               int16_t response_version) const;
     Buffer handleHeartbeat(RequestDispatcher::RequestContext& context);
-    Buffer buildHeartbeatError(const RequestDispatcher::RequestContext& context,
-                               ErrorCode code, int16_t response_version) const;
+    Buffer buildHeartbeatError(const RequestDispatcher::RequestContext& context, ErrorCode code,
+                               int16_t response_version) const;
     Buffer handleLeaveGroup(RequestDispatcher::RequestContext& context);
-    Buffer buildLeaveGroupError(const RequestDispatcher::RequestContext& context,
-                                ErrorCode code, int16_t response_version) const;
+    Buffer buildLeaveGroupError(const RequestDispatcher::RequestContext& context, ErrorCode code,
+                                int16_t response_version) const;
     Buffer handleOffsetCommit(RequestDispatcher::RequestContext& context);
-    Buffer buildOffsetCommitError(const RequestDispatcher::RequestContext& context,
-                                  ErrorCode code, int16_t response_version) const;
+    Buffer buildOffsetCommitError(const RequestDispatcher::RequestContext& context, ErrorCode code,
+                                  int16_t response_version) const;
     Buffer handleOffsetFetch(RequestDispatcher::RequestContext& context);
-    Buffer buildOffsetFetchError(const RequestDispatcher::RequestContext& context,
-                                 ErrorCode code, int16_t response_version) const;
+    Buffer buildOffsetFetchError(const RequestDispatcher::RequestContext& context, ErrorCode code,
+                                 int16_t response_version) const;
     Buffer handleDescribeGroups(RequestDispatcher::RequestContext& context);
     Buffer buildDescribeGroupsError(const RequestDispatcher::RequestContext& context,
                                     ErrorCode code, int16_t response_version) const;
     Buffer handleListGroups(RequestDispatcher::RequestContext& context);
-    Buffer buildListGroupsError(const RequestDispatcher::RequestContext& context,
-                                ErrorCode code, int16_t response_version) const;
+    Buffer buildListGroupsError(const RequestDispatcher::RequestContext& context, ErrorCode code,
+                                int16_t response_version) const;
     Buffer handleDescribeConfigs(RequestDispatcher::RequestContext& context);
     Buffer buildDescribeConfigsError(const RequestDispatcher::RequestContext& context,
                                      ErrorCode code, int16_t response_version) const;
@@ -203,8 +218,8 @@ private:
                                           ErrorCode code, int16_t response_version) const;
     // Phase 4.1a: AlterConfigs (replace-all topic/broker config).
     Buffer handleAlterConfigs(RequestDispatcher::RequestContext& context);
-    Buffer buildAlterConfigsError(const RequestDispatcher::RequestContext& context,
-                                  ErrorCode code, int16_t response_version) const;
+    Buffer buildAlterConfigsError(const RequestDispatcher::RequestContext& context, ErrorCode code,
+                                  int16_t response_version) const;
     // Phase 4.1b: IncrementalAlterConfigs (per-key SET/DELETE/APPEND/SUBTRACT).
     Buffer handleIncrementalAlterConfigs(RequestDispatcher::RequestContext& context);
     Buffer buildIncrementalAlterConfigsError(const RequestDispatcher::RequestContext& context,
@@ -277,6 +292,11 @@ private:
     // and ListTransactions can return real state for txn IDs the broker
     // has seen via InitProducerId.
     std::unique_ptr<class TransactionCoordinator> transaction_coordinator_;
+    // M1: durable persistence of transaction state to __transaction_state and
+    // replay on startup. Constructed once the internal-topic partition count
+    // is known (see ensureInternalTopics).
+    std::unique_ptr<class TransactionStateManager> transaction_state_manager_;
+    int32_t txn_state_num_partitions_ = 16;
     // Phase 1.4: KIP-227 FetchSessionManager. Allocates and tracks
     // fetch session_ids; the Fetch response uses these to maintain a
     // stable handle across polls.
@@ -372,11 +392,10 @@ private:
     // state lives next to the underlying socket instead of in a global
     // map.
     mutable std::mutex sasl_session_mutex_;
-    std::unordered_map<std::string, std::unique_ptr<class ScramAuthenticator>>
-        sasl_sessions_;
+    std::unordered_map<std::string, std::unique_ptr<class ScramAuthenticator>> sasl_sessions_;
 
     std::atomic<bool> running_{false};
-    
+
     // IO context for Raft transport
     boost::asio::io_context io_context_;
     // 0A.13: Work guard keeps io_context_.run() alive even when there is no

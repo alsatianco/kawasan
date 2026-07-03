@@ -156,7 +156,8 @@ TEST(RequiredMetricsTest, TransactionInProgressCount) {
     tc.addPartitions("a", {{"t", 0}});
     tc.recordInitProducerId("b", 2, 0, 60000);
     tc.addPartitions("b", {{"t", 1}});
-    tc.commitTxn("a");  // a → CompleteCommit; b stays Ongoing
+    tc.prepareCommit("a");
+    tc.completeCommit("a");  // a → CompleteCommit; b stays Ongoing
     auto m = tc.getMetrics();
     EXPECT_EQ(m.in_progress, 1);
     EXPECT_EQ(m.commits_total, 1);

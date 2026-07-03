@@ -35,7 +35,7 @@ Then point any Kafka client at `localhost:9092`. Prometheus metrics scrape from 
 | **Core broker** | Topics, Produce/Fetch (acks 0/1/-1), Metadata, compression (Snappy/LZ4/Zstd) | Stable |
 | **Consumer groups** | Persistent offsets (RocksDB), rebalancing, lag tracking | Stable |
 | **Storage** | RocksDB-backed segmented logs, time/size retention | Stable |
-| **Transactions** | Idempotent producers, transaction coordinator, read-committed isolation | Partial — single-node; transaction state is in-memory and **not durable across restart/failover** |
+| **Transactions** | Idempotent producers, two-phase transaction coordinator, read-committed isolation | Partial — single-node transaction state is **durable across restart** (persisted to `__transaction_state`, replayed on startup); multi-broker replication of it awaits follower fetch |
 | **Streams** | DSL (KStream/KTable), windowing, joins | Experimental — the topology/DSL builds, but the task **runtime is incomplete** (does not yet run end-to-end) |
 | **Connect** | Source/sink connector + task + worker framework | Experimental — framework only; **no REST API**, standalone, cannot host JVM Connect plugins |
 | **Security** | SASL/PLAIN + SASL/SCRAM (SHA-256/512) auth; ACL **enforcement** (opt-in via `authorizer.enabled`); per-client quotas (opt-in) | Implemented (no client/broker TLS — see below) |
