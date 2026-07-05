@@ -608,6 +608,15 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
     // Start background cleanup thread for expired groups and timed-out members
     group_coordinator_->startCleanupThread();
 
+    // M2: start the transaction-timeout sweep. Runs after initializeMetadata()
+    // has already replayed/re-armed persisted transactions, so it never acts on
+    // partially-restored state.
+    txn_sweep_interval_ms_ = std::max<int64_t>(
+        1000,
+        config_.get<int64_t>("transaction.abort.timed.out.transaction.cleanup.interval.ms", 10000));
+    txn_sweep_stop_.store(false);
+    txn_sweep_thread_ = std::thread(&KawasanBroker::transactionSweepLoop, this);
+
     request_metrics_ = std::make_shared<metrics::RequestMetrics>();
     request_dispatcher_ = std::make_shared<RequestDispatcher>(request_metrics_);
     supported_api_versions_ = {
@@ -733,6 +742,17 @@ void KawasanBroker::start() {
 }
 
 void KawasanBroker::stop() {
+    // M2: the transaction-timeout sweep is started during construction (next
+    // to the group cleanup thread), i.e. BEFORE running_ becomes true. Join it
+    // unconditionally here — before the running_ guard — so a broker that was
+    // constructed but never fully started (e.g. a config-validation test) still
+    // joins the sweep thread instead of terminating on a joinable std::thread.
+    txn_sweep_stop_.store(true);
+    txn_sweep_cv_.notify_all();
+    if (txn_sweep_thread_.joinable()) {
+        txn_sweep_thread_.join();
+    }
+
     if (!running_) {
         return;
     }
@@ -1027,6 +1047,47 @@ void KawasanBroker::persistTxnState(const std::string& transactional_id) {
     auto snap = transaction_coordinator_->describe(transactional_id);
     if (snap.has_value()) {
         transaction_state_manager_->persist(*snap);
+    }
+}
+
+bool KawasanBroker::txnEpochFenced(const std::string& transactional_id, int16_t req_epoch) {
+    if (!transaction_coordinator_ || transactional_id.empty())
+        return false;
+    auto snap = transaction_coordinator_->describe(transactional_id);
+    // Unknown txn: nothing to fence (it is auto-registered at this epoch).
+    if (!snap.has_value())
+        return false;
+    return req_epoch < snap->producer_epoch;
+}
+
+void KawasanBroker::transactionSweepLoop() {
+    // M2: periodically abort Ongoing transactions that have exceeded their
+    // transaction.timeout.ms, so a hung/crashed producer never holds the LSO
+    // (and read_committed consumers) hostage. Candidates are gathered under the
+    // coordinator lock (expiredOngoing) and aborted outside it — the same
+    // collect-then-act discipline the group cleanup thread uses.
+    while (!txn_sweep_stop_.load()) {
+        {
+            std::unique_lock<std::mutex> lock(txn_sweep_mutex_);
+            txn_sweep_cv_.wait_for(lock, std::chrono::milliseconds(txn_sweep_interval_ms_),
+                                   [this] { return txn_sweep_stop_.load(); });
+        }
+        if (txn_sweep_stop_.load())
+            break;
+        if (!transaction_coordinator_)
+            continue;
+
+        const int64_t now = transaction_coordinator_->nowMs();
+        const auto expired = transaction_coordinator_->expiredOngoing(now);
+        for (const auto& snap : expired) {
+            Logger::info("Transaction '{}' timed out (timeout={}ms) — auto-aborting",
+                         snap.transactional_id, snap.transaction_timeout_ms);
+            auto participating = transaction_coordinator_->prepareAbort(snap.transactional_id);
+            persistTxnState(snap.transactional_id);
+            finishTxnCompletion(snap.transactional_id, snap.producer_id, snap.producer_epoch,
+                                /*committed=*/false, participating, snap.pending_offsets,
+                                /*is_replay=*/false);
+        }
     }
 }
 
@@ -3490,23 +3551,52 @@ Buffer KawasanBroker::handleInitProducerId(RequestDispatcher::RequestContext& co
                  context.peer_identity, request.transactionalId().value_or("<null>"),
                  request.transactionTimeoutMs());
 
-    const int64_t producer_id = allocateNextProducerId();
-
     protocol::InitProducerIdResponse response;
     response.setThrottleTimeMs(0);
     response.setErrorCode(ErrorCode::NONE);
-    response.setProducerId(producer_id);
-    response.setProducerEpoch(0);
 
-    // Phase 4.1k/4.1l: register the transactional_id with the
-    // TransactionCoordinator so subsequent DescribeTransactions /
-    // ListTransactions can see it. Non-transactional InitProducerId
-    // (transactional_id null) skips this — no txn ID to track.
-    if (transaction_coordinator_ && request.transactionalId().has_value() &&
-        !request.transactionalId()->empty()) {
-        transaction_coordinator_->recordInitProducerId(*request.transactionalId(), producer_id,
-                                                       /*epoch=*/0, request.transactionTimeoutMs());
+    // M2: for a transactional_id, InitProducerId is the fencing point. If the
+    // transactional_id is already known, REUSE its producer_id and BUMP the
+    // epoch — this fences any earlier producer instance (its stale epoch now
+    // fails the txn-API epoch checks). A prior in-flight (Ongoing/Prepare*)
+    // transaction is auto-aborted at the OLD epoch first, so it doesn't dangle.
+    // A brand-new transactional_id (and non-transactional InitProducerId) gets
+    // a fresh producer_id at epoch 0.
+    int64_t producer_id;
+    int16_t producer_epoch;
+    const bool transactional =
+        request.transactionalId().has_value() && !request.transactionalId()->empty();
+    if (transactional && transaction_coordinator_) {
+        const std::string& txn_id = *request.transactionalId();
+        auto prior = transaction_coordinator_->describe(txn_id);
+        if (prior.has_value()) {
+            producer_id = prior->producer_id;
+            producer_epoch = static_cast<int16_t>(prior->producer_epoch + 1);
+            if (prior->state == TransactionCoordinator::State::Ongoing ||
+                prior->state == TransactionCoordinator::State::PrepareCommit ||
+                prior->state == TransactionCoordinator::State::PrepareAbort) {
+                Logger::info("InitProducerId fences in-flight txn '{}' (epoch {}->{}), aborting",
+                             txn_id, prior->producer_epoch, producer_epoch);
+                auto participating = transaction_coordinator_->prepareAbort(txn_id);
+                persistTxnState(txn_id);
+                finishTxnCompletion(txn_id, prior->producer_id, prior->producer_epoch,
+                                    /*committed=*/false, participating, prior->pending_offsets,
+                                    /*is_replay=*/false);
+            }
+        } else {
+            producer_id = allocateNextProducerId();
+            producer_epoch = 0;
+        }
+        transaction_coordinator_->recordInitProducerId(txn_id, producer_id, producer_epoch,
+                                                       request.transactionTimeoutMs());
+        persistTxnState(txn_id);
+    } else {
+        producer_id = allocateNextProducerId();
+        producer_epoch = 0;
     }
+
+    response.setProducerId(producer_id);
+    response.setProducerEpoch(producer_epoch);
 
     const int16_t version = std::clamp<int16_t>(context.header.apiVersion(), 0, 4);
     return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
@@ -4379,6 +4469,24 @@ Buffer KawasanBroker::handleAddPartitionsToTxn(RequestDispatcher::RequestContext
     req.decode(context.payload, context.header.apiVersion());
     Logger::info("AddPartitionsToTxn: transactional_id='{}' pid={} epoch={} {} topics",
                  req.transactionalId(), req.producerId(), req.producerEpoch(), req.topics().size());
+    // M2: fence a zombie producer whose epoch is older than the current one.
+    if (txnEpochFenced(req.transactionalId(), req.producerEpoch())) {
+        protocol::AddPartitionsToTxnResponse resp;
+        resp.setThrottleTimeMs(0);
+        for (const auto& t : req.topics()) {
+            protocol::AddPartitionsToTxnResponse::TopicResult tr;
+            tr.topic = t.topic;
+            for (int32_t p : t.partitions) {
+                protocol::AddPartitionsToTxnResponse::PartitionResult pr;
+                pr.partition = p;
+                pr.error_code = ErrorCode::INVALID_PRODUCER_EPOCH;
+                tr.partitions.push_back(pr);
+            }
+            resp.addTopic(std::move(tr));
+        }
+        return encodeResponse(context,
+                              [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
+    }
     // Phase 3.3: register the txn in the coordinator (idempotent — if
     // already registered, it stays) and record the participating
     // partitions so EndTxn can later emit control records to them.
@@ -4443,6 +4551,15 @@ Buffer KawasanBroker::handleAddOffsetsToTxn(RequestDispatcher::RequestContext& c
     Logger::info("AddOffsetsToTxn: txn='{}' group='{}' pid={} epoch={}", req.transactionalId(),
                  req.groupId(), req.producerId(), req.producerEpoch());
 
+    // M2: fence a zombie producer with a stale epoch.
+    if (txnEpochFenced(req.transactionalId(), req.producerEpoch())) {
+        protocol::AddOffsetsToTxnResponse resp;
+        resp.setThrottleTimeMs(0);
+        resp.setErrorCode(ErrorCode::INVALID_PRODUCER_EPOCH);
+        return encodeResponse(context,
+                              [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
+    }
+
     // S12: register the group's __consumer_offsets partition in the transaction
     // so the subsequent TxnOffsetCommit's offsets are part of the txn and EndTxn
     // emits a commit/abort marker to that partition (KIP-98 EOS). Previously this
@@ -4487,28 +4604,40 @@ Buffer KawasanBroker::handleEndTxn(RequestDispatcher::RequestContext& context) {
     // BEFORE emitting control markers, complete + persist Complete AFTER.
     // A crash between the two leaves a Prepare* snapshot that startup replay
     // re-drives to completion (finishTxnCompletion).
+    ErrorCode end_error = ErrorCode::NONE;
     if (transaction_coordinator_ && !req.transactionalId().empty()) {
-        auto snap = transaction_coordinator_->describe(req.transactionalId());
-        if (snap.has_value()) {
-            std::vector<TransactionCoordinator::TxnPartition> participating;
-            if (req.committed()) {
-                participating = transaction_coordinator_->prepareCommit(req.transactionalId());
+        // M2: fence a stale-epoch (zombie) producer.
+        if (txnEpochFenced(req.transactionalId(), req.producerEpoch())) {
+            end_error = ErrorCode::INVALID_PRODUCER_EPOCH;
+        } else {
+            auto snap = transaction_coordinator_->describe(req.transactionalId());
+            if (!snap.has_value()) {
+                end_error = ErrorCode::INVALID_TXN_STATE;
+            } else if (snap->state != TransactionCoordinator::State::Ongoing) {
+                // M2: the txn is not Ongoing — e.g. the timeout sweep already
+                // aborted it, or it's already terminal. A commit/abort here
+                // can't proceed; tell the client so it doesn't assume success.
+                end_error = ErrorCode::INVALID_TXN_STATE;
             } else {
-                participating = transaction_coordinator_->prepareAbort(req.transactionalId());
+                std::vector<TransactionCoordinator::TxnPartition> participating;
+                if (req.committed()) {
+                    participating = transaction_coordinator_->prepareCommit(req.transactionalId());
+                } else {
+                    participating = transaction_coordinator_->prepareAbort(req.transactionalId());
+                }
+                // Step 1: persist the Prepare snapshot (durable before markers).
+                persistTxnState(req.transactionalId());
+                // Step 2: complete the transaction (emit markers, apply/discard
+                // offsets, update the isolation tracker). Shared with replay.
+                finishTxnCompletion(req.transactionalId(), req.producerId(), req.producerEpoch(),
+                                    req.committed(), participating, snap->pending_offsets,
+                                    /*is_replay=*/false);
             }
-            // Step 1: persist the Prepare snapshot (durable before markers).
-            persistTxnState(req.transactionalId());
-
-            // Step 2: complete the transaction (emit markers, apply/discard
-            // offsets, update the isolation tracker). Shared with replay.
-            finishTxnCompletion(req.transactionalId(), req.producerId(), req.producerEpoch(),
-                                req.committed(), participating, snap->pending_offsets,
-                                /*is_replay=*/false);
         }
     }
     protocol::EndTxnResponse resp;
     resp.setThrottleTimeMs(0);
-    resp.setErrorCode(ErrorCode::NONE);
+    resp.setErrorCode(end_error);
     return encodeResponse(context,
                           [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
 }
@@ -4519,6 +4648,25 @@ Buffer KawasanBroker::handleTxnOffsetCommit(RequestDispatcher::RequestContext& c
     Logger::info("TxnOffsetCommit: txn='{}' group='{}' pid={} epoch={} {} topics",
                  req.transactionalId(), req.groupId(), req.producerId(), req.producerEpoch(),
                  req.topics().size());
+    // M2: fence a stale-epoch (zombie) producer before staging any offsets.
+    const bool txn_fenced = txnEpochFenced(req.transactionalId(), req.producerEpoch());
+    if (txn_fenced) {
+        protocol::TxnOffsetCommitResponse resp;
+        resp.setThrottleTimeMs(0);
+        for (const auto& t : req.topics()) {
+            protocol::TxnOffsetCommitResponse::TopicResult tr;
+            tr.topic = t.topic;
+            for (const auto& p : t.partitions) {
+                protocol::TxnOffsetCommitResponse::PartitionResult pr;
+                pr.partition = p.partition;
+                pr.error_code = ErrorCode::INVALID_PRODUCER_EPOCH;
+                tr.partitions.push_back(pr);
+            }
+            resp.addTopic(std::move(tr));
+        }
+        return encodeResponse(context,
+                              [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
+    }
     // Phase EX-6: stage the offsets in the transactional context. They
     // are applied to OffsetManager only on EndTxn(commit=true) and
     // discarded on EndTxn(commit=false). This makes consumer-group

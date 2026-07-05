@@ -5,16 +5,6 @@
 
 namespace kawasan::broker {
 
-namespace {
-
-int64_t nowMs() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
-}  // namespace
-
 void TransactionCoordinator::recordInitProducerId(const std::string& transactional_id,
                                                   int64_t producer_id, int16_t producer_epoch,
                                                   int32_t transaction_timeout_ms) {
@@ -28,7 +18,7 @@ void TransactionCoordinator::recordInitProducerId(const std::string& transaction
     s.producer_epoch = producer_epoch;
     s.transaction_timeout_ms = transaction_timeout_ms;
     if (s.state == State::Empty || s.state == State::Dead) {
-        s.state_start_time_ms = nowMs();
+        s.state_start_time_ms = clock_();
     }
     // Phase 3.3: InitProducerId resets the transaction to Empty (any
     // previous in-flight transaction is abandoned). Partition list is
@@ -51,7 +41,7 @@ void TransactionCoordinator::addPartitions(const std::string& transactional_id,
     if (s.state == State::Empty || s.state == State::CompleteCommit ||
         s.state == State::CompleteAbort) {
         s.state = State::Ongoing;
-        s.state_start_time_ms = nowMs();
+        s.state_start_time_ms = clock_();
         s.partitions.clear();
     }
     // De-dup by (topic, partition): AddPartitionsToTxn can be called
@@ -82,7 +72,7 @@ std::vector<TransactionCoordinator::TxnPartition> TransactionCoordinator::prepar
     // finish the commit. The CompleteCommit transition happens in
     // completeCommit() after control records are emitted.
     s.state = State::PrepareCommit;
-    s.state_start_time_ms = nowMs();
+    s.state_start_time_ms = clock_();
     return s.partitions;
 }
 
@@ -93,7 +83,7 @@ void TransactionCoordinator::completeCommit(const std::string& transactional_id)
         return;
     auto& s = it->second;
     s.state = State::CompleteCommit;
-    s.state_start_time_ms = nowMs();
+    s.state_start_time_ms = clock_();
     s.partitions.clear();
     s.pending_offsets.clear();
     commits_total_.fetch_add(1, std::memory_order_relaxed);
@@ -107,7 +97,7 @@ std::vector<TransactionCoordinator::TxnPartition> TransactionCoordinator::prepar
         return {};
     auto& s = it->second;
     s.state = State::PrepareAbort;
-    s.state_start_time_ms = nowMs();
+    s.state_start_time_ms = clock_();
     return s.partitions;
 }
 
@@ -118,7 +108,7 @@ void TransactionCoordinator::completeAbort(const std::string& transactional_id) 
         return;
     auto& s = it->second;
     s.state = State::CompleteAbort;
-    s.state_start_time_ms = nowMs();
+    s.state_start_time_ms = clock_();
     s.partitions.clear();
     // Phase EX-6: discard staged offsets — aborts MUST NOT make
     // consumer-group offset commits visible.
@@ -202,6 +192,22 @@ std::optional<TransactionCoordinator::TxnSnapshot> TransactionCoordinator::descr
     if (it == txns_.end())
         return std::nullopt;
     return it->second;
+}
+
+std::vector<TransactionCoordinator::TxnSnapshot> TransactionCoordinator::expiredOngoing(
+    int64_t now_ms) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<TxnSnapshot> out;
+    for (const auto& [_, s] : txns_) {
+        if (s.state != State::Ongoing)
+            continue;
+        if (s.transaction_timeout_ms <= 0)
+            continue;  // no deadline configured
+        if (now_ms - s.state_start_time_ms > s.transaction_timeout_ms) {
+            out.push_back(s);
+        }
+    }
+    return out;
 }
 
 const char* TransactionCoordinator::stateName(State s) {

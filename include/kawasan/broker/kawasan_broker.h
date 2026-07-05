@@ -130,6 +130,15 @@ private:
     /// `producer_id` at/after `from_offset` — the idempotency guard that stops
     /// crash-recovery re-drive from writing a duplicate marker.
     bool logHasControlBatchForProducer(storage::Log* log, int64_t producer_id, Offset from_offset);
+    /// @brief M2: true if `req_epoch` is older than the coordinator's stored
+    /// epoch for `transactional_id` — the request is from a fenced (zombie)
+    /// producer and must be rejected with INVALID_PRODUCER_EPOCH. False if the
+    /// txn is unknown (nothing to fence yet).
+    bool txnEpochFenced(const std::string& transactional_id, int16_t req_epoch);
+    /// @brief M2: background loop that auto-aborts Ongoing transactions past
+    /// their transaction.timeout.ms so a hung producer never blocks
+    /// read_committed consumers forever.
+    void transactionSweepLoop();
     /// @brief Background loop that calls ensureInternalTopics() until the
     /// internal topics exist, then exits. Handles the multi-broker case where
     /// leadership is established after startup.
@@ -351,6 +360,13 @@ private:
     std::thread bootstrap_thread_;
     std::mutex bootstrap_mutex_;
     std::condition_variable bootstrap_cv_;
+
+    // M2: transaction-timeout sweep thread — auto-aborts expired Ongoing txns.
+    std::atomic<bool> txn_sweep_stop_{false};
+    std::thread txn_sweep_thread_;
+    std::mutex txn_sweep_mutex_;
+    std::condition_variable txn_sweep_cv_;
+    int64_t txn_sweep_interval_ms_ = 10000;
 
     // Actual partition count of the `__consumer_offsets` topic, captured from
     // metadata after the topic is created/confirmed at startup. Used to route

@@ -165,4 +165,34 @@ TEST(TransactionCoordinatorTest, StagePendingOffsetsForUnknownTxnIsNoop) {
     EXPECT_TRUE(drained.empty());
 }
 
+// M2: transaction-timeout detection via the injectable clock.
+TEST(TransactionCoordinatorTest, ExpiredOngoingDetectedAfterTimeout) {
+    int64_t fake_now = 1000;
+    TransactionCoordinator tc([&] { return fake_now; });
+    tc.recordInitProducerId("t", 1, 0, /*timeout=*/500);
+    tc.addPartitions("t", {{"topic-a", 0, 5}});  // Ongoing, state_start = 1000
+
+    EXPECT_TRUE(tc.expiredOngoing(1400).empty()) << "400ms < 500ms: not yet expired";
+    auto expired = tc.expiredOngoing(1600);  // 600ms > 500ms
+    ASSERT_EQ(expired.size(), 1u);
+    EXPECT_EQ(expired[0].transactional_id, "t");
+}
+
+TEST(TransactionCoordinatorTest, ZeroTimeoutNeverExpires) {
+    TransactionCoordinator tc;
+    tc.recordInitProducerId("t", 1, 0, /*timeout=*/0);
+    tc.addPartitions("t", {{"a", 0, 0}});
+    EXPECT_TRUE(tc.expiredOngoing(1'000'000'000).empty());
+}
+
+TEST(TransactionCoordinatorTest, OnlyOngoingTxnsExpire) {
+    int64_t fake_now = 0;
+    TransactionCoordinator tc([&] { return fake_now; });
+    tc.recordInitProducerId("t", 1, 0, 100);
+    tc.addPartitions("t", {{"a", 0, 0}});
+    tc.prepareCommit("t");
+    tc.completeCommit("t");  // terminal — must never be swept
+    EXPECT_TRUE(tc.expiredOngoing(1'000'000).empty());
+}
+
 }  // namespace

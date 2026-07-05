@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -25,12 +26,21 @@ namespace kawasan::broker {
 //   Empty, Ongoing, PrepareCommit, PrepareAbort, CompleteCommit,
 //   CompleteAbort, Dead, PrepareEpochFence
 //
-// NOT yet done (later milestones): WriteTxnMarkers (API 27) for multi-broker
-// marker fan-out, producer-epoch fencing enforcement + transaction-timeout
-// auto-abort (M2), and multi-broker replication of __transaction_state (needs
-// follower fetch).
+// M2 added producer-epoch fencing (InitProducerId bumps the epoch and fences
+// the prior instance; the txn APIs reject stale epochs with
+// INVALID_PRODUCER_EPOCH) and transaction-timeout auto-abort (a broker sweep
+// aborts Ongoing txns past transaction.timeout.ms). NOT yet done:
+// WriteTxnMarkers (API 27) for multi-broker marker fan-out, and multi-broker
+// replication of __transaction_state (needs follower fetch).
 class TransactionCoordinator {
 public:
+    /// @brief Wall-clock source (epoch ms). Injectable so the M2 timeout
+    /// sweep is deterministically unit-testable. Defaults to system_clock.
+    using Clock = std::function<int64_t()>;
+
+    TransactionCoordinator() = default;
+    explicit TransactionCoordinator(Clock clock) : clock_(std::move(clock)) {}
+
     enum class State {
         Empty,
         Ongoing,
@@ -148,6 +158,16 @@ public:
     /// nullopt if unknown.
     std::optional<TxnSnapshot> describe(const std::string& transactional_id) const;
 
+    /// @brief M2: snapshots of all Ongoing transactions whose deadline has
+    /// passed (transaction_timeout_ms > 0 and now_ms - state_start_time_ms >
+    /// transaction_timeout_ms). The background sweep aborts each so a hung
+    /// transaction never blocks read_committed consumers forever.
+    std::vector<TxnSnapshot> expiredOngoing(int64_t now_ms) const;
+
+    /// @brief M2: the coordinator's current wall-clock (epoch ms), via the
+    /// injected clock. Used by the broker sweep to compute deadlines.
+    int64_t nowMs() const { return clock_(); }
+
     /// @brief Returns the state-name string Kafka uses on the wire.
     static const char* stateName(State s);
 
@@ -161,6 +181,13 @@ public:
     Metrics getMetrics() const;
 
 private:
+    static int64_t systemNowMs() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    }
+
+    Clock clock_ = &TransactionCoordinator::systemNowMs;
     mutable std::mutex mutex_;
     std::unordered_map<std::string, TxnSnapshot> txns_;
     // Phase EX-1 metrics.
