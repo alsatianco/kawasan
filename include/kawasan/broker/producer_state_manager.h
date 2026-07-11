@@ -90,6 +90,28 @@ public:
     std::vector<ActiveProducer> listProducers(const std::string& topic,
                                               PartitionId partition) const;
 
+    /// @brief M3: a fully-reconstructable producer-state record for one
+    /// (topic, partition, producer_id) — everything `check()` needs. Written to
+    /// a per-partition producer-state snapshot so startup replay only has to
+    /// scan the log TAIL after the snapshot offset, not the whole log.
+    struct SnapshotEntry {
+        int64_t producer_id = -1;
+        int16_t last_epoch = -1;
+        int32_t last_sequence = -1;
+        int32_t last_base_sequence = -1;
+        int32_t last_record_count = 0;
+        Offset last_base_offset = -1;
+    };
+
+    /// @brief M3: all producer-state entries for a (topic, partition).
+    std::vector<SnapshotEntry> snapshotEntries(const std::string& topic,
+                                               PartitionId partition) const;
+
+    /// @brief M3: restore producer-state entries for a (topic, partition) from a
+    /// snapshot (startup). Overwrites any existing state for those keys.
+    void restoreEntries(const std::string& topic, PartitionId partition,
+                        const std::vector<SnapshotEntry>& entries);
+
     /// @brief Phase EX-1 (§6.3): Prometheus metrics snapshot.
     struct Metrics {
         int64_t entries;            // gauge: tracked (topic, partition, producer_id) keys

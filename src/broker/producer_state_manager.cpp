@@ -108,6 +108,34 @@ ProducerStateManager::listProducers(const std::string& topic,
     return out;
 }
 
+std::vector<ProducerStateManager::SnapshotEntry> ProducerStateManager::snapshotEntries(
+    const std::string& topic, PartitionId partition) const {
+    std::vector<SnapshotEntry> out;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& [key, state] : states_) {
+        if (key.topic == topic && key.partition == partition) {
+            out.push_back({key.producer_id, state.last_epoch, state.last_sequence,
+                           state.last_base_sequence, state.last_record_count,
+                           state.last_base_offset});
+        }
+    }
+    return out;
+}
+
+void ProducerStateManager::restoreEntries(const std::string& topic, PartitionId partition,
+                                          const std::vector<SnapshotEntry>& entries) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& e : entries) {
+        State s;
+        s.last_epoch = e.last_epoch;
+        s.last_sequence = e.last_sequence;
+        s.last_base_sequence = e.last_base_sequence;
+        s.last_record_count = e.last_record_count;
+        s.last_base_offset = e.last_base_offset;
+        states_[Key{topic, partition, e.producer_id}] = s;
+    }
+}
+
 void ProducerStateManager::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     evictions_total_.fetch_add(static_cast<int64_t>(states_.size()),

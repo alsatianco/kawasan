@@ -110,7 +110,14 @@ private:
     /// @brief Rebuilds idempotent-producer state for one partition by replaying
     /// its persisted record-batch headers into producer_state_manager_ at
     /// startup (B3 — survives restart without a separate snapshot file).
-    void replayProducerStateFromLog(const std::string& topic, PartitionId partition);
+    void replayProducerStateFromLog(const std::string& topic, PartitionId partition,
+                                    Offset start_offset = 0);
+    /// @brief M3: write a producer-state snapshot for every open partition
+    /// (called periodically by the snapshot loop and once on graceful stop),
+    /// so restart only replays the log tail after the snapshot offset.
+    void writeAllProducerSnapshots();
+    /// @brief M3: background loop that periodically calls writeAllProducerSnapshots().
+    void producerSnapshotLoop();
     /// @brief M1: rebuilds TransactionCoordinator + IsolationTracker state at
     /// startup by replaying persisted snapshots from __transaction_state, and
     /// re-drives any transaction left in a Prepare* state to completion.
@@ -367,6 +374,13 @@ private:
     std::mutex txn_sweep_mutex_;
     std::condition_variable txn_sweep_cv_;
     int64_t txn_sweep_interval_ms_ = 10000;
+
+    // M3: producer-state snapshot writer thread.
+    std::atomic<bool> producer_snapshot_stop_{false};
+    std::thread producer_snapshot_thread_;
+    std::mutex producer_snapshot_mutex_;
+    std::condition_variable producer_snapshot_cv_;
+    int64_t producer_snapshot_interval_ms_ = 60000;
 
     // Actual partition count of the `__consumer_offsets` topic, captured from
     // metadata after the topic is created/confirmed at startup. Used to route

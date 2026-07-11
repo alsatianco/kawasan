@@ -22,6 +22,7 @@
 #include "kawasan/broker/fetch_session_manager.h"
 #include "kawasan/broker/isolation_tracker.h"
 #include "kawasan/broker/producer_state_manager.h"
+#include "kawasan/broker/producer_state_snapshot.h"
 #include "kawasan/broker/quota_manager.h"
 #include "kawasan/broker/replica_manager.h"
 #include "kawasan/broker/scram_auth.h"
@@ -617,6 +618,16 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
     txn_sweep_stop_.store(false);
     txn_sweep_thread_ = std::thread(&KawasanBroker::transactionSweepLoop, this);
 
+    // M3: start the producer-state snapshot writer. Started during construction
+    // (like the sweep) so a construct-only broker still owns a joinable thread
+    // that stop() tears down before its running_ guard. The loop is null-safe,
+    // so it does nothing useful until start() has populated the log manager and
+    // metadata.
+    producer_snapshot_interval_ms_ =
+        std::max<int64_t>(1000, config_.get<int64_t>("producer.state.snapshot.interval.ms", 60000));
+    producer_snapshot_stop_.store(false);
+    producer_snapshot_thread_ = std::thread(&KawasanBroker::producerSnapshotLoop, this);
+
     request_metrics_ = std::make_shared<metrics::RequestMetrics>();
     request_dispatcher_ = std::make_shared<RequestDispatcher>(request_metrics_);
     supported_api_versions_ = {
@@ -753,9 +764,24 @@ void KawasanBroker::stop() {
         txn_sweep_thread_.join();
     }
 
+    // M3: same lifecycle as the sweep — stop + join the snapshot writer before
+    // the running_ guard so a never-started broker doesn't terminate on a
+    // joinable thread.
+    producer_snapshot_stop_.store(true);
+    producer_snapshot_cv_.notify_all();
+    if (producer_snapshot_thread_.joinable()) {
+        producer_snapshot_thread_.join();
+    }
+
     if (!running_) {
         return;
     }
+
+    // M3: write a final producer-state snapshot before teardown, while the log
+    // manager and metadata are still alive and the writer thread is already
+    // joined (no concurrent writer). This makes the next restart replay the
+    // shortest possible tail.
+    writeAllProducerSnapshots();
 
     Logger::info("Stopping KawasanBroker...");
 
@@ -961,12 +987,26 @@ void KawasanBroker::initializeMetadata() {
                 // its segments via Log::loadSegments(); this is what
                 // restores prior records.
                 (void)log_manager_->getOrCreateLog(tm.name, pm.partition);
-                // Rebuild idempotent-producer state by replaying the persisted
-                // V2 batch headers (Kafka's fallback when no producer snapshot
-                // exists). Without this, a restart resets sequence tracking and
-                // an in-flight producer retry is seen as a new batch -> silent
-                // duplicate. The records themselves are already durable.
-                replayProducerStateFromLog(tm.name, pm.partition);
+                // M3: rebuild idempotent-producer state. Load the newest valid
+                // producer-state snapshot (if any) and restore its entries, then
+                // replay only the log TAIL after the snapshot offset. Without a
+                // snapshot this falls back to a full-log replay from offset 0
+                // (Kafka's behavior), which is why start_offset defaults there.
+                // Rebuilding this state is essential: a restart that reset
+                // sequence tracking would treat an in-flight producer retry as a
+                // new batch -> silent duplicate. The records themselves are
+                // already durable; only the dedup state is being reconstructed.
+                Offset psnap_offset = 0;
+                if (producer_state_manager_) {
+                    const std::string part_dir =
+                        log_dir_ + "/" + tm.name + "-" + std::to_string(pm.partition);
+                    if (auto snap = ProducerStateSnapshot::loadNewest(part_dir)) {
+                        producer_state_manager_->restoreEntries(tm.name, pm.partition,
+                                                                snap->entries);
+                        psnap_offset = snap->snapshot_offset;
+                    }
+                }
+                replayProducerStateFromLog(tm.name, pm.partition, psnap_offset);
                 ++restored;
             }
         }
@@ -1091,6 +1131,49 @@ void KawasanBroker::transactionSweepLoop() {
     }
 }
 
+void KawasanBroker::producerSnapshotLoop() {
+    // M3: periodically checkpoint per-partition producer-state to disk so a
+    // restart replays only the log tail after the last snapshot, not the whole
+    // log. The wait/stop discipline mirrors transactionSweepLoop().
+    while (!producer_snapshot_stop_.load()) {
+        {
+            std::unique_lock<std::mutex> lock(producer_snapshot_mutex_);
+            producer_snapshot_cv_.wait_for(
+                lock, std::chrono::milliseconds(producer_snapshot_interval_ms_),
+                [this] { return producer_snapshot_stop_.load(); });
+        }
+        if (producer_snapshot_stop_.load())
+            break;
+        writeAllProducerSnapshots();
+    }
+}
+
+void KawasanBroker::writeAllProducerSnapshots() {
+    if (!producer_state_manager_ || !log_manager_ || !metadata_controller_)
+        return;
+    const auto topics = metadata_controller_->describeTopics({});
+    for (const auto& tm : topics) {
+        for (const auto& pm : tm.partitions) {
+            auto* log = log_manager_->getLog(tm.name, pm.partition);
+            if (!log)
+                continue;
+            // Read the log-end offset BEFORE the entries so the snapshot offset
+            // never runs ahead of the state it captures. If a batch is appended
+            // between these two reads, the entries reflect it while the offset
+            // does not — harmless, because startup re-applies the tail from the
+            // offset and recordAppend is idempotent. The reverse ordering would
+            // skip that batch on replay and leave stale dedup state.
+            const Offset leo = log->logEndOffset();
+            auto entries = producer_state_manager_->snapshotEntries(tm.name, pm.partition);
+            if (entries.empty())
+                continue;  // no idempotent producers here; nothing to checkpoint
+            const std::string part_dir =
+                log_dir_ + "/" + tm.name + "-" + std::to_string(pm.partition);
+            ProducerStateSnapshot::write(part_dir, leo, entries);
+        }
+    }
+}
+
 void KawasanBroker::finishTxnCompletion(
     const std::string& transactional_id, int64_t producer_id, int16_t producer_epoch,
     bool committed, const std::vector<TransactionCoordinator::TxnPartition>& participating,
@@ -1199,7 +1282,8 @@ bool KawasanBroker::logHasControlBatchForProducer(storage::Log* log, int64_t pro
     return false;
 }
 
-void KawasanBroker::replayProducerStateFromLog(const std::string& topic, PartitionId partition) {
+void KawasanBroker::replayProducerStateFromLog(const std::string& topic, PartitionId partition,
+                                               Offset start_offset) {
     if (!producer_state_manager_ || !log_manager_) {
         return;
     }
@@ -1208,7 +1292,10 @@ void KawasanBroker::replayProducerStateFromLog(const std::string& topic, Partiti
         return;
     }
     const Offset end = log->logEndOffset();
-    Offset off = log->logStartOffset();
+    // M3: start from the producer-snapshot offset (if any) rather than the log
+    // start, so restart only rescans the tail. Clamp to the log start in case a
+    // snapshot references an already-truncated prefix.
+    Offset off = std::max(start_offset, log->logStartOffset());
     constexpr size_t kChunkBytes = 8 * 1024 * 1024;
     while (off < end) {
         auto batches = log->read(off, kChunkBytes);
