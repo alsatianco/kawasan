@@ -17,6 +17,7 @@ namespace kawasan::broker {
 
 // Forward declarations
 class KawasanBroker;
+class PeerClient;
 
 /// @brief Manages replicas for partitions on this broker
 /// @details In single-node mode, this broker is always the leader for all replicas.
@@ -147,6 +148,17 @@ public:
     /// @param offset The last fetched offset
     void updateFollowerFetchOffset(const TopicPartition& tp, BrokerId broker_id, Offset offset);
 
+    /// @brief M5: upsert a replica's leader/ISR/epoch from the Raft-committed
+    /// metadata. This is the single registration path used by the broker's
+    /// metadata reconciliation: it registers the partition (if new) with the
+    /// given role and, if it already exists, updates leader/ISR/epoch WITHOUT
+    /// disturbing follower-fetch progress (fetch_offset, follower_states). When
+    /// `leader != local id` the partition is a FOLLOWER and the fetcher thread
+    /// will replicate it from the leader. For a single-node RF=1 partition this
+    /// registers leader=self / ISR={self}, identical to the lazy path.
+    void reconcileReplica(const TopicPartition& tp, std::shared_ptr<storage::Log> log,
+                          BrokerId leader, const std::vector<BrokerId>& isr, int32_t leader_epoch);
+
     /// @brief Checks and updates ISR based on replica lag
     /// @details Called by leader to check if followers are keeping up
     /// @return true if ISR was modified
@@ -188,10 +200,24 @@ private:
     /// @brief Background thread for follower fetching
     void fetcherThreadLoop();
 
-    /// @brief Fetch from leader for a single partition
-    /// @param tp The topic-partition to fetch
-    /// @param info The replica info
-    void fetchFromLeader(const TopicPartition& tp, ReplicaInfo& info);
+    /// @brief M5: a follower-fetch unit of work snapshotted from replicas_ under
+    /// the lock, so the blocking network fetch runs WITHOUT holding mutex_.
+    struct FetchTask {
+        TopicPartition tp;
+        BrokerId leader;
+        Offset fetch_offset;
+        std::shared_ptr<storage::Log> log;
+    };
+
+    /// @brief M5: replicate one follower partition from its leader (network I/O,
+    /// runs outside mutex_). Appends fetched batches offset-preserved, adopts the
+    /// leader's high watermark, and writes the advanced fetch offset back into
+    /// replicas_ under the lock.
+    void fetchPartitionFromLeader(const FetchTask& task);
+
+    /// @brief M5: get (creating if needed) the cached PeerClient for a leader.
+    /// Called only from the fetcher thread, so peer_clients_ needs no lock.
+    PeerClient* peerClientFor(BrokerId leader, const std::string& host, int32_t port);
 
     mutable std::mutex mutex_;
     std::map<TopicPartition, ReplicaInfo> replicas_;
@@ -200,6 +226,9 @@ private:
     KawasanBroker* broker_ = nullptr;  // Reference to broker for sending fetch requests
     std::atomic<bool> running_{false};
     std::thread fetcher_thread_;
+    int64_t fetcher_interval_ms_ = 100;  // follower fetch cadence
+    // M5: one persistent connection per leader broker; fetcher-thread-only.
+    std::map<BrokerId, std::unique_ptr<PeerClient>> peer_clients_;
 
     // ISR management configuration
     int64_t max_replica_lag_messages_ = 10000;  // Max lag before removing from ISR

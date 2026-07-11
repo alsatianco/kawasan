@@ -23,6 +23,10 @@ add_executable(log_segment_test log_segment_test.cpp)
 target_link_libraries(log_segment_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME LogSegmentTest COMMAND log_segment_test)
 
+add_executable(replicated_append_test replicated_append_test.cpp)
+target_link_libraries(replicated_append_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME ReplicatedAppendTest COMMAND replicated_append_test)
+
 # Log durability test (Phase A1: sync default + atomic checkpoint)
 add_executable(log_durability_test log_durability_test.cpp)
 target_link_libraries(log_durability_test PRIVATE kawasan GTest::gtest GTest::gtest_main)

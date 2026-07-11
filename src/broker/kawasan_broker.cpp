@@ -741,6 +741,18 @@ void KawasanBroker::start() {
 
     running_ = true;
 
+    // M5: start the follower replica fetcher ONLY in multi-broker mode. In
+    // single-node mode there is nothing to replicate from, so we skip it entirely
+    // and behavior stays byte-identical (no fetcher thread, no metadata
+    // reconciliation). With peers present, the fetcher reconciles replicas from
+    // metadata and pulls follower partitions from their leaders.
+    if (!cluster_brokers_.empty() && replica_manager_) {
+        replica_manager_->setBroker(this);
+        replica_manager_->start();
+        Logger::info("Started follower replica fetcher (multi-broker mode, {} peers)",
+                     cluster_brokers_.size());
+    }
+
     // Start the controller-bootstrap loop. In single-node mode the internal
     // topics were already created synchronously above (this broker is leader
     // immediately), so the loop sees them and exits at once. In a multi-broker
@@ -782,6 +794,12 @@ void KawasanBroker::stop() {
 
     if (!running_) {
         return;
+    }
+
+    // M5: stop the follower replica fetcher first, so no fetch thread touches the
+    // logs / metadata while they are torn down below. Safe if never started.
+    if (replica_manager_) {
+        replica_manager_->stop();
     }
 
     // M3: write a final producer-state snapshot before teardown, while the log
@@ -3405,6 +3423,54 @@ BrokerId KawasanBroker::controllerId() const {
         }
     }
     return broker_id_;
+}
+
+std::optional<std::pair<std::string, int32_t>> KawasanBroker::peerEndpoint(
+    BrokerId broker_id) const {
+    if (broker_id == broker_id_) {
+        return std::make_pair(advertised_host_.empty() ? host_ : advertised_host_, port_);
+    }
+    if (metadata_controller_) {
+        for (const auto& b : metadata_controller_->brokers()) {
+            if (b.id == broker_id) {
+                return std::make_pair(b.host, b.port);
+            }
+        }
+    }
+    // Fall back to the raft.peers seed (available before metadata is populated).
+    for (const auto& b : cluster_brokers_) {
+        if (b.id == broker_id) {
+            return std::make_pair(b.host, b.port);
+        }
+    }
+    return std::nullopt;
+}
+
+void KawasanBroker::reconcileReplicas() {
+    if (!metadata_controller_ || !log_manager_ || !replica_manager_) {
+        return;
+    }
+    const auto topics = metadata_controller_->describeTopics({});
+    for (const auto& tm : topics) {
+        for (const auto& pm : tm.partitions) {
+            // Only manage partitions this broker is assigned to host.
+            const bool local_is_replica =
+                std::find(pm.replicas.begin(), pm.replicas.end(), broker_id_) != pm.replicas.end();
+            if (!local_is_replica) {
+                continue;
+            }
+            auto* log = log_manager_->getOrCreateLog(tm.name, pm.partition);
+            if (!log) {
+                continue;
+            }
+            std::shared_ptr<storage::Log> log_ptr(log, [](storage::Log*) {});
+            // leader == broker_id_ => this broker leads (ISR = assigned replicas,
+            // so acks=all waits for followers); otherwise it is a follower and the
+            // fetcher thread will replicate from pm.leader.
+            replica_manager_->reconcileReplica({tm.name, pm.partition}, log_ptr, pm.leader, pm.isr,
+                                               pm.leader_epoch);
+        }
+    }
 }
 
 std::vector<BrokerMetadata> KawasanBroker::buildBrokerMetadata() const {

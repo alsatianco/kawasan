@@ -13,6 +13,7 @@ add_library(kawasan_broker OBJECT
     replica_manager.cpp
     producer_state_manager.cpp
     producer_state_snapshot.cpp
+    peer_client.cpp
     scram_auth.cpp
     acl_store.cpp
     transaction_coordinator.cpp

@@ -84,6 +84,19 @@ public:
     /// @brief Returns the replica manager (leader/ISR/high-watermark state).
     ReplicaManager* replicaManager() { return replica_manager_.get(); }
 
+    /// @brief M5: resolve a peer broker's Kafka listener address (host, port)
+    /// from cluster metadata. Used by the replica fetcher to reach a partition
+    /// leader. Returns nullopt if the broker id is unknown.
+    std::optional<std::pair<std::string, int32_t>> peerEndpoint(BrokerId broker_id) const;
+
+    /// @brief M5: reconcile ReplicaManager against the Raft-committed metadata —
+    /// for every partition this broker replicates, register it as leader (ISR =
+    /// assigned replicas) or as a follower (leader = the assigned leader) so the
+    /// fetcher thread replicates it. Called periodically by the fetcher thread
+    /// and once at startup. A no-op-equivalent for single-node RF=1 (registers
+    /// leader=self / ISR={self}).
+    void reconcileReplicas();
+
     /// @brief Returns the port the broker is bound to.
     int32_t port() const {
         if (tcp_server_) {

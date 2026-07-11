@@ -81,6 +81,26 @@ public:
     ///        consumers.
     Offset appendBatch(RecordBatch batch, bool advance_high_watermark = true);
 
+    /// @brief M5: result of a follower-side replicated append.
+    enum class ReplicaAppendResult {
+        kAppended,   ///< batch written at its leader-assigned base offset
+        kDuplicate,  ///< wire base offset < local LEO — already have it, skipped
+        kGap,        ///< wire base offset > local LEO — follower diverged; caller
+                     ///< must stop and re-fetch (truncate handled by later M7)
+    };
+
+    /// @brief M5: append a batch replicated from the partition leader, PRESERVING
+    /// its leader-assigned base offset and WITHOUT advancing the high watermark.
+    /// A follower's log must be offset-identical to the leader's, so — unlike
+    /// appendBatch, which reassigns the base offset to the local LEO — this
+    /// requires the batch's wire base offset to equal the local log-end-offset
+    /// (strict contiguity), because the underlying segment keys the record at its
+    /// own next-offset. The high watermark is driven separately by the follower
+    /// adopting the leader's reported HW (setHighWatermark), never by this append.
+    /// @param batch A batch already deserialized from the leader's fetched bytes
+    ///        (its CRC was validated during deserialization).
+    ReplicaAppendResult appendReplicatedBatch(const RecordBatch& batch);
+
     /// @brief Reads records from the log
     /// @param start_offset Starting offset
     /// @param max_bytes Maximum bytes to read

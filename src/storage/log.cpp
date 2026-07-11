@@ -210,6 +210,41 @@ Offset Log::appendBatch(RecordBatch batch, bool advance_high_watermark) {
     return offset;
 }
 
+Log::ReplicaAppendResult Log::appendReplicatedBatch(const RecordBatch& batch) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    const Offset wire_base = batch.baseOffset();
+    const Offset leo = endOffsetUnlocked();
+    // Idempotent re-delivery: the leader may resend a batch the follower already
+    // has (e.g. after a reconnect). Skip it — re-appending would double-key and
+    // over-count the segment's next-offset.
+    if (wire_base < leo) {
+        return ReplicaAppendResult::kDuplicate;
+    }
+    // A hole: the follower is missing offsets in [leo, wire_base). It must NOT
+    // append here — the segment would relabel the batch to `leo` and silently
+    // corrupt offsets. The fetcher stops and re-fetches from `leo` (leader-epoch
+    // truncation is M7); report the gap.
+    if (wire_base > leo) {
+        Logger::warn("Replicated append gap on {}-{}: wire base {} > local LEO {}", topic_,
+                     partition_, wire_base, leo);
+        return ReplicaAppendResult::kGap;
+    }
+
+    auto* segment = activeSegment();
+    if (shouldRollForTime() || (segment && segment->size() >= config_.segment_size)) {
+        rollNewSegment();
+        segment = activeSegment();
+    }
+
+    // Do NOT reassign the base offset: wire_base == leo == segment->nextOffset(),
+    // so the segment keys the record at the leader's offset and it is preserved.
+    // Do NOT advance the high watermark — a follower's HW is leader-driven.
+    segment->append(batch, config_.flush_mode == FlushMode::kSync);
+    persistCheckpointLocked();
+    return ReplicaAppendResult::kAppended;
+}
+
 std::vector<uint8_t> Log::readRaw(Offset start_offset, size_t max_bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<uint8_t> out;
