@@ -273,6 +273,11 @@ private:
     // Shared trivial error builder for all the misc handlers above.
     Buffer buildEmptyErrorResponse(const RequestDispatcher::RequestContext& context) const;
     std::vector<BrokerMetadata> buildBrokerMetadata() const;
+    /// @brief CM-5: the id of the active controller — the current Raft leader —
+    /// for Metadata/DescribeCluster responses. Falls back to this broker's own id
+    /// when no leader is known yet (single-node becomes leader immediately, so it
+    /// reports itself; a multi-broker follower reports the real controller).
+    BrokerId controllerId() const;
     TopicMetadata buildDefaultTopicMetadata() const;
     BrokerMetadata localBrokerMetadata() const;
     std::pair<std::optional<TopicMetadata>, ErrorCode> getTopicMetadata(

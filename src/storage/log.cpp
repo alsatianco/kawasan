@@ -276,6 +276,15 @@ Offset Log::logEndOffset() const {
     return endOffsetUnlocked();
 }
 
+size_t Log::sizeBytes() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    size_t total = 0;
+    for (const auto& segment : segments_) {
+        total += segment->size();
+    }
+    return total;
+}
+
 void Log::flush() {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& segment : segments_) {

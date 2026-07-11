@@ -12,6 +12,7 @@
 #include <map>
 #include <nlohmann/json.hpp>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -1891,7 +1892,7 @@ Buffer KawasanBroker::handleMetadata(RequestDispatcher::RequestContext& context)
         metadata_controller_ ? metadata_controller_->clusterId() : cluster_id_;
     Logger::info("Metadata: cluster_id='{}' (length={})", cluster_id, cluster_id.size());
     response.setClusterId(cluster_id);
-    response.setControllerId(broker_id_);
+    response.setControllerId(controllerId());
     response.setBrokers(buildBrokerMetadata());
 
     std::vector<TopicMetadata> topics;
@@ -1937,7 +1938,7 @@ Buffer KawasanBroker::buildMetadataError(const RequestDispatcher::RequestContext
     const std::string cluster_id =
         metadata_controller_ ? metadata_controller_->clusterId() : cluster_id_;
     response.setClusterId(cluster_id);
-    response.setControllerId(broker_id_);
+    response.setControllerId(controllerId());
     response.setBrokers(buildBrokerMetadata());
     TopicMetadata error_topic;
     error_topic.error_code = code;
@@ -3394,6 +3395,18 @@ Buffer KawasanBroker::buildOffsetFetchError(const RequestDispatcher::RequestCont
     return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
+BrokerId KawasanBroker::controllerId() const {
+    // The active controller is the Raft leader. Report it when known; otherwise
+    // (pre-election, or single-node before it elects itself) fall back to self.
+    if (raft_node_) {
+        const BrokerId leader = raft_node_->leaderId();
+        if (leader >= 0) {
+            return leader;
+        }
+    }
+    return broker_id_;
+}
+
 std::vector<BrokerMetadata> KawasanBroker::buildBrokerMetadata() const {
     if (metadata_controller_) {
         auto brokers = metadata_controller_->brokers();
@@ -3654,7 +3667,7 @@ Buffer KawasanBroker::handleDescribeCluster(RequestDispatcher::RequestContext& c
         metadata_controller_ ? metadata_controller_->clusterId() : cluster_id_;
     Logger::info("DescribeCluster: cluster_id='{}' (length={})", cluster_id, cluster_id.size());
     response.setClusterId(cluster_id);
-    response.setControllerId(broker_id_);
+    response.setControllerId(controllerId());
     response.setBrokers(buildBrokerMetadata());
 
     // Set cluster authorized operations if requested
@@ -3678,7 +3691,7 @@ Buffer KawasanBroker::buildDescribeClusterError(const RequestDispatcher::Request
     const std::string cluster_id =
         metadata_controller_ ? metadata_controller_->clusterId() : cluster_id_;
     response.setClusterId(cluster_id);
-    response.setControllerId(broker_id_);
+    response.setControllerId(controllerId());
     response.setBrokers(buildBrokerMetadata());
 
     const int16_t version = std::clamp<int16_t>(response_version, 0, 1);  // Phase 1.17
@@ -4016,20 +4029,62 @@ Buffer KawasanBroker::handleDescribeLogDirs(RequestDispatcher::RequestContext& c
     protocol::DescribeLogDirsResponse response;
     response.setThrottleTimeMs(0);
 
+    // CM-5: report the real per-partition on-disk size and offset lag, grouped
+    // by topic (one TopicInfo per topic, matching Kafka), and honor the request's
+    // topic/partition filter (a null topics list means "all").
+    //
+    // Build the filter: topic -> requested partition set (empty set = all
+    // partitions of that topic).
+    std::map<std::string, std::set<int32_t>> filter;
+    const bool fetch_all = request.fetchAll();
+    if (!fetch_all) {
+        for (const auto& t : request.topics()) {
+            auto& parts = filter[t.topic];
+            for (int32_t p : t.partitions) {
+                parts.insert(p);
+            }
+        }
+    }
+    auto wanted = [&](const std::string& topic, int32_t partition) {
+        if (fetch_all) {
+            return true;
+        }
+        auto it = filter.find(topic);
+        if (it == filter.end()) {
+            return false;
+        }
+        return it->second.empty() || it->second.count(partition) > 0;
+    };
+
     protocol::DescribeLogDirsResponse::LogDirInfo info;
     info.error_code = ErrorCode::NONE;
     info.log_dir = log_dir_;
     if (log_manager_) {
+        // Group partitions under their topic so a multi-partition topic appears
+        // once with all its partitions (Kafka's layout), preserving insertion
+        // order of first appearance.
+        std::map<std::string, size_t> topic_index;  // topic -> index in info.topics
         for (auto* log : log_manager_->allLogs()) {
-            protocol::DescribeLogDirsResponse::TopicInfo ti;
-            ti.topic = log->topic();
+            const std::string& topic = log->topic();
+            const int32_t partition = log->partition();
+            if (!wanted(topic, partition)) {
+                continue;
+            }
+            auto [it, inserted] = topic_index.try_emplace(topic, info.topics.size());
+            if (inserted) {
+                protocol::DescribeLogDirsResponse::TopicInfo ti;
+                ti.topic = topic;
+                info.topics.push_back(std::move(ti));
+            }
             protocol::DescribeLogDirsResponse::PartitionInfo pi;
-            pi.partition = log->partition();
-            pi.size_bytes = 0;
-            pi.offset_lag = 0;
+            pi.partition = partition;
+            pi.size_bytes = static_cast<int64_t>(log->sizeBytes());
+            // offset_lag = records not yet committed to the ISR (LEO - HW). On a
+            // single-node leader HW==LEO so this is 0, matching Kafka's report
+            // for a caught-up leader replica.
+            pi.offset_lag = std::max<int64_t>(0, log->logEndOffset() - log->highWatermark());
             pi.is_future = false;
-            ti.partitions.push_back(pi);
-            info.topics.push_back(std::move(ti));
+            info.topics[it->second].partitions.push_back(pi);
         }
     }
     response.addLogDir(std::move(info));
@@ -4186,18 +4241,49 @@ Buffer KawasanBroker::handleCreatePartitions(RequestDispatcher::RequestContext& 
 
     protocol::CreatePartitionsResponse response;
     response.setThrottleTimeMs(0);
+    const bool validate_only = request.validateOnly();
     for (const auto& t : request.topics()) {
         protocol::CreatePartitionsResponse::Result r;
         r.topic = t.topic;
 
-        // Phase 4.1c: real implementation. Forwards the partition increase
-        // through the Raft-replicated metadata controller. New partitions
-        // are appended with round-robin replica assignment continuing from
-        // the existing partitions; logs are created lazily on first produce
-        // for each new partition.
+        // Phase 4.1c / CM-5: forward the partition increase through the
+        // Raft-replicated metadata controller. New partitions get round-robin
+        // replica assignment continuing from the existing partitions; logs are
+        // created lazily on first produce. CM-5 adds up-front validation and
+        // honors validate_only (dry-run: validate but do not apply).
         if (!metadata_controller_) {
             r.error_code = ErrorCode::COORDINATOR_NOT_AVAILABLE;
             r.error_message = "Metadata controller not initialized";
+            response.addResult(std::move(r));
+            continue;
+        }
+
+        // Look up the current partition count so validate_only and explicit
+        // assignments can be checked without mutating metadata.
+        const auto md = metadata_controller_->describeTopics({t.topic});
+        const bool exists = !md.empty() && !md.front().partitions.empty();
+        const int32_t current_count =
+            exists ? static_cast<int32_t>(md.front().partitions.size()) : 0;
+
+        if (!exists) {
+            r.error_code = ErrorCode::UNKNOWN_TOPIC_OR_PARTITION;
+            r.error_message = "Topic does not exist";
+        } else if (t.count <= current_count) {
+            // Kafka rejects a non-increase (including equal count) with
+            // INVALID_PARTITIONS.
+            r.error_code = ErrorCode::INVALID_PARTITIONS;
+            r.error_message = "Topic already has " + std::to_string(current_count) +
+                              " partitions (requested " + std::to_string(t.count) + ")";
+        } else if (!t.assignments.empty() &&
+                   static_cast<int32_t>(t.assignments.size()) != t.count - current_count) {
+            // If explicit replica assignments are supplied, there must be exactly
+            // one per new partition (Kafka: INVALID_REPLICA_ASSIGNMENT).
+            r.error_code = ErrorCode::INVALID_REPLICA_ASSIGNMENT;
+            r.error_message = "Expected " + std::to_string(t.count - current_count) +
+                              " assignment(s), got " + std::to_string(t.assignments.size());
+        } else if (validate_only) {
+            // Dry-run: validation passed, do not apply.
+            r.error_code = ErrorCode::NONE;
         } else {
             auto result = metadata_controller_->increasePartitions(t.topic, t.count);
             r.error_code = result.error_code;
@@ -4206,8 +4292,8 @@ Buffer KawasanBroker::handleCreatePartitions(RequestDispatcher::RequestContext& 
             }
         }
 
-        Logger::info("CreatePartitions: topic='{}' new_count={} -> error={}", t.topic, t.count,
-                     static_cast<int16_t>(r.error_code));
+        Logger::info("CreatePartitions: topic='{}' new_count={} validate_only={} -> error={}",
+                     t.topic, t.count, validate_only, static_cast<int16_t>(r.error_code));
         response.addResult(std::move(r));
     }
     return encodeResponse(

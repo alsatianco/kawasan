@@ -36,8 +36,15 @@ public:
     // null topics list (v0+) means "all topics".
     bool fetchAll() const { return fetch_all_; }
     const std::vector<Topic>& topics() const { return topics_; }
+    // Client-side builders (symmetric with encode()).
+    void setFetchAll(bool v) { fetch_all_ = v; }
+    void addTopic(Topic t) {
+        fetch_all_ = false;
+        topics_.push_back(std::move(t));
+    }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
+
 private:
     bool fetch_all_ = true;
     std::vector<Topic> topics_;
@@ -62,8 +69,10 @@ public:
     };
     void setThrottleTimeMs(int32_t v) { throttle_time_ms_ = v; }
     void addLogDir(LogDirInfo d) { log_dirs_.push_back(std::move(d)); }
+    const std::vector<LogDirInfo>& logDirs() const { return log_dirs_; }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
+
 private:
     int32_t throttle_time_ms_ = 0;
     std::vector<LogDirInfo> log_dirs_;
@@ -73,22 +82,34 @@ private:
 // Single-broker: we have one log dir; accept all requests and return success.
 class AlterReplicaLogDirsRequest {
 public:
-    struct PartitionRef { std::string topic; int32_t partition; };
-    struct DirSpec { std::string log_dir; std::vector<PartitionRef> partitions; };
+    struct PartitionRef {
+        std::string topic;
+        int32_t partition;
+    };
+    struct DirSpec {
+        std::string log_dir;
+        std::vector<PartitionRef> partitions;
+    };
     const std::vector<DirSpec>& dirs() const { return dirs_; }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
+
 private:
     std::vector<DirSpec> dirs_;
 };
 
 class AlterReplicaLogDirsResponse {
 public:
-    struct PartitionResult { std::string topic; int32_t partition = 0; ErrorCode error_code = ErrorCode::NONE; };
+    struct PartitionResult {
+        std::string topic;
+        int32_t partition = 0;
+        ErrorCode error_code = ErrorCode::NONE;
+    };
     void setThrottleTimeMs(int32_t v) { throttle_time_ms_ = v; }
     void addResult(PartitionResult r) { results_.push_back(std::move(r)); }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
+
 private:
     int32_t throttle_time_ms_ = 0;
     std::vector<PartitionResult> results_;
@@ -107,6 +128,7 @@ public:
     int32_t timeoutMs() const { return timeout_ms_; }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
+
 private:
     int8_t election_type_ = 0;
     std::vector<TopicPartitionsList> topics_;
@@ -115,13 +137,21 @@ private:
 
 class ElectLeadersResponse {
 public:
-    struct PartitionResult { int32_t partition = 0; ErrorCode error_code = ErrorCode::NONE; std::string error_message; };
-    struct TopicResult { std::string topic; std::vector<PartitionResult> partitions; };
+    struct PartitionResult {
+        int32_t partition = 0;
+        ErrorCode error_code = ErrorCode::NONE;
+        std::string error_message;
+    };
+    struct TopicResult {
+        std::string topic;
+        std::vector<PartitionResult> partitions;
+    };
     void setThrottleTimeMs(int32_t v) { throttle_time_ms_ = v; }
     void setErrorCode(ErrorCode v) { error_code_ = v; }
     void addTopic(TopicResult t) { topics_.push_back(std::move(t)); }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
+
 private:
     int32_t throttle_time_ms_ = 0;
     ErrorCode error_code_ = ErrorCode::NONE;
@@ -132,12 +162,19 @@ private:
 // Advances log_start_offset to a given offset per partition.
 class DeleteRecordsRequest {
 public:
-    struct PartitionSpec { int32_t partition = 0; int64_t offset = 0; };
-    struct TopicSpec { std::string topic; std::vector<PartitionSpec> partitions; };
+    struct PartitionSpec {
+        int32_t partition = 0;
+        int64_t offset = 0;
+    };
+    struct TopicSpec {
+        std::string topic;
+        std::vector<PartitionSpec> partitions;
+    };
     const std::vector<TopicSpec>& topics() const { return topics_; }
     int32_t timeoutMs() const { return timeout_ms_; }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
+
 private:
     std::vector<TopicSpec> topics_;
     int32_t timeout_ms_ = 60000;
@@ -145,12 +182,20 @@ private:
 
 class DeleteRecordsResponse {
 public:
-    struct PartitionResult { int32_t partition = 0; int64_t low_watermark = 0; ErrorCode error_code = ErrorCode::NONE; };
-    struct TopicResult { std::string topic; std::vector<PartitionResult> partitions; };
+    struct PartitionResult {
+        int32_t partition = 0;
+        int64_t low_watermark = 0;
+        ErrorCode error_code = ErrorCode::NONE;
+    };
+    struct TopicResult {
+        std::string topic;
+        std::vector<PartitionResult> partitions;
+    };
     void setThrottleTimeMs(int32_t v) { throttle_time_ms_ = v; }
     void addTopic(TopicResult t) { topics_.push_back(std::move(t)); }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
+
 private:
     int32_t throttle_time_ms_ = 0;
     std::vector<TopicResult> topics_;
@@ -162,17 +207,22 @@ public:
     const std::vector<std::string>& groups() const { return groups_; }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
+
 private:
     std::vector<std::string> groups_;
 };
 
 class DeleteGroupsResponse {
 public:
-    struct Result { std::string group_id; ErrorCode error_code = ErrorCode::NONE; };
+    struct Result {
+        std::string group_id;
+        ErrorCode error_code = ErrorCode::NONE;
+    };
     void setThrottleTimeMs(int32_t v) { throttle_time_ms_ = v; }
     void addResult(Result r) { results_.push_back(std::move(r)); }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
+
 private:
     int32_t throttle_time_ms_ = 0;
     std::vector<Result> results_;
@@ -181,12 +231,18 @@ private:
 // ---- OffsetDelete (API 47) ----
 class OffsetDeleteRequest {
 public:
-    struct PartitionSpec { int32_t partition = 0; };
-    struct TopicSpec { std::string topic; std::vector<PartitionSpec> partitions; };
+    struct PartitionSpec {
+        int32_t partition = 0;
+    };
+    struct TopicSpec {
+        std::string topic;
+        std::vector<PartitionSpec> partitions;
+    };
     const std::string& groupId() const { return group_id_; }
     const std::vector<TopicSpec>& topics() const { return topics_; }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
+
 private:
     std::string group_id_;
     std::vector<TopicSpec> topics_;
@@ -194,13 +250,20 @@ private:
 
 class OffsetDeleteResponse {
 public:
-    struct PartitionResult { int32_t partition = 0; ErrorCode error_code = ErrorCode::NONE; };
-    struct TopicResult { std::string topic; std::vector<PartitionResult> partitions; };
+    struct PartitionResult {
+        int32_t partition = 0;
+        ErrorCode error_code = ErrorCode::NONE;
+    };
+    struct TopicResult {
+        std::string topic;
+        std::vector<PartitionResult> partitions;
+    };
     void setErrorCode(ErrorCode v) { error_code_ = v; }
     void setThrottleTimeMs(int32_t v) { throttle_time_ms_ = v; }
     void addTopic(TopicResult t) { topics_.push_back(std::move(t)); }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
+
 private:
     ErrorCode error_code_ = ErrorCode::NONE;
     int32_t throttle_time_ms_ = 0;
@@ -212,14 +275,19 @@ class CreatePartitionsRequest {
 public:
     struct TopicSpec {
         std::string topic;
-        int32_t count = 0;  // new total partition count
+        int32_t count = 0;                              // new total partition count
         std::vector<std::vector<int32_t>> assignments;  // optional explicit
     };
     const std::vector<TopicSpec>& topics() const { return topics_; }
     int32_t timeoutMs() const { return timeout_ms_; }
     bool validateOnly() const { return validate_only_; }
+    // Client-side builders (symmetric with encode()).
+    void addTopic(TopicSpec t) { topics_.push_back(std::move(t)); }
+    void setTimeoutMs(int32_t v) { timeout_ms_ = v; }
+    void setValidateOnly(bool v) { validate_only_ = v; }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
+
 private:
     std::vector<TopicSpec> topics_;
     int32_t timeout_ms_ = 60000;
@@ -228,11 +296,17 @@ private:
 
 class CreatePartitionsResponse {
 public:
-    struct Result { std::string topic; ErrorCode error_code = ErrorCode::NONE; std::string error_message; };
+    struct Result {
+        std::string topic;
+        ErrorCode error_code = ErrorCode::NONE;
+        std::string error_message;
+    };
     void setThrottleTimeMs(int32_t v) { throttle_time_ms_ = v; }
     void addResult(Result r) { results_.push_back(std::move(r)); }
+    const std::vector<Result>& results() const { return results_; }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
+
 private:
     int32_t throttle_time_ms_ = 0;
     std::vector<Result> results_;

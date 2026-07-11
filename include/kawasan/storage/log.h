@@ -104,6 +104,11 @@ public:
     /// @brief Returns the high watermark
     Offset highWatermark() const { return high_watermark_; }
 
+    /// @brief Total on-disk size of this partition's log in bytes (sum of all
+    /// segment sizes). Used by DescribeLogDirs to report real per-partition
+    /// storage usage.
+    size_t sizeBytes() const;
+
     /// @brief Sets the high watermark
     void setHighWatermark(Offset offset);
 
