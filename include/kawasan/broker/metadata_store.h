@@ -29,9 +29,13 @@ public:
     TopicOperationResult applyDelete(const std::string& topic_name);
 
     /// @brief Applies an ISR update command.
-    TopicOperationResult applyUpdateISR(const std::string& topic_name,
-                                       PartitionId partition_id,
-                                       const std::vector<BrokerId>& isr);
+    TopicOperationResult applyUpdateISR(const std::string& topic_name, PartitionId partition_id,
+                                        const std::vector<BrokerId>& isr);
+
+    /// @brief M7: applies a leader-election command — sets the partition leader
+    /// (must be an assigned replica) and bumps its leader_epoch.
+    TopicOperationResult applyUpdateLeader(const std::string& topic_name, PartitionId partition_id,
+                                           BrokerId leader);
 
     /// @brief Phase 4.1c: increases a topic's partition count.
     /// @param new_total_count The new total partition count (Kafka semantics:
@@ -44,8 +48,7 @@ public:
                                                  int32_t new_total_count);
 
     /// @brief Returns topic metadata for the requested topics (all if empty).
-    std::vector<TopicMetadata> describeTopics(
-        const std::vector<std::string>& topic_names) const;
+    std::vector<TopicMetadata> describeTopics(const std::vector<std::string>& topic_names) const;
 
     /// @brief Returns known brokers.
     std::vector<BrokerMetadata> brokers() const;

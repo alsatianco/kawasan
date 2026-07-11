@@ -4229,17 +4229,78 @@ Buffer KawasanBroker::handleElectLeaders(RequestDispatcher::RequestContext& cont
     protocol::ElectLeadersRequest request;
     request.decode(context.payload, context.header.apiVersion());
 
+    // M7: real preferred-replica election. For each requested partition, elect
+    // the preferred replica (replicas[0]) when it is in the ISR and not already
+    // the leader; the change is Raft-committed via UPDATE_LEADER (bumping the
+    // leader epoch). This is the manual instrument for moving leadership; only
+    // the active controller can commit (else NOT_CONTROLLER). An empty partition
+    // list for a topic means "all partitions of that topic".
+    const bool is_controller = !raft_node_ || raft_node_->isLeader();
+
     protocol::ElectLeadersResponse response;
     response.setThrottleTimeMs(0);
     response.setErrorCode(ErrorCode::NONE);
+
+    auto elect_one =
+        [&](const std::string& topic,
+            const PartitionMetadata& pm) -> protocol::ElectLeadersResponse::PartitionResult {
+        protocol::ElectLeadersResponse::PartitionResult pr;
+        pr.partition = pm.partition;
+        const BrokerId preferred = pm.replicas.empty() ? -1 : pm.replicas.front();
+        if (preferred < 0) {
+            pr.error_code = ErrorCode::PREFERRED_LEADER_NOT_AVAILABLE;
+            return pr;
+        }
+        if (preferred == pm.leader) {
+            pr.error_code = ErrorCode::NONE;  // already the preferred leader — idempotent
+            return pr;
+        }
+        if (std::find(pm.isr.begin(), pm.isr.end(), preferred) == pm.isr.end()) {
+            // Preferred replica is not in-sync: unclean election is not permitted.
+            pr.error_code = ErrorCode::PREFERRED_LEADER_NOT_AVAILABLE;
+            return pr;
+        }
+        if (!is_controller) {
+            pr.error_code = ErrorCode::NOT_CONTROLLER;
+            return pr;
+        }
+        auto result = metadata_controller_->updatePartitionLeader(topic, pm.partition, preferred);
+        pr.error_code = result.error_code;
+        return pr;
+    };
+
     for (const auto& t : request.topics()) {
         protocol::ElectLeadersResponse::TopicResult tr;
         tr.topic = t.topic;
-        for (int32_t p : t.partitions) {
-            protocol::ElectLeadersResponse::PartitionResult pr;
-            pr.partition = p;
-            pr.error_code = ErrorCode::NONE;
-            tr.partitions.push_back(pr);
+        const auto md = metadata_controller_ ? metadata_controller_->describeTopics({t.topic})
+                                             : std::vector<TopicMetadata>{};
+        const TopicMetadata* tm = (!md.empty()) ? &md.front() : nullptr;
+
+        if (t.partitions.empty() && tm) {
+            // Elect for all partitions of the topic.
+            for (const auto& pm : tm->partitions) {
+                tr.partitions.push_back(elect_one(t.topic, pm));
+            }
+        } else {
+            for (int32_t p : t.partitions) {
+                const PartitionMetadata* pm = nullptr;
+                if (tm) {
+                    for (const auto& cand : tm->partitions) {
+                        if (cand.partition == p) {
+                            pm = &cand;
+                            break;
+                        }
+                    }
+                }
+                if (!pm) {
+                    protocol::ElectLeadersResponse::PartitionResult pr;
+                    pr.partition = p;
+                    pr.error_code = ErrorCode::UNKNOWN_TOPIC_OR_PARTITION;
+                    tr.partitions.push_back(std::move(pr));
+                } else {
+                    tr.partitions.push_back(elect_one(t.topic, *pm));
+                }
+            }
         }
         response.addTopic(std::move(tr));
     }

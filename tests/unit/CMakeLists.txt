@@ -31,6 +31,10 @@ add_executable(truncate_suffix_test truncate_suffix_test.cpp)
 target_link_libraries(truncate_suffix_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME TruncateSuffixTest COMMAND truncate_suffix_test)
 
+add_executable(metadata_leader_election_test metadata_leader_election_test.cpp)
+target_link_libraries(metadata_leader_election_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME MetadataLeaderElectionTest COMMAND metadata_leader_election_test)
+
 # Log durability test (Phase A1: sync default + atomic checkpoint)
 add_executable(log_durability_test log_durability_test.cpp)
 target_link_libraries(log_durability_test PRIVATE kawasan GTest::gtest GTest::gtest_main)

@@ -394,6 +394,42 @@ TopicOperationResult MetadataStore::applyUpdateISR(const std::string& topic_name
     return result;
 }
 
+TopicOperationResult MetadataStore::applyUpdateLeader(const std::string& topic_name,
+                                                      PartitionId partition_id, BrokerId leader) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto it = topics_.find(topic_name);
+    if (it == topics_.end()) {
+        return TopicOperationResult::failure(ErrorCode::UNKNOWN_TOPIC_OR_PARTITION,
+                                             "Topic does not exist");
+    }
+
+    for (auto& partition : it->second.metadata.partitions) {
+        if (partition.partition == partition_id) {
+            // The new leader must be an assigned replica (M7 elects among the
+            // partition's replicas). Bump the leader epoch on every change so
+            // followers can detect stale leadership (KIP-101).
+            if (std::find(partition.replicas.begin(), partition.replicas.end(), leader) ==
+                partition.replicas.end()) {
+                return TopicOperationResult::failure(ErrorCode::INVALID_REPLICA_ASSIGNMENT,
+                                                     "New leader is not an assigned replica");
+            }
+            partition.leader = leader;
+            partition.leader_epoch += 1;
+            persistLocked();
+            Logger::info("Elected leader {} for {}-{} (leader_epoch now {})", leader, topic_name,
+                         partition_id, partition.leader_epoch);
+            TopicOperationResult result;
+            result.error_code = ErrorCode::NONE;
+            result.topic_metadata = it->second.metadata;
+            result.has_metadata = true;
+            return result;
+        }
+    }
+    return TopicOperationResult::failure(ErrorCode::UNKNOWN_TOPIC_OR_PARTITION,
+                                         "Partition does not exist");
+}
+
 std::vector<TopicMetadata> MetadataStore::describeTopics(
     const std::vector<std::string>& topic_names) const {
     std::lock_guard<std::mutex> lock(mutex_);

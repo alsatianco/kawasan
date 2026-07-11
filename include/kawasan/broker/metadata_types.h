@@ -42,6 +42,7 @@ enum class MetadataCommandType {
     DELETE_TOPIC,
     UPDATE_ISR,
     INCREASE_PARTITIONS,
+    UPDATE_LEADER,  // M7: elect a new partition leader (bumps leader_epoch)
 };
 
 /// @brief Command payload stored in the Raft log.
@@ -54,6 +55,8 @@ struct MetadataCommand {
     std::vector<BrokerId> isr;
     // For INCREASE_PARTITIONS command: new total partition count.
     int32_t new_partition_count = 0;
+    // For UPDATE_LEADER command (M7): the newly-elected leader for partition_id.
+    BrokerId leader = -1;
 };
 
 }  // namespace kawasan::broker

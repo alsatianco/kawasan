@@ -14,8 +14,8 @@ namespace kawasan::broker {
 class MetadataController {
 public:
     MetadataController(std::string metadata_dir, std::string cluster_id,
-                       const BrokerMetadata& local_broker,
-                       storage::LogManager* log_manager, raft::RaftNode* raft_node);
+                       const BrokerMetadata& local_broker, storage::LogManager* log_manager,
+                       raft::RaftNode* raft_node);
     ~MetadataController();
 
     MetadataController(const MetadataController&) = delete;
@@ -35,16 +35,18 @@ public:
     /// @param partition Partition ID
     /// @param isr New ISR list
     /// @return Operation result
-    TopicOperationResult updatePartitionISR(const std::string& topic,
-                                            PartitionId partition,
+    TopicOperationResult updatePartitionISR(const std::string& topic, PartitionId partition,
                                             const std::vector<BrokerId>& isr);
 
-    /// @brief Phase 4.1c: increases a topic's partition count to a new total.
-    TopicOperationResult increasePartitions(const std::string& topic_name,
-                                            int32_t new_total_count);
+    /// @brief M7: elect a new leader for a partition (Raft-replicated). Bumps the
+    /// partition's leader_epoch. Only the active controller can commit.
+    TopicOperationResult updatePartitionLeader(const std::string& topic, PartitionId partition,
+                                               BrokerId leader);
 
-    std::vector<TopicMetadata> describeTopics(
-        const std::vector<std::string>& names) const {
+    /// @brief Phase 4.1c: increases a topic's partition count to a new total.
+    TopicOperationResult increasePartitions(const std::string& topic_name, int32_t new_total_count);
+
+    std::vector<TopicMetadata> describeTopics(const std::vector<std::string>& names) const {
         return store_.describeTopics(names);
     }
 

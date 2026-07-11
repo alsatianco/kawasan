@@ -61,6 +61,17 @@ TopicOperationResult MetadataController::updatePartitionISR(const std::string& t
     return replicateAndAwait(command);
 }
 
+TopicOperationResult MetadataController::updatePartitionLeader(const std::string& topic,
+                                                               PartitionId partition,
+                                                               BrokerId leader) {
+    MetadataCommand command;
+    command.type = MetadataCommandType::UPDATE_LEADER;
+    command.topic_name = topic;
+    command.partition_id = partition;
+    command.leader = leader;
+    return replicateAndAwait(command);
+}
+
 TopicOperationResult MetadataController::increasePartitions(const std::string& topic_name,
                                                             int32_t new_total_count) {
     MetadataCommand command;
@@ -118,6 +129,9 @@ TopicOperationResult MetadataController::applyCommand(const MetadataCommand& com
             return store_.applyUpdateISR(command.topic_name, command.partition_id, command.isr);
         case MetadataCommandType::INCREASE_PARTITIONS:
             return store_.applyIncreasePartitions(command.topic_name, command.new_partition_count);
+        case MetadataCommandType::UPDATE_LEADER:
+            return store_.applyUpdateLeader(command.topic_name, command.partition_id,
+                                            command.leader);
     }
     TopicOperationResult unknown;
     unknown.error_code = ErrorCode::INVALID_REQUEST;
@@ -146,6 +160,11 @@ std::vector<uint8_t> MetadataController::serializeCommand(const MetadataCommand&
         json["type"] = "increase_partitions";
         json["topic_name"] = command.topic_name;
         json["new_partition_count"] = command.new_partition_count;
+    } else if (command.type == MetadataCommandType::UPDATE_LEADER) {
+        json["type"] = "update_leader";
+        json["topic_name"] = command.topic_name;
+        json["partition_id"] = command.partition_id;
+        json["leader"] = command.leader;
     }
     auto dump = json.dump();
     return std::vector<uint8_t>(dump.begin(), dump.end());
@@ -176,6 +195,11 @@ MetadataCommand MetadataController::deserializeCommand(const std::vector<uint8_t
         command.type = MetadataCommandType::INCREASE_PARTITIONS;
         command.topic_name = json.at("topic_name").get<std::string>();
         command.new_partition_count = json.at("new_partition_count").get<int32_t>();
+    } else if (type == "update_leader") {
+        command.type = MetadataCommandType::UPDATE_LEADER;
+        command.topic_name = json.at("topic_name").get<std::string>();
+        command.partition_id = json.at("partition_id").get<PartitionId>();
+        command.leader = json.at("leader").get<BrokerId>();
     }
     return command;
 }
