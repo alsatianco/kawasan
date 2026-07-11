@@ -251,8 +251,12 @@ void ReplicaManager::fetcherThreadLoop() {
         try {
             // M5: reconcile ReplicaManager against the latest committed metadata
             // (register/update leader + follower replicas). Done OUTSIDE mutex_.
+            // M6: then, for partitions this broker leads, propose ISR shrink/expand
+            // to the controller (AlterPartition) so a dead follower stops blocking
+            // acks=all. Both run outside mutex_ (they take it internally / do I/O).
             if (broker_) {
                 broker_->reconcileReplicas();
+                broker_->maintainLeaderIsr();
             }
 
             // Snapshot the follower fetch work under the lock, so the blocking
@@ -418,6 +422,50 @@ void ReplicaManager::reconcileReplica(const TopicPartition& tp, std::shared_ptr<
     info.leader = leader;
     info.isr = isr;
     info.leader_epoch = leader_epoch;
+}
+
+std::optional<std::vector<BrokerId>> ReplicaManager::computeIsrUpdate(const TopicPartition& tp,
+                                                                      int64_t lag_ms,
+                                                                      int64_t now_ms) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = replicas_.find(tp);
+    if (it == replicas_.end() || it->second.leader != local_broker_id_) {
+        return std::nullopt;  // not managed, or we do not lead this partition
+    }
+    const auto& info = it->second;
+    const Offset hw = info.log ? info.log->highWatermark() : 0;
+
+    std::set<BrokerId> current(info.isr.begin(), info.isr.end());
+    std::set<BrokerId> proposed;
+    proposed.insert(local_broker_id_);  // the leader is always in the ISR
+
+    // Keep each current in-sync follower unless we have SEEN its fetch go stale.
+    for (BrokerId r : info.isr) {
+        if (r == local_broker_id_) {
+            continue;
+        }
+        auto fit = info.follower_states.find(r);
+        const bool seen_stale = fit != info.follower_states.end() &&
+                                (now_ms - fit->second.last_update_time_ms) > lag_ms;
+        if (!seen_stale) {
+            proposed.insert(r);
+        }
+    }
+    // (Re-)add a follower that is fetching recently AND has caught up to the HW.
+    for (const auto& [r, fs] : info.follower_states) {
+        if (r == local_broker_id_ || current.count(r)) {
+            continue;
+        }
+        const bool recent = (now_ms - fs.last_update_time_ms) <= lag_ms;
+        if (recent && fs.last_fetched_offset >= hw) {
+            proposed.insert(r);
+        }
+    }
+
+    if (proposed == current) {
+        return std::nullopt;
+    }
+    return std::vector<BrokerId>(proposed.begin(), proposed.end());
 }
 
 bool ReplicaManager::checkAndUpdateISR(const TopicPartition& tp) {

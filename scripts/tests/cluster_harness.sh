@@ -57,7 +57,17 @@ monitoring.enabled=true
 monitoring.port=$(mon_port "$id")
 auto.create.topics.enable=true
 network.io_threads=2
+replica.lag.time.max.ms=${LAG_MS:-30000}
+min.insync.replicas=${MIN_ISR:-1}
 EOF
+}
+
+launch_broker() {
+  local id="$1"
+  local dir="$BASE/broker-$id"
+  "$BROKER_BIN" --config "$dir/broker.properties" --log-level "${LOG_LEVEL:-info}" \
+    >> "$dir/broker.log" 2>&1 &
+  echo $! > "$dir/broker.pid"
 }
 
 cmd_up() {
@@ -66,8 +76,7 @@ cmd_up() {
   for i in $(seq 0 $((N - 1))); do
     local dir="$BASE/broker-$i"
     write_config "$i" "$dir"
-    "$BROKER_BIN" --config "$dir/broker.properties" --log-level "${LOG_LEVEL:-info}" > "$dir/broker.log" 2>&1 &
-    echo $! > "$dir/broker.pid"
+    launch_broker "$i"
     echo "[harness] broker $i: pid $(cat "$dir/broker.pid"), kafka :$(kafka_port "$i"), raft :$(raft_port "$i")"
   done
 
@@ -113,10 +122,27 @@ cmd_down() {
   echo "[harness] cleaned $BASE"
 }
 
+cmd_kill() {
+  local id="${1:?usage: kill <broker-id>}"
+  local pidf="$BASE/broker-$id/broker.pid"
+  if [ -f "$pidf" ]; then
+    kill "$(cat "$pidf")" 2>/dev/null && echo "[harness] killed broker $id"
+    rm -f "$pidf"
+  fi
+}
+
+cmd_restart() {
+  local id="${1:?usage: restart <broker-id>}"
+  launch_broker "$id"
+  echo "[harness] restarted broker $id: pid $(cat "$BASE/broker-$id/broker.pid")"
+}
+
 case "${1:-up}" in
   up) cmd_up ;;
   down) cmd_down ;;
   status) cmd_status ;;
   logs) cmd_logs "${2:-0}" ;;
-  *) echo "usage: $0 {up|down|status|logs [id]}"; exit 1 ;;
+  kill) cmd_kill "${2:-}" ;;
+  restart) cmd_restart "${2:-}" ;;
+  *) echo "usage: $0 {up|down|status|logs [id]|kill <id>|restart <id>}"; exit 1 ;;
 esac

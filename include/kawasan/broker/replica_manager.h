@@ -159,6 +159,19 @@ public:
     void reconcileReplica(const TopicPartition& tp, std::shared_ptr<storage::Log> log,
                           BrokerId leader, const std::vector<BrokerId>& isr, int32_t leader_epoch);
 
+    /// @brief M6: compute a proposed ISR for a partition THIS broker leads, from
+    /// tracked follower progress. A current ISR member is dropped only once its
+    /// last fetch has gone stale (older than `lag_ms`) — a member we have not yet
+    /// heard from is kept (avoids churn right after assignment; a never-started
+    /// broker is M8's concern). A follower not in the ISR is (re-)added once it is
+    /// fetching recently AND has caught up to the leader's high watermark. Returns
+    /// the proposed ISR (sorted, always including the leader) if it differs from
+    /// the current ISR, else nullopt. nullopt too if this broker is not the leader
+    /// or the partition is unmanaged. The caller commits the change through the
+    /// controller (AlterPartition / UPDATE_ISR).
+    std::optional<std::vector<BrokerId>> computeIsrUpdate(const TopicPartition& tp, int64_t lag_ms,
+                                                          int64_t now_ms) const;
+
     /// @brief Checks and updates ISR based on replica lag
     /// @details Called by leader to check if followers are keeping up
     /// @return true if ISR was modified

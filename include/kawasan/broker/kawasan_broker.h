@@ -97,6 +97,13 @@ public:
     /// leader=self / ISR={self}).
     void reconcileReplicas();
 
+    /// @brief M6: for every partition this broker LEADS, propose an ISR
+    /// shrink/expand (from tracked follower lag) and commit it through the
+    /// controller — directly via `updatePartitionISR` when this broker is the
+    /// controller, otherwise via an AlterPartition RPC to the controller. Called
+    /// periodically by the replica-fetcher thread (multi-broker only).
+    void maintainLeaderIsr();
+
     /// @brief Returns the port the broker is bound to.
     int32_t port() const {
         if (tcp_server_) {
@@ -302,6 +309,9 @@ private:
     // NOT_ENOUGH_REPLICAS when the partition's ISR has fewer members than this.
     // Default 1 keeps single-node produce working unchanged.
     int32_t min_insync_replicas_ = 1;
+    // M6: replica.lag.time.max.ms — a follower whose last fetch is older than
+    // this is dropped from the ISR (shrink), unblocking acks=all.
+    int64_t replica_lag_time_max_ms_ = 30000;
     std::string host_;
     std::string advertised_host_;
     int32_t port_;

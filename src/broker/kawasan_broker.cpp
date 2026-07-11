@@ -22,6 +22,7 @@
 #include "kawasan/broker/acl_store.h"
 #include "kawasan/broker/fetch_session_manager.h"
 #include "kawasan/broker/isolation_tracker.h"
+#include "kawasan/broker/peer_client.h"
 #include "kawasan/broker/producer_state_manager.h"
 #include "kawasan/broker/producer_state_snapshot.h"
 #include "kawasan/broker/quota_manager.h"
@@ -454,6 +455,10 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
     replica_manager_->setLocalBrokerId(broker_id_);
     // M4: cache min.insync.replicas for the acks=all NOT_ENOUGH_REPLICAS gate.
     min_insync_replicas_ = std::max<int32_t>(1, config_.get<int32_t>("min.insync.replicas", 1));
+    // M6: replica.lag.time.max.ms — how long a follower can go without fetching
+    // before the leader drops it from the ISR (clamped to a sane floor).
+    replica_lag_time_max_ms_ =
+        std::max<int64_t>(1000, config_.get<int64_t>("replica.lag.time.max.ms", 30000));
 
     // Initialize OffsetManager with persistent storage
     const std::string offset_db_path = log_dir_ + "/consumer_offsets";
@@ -3473,6 +3478,48 @@ void KawasanBroker::reconcileReplicas() {
     }
 }
 
+void KawasanBroker::maintainLeaderIsr() {
+    if (!metadata_controller_ || !replica_manager_) {
+        return;
+    }
+    // Wall-clock millis, matching the timestamp ReplicaManager records on each
+    // follower fetch (updateFollowerFetchOffset uses system_clock).
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+    const BrokerId controller = controllerId();
+    const auto topics = metadata_controller_->describeTopics({});
+    for (const auto& tm : topics) {
+        for (const auto& pm : tm.partitions) {
+            // Only the partition leader of a replicated partition maintains ISR.
+            if (pm.leader != broker_id_ || pm.replicas.size() <= 1) {
+                continue;
+            }
+            auto proposed = replica_manager_->computeIsrUpdate({tm.name, pm.partition},
+                                                               replica_lag_time_max_ms_, now);
+            if (!proposed) {
+                continue;  // ISR already correct
+            }
+            Logger::info("ISR change proposed for {}-{}: {} members -> {} members", tm.name,
+                         pm.partition, pm.isr.size(), proposed->size());
+
+            if (controller == broker_id_) {
+                // We are the controller: commit directly through Raft metadata.
+                metadata_controller_->updatePartitionISR(tm.name, pm.partition, *proposed);
+            } else {
+                // Send an AlterPartition RPC to the controller broker.
+                auto ep = peerEndpoint(controller);
+                if (!ep) {
+                    continue;
+                }
+                PeerClient client(ep->first, ep->second, broker_id_);
+                client.alterPartition(tm.name, pm.partition, pm.leader_epoch, *proposed,
+                                      /*partition_epoch=*/0);
+            }
+        }
+    }
+}
+
 std::vector<BrokerMetadata> KawasanBroker::buildBrokerMetadata() const {
     if (metadata_controller_) {
         auto brokers = metadata_controller_->brokers();
@@ -4469,9 +4516,79 @@ Buffer KawasanBroker::handleDescribeTransactions(RequestDispatcher::RequestConte
 Buffer KawasanBroker::handleAlterPartition(RequestDispatcher::RequestContext& context) {
     protocol::AlterPartitionRequest req;
     req.decode(context.payload, context.header.apiVersion());
+
+    // M6: a partition leader is asking the controller to change a partition's
+    // ISR. Only the active controller can commit metadata; validate that the
+    // requester is the current leader, then commit through the Raft UPDATE_ISR
+    // path. A non-controller replies NOT_CONTROLLER so the leader retries the
+    // real controller.
     protocol::AlterPartitionResponse resp;
     resp.setThrottleTimeMs(0);
     resp.setErrorCode(ErrorCode::NONE);
+
+    const bool is_controller = !raft_node_ || raft_node_->isLeader();
+
+    for (const auto& t : req.topics) {
+        protocol::AlterPartitionResponse::TopicResult tr;
+        tr.topic_name = t.topic_name;
+        // Current metadata for this topic (for leader/epoch validation + echo).
+        const auto md = metadata_controller_ ? metadata_controller_->describeTopics({t.topic_name})
+                                             : std::vector<TopicMetadata>{};
+        const TopicMetadata* tm = (!md.empty()) ? &md.front() : nullptr;
+
+        for (const auto& p : t.partitions) {
+            protocol::AlterPartitionResponse::PartitionResult pr;
+            pr.partition_index = p.partition_index;
+
+            const PartitionMetadata* pm = nullptr;
+            if (tm) {
+                for (const auto& cand : tm->partitions) {
+                    if (cand.partition == p.partition_index) {
+                        pm = &cand;
+                        break;
+                    }
+                }
+            }
+            if (!pm) {
+                pr.error_code = ErrorCode::UNKNOWN_TOPIC_OR_PARTITION;
+                tr.partitions.push_back(std::move(pr));
+                continue;
+            }
+            if (!is_controller) {
+                pr.error_code = ErrorCode::NOT_CONTROLLER;
+                tr.partitions.push_back(std::move(pr));
+                continue;
+            }
+            // Only the current partition leader may alter its ISR, and its
+            // leader epoch must match (stale leaders are fenced).
+            if (req.broker_id != pm->leader) {
+                pr.error_code = ErrorCode::INVALID_REQUEST;
+                tr.partitions.push_back(std::move(pr));
+                continue;
+            }
+            if (p.leader_epoch != pm->leader_epoch) {
+                pr.error_code = ErrorCode::FENCED_LEADER_EPOCH;
+                tr.partitions.push_back(std::move(pr));
+                continue;
+            }
+
+            std::vector<BrokerId> new_isr(p.new_isr.begin(), p.new_isr.end());
+            auto result =
+                metadata_controller_->updatePartitionISR(t.topic_name, p.partition_index, new_isr);
+            pr.error_code = result.error_code;
+            pr.leader_id = pm->leader;
+            pr.leader_epoch = pm->leader_epoch;
+            pr.isr = p.new_isr;
+            pr.partition_epoch = p.partition_epoch;
+            if (result.error_code == ErrorCode::NONE) {
+                Logger::info("AlterPartition committed ISR for {}-{}: {} members", t.topic_name,
+                             p.partition_index, new_isr.size());
+            }
+            tr.partitions.push_back(std::move(pr));
+        }
+        resp.addTopic(std::move(tr));
+    }
+
     return encodeResponse(context,
                           [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
 }

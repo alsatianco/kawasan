@@ -172,6 +172,8 @@ public:
     void setThrottleTimeMs(int32_t v) { throttle_time_ms_ = v; }
     void setErrorCode(ErrorCode v) { error_code_ = v; }
     void addTopic(TopicResult t) { topics_.push_back(std::move(t)); }
+    ErrorCode errorCode() const { return error_code_; }
+    const std::vector<TopicResult>& topics() const { return topics_; }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
 

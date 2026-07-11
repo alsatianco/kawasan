@@ -7,6 +7,7 @@
 
 #include "kawasan/common/buffer.h"
 #include "kawasan/common/logger.h"
+#include "kawasan/protocol/admin_stubs.h"
 #include "kawasan/protocol/api_keys.h"
 #include "kawasan/protocol/fetch_request.h"
 #include "kawasan/protocol/request_header.h"
@@ -116,6 +117,80 @@ std::optional<PeerClient::FetchResult> PeerClient::fetch(const std::string& topi
         return result;
     } catch (const std::exception& e) {
         Logger::warn("PeerClient fetch to {}:{} failed: {}", host_, port_, e.what());
+        disconnect();
+        return std::nullopt;
+    }
+}
+
+std::optional<ErrorCode> PeerClient::alterPartition(const std::string& topic, PartitionId partition,
+                                                    int32_t leader_epoch,
+                                                    const std::vector<BrokerId>& new_isr,
+                                                    int32_t partition_epoch) {
+    try {
+        ensureConnected();
+
+        const int32_t corr = ++correlation_id_;
+        Buffer payload;
+        // AlterPartition (API 56) is flexible from v0 — RequestHeader::encode
+        // emits the flexible header automatically for this api key.
+        protocol::RequestHeader header(protocol::ApiKey::ALTER_PARTITION, /*version=*/0, corr,
+                                       "kawasan-leader-" + std::to_string(self_broker_id_));
+        header.encode(payload);
+
+        protocol::AlterPartitionRequest request;
+        request.broker_id = self_broker_id_;
+        request.broker_epoch = -1;
+        protocol::AlterPartitionRequest::TopicData td;
+        td.topic_name = topic;
+        protocol::AlterPartitionRequest::PartitionData pd;
+        pd.partition_index = partition;
+        pd.leader_epoch = leader_epoch;
+        pd.partition_epoch = partition_epoch;
+        pd.new_isr.reserve(new_isr.size());
+        for (BrokerId b : new_isr) {
+            pd.new_isr.push_back(static_cast<int32_t>(b));
+        }
+        td.partitions.push_back(std::move(pd));
+        request.topics.push_back(std::move(td));
+        request.encode(payload, 0);
+
+        const int32_t payload_size = static_cast<int32_t>(payload.size());
+        std::vector<uint8_t> frame(sizeof(int32_t) + payload_size);
+        const int32_t net_size = htonl(payload_size);
+        std::memcpy(frame.data(), &net_size, sizeof(net_size));
+        if (payload_size > 0) {
+            std::memcpy(frame.data() + sizeof(int32_t), payload.data(), payload.size());
+        }
+        boost::asio::write(socket_, boost::asio::buffer(frame));
+
+        std::array<uint8_t, 4> size_bytes{};
+        boost::asio::read(socket_, boost::asio::buffer(size_bytes));
+        uint32_t net_len = 0;
+        std::memcpy(&net_len, size_bytes.data(), size_bytes.size());
+        const int32_t resp_size = ntohl(net_len);
+        if (resp_size < 0) {
+            disconnect();
+            return std::nullopt;
+        }
+        std::vector<uint8_t> resp_body(static_cast<size_t>(resp_size));
+        if (resp_size > 0) {
+            boost::asio::read(socket_, boost::asio::buffer(resp_body));
+        }
+
+        Buffer resp(std::move(resp_body));
+        protocol::ResponseHeader resp_header;
+        resp_header.setFlexible(true);  // AlterPartition response uses header v1
+        resp_header.decode(resp);
+        protocol::AlterPartitionResponse ar;
+        ar.decode(resp, 0);
+
+        // Prefer the per-partition error; fall back to the top-level error.
+        if (!ar.topics().empty() && !ar.topics().front().partitions.empty()) {
+            return ar.topics().front().partitions.front().error_code;
+        }
+        return ar.errorCode();
+    } catch (const std::exception& e) {
+        Logger::warn("PeerClient alterPartition to {}:{} failed: {}", host_, port_, e.what());
         disconnect();
         return std::nullopt;
     }

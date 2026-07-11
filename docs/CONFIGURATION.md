@@ -149,7 +149,7 @@ Single-node is the primary, hardened mode. Multi-broker Raft replication exists 
 | `offsets.topic.replication.factor` | int | `1` | Inert | Accepted; not applied. |
 | `transaction.state.log.replication.factor` | int | `1` | Inert | Accepted; not applied. |
 | `transaction.state.log.min.isr` | int | `1` | Inert | Accepted; not applied. |
-| `replica.lag.time.max.ms` | long | `30000` | Inert | Accepted; not applied. |
+| `replica.lag.time.max.ms` | long | `30000` | Honored (multi-broker) | M6: a follower whose last replica-fetch is older than this is dropped from the ISR by the partition leader (shrink), so a dead/slow follower stops blocking `acks=all`; it is re-added once it fetches again and catches up to the high watermark. Only active in multi-broker mode (the replica fetcher runs only when `raft.peers` is set). Clamped to a 1s floor. |
 | `num.replica.fetchers` | int | `1` | Inert | Accepted; not applied. |
 | `num.recovery.threads.per.data.dir` | int | `1` | Inert | Accepted; not applied. |
 

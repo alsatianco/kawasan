@@ -46,6 +46,15 @@ public:
     std::optional<FetchResult> fetch(const std::string& topic, PartitionId partition,
                                      Offset fetch_offset);
 
+    /// @brief M6: propose an ISR change for one partition to the controller
+    /// (AlterPartition, API 56 — a flexible-from-v0 API). Returns the committed
+    /// error code (NONE on success, NOT_CONTROLLER if this peer is not the active
+    /// controller, or a fencing error), or nullopt on a connection/protocol error.
+    std::optional<ErrorCode> alterPartition(const std::string& topic, PartitionId partition,
+                                            int32_t leader_epoch,
+                                            const std::vector<BrokerId>& new_isr,
+                                            int32_t partition_epoch);
+
     const std::string& host() const { return host_; }
     int32_t port() const { return port_; }
 
