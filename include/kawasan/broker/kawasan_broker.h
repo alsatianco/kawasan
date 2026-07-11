@@ -81,6 +81,9 @@ public:
     /// @brief Returns the Raft node
     raft::RaftNode* raftNode() { return raft_node_.get(); }
 
+    /// @brief Returns the replica manager (leader/ISR/high-watermark state).
+    ReplicaManager* replicaManager() { return replica_manager_.get(); }
+
     /// @brief Returns the port the broker is bound to.
     int32_t port() const {
         if (tcp_server_) {
@@ -277,6 +280,10 @@ private:
 
     Config config_;
     BrokerId broker_id_;
+    // M4: min.insync.replicas — an acks=all produce is rejected with
+    // NOT_ENOUGH_REPLICAS when the partition's ISR has fewer members than this.
+    // Default 1 keeps single-node produce working unchanged.
+    int32_t min_insync_replicas_ = 1;
     std::string host_;
     std::string advertised_host_;
     int32_t port_;

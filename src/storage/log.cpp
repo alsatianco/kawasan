@@ -185,7 +185,7 @@ Offset Log::append(const std::vector<Record>& records, bool force_sync) {
     return offset;
 }
 
-Offset Log::appendBatch(RecordBatch batch) {
+Offset Log::appendBatch(RecordBatch batch, bool advance_high_watermark) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     // Assign the next available offset to this pre-built batch.
@@ -198,7 +198,14 @@ Offset Log::appendBatch(RecordBatch batch) {
     }
 
     Offset offset = segment->append(batch, config_.flush_mode == FlushMode::kSync);
-    high_watermark_ = segment->nextOffset();
+    // M4: on a replicated partition (RF>1) the leader must NOT advance the high
+    // watermark at append time — the record is not yet committed until the ISR
+    // has it. The replication layer advances HW via maybeAdvanceHighWatermark.
+    // With advance_high_watermark=true (single-node default) HW==LEO exactly as
+    // before, so single-node behavior is byte-identical.
+    if (advance_high_watermark) {
+        high_watermark_ = segment->nextOffset();
+    }
     persistCheckpointLocked();
     return offset;
 }

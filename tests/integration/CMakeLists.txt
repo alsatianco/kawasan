@@ -46,6 +46,10 @@ add_executable(transaction_fencing_test transaction_fencing_test.cpp)
 target_link_libraries(transaction_fencing_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME TransactionFencingTest COMMAND transaction_fencing_test)
 
+add_executable(replica_fetch_test replica_fetch_test.cpp)
+target_link_libraries(replica_fetch_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME ReplicaFetchTest COMMAND replica_fetch_test)
+
 add_executable(produce_acks_test produce_acks_test.cpp)
 target_link_libraries(produce_acks_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME ProduceAcksTest COMMAND produce_acks_test)

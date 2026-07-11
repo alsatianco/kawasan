@@ -71,7 +71,15 @@ public:
     /// by EndTxn — these MUST keep the isControl bit so read_committed
     /// consumers can identify transaction boundaries (KIP-98).
     /// The base offset is assigned by the log.
-    Offset appendBatch(RecordBatch batch);
+    /// @param advance_high_watermark When true (default) the high watermark is
+    ///        advanced to the new log-end-offset in the same step, matching the
+    ///        single-node invariant HW==LEO. A leader of a replicated partition
+    ///        (RF>1) passes false so the high watermark is instead advanced by
+    ///        the replication layer once the ISR has the record
+    ///        (`ReplicaManager::maybeAdvanceHighWatermark`), keeping
+    ///        un-replicated records below the watermark and thus invisible to
+    ///        consumers.
+    Offset appendBatch(RecordBatch batch, bool advance_high_watermark = true);
 
     /// @brief Reads records from the log
     /// @param start_offset Starting offset

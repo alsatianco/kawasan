@@ -145,7 +145,7 @@ Single-node is the primary, hardened mode. Multi-broker Raft replication exists 
 | `raft.ssl.key.file` | string | `""` | Parsed, not enforced | PEM private key. |
 | `raft.ssl.key.password` | string | `""` | Parsed, not enforced | Private-key password. |
 | `raft.ssl.ca.file` | string | `""` | Parsed, not enforced | PEM CA bundle for peer verification. |
-| `min.insync.replicas` | int | `1` | Inert (validated) | Accepted; range/cross-checked at validation but not enforced at write time. With `deployment.mode=production`, a value `> 1` is **rejected at startup** (it would be inert on a single node). |
+| `min.insync.replicas` | int | `1` | Honored (acks=all) | Enforced at write time (M4): an `acks=all` produce is rejected with `NOT_ENOUGH_REPLICAS` when the partition's ISR has fewer than this many members. With the default `1` and a single-node ISR of `{self}`, the gate never fires (`acks=all` behaves exactly as before). Still range/cross-checked at startup (`>= 1`, `<= default.replication.factor` when that key is set). With `deployment.mode=production`, a value `> 1` is **rejected at startup** because a single node can never satisfy it. |
 | `offsets.topic.replication.factor` | int | `1` | Inert | Accepted; not applied. |
 | `transaction.state.log.replication.factor` | int | `1` | Inert | Accepted; not applied. |
 | `transaction.state.log.min.isr` | int | `1` | Inert | Accepted; not applied. |

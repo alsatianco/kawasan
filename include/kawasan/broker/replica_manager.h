@@ -111,6 +111,16 @@ public:
     /// @param broker Pointer to the KawasanBroker instance
     void setBroker(KawasanBroker* broker);
 
+    /// @brief M4: sets this broker's own id. Must be called before any replica is
+    /// registered, so `addReplica`'s self-leader/self-ISR seeding and the
+    /// leader-side follower-offset check (`leader == local_broker_id_`) use the
+    /// real `broker.id` rather than the hardcoded 0. Single-node behavior is
+    /// unchanged because leader and local id stay equal.
+    void setLocalBrokerId(BrokerId id) { local_broker_id_ = id; }
+
+    /// @brief M4: returns this broker's own id (the ISR/leader identity).
+    BrokerId localBrokerId() const { return local_broker_id_; }
+
     /// @brief Starts the follower fetch thread
     /// @details Begins background fetching from leaders for follower replicas
     void start();
@@ -159,10 +169,10 @@ private:
     /// @brief Information about a replica
     struct ReplicaInfo {
         std::shared_ptr<storage::Log> log;
-        BrokerId leader;  // Leader broker ID (always this broker in single-node mode)
+        BrokerId leader;            // Leader broker ID (always this broker in single-node mode)
         std::vector<BrokerId> isr;  // In-Sync Replicas
-        Offset fetch_offset = 0;  // Last fetched offset (for follower replicas)
-        int32_t leader_epoch = 0;  // KIP-101: bumped on each leadership change
+        Offset fetch_offset = 0;    // Last fetched offset (for follower replicas)
+        int32_t leader_epoch = 0;   // KIP-101: bumped on each leadership change
 
         // Leader-side tracking of follower states (only used when this broker is leader)
         std::map<BrokerId, FollowerState> follower_states;
@@ -186,11 +196,11 @@ private:
     mutable std::mutex mutex_;
     std::map<TopicPartition, ReplicaInfo> replicas_;
     BrokerId local_broker_id_ = 0;  // This broker's ID
-    
+
     KawasanBroker* broker_ = nullptr;  // Reference to broker for sending fetch requests
     std::atomic<bool> running_{false};
     std::thread fetcher_thread_;
-    
+
     // ISR management configuration
     int64_t max_replica_lag_messages_ = 10000;  // Max lag before removing from ISR
 };

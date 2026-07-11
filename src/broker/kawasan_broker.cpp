@@ -447,6 +447,12 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
         log_manager_->setCleanupIntervalMs(cleanup_ms);
     }
     replica_manager_ = std::make_unique<ReplicaManager>();
+    // M4: give the replica manager this broker's real id BEFORE any partition is
+    // registered, so leader/ISR identity and the leader-side follower-offset
+    // check use broker.id instead of the hardcoded 0.
+    replica_manager_->setLocalBrokerId(broker_id_);
+    // M4: cache min.insync.replicas for the acks=all NOT_ENOUGH_REPLICAS gate.
+    min_insync_replicas_ = std::max<int32_t>(1, config_.get<int32_t>("min.insync.replicas", 1));
 
     // Initialize OffsetManager with persistent storage
     const std::string offset_db_path = log_dir_ + "/consumer_offsets";
@@ -2203,6 +2209,25 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                     replica_manager_->addReplica(tp, log_ptr);
                 }
 
+                // M4: partition replication state. On a single-node partition the
+                // ISR is {self} (size 1), so both the NOT_ENOUGH_REPLICAS gate and
+                // the HW-decoupling below are no-ops and behavior is byte-identical.
+                const size_t isr_size = replica_manager_->getISR(tp).size();
+
+                // M4: min.insync.replicas gate. For acks=all, refuse the write up
+                // front when the ISR is too small to durably commit it, rather
+                // than appending and then failing the ack — this is what lets a
+                // producer distinguish "not enough replicas" from a slow commit.
+                if (acks == -1 && static_cast<int32_t>(isr_size) < min_insync_replicas_) {
+                    partition_response.error_code = ErrorCode::NOT_ENOUGH_REPLICAS;
+                    Logger::warn("Produce rejected: {}-{} ISR size {} < min.insync.replicas {}",
+                                 topic_data.topic, partition_data.partition, isr_size,
+                                 min_insync_replicas_);
+                    topic_response.partitions.push_back(partition_response);
+                    has_error = true;
+                    continue;
+                }
+
                 // Phase 2.1: idempotent producer dedup. For non-idempotent
                 // producers (producer_id < 0), check() returns NONE.
                 if (producer_state_manager_ && batch.producerId() >= 0) {
@@ -2249,7 +2274,13 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                 const int64_t saved_pid = batch.producerId();
                 const int16_t saved_epoch = batch.producerEpoch();
                 const int32_t saved_base_seq = batch.baseSequence();
-                const Offset base_offset = log->appendBatch(std::move(batch));
+                // M4: on a replicated partition (ISR>1) do NOT advance the high
+                // watermark at append time — the record is committed only once
+                // the ISR has it (advanced by maybeAdvanceHighWatermark below and
+                // when followers fetch). Single-node (ISR==1) advances HW=LEO in
+                // the append, byte-identical to before.
+                const bool advance_hw = isr_size <= 1;
+                const Offset base_offset = log->appendBatch(std::move(batch), advance_hw);
 
                 // Phase 2.1: record successful append for dedup.
                 if (producer_state_manager_ && saved_pid >= 0) {
@@ -2388,6 +2419,12 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
     const int32_t request_max_bytes_raw =
         request.maxBytes() > 0 ? request.maxBytes() : 50 * 1024 * 1024;
     const size_t request_max_bytes = static_cast<size_t>(request_max_bytes_raw);
+
+    // M4: a Fetch with replica_id >= 0 is a follower broker replicating from this
+    // leader, not a consumer. Followers read up to the log-end-offset (they must
+    // copy un-committed records) and report their position so the leader can
+    // advance the high watermark; consumers read only up to the high watermark.
+    const bool is_follower = request.replicaId() >= 0;
 
     const auto deadline = start_time + std::chrono::milliseconds(max_wait_ms);
 
@@ -2570,6 +2607,17 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
                     replica_manager_->addReplica(tp, log_ptr);
                 }
 
+                // M4: leader-side follower bookkeeping. The follower's fetch
+                // offset is its log-end-offset (everything below it is replicated
+                // on the follower), so record it and recompute the high watermark
+                // from the ISR. This is what unblocks an acks=all produce and what
+                // lets the leader advance HW past records now held by the ISR.
+                if (is_follower) {
+                    replica_manager_->updateFollowerFetchOffset(tp, request.replicaId(),
+                                                                partition.fetch_offset);
+                    replica_manager_->maybeAdvanceHighWatermark(tp);
+                }
+
                 const Offset log_start = log->logStartOffset();
                 const Offset log_end = log->logEndOffset();
                 partition_response.log_start_offset = log_start;
@@ -2578,6 +2626,13 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
                 auto hw_opt = replica_manager_->getHighWatermark(tp);
                 const Offset high_watermark = hw_opt.value_or(log->highWatermark());
                 partition_response.high_watermark = high_watermark;
+
+                // M4: the readable upper bound. A consumer sees only committed
+                // records (up to the high watermark); a follower replicates
+                // everything the leader has (up to the log-end-offset). On a
+                // single-node partition HW==LEO so read_bound==log_end for both,
+                // and the raw fast path below is unchanged (byte-identical).
+                const Offset read_bound = is_follower ? log_end : high_watermark;
 
                 // Phase EX-10: LSO = min(first_offset across in-flight
                 // transactional batches) or HWM if none. read_committed
@@ -2639,7 +2694,14 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
                     // whose base_offset is past LSO (those are in-flight
                     // transactional records the consumer must not see).
                     const bool read_committed = request.isolationLevel() == 1;
-                    const bool use_raw = context.header.apiVersion() >= 4 && !read_committed;
+                    // M4: the raw byte fast path copies straight through to the
+                    // log-end-offset, so it is only safe when the readable bound
+                    // already reaches the log end (single-node, or a follower).
+                    // A consumer on a replicated partition with an un-committed
+                    // tail (read_bound < LEO) takes the deserialized path so the
+                    // batches past the high watermark can be dropped.
+                    const bool use_raw = context.header.apiVersion() >= 4 && !read_committed &&
+                                         read_bound >= log_end;
                     std::vector<uint8_t> serialized;
                     size_t total_messages_for_metrics = 0;
                     if (use_raw) {
@@ -2664,6 +2726,22 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
                             kept.reserve(batches.size());
                             for (auto& b : batches) {
                                 if (b.baseOffset() >= lso)
+                                    continue;
+                                kept.push_back(std::move(b));
+                            }
+                            batches = std::move(kept);
+                        }
+
+                        // M4: high-watermark clamp for consumers. On a replicated
+                        // partition the leader's log tail past the HW is not yet
+                        // committed; a consumer must not see it. read_bound==LEO
+                        // for followers and single-node partitions, so this is a
+                        // no-op there.
+                        if (read_bound < log_end) {
+                            std::vector<storage::RecordBatch> kept;
+                            kept.reserve(batches.size());
+                            for (auto& b : batches) {
+                                if (b.baseOffset() >= read_bound)
                                     continue;
                                 kept.push_back(std::move(b));
                             }
@@ -2754,6 +2832,13 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
         response.setSessionId(resp_session_id);
         bytes_returned = build_response(response);
 
+        // M4: follower (replica) fetches do not long-poll — the leader answers
+        // immediately with whatever is available up to its LEO so the follower
+        // can pipeline the next fetch. Only consumer fetches honor min_bytes/
+        // max_wait long-polling.
+        if (is_follower) {
+            break;
+        }
         if (bytes_returned >= min_bytes || min_bytes == 0) {
             break;
         }
