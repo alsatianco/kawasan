@@ -165,6 +165,16 @@ public:
     /// log_start_offset (clamped to logEndOffset).
     Offset truncatePrefix(Offset new_start_offset);
 
+    /// @brief M7: truncate the log SUFFIX — remove every record at or after
+    /// `target_offset`, so the log-end-offset becomes `target_offset` (a batch
+    /// that straddles the boundary is removed whole, since batches are atomic).
+    /// This is how a follower reconciles a divergent tail against a new leader
+    /// (KIP-101). Trailing segments fully at/after the target are dropped; the
+    /// segment containing the target is truncated in place; the high watermark is
+    /// clamped down to the new log-end. No-op if `target_offset >= logEndOffset`.
+    /// Returns the new log-end-offset. DESTRUCTIVE — the removed records are gone.
+    Offset truncateSuffix(Offset target_offset);
+
 private:
     void loadSegments();
     void rollNewSegment();

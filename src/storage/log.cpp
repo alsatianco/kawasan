@@ -414,6 +414,45 @@ Offset Log::truncatePrefix(Offset new_start_offset) {
     return startOffsetUnlocked();
 }
 
+Offset Log::truncateSuffix(Offset target_offset) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    const Offset end = endOffsetUnlocked();
+    if (target_offset >= end) {
+        return end;  // nothing at or after the target — no-op
+    }
+    // Never truncate below the log start.
+    Offset target = std::max(target_offset, startOffsetUnlocked());
+
+    // Drop trailing segments that lie entirely at/after the target (keep at
+    // least one segment; the segment that contains the target is truncated
+    // in place below).
+    while (segments_.size() > 1 && segments_.back()->baseOffset() >= target) {
+        const auto path = segments_.back()->path();
+        segments_.back()->close();
+        std::error_code ec;
+        fs::remove_all(path, ec);
+        segments_.pop_back();
+    }
+
+    // Truncate within the (now) last segment if it extends past the target.
+    auto& seg = segments_.back();
+    if (seg->nextOffset() > target) {
+        seg->truncateTo(target);
+    }
+    seg->setActive(true);  // the last segment is the write head after truncation
+
+    // The high watermark can never exceed the log end.
+    const Offset new_end = endOffsetUnlocked();
+    if (high_watermark_ > new_end) {
+        high_watermark_ = new_end;
+    }
+    persistCheckpointLocked();
+    Logger::info("Truncated {}-{} suffix to offset {} (log end now {})", topic_, partition_, target,
+                 new_end);
+    return new_end;
+}
+
 void Log::cleanup() {
     std::lock_guard<std::mutex> lock(mutex_);
 

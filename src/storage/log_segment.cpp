@@ -383,4 +383,62 @@ bool LogSegment::deleteBatchAt(Offset base) {
     return true;
 }
 
+Offset LogSegment::truncateTo(Offset target) {
+    // M7: remove the tail of this segment. Unlike deleteBatchAt, this is allowed
+    // on the active segment — a follower truncates its live tail to reconcile
+    // with a new leader. Batches are atomic, so a batch straddling `target` is
+    // removed whole (target should be a batch boundary in practice).
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!db_ || closed_) {
+        return next_offset_;
+    }
+
+    std::vector<std::string> keys;
+    size_t freed = 0;
+
+    // A batch that straddles `target` (base < target < base + record_count).
+    {
+        std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(rocksdb::ReadOptions()));
+        it->SeekForPrev(encodeOffsetKey(target));
+        if (it->Valid()) {
+            const Offset base = decodeOffsetKey(it->key().ToString());
+            const std::string value = it->value().ToString();
+            if (base < target) {
+                auto batch =
+                    RecordBatch::deserialize(std::vector<uint8_t>(value.begin(), value.end()));
+                if (base + static_cast<Offset>(batch.records().size()) > target) {
+                    keys.push_back(it->key().ToString());
+                    freed += value.size();
+                }
+            }
+        }
+    }
+    // Every batch keyed at or after `target`.
+    {
+        std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(rocksdb::ReadOptions()));
+        for (it->Seek(encodeOffsetKey(target)); it->Valid(); it->Next()) {
+            keys.push_back(it->key().ToString());
+            freed += it->value().size();
+        }
+    }
+    for (const auto& k : keys) {
+        db_->Delete(rocksdb::WriteOptions(), k);
+    }
+    size_bytes_ = (size_bytes_ >= freed) ? (size_bytes_ - freed) : 0;
+
+    // Reset the next-offset to the end of the highest remaining batch (or the
+    // segment base if it is now empty).
+    std::unique_ptr<rocksdb::Iterator> last(db_->NewIterator(rocksdb::ReadOptions()));
+    last->SeekToLast();
+    if (last->Valid()) {
+        const Offset base = decodeOffsetKey(last->key().ToString());
+        const std::string value = last->value().ToString();
+        auto batch = RecordBatch::deserialize(std::vector<uint8_t>(value.begin(), value.end()));
+        next_offset_ = base + static_cast<Offset>(batch.records().size());
+    } else {
+        next_offset_ = base_offset_;
+    }
+    return next_offset_;
+}
+
 }  // namespace kawasan::storage

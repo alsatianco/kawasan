@@ -82,6 +82,14 @@ public:
     /// Returns true if a batch was actually removed.
     bool deleteBatchAt(Offset base);
 
+    /// @brief M7: truncate this segment's tail — remove every batch at or after
+    /// `target` (and a batch that straddles `target`, since a batch cannot be
+    /// split), then reset the next-offset to the highest remaining batch end
+    /// (or the segment base if it becomes empty). Unlike deleteBatchAt this is
+    /// permitted on the active segment — truncation always targets the tail.
+    /// Returns the segment's next-offset after truncation.
+    Offset truncateTo(Offset target);
+
     /// @brief Marks this segment as the log's active (append) segment.
     /// The owning Log keeps exactly the newest segment active; destructive
     /// per-batch ops (deleteBatchAt) refuse while the flag is set.
