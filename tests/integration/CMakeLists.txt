@@ -40,6 +40,12 @@ add_executable(transaction_state_recovery_test transaction_state_recovery_test.c
 target_link_libraries(transaction_state_recovery_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME TransactionStateRecoveryTest COMMAND transaction_state_recovery_test)
 
+# M2: producer-epoch fencing + transaction-timeout auto-abort, over a real
+# socket against an in-process broker.
+add_executable(transaction_fencing_test transaction_fencing_test.cpp)
+target_link_libraries(transaction_fencing_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME TransactionFencingTest COMMAND transaction_fencing_test)
+
 add_executable(produce_acks_test produce_acks_test.cpp)
 target_link_libraries(produce_acks_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME ProduceAcksTest COMMAND produce_acks_test)
