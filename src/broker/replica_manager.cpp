@@ -326,6 +326,33 @@ void ReplicaManager::fetchPartitionFromLeader(const FetchTask& task) {
         peer_clients_.erase(task.leader);
         return;
     }
+    if (result->error == ErrorCode::OFFSET_OUT_OF_RANGE) {
+        // M7: the leader rejected our fetch offset. If we hold an un-committed
+        // tail (high watermark < log-end), it may have diverged from the (new)
+        // leader — reconcile by truncating the tail down to our high watermark
+        // and re-syncing. This never discards acknowledged data: everything up
+        // to the HW was committed by the ISR. If there is no un-committed tail
+        // (HW == LEO) we are instead behind the leader's log start (records were
+        // retention-deleted) — a full resync, out of scope until later.
+        const Offset leo = task.log->logEndOffset();
+        const Offset hw = task.log->highWatermark();
+        if (hw < leo) {
+            spdlog::warn(
+                "Follower {}-{}: leader rejected fetch at {}; truncating divergent tail to HW {}",
+                task.tp.topic, task.tp.partition, task.fetch_offset, hw);
+            task.log->truncateSuffix(hw);
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = replicas_.find(task.tp);
+            if (it != replicas_.end()) {
+                it->second.fetch_offset = task.log->logEndOffset();
+            }
+        } else {
+            spdlog::warn("Follower {}-{}: out of range at {} with no un-committed tail "
+                         "(leader log-start ahead — needs full resync)",
+                         task.tp.topic, task.tp.partition, task.fetch_offset);
+        }
+        return;
+    }
     if (result->error != ErrorCode::NONE) {
         // Leadership may have moved; the next reconcile fixes our view.
         spdlog::debug("Fetch from leader {} for {}-{} returned error {}", task.leader,
