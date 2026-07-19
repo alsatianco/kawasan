@@ -127,6 +127,7 @@ Read in `src/broker/kawasan_broker.cpp`. Time-based keys are resolved most-speci
 | `offsets.topic.num.partitions` | int | `16` | Honored | Partition count for the internal `__consumer_offsets` topic. Each partition is its own RocksDB instance, so a lower count reduces the startup file-descriptor footprint (Kafka's default is 50). Fixed at first creation. |
 | `transaction.state.topic.num.partitions` | int | `16` | Honored | Partition count for the internal `__transaction_state` topic. Same FD trade-off as above. |
 | `producer.state.snapshot.interval.ms` | long | `60000` | Honored | Interval of the background writer that checkpoints per-partition idempotent-producer state to `producer-<offset>.psnap` files (atomic temp+rename, CRC-32C framed, newest two kept), plus one snapshot on graceful shutdown. On restart the broker restores the newest valid snapshot and replays only the log tail after its offset instead of the whole log; a corrupt snapshot is skipped and recovery falls back to an older snapshot or a full replay. Clamped to a 1s minimum. |
+| `transaction.abort.timed.out.transaction.cleanup.interval.ms` | long | `10000` | Honored | Interval of the background sweep that auto-aborts transactions that exceeded their client-requested `transaction.timeout.ms` (M2). Clamped to a 1s floor. The sweep starts after startup transaction-state replay. |
 | `compression.type` | string | `none` | Inert (validated) | Accepted; value is validated against `none/gzip/snappy/lz4/zstd` but compression selection is per-batch from the client. |
 
 Durability note: with `log.durability=sync` (the default) message/log writes are fsynced (`sync=true`) before the produce is acknowledged, as are offset commits, for at-least-once durability; consumer-group metadata uses async writes (`sync=false`) protected by the WAL. The high-watermark checkpoint is written atomically (temp file + fsync + rename). See [./OPERATIONS.md](./OPERATIONS.md) for the durability model.
@@ -137,7 +138,7 @@ Single-node is the primary, hardened mode. Multi-broker Raft replication exists 
 
 | Key | Type | Default | Status | Description |
 |-----|------|---------|--------|-------------|
-| `default.replication.factor` | int | `1` | Honored (clamped) | Default RF for new topics. Values `> 1` are **forced to 1** in this build; `< 1` is corrected to 1. With `deployment.mode=production`, RF > 1 is **rejected at startup** instead of silently clamped (see Deployment mode). |
+| `default.replication.factor` | int | `1` | Honored (clamped) | Default RF for new topics. Values above the **cluster size** (1 + number of commas in `raft.peers`, so 1 for single-node) are clamped to it with a warning; `< 1` is corrected to 1. In a 3-broker cluster RF=3 is honored (M5 follower replication). With `deployment.mode=production`, RF > cluster size is **rejected at startup** instead of silently clamped (see Deployment mode). |
 | `raft.port` | int | `9093` | Honored | Inter-broker Raft listener port. |
 | `raft.peers` | string | `""` (single-node) | Honored | Comma-separated `id:host:port` list, e.g. `0:host0:9093,1:host1:9093`. Empty = single-node. If non-empty, **this broker's `broker.id` must appear in the list** or startup fails. |
 | `raft.ssl.enabled` | bool | `false` | Parsed, **not enforced** | When `true`, the cert/key/ca paths below are read and validated, but `src/raft/raft_transport.{cpp,h}` contains no TLS code — inter-broker Raft traffic stays PLAINTEXT regardless. See [../CLAUDE.md](../CLAUDE.md). |
@@ -145,7 +146,7 @@ Single-node is the primary, hardened mode. Multi-broker Raft replication exists 
 | `raft.ssl.key.file` | string | `""` | Parsed, not enforced | PEM private key. |
 | `raft.ssl.key.password` | string | `""` | Parsed, not enforced | Private-key password. |
 | `raft.ssl.ca.file` | string | `""` | Parsed, not enforced | PEM CA bundle for peer verification. |
-| `min.insync.replicas` | int | `1` | Honored (acks=all) | Enforced at write time (M4): an `acks=all` produce is rejected with `NOT_ENOUGH_REPLICAS` when the partition's ISR has fewer than this many members. With the default `1` and a single-node ISR of `{self}`, the gate never fires (`acks=all` behaves exactly as before). Still range/cross-checked at startup (`>= 1`, `<= default.replication.factor` when that key is set). With `deployment.mode=production`, a value `> 1` is **rejected at startup** because a single node can never satisfy it. |
+| `min.insync.replicas` | int | `1` | Honored (acks=all) | Enforced at write time (M4): an `acks=all` produce is rejected with `NOT_ENOUGH_REPLICAS` when the partition's ISR has fewer than this many members. With the default `1` and a single-node ISR of `{self}`, the gate never fires (`acks=all` behaves exactly as before). Still range/cross-checked at startup (`>= 1`, `<= default.replication.factor` when that key is set). With `deployment.mode=production`, a value above the **cluster size** is **rejected at startup** (so minISR=2 is fine in a 3-broker production cluster, but impossible single-node). |
 | `offsets.topic.replication.factor` | int | `1` | Inert | Accepted; not applied. |
 | `transaction.state.log.replication.factor` | int | `1` | Inert | Accepted; not applied. |
 | `transaction.state.log.min.isr` | int | `1` | Inert | Accepted; not applied. |
@@ -236,7 +237,7 @@ Per-client byte-rate throttling. Disabled (unlimited) when `<= 0` (the default).
 
 | Key | Type | Default | Status | Description |
 |-----|------|---------|--------|-------------|
-| `deployment.mode` | string | `""` | Honored | Set to `production` (or env `KAWASAN_DEPLOYMENT_MODE=production`) to fail fast at startup on settings the broker cannot honor (TLS-implying `security.protocol`, `default.replication.factor > 1`, `min.insync.replicas > 1`) and to refuse SASL/PLAIN "accept-any" when no credentials are configured. |
+| `deployment.mode` | string | `""` | Honored | Set to `production` (or env `KAWASAN_DEPLOYMENT_MODE=production`) to fail fast at startup on settings the broker cannot honor (TLS-implying `security.protocol`, `default.replication.factor` or `min.insync.replicas` above the cluster size derived from `raft.peers`) and to refuse SASL/PLAIN "accept-any" when no credentials are configured. |
 
 ## Accepted-but-inert keys
 
@@ -246,7 +247,7 @@ These keys are present in the sample configs for Kafka tooling compatibility but
 |----------|------|
 | Network | `num.network.threads`, `num.io.threads`, `socket.send.buffer.bytes`, `socket.receive.buffer.bytes`, `socket.request.max.bytes` |
 | Flush / cleanup | `log.flush.interval.messages`, `log.flush.interval.ms`, `log.flush.scheduler.interval.ms`, `log.retention.check.interval.ms`, `log.cleanup.policy` |
-| Replication | `min.insync.replicas`, `offsets.topic.replication.factor`, `transaction.state.log.replication.factor`, `transaction.state.log.min.isr`, `replica.lag.time.max.ms`, `num.replica.fetchers`, `num.recovery.threads.per.data.dir` |
+| Replication | `offsets.topic.replication.factor`, `transaction.state.log.replication.factor`, `transaction.state.log.min.isr`, `num.replica.fetchers`, `num.recovery.threads.per.data.dir` |
 | Producer / consumer | `max.request.size`, `fetch.min.bytes`, `fetch.max.wait.ms`, `compression.type` |
 | Groups / offsets | `group.initial.rebalance.delay.ms`, `group.min.session.timeout.ms`, `group.max.session.timeout.ms`, `group.retention.ms`, `offsets.retention.minutes`, `consumer.lag.metrics.enabled`, `consumer.lag.check.interval.ms` |
 | Monitoring | `monitoring.enabled`, `metrics.recording.level` |

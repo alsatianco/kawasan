@@ -2,7 +2,7 @@
 
 Kawasan is a C++20 message streaming platform that is wire-protocol compatible with Apache Kafka. A single broker process embeds the Kafka protocol layer, RocksDB-backed log storage, a Raft consensus implementation for metadata, consumer-group coordination, and a Prometheus monitoring endpoint. The same source tree also ships a producer client, a Kawasan Streams DSL, and a Connect framework as separate library modules.
 
-The single-node broker is the primary, fully supported mode. Multi-broker Raft replication is implemented but is not production-hardened; treat anything that depends on inter-broker replication as best-effort.
+The single-node broker is the primary, fully supported mode. Multi-broker replication works end-to-end for the data plane — followers fetch from leaders, `acks=all` is governed by the ISR, the ISR shrinks/expands under controller authority, a divergent follower truncates and re-syncs, and preferred-replica election is available via `ElectLeaders` — but **automatic partition-leader failover is not implemented**: a leader loss strands the partition until leadership is manually re-elected. Treat multi-broker as experimental.
 
 This document explains how the system is structured and how the pieces fit together. For installing, configuring, and operating a broker see [./OPERATIONS.md](./OPERATIONS.md) and [./CONFIGURATION.md](./CONFIGURATION.md); for the full set of supported protocol APIs see [./api_coverage_matrix.md](./api_coverage_matrix.md).
 
@@ -98,12 +98,12 @@ Log-structured, append-only storage backed by RocksDB.
 | Class | Responsibility |
 |-------|----------------|
 | `LogManager` (`log_manager.h`) | Owns every per-topic-partition `Log`. Resolves/creates log directories, holds per-topic `LogConfig` overrides, runs the background cleanup thread, and exposes `flushAll` / `cleanupAll`. |
-| `Log` (`log.h`) | One topic-partition. Holds an ordered list of `LogSegment`s, tracks the high watermark, appends record batches, serves reads up to the high watermark, rolls new segments, and applies retention/compaction. |
-| `LogSegment` (`log_segment.h`) | A single segment, named by its base offset and backed by its own RocksDB instance (`std::unique_ptr<rocksdb::DB>`). Stores encoded record batches and serves both decoded `RecordBatch` reads and raw byte reads. |
+| `Log` (`log.h`) | One topic-partition. Holds an ordered list of `LogSegment`s, tracks the high watermark (checkpointed atomically to `checkpoint.meta`), appends record batches (`appendBatch`, plus the offset-preserving `appendReplicatedBatch` used by follower replication), truncates its tail (`truncateSuffix`), serves reads, rolls new segments, and applies retention/compaction. |
+| `LogSegment` (`log_segment.h`) | A single segment, named by its base offset and backed by its own RocksDB instance (`std::unique_ptr<rocksdb::DB>`). Stores encoded record batches, serves both decoded `RecordBatch` reads and raw byte reads, and supports tail truncation (`truncateTo`). |
 | `RecordBatch` (`record_batch.h`) | The Kafka record-batch unit of storage and transfer. |
 | `lz4_decoder.h` | Decodes LZ4-compressed batches; other codecs (gzip, snappy, zstd) are handled via the linked compression libraries. |
 
-`Log::read` and `LogSegment::readRaw` return raw RocksDB bytes without re-deserializing into `RecordBatch` objects, so the fetch path can stream stored bytes straight to the client.
+`Log::readRaw` / `LogSegment::readRaw` return stored batch bytes without re-deserializing into `RecordBatch` objects, so the fetch path can stream stored bytes straight to the client; `Log::read` is the decoding variant used off the hot path.
 
 ### raft
 
@@ -111,7 +111,7 @@ Raft consensus used for metadata replication. See [Raft consensus](#raft-consens
 
 | Class | Responsibility |
 |-------|----------------|
-| `RaftNode` (`raft_node.h`) | The state machine: `NodeState` (FOLLOWER / CANDIDATE / LEADER), election timers, log, commit index, and `applyCommittedEntries`. Holds `PeerInfo` for each peer and a `SnapshotAccumulator` for incoming snapshot chunks. |
+| `RaftNode` (`raft_node.h`) | The state machine: `NodeState` (FOLLOWER / CANDIDATE / LEADER), log, commit index, and `applyCommittedEntries`. Runs three dedicated threads — a CV-driven election-timeout thread, a leader heartbeat/snapshot thread, and an apply thread that feeds committed entries to the state machine. Holds `PeerInfo` for each peer and a `SnapshotAccumulator` for incoming snapshot chunks. |
 | `RaftProtocol` (`raft_protocol.h`) | Wire encode/decode of the six RPC message types plus `ByteBuffer` and `ProtocolException`. |
 | `RaftTransport` (`raft_transport.h`) | Boost.Asio TCP transport. Listens for peer connections, dials peers, and frames each message with a 4-byte big-endian length prefix. |
 
@@ -124,12 +124,15 @@ The orchestration layer. `KawasanBroker` constructs and wires every subsystem be
 | `KawasanBroker` | Top-level broker. Owns all subsystems; one handler method per protocol API. |
 | `RequestDispatcher` | Maps `(ApiKey, version)` to a registered `HandlerFunc`, runs it, and frames the response. Builds protocol-correct error payloads for unsupported versions or handler errors. |
 | `TcpServer` (`network/`) | Boost.Asio TCP server: accepts connections across one or more acceptors, reads length-prefixed request frames, calls the dispatcher, and writes responses. Optionally TLS-wrapped for the Kafka protocol. |
-| `ReplicaManager` | Leader/follower bookkeeping, ISR membership, and (multi-broker) follower-fetch replication. In single-node mode this broker is always the leader for every partition. |
-| `MetadataController` | Applies metadata mutations (create/delete topic, ISR updates) through the Raft log and serves cached metadata back to handlers. |
+| `ReplicaManager` | Leader/follower bookkeeping and replication. Leader side: records each follower's fetch offset, computes the ISR-derived high watermark, tracks leader epochs, and proposes ISR shrink/expand from fetch recency (`computeIsrUpdate`). Follower side (multi-broker): the fetcher thread pulls batches from partition leaders via per-leader `PeerClient`s. In single-node mode this broker is always the leader for every partition. |
+| `PeerClient` | Minimal broker-to-broker Kafka client: replica Fetch (v4, `replica_id` = own broker id) and AlterPartition RPCs to peers. |
+| `MetadataController` | Applies metadata mutations through the Raft log (five commands: `CREATE_TOPIC`, `DELETE_TOPIC`, `UPDATE_ISR`, `INCREASE_PARTITIONS`, `UPDATE_LEADER`) and serves cached metadata back to handlers. |
 | `MetadataStore` / `metadata_types.h` | Persistent and in-memory representation of cluster metadata (topics, partitions, brokers). |
 | `GroupCoordinator` | Consumer-group lifecycle: JoinGroup/SyncGroup/Heartbeat/LeaveGroup, rebalance generations, and member tracking. Persists group state and offsets through `OffsetManager`. |
 | `OffsetManager` | RocksDB-backed consumer offset and group-metadata store. See [Consumer offset storage](#consumer-offset-storage). |
-| `TransactionCoordinator` | Transactional-producer and exactly-once support (InitProducerId, AddPartitionsToTxn, EndTxn, TxnOffsetCommit). |
+| `TransactionCoordinator` | Transactional-producer and exactly-once support (InitProducerId with epoch fencing, AddPartitionsToTxn, two-phase EndTxn, TxnOffsetCommit). |
+| `TransactionStateManager` | Persists transaction-coordinator snapshots to the `__transaction_state` internal topic (fsynced regardless of `log.durability`) and replays them on startup. |
+| `QuotaManager` | Per-client produce/consume byte-rate quotas (`quota.producer.default` / `quota.consumer.default`), returning `throttle_time_ms`. |
 | `ProducerStateManager` | Tracks `(topic, partition, producer_id)` state for idempotent/duplicate detection; exposes entry/eviction metrics. |
 | `FetchSessionManager` | Incremental-fetch session state (KIP-227 style fetch sessions). |
 | `IsolationTracker` | Tracks the last stable offset for `read_committed` consumers. |
@@ -157,22 +160,22 @@ Every client request follows the same envelope: `TcpServer` reads a length-prefi
 1. `handleProduce` decodes the `ProduceRequest`.
 2. For each topic-partition it resolves the leader via `ReplicaManager` (always local in single-node mode) and obtains the `Log` from `LogManager` (`getOrCreateLog`).
 3. With idempotent/transactional producers, `ProducerStateManager` validates the producer id and sequence numbers.
-4. The record batch is appended with `Log::appendBatch`, which writes to the active `LogSegment` (RocksDB) and rolls a new segment if size/time thresholds are exceeded. Message writes use synchronous RocksDB writes (`sync=true`) — see [Durability trade-offs](#durability-trade-offs).
+4. The record batch is appended with `Log::appendBatch`, which writes to the active `LogSegment` (RocksDB) and rolls a new segment if size/time thresholds are exceeded. Write durability follows `log.durability` (default `sync` → fsync per acked produce) — see [Durability trade-offs](#durability-trade-offs).
 5. The high watermark is advanced (single-node) or advanced after ISR acknowledgement (multi-broker), honoring the request `acks`.
 6. `handleProduce` encodes a `ProduceResponse` with the base offset and per-partition error codes.
 
 ### Fetch
 
 1. `handleFetch` decodes the `FetchRequest`; if it carries a session id, `FetchSessionManager` resolves the incremental session.
-2. For each requested partition it reads from the local `Log` starting at the requested offset, bounded by the high watermark (and the last stable offset via `IsolationTracker` for `read_committed`).
-3. Reads use `Log::read` / `LogSegment::readRaw`, returning stored batch bytes without re-encoding, so compressed batches are served as stored.
+2. For each requested partition it reads from the local `Log` starting at the requested offset. Consumer fetches (`replica_id == -1`) are bounded by the high watermark (and the last stable offset via `IsolationTracker` for `read_committed`); a replica fetch from a follower broker (`replica_id >= 0`) reads up to the log-end offset and updates the leader's follower-progress tracking.
+3. Reads use `Log::readRaw` / `LogSegment::readRaw`, returning stored batch bytes without re-encoding, so compressed batches are served as stored.
 4. `handleFetch` assembles a `FetchResponse` with the record bytes and per-partition high watermark / log-start metadata.
 
 ### Metadata
 
 1. `handleMetadata` decodes the `MetadataRequest`.
 2. It reads the cached cluster view from `MetadataController` / `MetadataStore` — broker list, topics, partitions, leaders, and ISR.
-3. Topic-altering admin APIs (`handleCreateTopics`, `handleDeleteTopics`, ISR changes) instead route the mutation through `MetadataController`, which proposes it to the Raft log; the change becomes visible once committed and applied. In single-node mode the broker is the sole voter, so commits are immediate.
+3. Topic-altering admin APIs (`handleCreateTopics`, `handleDeleteTopics`, `handleCreatePartitions`) route the mutation through `MetadataController`, which proposes it to the Raft log; the change becomes visible once committed and applied. ISR changes arrive two ways: the partition leader's own ISR maintenance (`maintainLeaderIsr`, driven by `replica.lag.time.max.ms`) commits directly when the leader is the controller, or sends an **AlterPartition** RPC to the controller (`handleAlterPartition` validates leader + leader-epoch, then commits `UPDATE_ISR`). **ElectLeaders** (`handleElectLeaders`) performs preferred-replica election by committing `UPDATE_LEADER`, which bumps the partition's `leader_epoch`. In single-node mode the broker is the sole voter, so commits are immediate.
 4. `handleMetadata` encodes a `MetadataResponse` describing brokers and topic/partition leadership.
 
 ## Threading model
@@ -185,8 +188,12 @@ The broker is event-driven on top of one Boost.Asio `io_context`. The number of 
 | IO context thread | `KawasanBroker` | Drives `io_context_.run()` for the Raft transport; kept alive by a work guard so it does not exit when idle. |
 | Log cleanup thread | `LogManager` | Periodic retention/compaction sweep across all logs (interval from `cleanup_interval_ms_`, default 5 minutes). |
 | Group cleanup thread | `GroupCoordinator` | Expires empty groups and times out stale members (`startCleanupThread`). |
-| Follower fetch thread | `ReplicaManager` | In multi-broker mode, background fetch from partition leaders to keep follower replicas current. Idle in single-node mode. |
-| Raft timers | `RaftNode` | Election timeout and leader heartbeat, scheduled on the shared `io_context`. |
+| Replica fetcher thread | `ReplicaManager` | Multi-broker only (started only when `raft.peers` is non-empty — never created single-node): each cycle reconciles replica assignments from Raft metadata, fetches from partition leaders for followed partitions, and runs the leader-side ISR maintenance pass. |
+| Raft election / heartbeat / apply threads | `RaftNode` | Three dedicated threads: CV-driven election timeout, periodic leader heartbeat + snapshot check, and application of committed entries to the state machine. |
+| Controller bootstrap thread | `KawasanBroker` | One-shot startup thread that waits for Raft leadership resolution and bootstraps internal topics. |
+| Transaction sweep thread | `KawasanBroker` | Auto-aborts transactions past their timeout (`transaction.abort.timed.out.transaction.cleanup.interval.ms`). |
+| Producer-state snapshot thread | `KawasanBroker` | Periodically checkpoints idempotent-producer state (`producer.state.snapshot.interval.ms`). |
+| Consumer-lag thread | `KawasanBroker` | Recomputes per-group consumer-lag metrics on an interval. |
 | Monitoring HTTP thread | `MonitoringManager` | Serves `/metrics` and health endpoints (Boost.Beast). |
 
 Because handlers run inline on IO threads, shared subsystems (`LogManager`, `GroupCoordinator`, `OffsetManager`, `ReplicaManager`) provide their own internal synchronization — for example `LogManager` guards its log map with a `std::shared_mutex` and each `Log` guards its segments with a mutex.
@@ -198,6 +205,7 @@ Partition logs live under the directories named by `log.dirs`. Each topic-partit
 ```
 <log.dirs>/
   ├── orders-0/                 # topic "orders", partition 0
+  │   ├── checkpoint.meta       # start/end offsets + high watermark (atomic temp+fsync+rename)
   │   ├── 0/                    # segment, base offset 0 (RocksDB instance)
   │   ├── 1048576/              # segment, base offset 1048576
   │   └── ...
@@ -224,11 +232,11 @@ Kawasan tunes RocksDB write durability per data class to balance at-least-once s
 
 | Data | Write mode | Rationale |
 |------|-----------|-----------|
-| Message / log writes | `sync=true` | Partition data must survive a crash for at-least-once delivery. |
+| Message / log writes | `log.durability` (default `sync`) | With `sync`, each acked produce is fsynced so partition data survives a power loss; `async` is WAL-buffered (lower latency, crash-loss window on the un-flushed tail). Durability-critical internal topics (`__transaction_state`) force fsync regardless. |
 | Consumer offset commits | `sync=true`, WAL on | Offsets back at-least-once consumption; a lost commit could silently skip records. Commits across partitions are coalesced into a single RocksDB `WriteBatch` so one fsync covers the whole commit. |
 | Consumer-group metadata | `sync=false`, WAL on | Member lists, assignments, and generation IDs are reconstructable by rejoin/rebalance, so async writes (protected by the WAL) are an acceptable trade for throughput. |
 
-In short: offsets and messages are synchronous; group metadata is asynchronous but WAL-protected, with a small (~WAL-flush-interval) loss window on crash. After a crash the RocksDB WAL replays all writes, including the async group-metadata ones.
+In short: offsets are always synchronous and messages are synchronous by default; group metadata is asynchronous but WAL-protected, with a small (~WAL-flush-interval) loss window on crash. After a crash the RocksDB WAL replays all writes, including the async group-metadata ones.
 
 ## Consumer offset storage
 
@@ -274,7 +282,16 @@ The relevant `OffsetManager` API includes `commitOffset` / `commitOffsetBatch`, 
 
 ## Raft consensus
 
-Raft replicates cluster metadata (topics, partitions, ISR) across brokers without ZooKeeper. `MetadataController` proposes metadata commands to the Raft log; once an entry commits, every node applies it through `RaftNode::applyCommittedEntries`. In single-node mode the broker is the only voter, so commits are immediate.
+Raft replicates cluster metadata across brokers without ZooKeeper. `MetadataController` proposes metadata commands to the Raft log; once an entry commits, every node applies it through `RaftNode::applyCommittedEntries`. In single-node mode the broker is the only voter, so commits are immediate.
+
+The metadata command set (`MetadataCommandType`, `include/kawasan/broker/metadata_types.h`):
+
+| Command | Effect |
+|---------|--------|
+| `CREATE_TOPIC` / `DELETE_TOPIC` | Topic lifecycle. |
+| `UPDATE_ISR` | Commits an ISR shrink/expand proposed by the partition leader (directly or via the AlterPartition RPC). |
+| `INCREASE_PARTITIONS` | Applies a `CreatePartitions` count increase. |
+| `UPDATE_LEADER` | Sets the partition leader (assigned replicas only) and bumps `leader_epoch` — the primitive behind `ElectLeaders`. |
 
 A `RaftNode` is always in one of three states — `FOLLOWER`, `CANDIDATE`, or `LEADER`:
 
@@ -309,7 +326,7 @@ The broker parses and validates the `raft.ssl.*` configuration keys (`raft.ssl.e
 
 ## Kawasan Streams
 
-Kawasan Streams (`include/kawasan/streams/`) is a declarative stream-processing DSL layered on the broker and `client` producer/consumer. It mirrors Kafka Streams concepts in C++20 with templated, type-safe operators.
+Kawasan Streams (`include/kawasan/streams/`) is a declarative stream-processing DSL mirroring Kafka Streams concepts in C++20 with templated, type-safe operators. **Status: the DSL/topology layer is implemented; the execution runtime is not** — see [Execution](#execution-tasks-and-threads) below. (The `client` module currently provides only a `Producer`; there is no consumer class, which is the main reason the runtime cannot yet poll and process.)
 
 ### Topology and the DSL
 
@@ -324,7 +341,7 @@ The two convert into each other: `KStream` → `KTable` via `groupByKey().aggreg
 
 ### Execution: tasks and threads
 
-Input partitions are grouped into `StreamTask`s — the smallest unit of parallelism — and tasks are distributed across stream threads (`stream_task.h`). A task owns its partitions, its slice of the topology, its consumer/producer, and its state stores; `process()` polls, processes, and produces, while `commit()` commits offsets and flushes state.
+The intended design groups input partitions into `StreamTask`s — the smallest unit of parallelism — distributed across stream threads (`stream_task.h`). **This layer is scaffolding, not yet functional:** `StreamTask::process()`/`processRecord()`/`commit()` are TODO stubs, and `KawasanStreams` does not yet create tasks from a topology or start stream threads (`src/streams/kawasan_streams.cpp`, `src/streams/stream_task.cpp`). A topology can be built and validated but not executed end-to-end.
 
 ### State stores
 
@@ -339,7 +356,7 @@ Backends are RocksDB (`RocksDBKeyValueStore`, `RocksDBWindowStore` in `rocksdb_s
 
 ### Changelog and fault tolerance
 
-Each state store is backed through to a changelog topic named `<app-id>-<store-name>-changelog`. Every `put`/`delete` is written to the changelog; on restart the store is rebuilt by replaying the changelog from the beginning until caught up. Changelog topics use log compaction so they retain only the latest value per key (tombstones eventually drop).
+The intended design backs each state store with a changelog topic named `<store-name>-changelog`, replayed on restart to rebuild the store. **This is not yet implemented:** `RocksDBKeyValueStore::sendToChangelog` is a no-op placeholder and `StreamTask::restoreStateStores` is a TODO stub — state stores persist locally in RocksDB but are not fault-tolerant across a lost disk.
 
 ### Windowing and time
 
@@ -355,7 +372,7 @@ Each state store is backed through to a changelog topic named `<app-id>-<store-n
 
 ### Processing guarantees
 
-The default guarantee is **at-least-once**: offset commits are independent of state writes, so a crash after processing but before commit causes reprocessing. **Exactly-once** is available via Kafka transactions, atomically committing output records, changelog writes, and consumer offsets together; it requires an idempotent/transactional producer, the broker's `TransactionCoordinator`, and `read_committed` consumers.
+The intended default guarantee is **at-least-once** (offset commits independent of state writes, so a crash causes reprocessing). The broker side of **exactly-once** — idempotent producers, the `TransactionCoordinator`, and `read_committed` isolation — is real and usable by external clients, but the Streams runtime does not yet execute topologies (see above), so neither guarantee is currently delivered by Kawasan Streams itself. Running real JVM Kafka Streams applications against the broker is the supported route today.
 
 ## Kawasan Connect
 

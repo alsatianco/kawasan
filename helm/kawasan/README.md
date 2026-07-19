@@ -6,7 +6,7 @@ This Helm chart deploys Kawasan message broker on Kubernetes.
 
 ### Prerequisites
 
-- Kubernetes 1.19+
+- Kubernetes 1.21+ (the PodDisruptionBudget template uses `policy/v1`)
 - Helm 3.0+
 - PersistentVolume provisioner support in the underlying infrastructure
 
@@ -43,8 +43,8 @@ The following table lists the configurable parameters of the Kawasan chart and t
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `deploymentType` | Deployment type (statefulset/deployment) | `statefulset` |
-| `replicaCount` | Number of replicas | `3` |
+| `deploymentType` | Workload type — only `statefulset` is implemented (any other value renders no workload) | `statefulset` |
+| `replicaCount` | Number of replicas — keep at `1`; see High Availability below | `1` |
 
 ### Resource Configuration
 
@@ -66,15 +66,14 @@ The following table lists the configurable parameters of the Kawasan chart and t
 
 ### Broker Configuration
 
-All broker configuration parameters are available under the `config` section. See `values.yaml` for the complete list.
+A **subset** of broker configuration is exposed under the `config` section — see `templates/configmap.yaml` for exactly which keys render (roughly: identity, network, log dirs/retention, topic defaults). Other broker keys (e.g. `monitoring.port`, `raft.*`, `log.durability`, security) are not currently settable through the chart.
 
 ## Examples
 
-### Install with 5 brokers and 200Gi storage
+### Install with 200Gi storage
 
 ```bash
 helm install kawasan kawasan/kawasan \
-  --set replicaCount=5 \
   --set persistence.size=200Gi
 ```
 
@@ -96,11 +95,8 @@ helm install kawasan kawasan/kawasan \
 ## Upgrading
 
 ```bash
-# Upgrade with new values
+# Upgrade with new values (use ./helm/kawasan when installing from a local checkout)
 helm upgrade kawasan kawasan/kawasan -f values.yaml
-
-# Upgrade to a new version
-helm upgrade kawasan kawasan/kawasan --version 1.1.0
 ```
 
 ## Uninstalling
@@ -116,17 +112,7 @@ kubectl delete pvc -l app.kubernetes.io/name=kawasan
 
 ## Monitoring
 
-### Prometheus Integration
-
-The chart supports Prometheus monitoring through ServiceMonitor CRD:
-
-```yaml
-metrics:
-  enabled: true
-  serviceMonitor:
-    enabled: true
-    interval: 30s
-```
+The broker serves Prometheus metrics and health probes on its monitoring HTTP port (default **9094** — see [`docs/OPERATIONS.md`](../../docs/OPERATIONS.md)). **Known gaps in the current chart:** it ships no ServiceMonitor template (the `metrics.serviceMonitor.*` values render nothing), its `metrics.port: 9308` does not match the broker's 9094, and the `prometheus.io/port` pod annotation points at the Kafka port. Until these are fixed, scrape the pods directly on port 9094.
 
 ## Security
 
@@ -139,25 +125,7 @@ The chart follows security best practices:
 
 ## High Availability
 
-For production deployments:
-
-1. Set `replicaCount` to at least 3
-2. Enable `podDisruptionBudget`
-3. Use `required` pod anti-affinity
-4. Configure appropriate resource limits
-5. Use fast storage (SSD) for persistence
-
-```yaml
-replicaCount: 3
-podDisruptionBudget:
-  enabled: true
-  minAvailable: 2
-affinity:
-  podAntiAffinity:
-    type: required
-persistence:
-  storageClass: fast-ssd
-```
+**Run a single replica.** Raising `replicaCount` does **not** form a cluster: the chart's ConfigMap generates no `raft.peers`, so N replicas are N independent single-node brokers behind one Service — clients get routed to random brokers with disjoint data. Additionally, multi-broker Kawasan has no automatic partition-leader failover yet (see the repository README), so multi-replica deployments are doubly unsupported. For production: `replicaCount: 1`, fast (SSD) storage, and appropriate resource limits.
 
 ## Troubleshooting
 
@@ -171,17 +139,15 @@ kubectl logs -l app=kawasan -f
 
 ```bash
 kubectl get pods -l app=kawasan
-kubectl describe statefulset kawasan-broker
+kubectl describe statefulset kawasan     # for release name "kawasan"; otherwise <release>-kawasan
 ```
 
 ### Access broker shell
 
 ```bash
-kubectl exec -it kawasan-broker-0 -- /bin/sh
+kubectl exec -it kawasan-0 -- /bin/sh
 ```
 
 ## Support
 
-For issues and questions, please visit:
-- GitHub: https://github.com/kawasan/kawasan
-- Documentation: see [`docs/`](../../docs/) in this repository
+For issues and questions, see [`docs/`](../../docs/) in this repository.

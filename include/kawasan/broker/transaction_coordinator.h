@@ -30,8 +30,9 @@ namespace kawasan::broker {
 // the prior instance; the txn APIs reject stale epochs with
 // INVALID_PRODUCER_EPOCH) and transaction-timeout auto-abort (a broker sweep
 // aborts Ongoing txns past transaction.timeout.ms). NOT yet done:
-// WriteTxnMarkers (API 27) for multi-broker marker fan-out, and multi-broker
-// replication of __transaction_state (needs follower fetch).
+// WriteTxnMarkers (API 27) for multi-broker marker fan-out, and coordinator
+// failover between brokers (__transaction_state replicates over follower
+// fetch since M5, but the source-of-truth flip is M10).
 class TransactionCoordinator {
 public:
     /// @brief Wall-clock source (epoch ms). Injectable so the M2 timeout

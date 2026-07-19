@@ -85,10 +85,11 @@ docker build -t kawasan:latest .
 docker run -d \
   -p 9092:9092 -p 9094:9094 \
   -v kawasan-data:/var/lib/kawasan/data \
-  -v "$PWD/config/broker.docker.properties:/etc/kawasan/server.properties:ro" \
   --name kawasan-broker \
   kawasan:latest
 ```
+
+The image's baked-in `/etc/kawasan/server.properties` already points `log.dirs` at `/var/lib/kawasan/data`, matching the volume above. If you mount your own config over it, make sure its `log.dirs` is `/var/lib/kawasan/data` — and note that `config/broker.docker.properties` is **not** suitable for this (it configures a broker running on the host with clients in Docker: `log.dirs=/tmp/...`, `advertised.host=host.docker.internal`).
 
 A single-broker `docker-compose.yml` is also provided (service `kawasan-broker-1`, additional brokers commented out as a starting point).
 
@@ -215,14 +216,13 @@ The handful of keys you adjust most often when operating a broker:
 | `broker.id` | Unique broker identity | `0` (single node) |
 | `host` / `listeners` | Bind address | `0.0.0.0` |
 | `port` | Kafka client port | `9092` |
-| `advertised.host` / `advertised.port` | Address clients are told to use | matches reachable address (see [Kafka UI](#connecting-kafka-ui-and-admin-tools)) |
+| `advertised.host` | Host clients are told to use (the advertised port is always `port`) | matches reachable address (see [Kafka UI](#connecting-kafka-ui-and-admin-tools)) |
 | `log.dirs` | Data directory | `/var/lib/kawasan/data` |
 | `log.retention.hours` / `log.retention.bytes` | Retention | `168` / `-1` |
-| `num.network.threads` / `num.io.threads` | Concurrency | tune to cores |
-| `compression.type` | `none`/`gzip`/`snappy`/`lz4`/`zstd` | `snappy` or `lz4` |
-| `monitoring.enabled` / `monitoring.host` / `monitoring.port` | HTTP metrics + health server | see [Ports](#ports) |
+| `network.io_threads` | Network concurrency | defaults to hardware concurrency; tune to cores |
+| `monitoring.host` / `monitoring.port` | HTTP metrics + health server (always runs; `monitoring.enabled` is accepted but not honored) | see [Ports](#ports) |
 
-**Durability behavior** (fixed, not configurable per request): message/log writes and consumer offset commits use synchronous RocksDB writes (`sync=true`) for at-least-once durability, with offset commits batched across partitions into a single `WriteBatch`; consumer-group metadata uses async writes (`sync=false`) protected by the RocksDB WAL.
+**Durability behavior**: message/log writes follow the `log.durability` broker config (default `sync` → fsync per acked produce, so an acked record survives power loss; `async` is WAL-buffered — lower latency but a machine crash can lose the un-flushed tail). Durability-critical internal topics (`__transaction_state`) force fsync regardless. Consumer offset commits are always synchronous (`sync=true`), batched across partitions into a single `WriteBatch`; consumer-group metadata uses async writes (`sync=false`) protected by the RocksDB WAL.
 
 **Raft TLS is a known limitation.** The `raft.ssl.*` keys are parsed and validated at broker startup (`src/broker/kawasan_broker.cpp`), so an invalid combination throws at boot. However, the Raft transport (`src/raft/raft_transport.{cpp,h}`) contains no SSL code, so **inter-broker Raft traffic is plaintext even when `raft.ssl.enabled=true`**. Do not rely on Raft TLS for confidentiality; isolate inter-broker traffic at the network layer instead.
 
@@ -270,7 +270,7 @@ docker logs -f kawasan-broker
 ./build/tools/kawasan-broker --config config/broker.dev.properties --log-level debug
 ```
 
-Logs are structured (spdlog) and written to stdout and the configured log directory; control verbosity with `--log-level` (`trace|debug|info|warn|error`).
+Logs are structured (spdlog) and written to stdout and the configured log directory; control verbosity with `--log-level` (`trace|debug|info|warn|error|critical`).
 
 ### Verifying the broker is up
 
@@ -284,7 +284,7 @@ curl -s http://localhost:9094/health
 
 ## Monitoring
 
-The broker runs an embedded HTTP server (Boost.Beast) that serves Prometheus metrics and health endpoints. It is controlled by `monitoring.enabled`, `monitoring.host`, and `monitoring.port`.
+The broker runs an embedded HTTP server (Boost.Beast) that serves Prometheus metrics and health endpoints. It is controlled by `monitoring.host` and `monitoring.port` and always runs (`monitoring.enabled` appears in shipped configs but is not honored).
 
 ### Ports
 
@@ -332,11 +332,16 @@ curl http://localhost:9094/metrics
 | `kawasan_bytes_out_total` | Counter | Total bytes sent |
 | `kawasan_requests_total` | Counter | Total requests, by API |
 | `kawasan_request_errors_total` | Counter | Total request errors, by API |
-| `kawasan_produce_latency_ms` | Histogram | Produce latency (P50/P95/P99) |
-| `kawasan_fetch_latency_ms` | Histogram | Fetch latency (P50/P95/P99) |
+| `kawasan_produce_latency_ms` | Histogram | Produce latency (compute P50/P95/P99 with `histogram_quantile`) |
+| `kawasan_fetch_latency_ms` | Histogram | Fetch latency (compute quantiles downstream) |
+| `kawasan_request_latency_ms` | Histogram | Per-API request latency |
+| `kawasan_connections_created_total` | Counter | Client connections opened |
+| `kawasan_connections_closed_total` | Counter | Client connections closed, labeled `{reason}` |
 | `kawasan_disk_usage_bytes` | Gauge | Disk usage |
 | `kawasan_memory_usage_bytes` | Gauge | Memory usage |
 | `kawasan_consumer_lag` | Gauge | Messages behind, labeled `{group,topic,partition}` |
+
+The authoritative list is the collector itself (`src/broker/monitoring/metrics_collector.cpp`) — check `/metrics` on a running broker for the full set.
 
 ### Prometheus and Grafana
 
@@ -384,7 +389,7 @@ sudo tar -czf kawasan-backup-$(date +%Y%m%d).tar.gz /var/lib/kawasan/data /etc/k
 sudo systemctl start kawasan-broker
 ```
 
-### RocksDB checkpoint (online)
+### Online copy (approximate)
 
 RocksDB supports consistent online copies. The simplest operational form copies the data directory while the broker runs; for a transactionally consistent snapshot, prefer a filesystem/volume snapshot (below) over a plain `cp` of a live directory.
 
@@ -467,7 +472,7 @@ Guidance: more partitions = more parallelism but more per-partition overhead; do
 
 ### Horizontal scaling (experimental)
 
-Multi-broker Raft replication is **not production-hardened**. The `docker-compose-cluster.yml` and `k8s` StatefulSet exist for experimentation and compatibility testing. If you run a multi-broker cluster:
+Multi-broker Raft replication is **not production-hardened**. Followers replicate data, the ISR shrinks/expands automatically, and `acks=all` waits on the ISR — but there is **no automatic partition-leader failover**: killing a partition's leader strands that partition (availability loss, not acked-data loss) until leadership is manually re-elected (`ElectLeaders`) or the broker returns. The `docker-compose-cluster.yml` and `k8s` StatefulSet exist for experimentation and compatibility testing. If you run a multi-broker cluster:
 
 - Every broker needs a unique `broker.id`.
 - Configure `raft.port` and `raft.peers` (`id:host:port,...`) consistently across brokers.
@@ -692,7 +697,7 @@ Kafka clients (Kafka UI, `kcat`, console tools, language clients) discover broke
 | UI in Docker, broker on host | `0.0.0.0` | `host.docker.internal` |
 | Both in Docker (same network) | `0.0.0.0` | the broker's compose service name (e.g. `kawasan-broker`) |
 
-The `kafka-ui` profile generates a UI-ready config without hand-editing files. It sets `host=0.0.0.0`, `advertised.host=host.docker.internal` (override with `KAWASAN_ADVERTISED_HOST`), and matches `advertised.port` to the listener port (override with `KAWASAN_ADVERTISED_PORT`):
+The `kafka-ui` profile (implemented by `scripts/quick-start.sh`) generates a UI-ready config without hand-editing files. It sets `host=0.0.0.0`, `advertised.host=host.docker.internal` (override with `KAWASAN_ADVERTISED_HOST`), and matches `advertised.port` to the listener port (override with `KAWASAN_ADVERTISED_PORT`). `scripts/reset.sh` is a wrapper that **kills the broker and deletes all `/tmp/kawasan-*` data** before re-running quick-start:
 
 ```bash
 KAWASAN_PROFILE=kafka-ui bash scripts/reset.sh

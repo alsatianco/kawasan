@@ -32,14 +32,14 @@ Then point any Kafka client at `localhost:9092`. Prometheus metrics scrape from 
 
 | Area | Capability | Status |
 |------|-----------|--------|
-| **Core broker** | Topics, Produce/Fetch (acks 0/1/-1), Metadata, compression (Snappy/LZ4/Zstd) | Stable |
+| **Core broker** | Topics, Produce/Fetch (acks 0/1/-1), Metadata, compression (Gzip/Snappy/LZ4/Zstd) | Stable |
 | **Consumer groups** | Persistent offsets (RocksDB), rebalancing, lag tracking | Stable |
 | **Storage** | RocksDB-backed segmented logs, time/size retention | Stable |
-| **Transactions** | Idempotent producers, two-phase transaction coordinator, read-committed isolation | Partial — single-node transaction state is **durable across restart** (persisted to `__transaction_state`, replayed on startup); multi-broker replication of it awaits follower fetch |
+| **Transactions** | Idempotent producers, two-phase transaction coordinator, read-committed isolation | Partial — single-node transaction state is **durable across restart** (persisted to `__transaction_state`, replayed on startup); `__transaction_state` replicates over the follower-fetch path, but the transaction coordinator does not yet fail over between brokers |
 | **Streams** | DSL (KStream/KTable), windowing, joins | Experimental — the topology/DSL builds, but the task **runtime is incomplete** (does not yet run end-to-end) |
 | **Connect** | Source/sink connector + task + worker framework | Experimental — framework only; **no REST API**, standalone, cannot host JVM Connect plugins |
 | **Security** | SASL/PLAIN + SASL/SCRAM (SHA-256/512) auth; ACL **enforcement** (opt-in via `authorizer.enabled`); per-client quotas (opt-in) | Implemented (no client/broker TLS — see below) |
-| **Consensus** | Raft metadata (single-node operational; multi-broker not hardened) | Partial |
+| **Consensus & replication** | Raft metadata (no ZooKeeper); data replication with follower fetch, ISR shrink/expand, ISR-governed `acks=all`, and manual preferred-replica election — but **no automatic leader failover yet**, so multi-broker is experimental | Partial |
 | **Monitoring** | Prometheus metrics, health endpoints, Grafana dashboard | Stable |
 | **Deployment** | Docker, Compose, systemd, macOS launchd, Helm, k8s manifests | Stable |
 
@@ -47,14 +47,14 @@ Known limitations: client/broker **TLS is not implemented** (the broker refuses 
 
 ## Building (Linux & macOS)
 
-Verified on Ubuntu 22.04/24.04 and macOS 13+/14+ (Intel and Apple Silicon). Requires a modern compiler (GCC ≥ 11 or Clang ≥ 13) and CMake ≥ 3.20.
+CI-verified on current Ubuntu and macOS runners (Intel and Apple Silicon). Requires a modern compiler (GCC ≥ 11 or Clang ≥ 13) and CMake ≥ 3.20.
 
 **Install prerequisites**
 
 ```bash
 # Linux (Ubuntu/Debian)
 sudo apt update && sudo apt install -y build-essential cmake ninja-build git pkg-config \
-    libssl-dev librocksdb-dev libspdlog-dev nlohmann-json3-dev \
+    libboost-all-dev libssl-dev librocksdb-dev libspdlog-dev nlohmann-json3-dev \
     libgtest-dev zlib1g-dev libsnappy-dev liblz4-dev libzstd-dev
 
 # macOS (Homebrew)
@@ -138,7 +138,7 @@ Prometheus metrics are exposed at `http://localhost:9094/metrics` (default; stag
 
 ## Performance
 
-Targets are 100k+ msg/sec with p99 < 5ms and < 1GB idle memory. A single-node baseline on mid-range hardware (8-core, 16GB, SSD) measures roughly 30k produce / 18k consume msg/sec. Tuning and profiling recipes: [docs/OPERATIONS.md](docs/OPERATIONS.md).
+The recorded single-node baseline lives in [`bench/baseline.json`](bench/baseline.json) (regenerate with `bench/run_suite.sh`): roughly 100k msg/sec produce and 790k msg/sec consume at 1 KiB records with `log.durability=async` on an Apple M3 Pro — numbers are environment-specific, so compare only within one machine. Tuning and profiling recipes: [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ## Documentation
 

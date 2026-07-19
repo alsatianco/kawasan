@@ -106,7 +106,7 @@ ctest --test-dir build -R KawasanBrokerErrorTest     # one suite by name
 | `tests/unit/` | One GTest binary per file (suffix `_test.cpp`), each registered via `add_test`. Includes `BufferTest`, `RecordBatchTest`, `KawasanBrokerErrorTest`, `LogSegmentTest`, `RaftProtocolTest`, `RaftTransportTest`, `ISRManagementTest`, `StreamsTopologyTest`, and more. |
 | `tests/integration/` | End-to-end broker paths: produce/fetch, offset persistence, log recovery, replication, transactional recovery, Streams, Connect, shutdown. |
 | `tests/benchmark/` | Throughput, load, replication, and Streams performance benchmarks. |
-| `tests/fuzz/` | libFuzzer harnesses for wire decoding (`fuzz_request_header`, `fuzz_record_batch`); build with `-DKAWASAN_BUILD_FUZZ=ON` using Clang. |
+| `tests/fuzz/` | libFuzzer harnesses for wire decoding and codecs (request header, record batch, produce/fetch/metadata requests, compression); build with `-DKAWASAN_BUILD_FUZZ=ON` using Clang. |
 
 Place a new unit test in `tests/unit/` as `<thing>_test.cpp` and register it in the relevant `CMakeLists.txt`; integration tests go in `tests/integration/`.
 
@@ -118,13 +118,13 @@ These run against a live broker and validate the Kafka drop-in contract:
 |-------|--------------|------------|
 | `tests/compatibility/` | Client-library round-trips (kafka-python implemented; KafkaJS, Sarama, Java client present). | `scripts/run_compatibility_tests.sh` starts a broker and drives the clients. |
 | `tests/ecosystem/` | Drop-in contract harness: each check runs against **both** Apache Kafka (oracle) and Kawasan (candidate) via Docker Compose, covering api-compat, idempotent/transactional produce, compaction, ACLs, SASL, Schema Registry, Kafka UI, Kafka Connect, ksqlDB, Streams EOS, etc. | `tests/ecosystem/scripts/run_all.sh kafka` for the oracle baseline, then `run_all.sh kawasan` for the candidate. See [Operations](./OPERATIONS.md) for harness details. |
-| `scripts/tests/` | Ad-hoc Python integration scripts (kafka-python / librdkafka) for offset, ordering, consumer-group, and metadata behaviors against a running broker. | `python3 scripts/tests/<script>.py` with a broker up. |
+| `scripts/tests/` | Python integration scripts (kafka-python / librdkafka) for offset, ordering, consumer-group, and metadata behaviors, plus the multi-broker replication suites (`cluster_harness.sh`, `test_replication_m5.py`, `test_isr_shrink_m6.py`). | `python3 scripts/tests/<script>.py` with a broker up; cluster suites manage their own 3-broker cluster via the harness. |
 
 ## Areas for contribution
 
 **Good first issues:** documentation, additional unit tests, code cleanup/refactoring, and well-scoped bug fixes.
 
-**Larger efforts:** protocol-API coverage (see [./api_coverage_matrix.md](./api_coverage_matrix.md) for current support), the Streams task runtime and Connect REST surfaces, durable transactions, performance optimization, and security features. Multi-broker Raft replication exists but is **not** production-hardened — the metadata plane (election, ISR tracking, assignment) works, but the highest-value remaining gap is the **follower record-fetcher** (`ReplicaManager::fetchFromLeader` is a stub, so followers do not yet copy partition data from the leader). Separately, `raft.ssl.*` keys are parsed and validated but are not wired into the transport (`src/raft/raft_transport.{cpp,h}` has no TLS), so inter-broker Raft traffic is plaintext even with `raft.ssl.enabled=true`. Hardening these paths is high-value. The single-node broker is the primary, production-ready mode.
+**Larger efforts:** protocol-API coverage (see [./api_coverage_matrix.md](./api_coverage_matrix.md) for current support), the Streams task runtime and Connect REST surfaces, multi-broker transaction-coordinator failover, performance optimization, and security features. Multi-broker replication now has a working data plane (follower fetch, ISR shrink/expand, truncation, manual leader election) but is **not** production-hardened — the highest-value remaining gap is **automatic partition-leader failover with stale-leader fencing and the KIP-101 leader-epoch cache** (today a dead leader strands its partitions until leadership is manually re-elected). Separately, `raft.ssl.*` keys are parsed and validated but are not wired into the transport (`src/raft/raft_transport.{cpp,h}` has no TLS), so inter-broker Raft traffic is plaintext even with `raft.ssl.enabled=true`. Hardening these paths is high-value. The single-node broker is the primary, production-ready mode.
 
 ## Licensing
 

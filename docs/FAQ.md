@@ -41,7 +41,7 @@ Point the client's bootstrap server at the broker's host and port (default `loca
 
 ## Does it support TLS?
 
-For the **Kafka client protocol**, TLS is **not** implemented in this build: the TCP session uses a plain socket, and the broker deliberately refuses to start if `security.protocol=SSL` or `ssl.enabled=true` is set (`src/broker/kawasan_broker.cpp`) rather than silently serving plaintext on a "TLS" port. Use `security.protocol=PLAINTEXT` (terminate TLS at a proxy/load balancer if you need encryption in transit). Note that `config/broker.production.properties` ships with `security.protocol=SSL` / `ssl.enabled=true` defaults that will fail to start until you override them to PLAINTEXT.
+For the **Kafka client protocol**, TLS is **not** implemented in this build: the TCP session uses a plain socket, and the broker deliberately refuses to start if `security.protocol=SSL` or `ssl.enabled=true` is set (`src/broker/kawasan_broker.cpp`) rather than silently serving plaintext on a "TLS" port. Use `security.protocol=PLAINTEXT` (terminate TLS at a proxy/load balancer if you need encryption in transit). `config/broker.production.properties` defaults to PLAINTEXT (`${KAWASAN_SECURITY_PROTOCOL:PLAINTEXT}`); opting into SSL via those env vars makes the broker refuse to start until client TLS is implemented.
 
 For **inter-broker Raft traffic**, the `raft.ssl.*` keys are parsed and validated (`src/broker/kawasan_broker.cpp`), but they are not wired into the transport — `src/raft/raft_transport.{cpp,h}` contains no SSL code — so Raft traffic is **plaintext even when `raft.ssl.enabled=true`**.
 
@@ -51,7 +51,7 @@ Yes, partially. SASL/PLAIN (credentials from `sasl.plain.credentials.file` or in
 
 ## Is it single-node or multi-broker today?
 
-The single-node broker is the primary, production-intended mode and is fully functional. Multi-broker Raft replication exists as infrastructure — leader election and metadata consensus work end-to-end, ISR is tracked, and a 3-broker Docker Compose ships — but it is **not** production-hardened. In particular the follower record-fetcher is still a stub (`ReplicaManager::fetchFromLeader` is a no-op with a TODO), so followers do not yet copy partition data from the leader; treat clustering as experimental and validate failover yourself before relying on it.
+The single-node broker is the primary, production-intended mode and is fully functional. Multi-broker replication is substantially implemented — followers replicate partition data from the leader (follower fetch), the ISR shrinks and expands automatically, `acks=all` genuinely waits on the ISR, a divergent follower truncates and re-syncs, manual preferred-replica election works, and a 3-broker Docker Compose ships — but it is **not** production-hardened: there is **no automatic partition-leader failover or stale-leader fencing yet**, so killing a partition's leader strands that partition (availability loss, not acked-data loss) until leadership is manually re-elected. Treat clustering as experimental.
 
 ## Where is data stored?
 
@@ -63,11 +63,11 @@ Stop the broker (or snapshot the filesystem) and copy the entire `log.dirs` tree
 
 ## What performance can I expect?
 
-As an approximate single-node baseline on mid-range hardware, expect roughly 30k produce and 18k consume messages/second; design targets are 100k+ msg/sec, p99 latency under 5 ms, and under 1 GB idle memory. Actual numbers depend heavily on message size, `acks`, compression, and disk; see [Operations](./OPERATIONS.md) for tuning guidance.
+The recorded single-node baseline is [`bench/baseline.json`](../bench/baseline.json) (regenerate with `bench/run_suite.sh`) — roughly 100k msg/sec produce and 790k msg/sec consume at 1 KiB records with `log.durability=async` on the reference machine. Numbers are environment-specific and depend heavily on message size, `acks`, durability mode, compression, and disk; see [Operations](./OPERATIONS.md) for tuning guidance.
 
 ## How do I monitor it, and on what port?
 
-The broker exposes Prometheus metrics at `/metrics` plus `/health`, `/readiness`, and `/liveness` probes over HTTP. The `monitoring.port` default is **9094** (used by the dev, docker, and `broker-N` profiles); the staging and production profiles override it to **8080** via `${KAWASAN_MONITORING_PORT:8080}`, and `monitoring/prometheus.yml` scrapes `:8080`. Durability commits and message/log writes use synchronous RocksDB writes (`sync=true`) for at-least-once durability, while group metadata uses async writes protected by the WAL.
+The broker exposes Prometheus metrics at `/metrics` plus `/health`, `/readiness`, and `/liveness` probes over HTTP. The `monitoring.port` default is **9094** (used by the dev, docker, and `broker-N` profiles); the staging and production profiles override it to **8080** via `${KAWASAN_MONITORING_PORT:8080}`, and `monitoring/prometheus.yml` scrapes `:8080`.
 
 ## Is it production-ready?
 
