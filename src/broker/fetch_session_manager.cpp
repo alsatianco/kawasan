@@ -1,5 +1,7 @@
 #include "kawasan/broker/fetch_session_manager.h"
 
+#include <algorithm>
+
 namespace kawasan::broker {
 
 namespace {
@@ -17,9 +19,12 @@ FetchSessionManager::validate(int32_t requested_session_id,
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (requested_session_id == kInvalidSessionId &&
-        requested_session_epoch == kInvalidSessionId) {
-        // No session in use — single, "sessionless" fetch. Return
-        // session_id = 0 so the client knows we're not tracking.
+        (requested_session_epoch == kInvalidSessionId || requested_session_epoch == kFinalEpoch)) {
+        // No session in use — single, "sessionless" fetch. 0/-1 is Kafka's
+        // legacy sessionless full fetch (librdkafka sends it on every Fetch);
+        // 0/0 would request a new session, but without incremental delivery
+        // we decline it. Return session_id = 0 so the client knows we're not
+        // tracking.
         r.session_id = 0;
         r.session_epoch = 0;
         r.is_new_session = false;
@@ -32,10 +37,18 @@ FetchSessionManager::validate(int32_t requested_session_id,
         // is technically the same case as sessionless, but some clients
         // use epoch=0 with id=0 to request session establishment; we
         // allocate one).
+        const auto now = std::chrono::steady_clock::now();
+        // Sessions only accumulate here, so reaping here bounds the store.
+        const auto reap_interval =
+            std::chrono::milliseconds(std::min<int64_t>(idle_timeout_ms_, 1000));
+        if (now - last_reap_ >= reap_interval) {
+            last_reap_ = now;
+            evictIdleLocked(idle_timeout_ms_, now);
+        }
         Session s;
         s.session_id = next_session_id_.fetch_add(1);
         s.session_epoch = 1;
-        s.last_used = std::chrono::steady_clock::now();
+        s.last_used = now;
         sessions_[s.session_id] = s;
         r.session_id = s.session_id;
         r.session_epoch = s.session_epoch;
@@ -113,7 +126,11 @@ int64_t FetchSessionManager::lastSeenOffset(
 
 size_t FetchSessionManager::evictIdle(int64_t max_idle_ms) {
     std::lock_guard<std::mutex> lock(mutex_);
-    const auto now = std::chrono::steady_clock::now();
+    return evictIdleLocked(max_idle_ms, std::chrono::steady_clock::now());
+}
+
+size_t FetchSessionManager::evictIdleLocked(int64_t max_idle_ms,
+                                            std::chrono::steady_clock::time_point now) {
     size_t evicted = 0;
     for (auto it = sessions_.begin(); it != sessions_.end();) {
         const auto idle = std::chrono::duration_cast<std::chrono::milliseconds>(

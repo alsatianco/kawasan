@@ -21,7 +21,9 @@ namespace kawasan::broker {
 // whose state changed.
 //
 // This minimal implementation supports the wire-level handshake:
-//   - session_id == 0 in request → allocate a new session
+//   - session_id == 0 with epoch 0 or -1 → sessionless full fetch (a
+//     new-session request is declined: no incremental delivery yet)
+//   - session_id == 0 with any other epoch → allocate a new session
 //   - session_id != 0 → look up; validate session_epoch
 //   - epoch on response = epoch in request
 //   - INVALID_FETCH_SESSION_ID / INVALID_FETCH_SESSION_EPOCH on mismatch
@@ -32,6 +34,13 @@ namespace kawasan::broker {
 // they can use for their lifetime.
 class FetchSessionManager {
 public:
+    /// Sessions unused for longer than this are reaped when a new session is
+    /// allocated (Kafka's min.incremental.fetch.session.eviction.ms default).
+    static constexpr int64_t kDefaultIdleTimeoutMs = 120000;
+
+    explicit FetchSessionManager(int64_t idle_timeout_ms = kDefaultIdleTimeoutMs)
+        : idle_timeout_ms_(idle_timeout_ms) {}
+
     /// @brief Per-partition tracked offset in a session.
     struct SessionPartition {
         std::string topic;
@@ -101,6 +110,10 @@ public:
     void recordHitOrMiss(bool hit);
 
 private:
+    size_t evictIdleLocked(int64_t max_idle_ms, std::chrono::steady_clock::time_point now);
+
+    const int64_t idle_timeout_ms_;
+    std::chrono::steady_clock::time_point last_reap_{};
     mutable std::mutex mutex_;
     std::unordered_map<int32_t, Session> sessions_;
     std::atomic<int32_t> next_session_id_{1};

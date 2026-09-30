@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <thread>
+
 #include "kawasan/broker/fetch_session_manager.h"
 
 using kawasan::broker::FetchSessionManager;
@@ -48,6 +51,33 @@ TEST(FetchSessionManagerTest, EvictIdle) {
     auto evicted = m.evictIdle(/*max_idle_ms=*/0);
     EXPECT_EQ(evicted, 0u);
     EXPECT_EQ(m.size(), 0u);
+}
+
+// librdkafka sends session_id=0 / epoch=-1 (Kafka's legacy sessionless full
+// fetch) on every Fetch; that must not allocate a session per request.
+TEST(FetchSessionManagerTest, LegacySessionlessFinalEpochDoesNotAllocate) {
+    FetchSessionManager m;
+    for (int i = 0; i < 100; ++i) {
+        auto v = m.validate(/*session_id=*/0, /*session_epoch=*/-1);
+        EXPECT_FALSE(v.is_error);
+        EXPECT_FALSE(v.is_new_session);
+        EXPECT_EQ(v.session_id, 0);
+    }
+    EXPECT_EQ(m.size(), 0u);
+}
+
+TEST(FetchSessionManagerTest, IdleSessionsReapedOnAllocation) {
+    FetchSessionManager m(/*idle_timeout_ms=*/20);
+    auto first = m.validate(/*session_id=*/0, /*session_epoch=*/1);
+    ASSERT_TRUE(first.is_new_session);
+    EXPECT_EQ(m.size(), 1u);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    auto second = m.validate(/*session_id=*/0, /*session_epoch=*/1);
+    ASSERT_TRUE(second.is_new_session);
+    EXPECT_EQ(m.size(), 1u);  // the idle first session was reaped
+    EXPECT_EQ(m.getMetrics().evictions_total, 1);
+    EXPECT_TRUE(m.validate(first.session_id, first.session_epoch).is_error);
 }
 
 }  // namespace

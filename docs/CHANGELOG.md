@@ -44,6 +44,7 @@ Single-node production-hardening (durability, security, quotas), durable single-
 
 ### Fixed
 
+- **Fetch sessions leaked on every librdkafka Fetch.** librdkafka sends `session_id=0, epoch=-1` (Kafka's legacy sessionless full fetch) on each Fetch v7+, but the broker treated that as "allocate a new session" and never reaped sessions. One consumer leaked about 10 sessions per second and logged each one at `info`. `0/-1` is now sessionless, as in Kafka. Sessions that are still allocated are reaped after 120 s idle, which `kawasan_fetch_session_evictions_total` now reflects.
 - **Producer byte-rate quotas never engaged over TCP.** The request size handed to handlers was read after the frame buffer had been moved out, so every request counted as 0 bytes. `quota.producer.default` was inert, and request-size metrics read 0. Both now use the real frame size.
 - **Per-request `info` log on the network hot path.** Each request logged its API key and correlation id at `info`. That message is now `debug`.
 - **A partition's data could be silently wiped on open failure.** `LogManager::getOrCreateLog` used to `remove_all` the partition directory and start an empty log after *any* open error. That included environmental errors such as a RocksDB `LOCK` held by another process, fd exhaustion, permissions, or a full disk. Environmental errors now propagate with the data left untouched. Other failures, treated as corruption, rename the directory to `<topic>-<partition>.corrupt-<epoch_ms>` for manual recovery before an empty log is created.
