@@ -169,3 +169,8 @@ add_test(NAME GroupCoordinatorTest COMMAND group_coordinator_test)
 add_executable(delayed_operation_purgatory_test delayed_operation_purgatory_test.cpp)
 target_link_libraries(delayed_operation_purgatory_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME DelayedOperationPurgatoryTest COMMAND delayed_operation_purgatory_test)
+
+# LogManager open-failure handling (no data destruction)
+add_executable(log_open_failure_test log_open_failure_test.cpp)
+target_link_libraries(log_open_failure_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME LogOpenFailureTest COMMAND log_open_failure_test)

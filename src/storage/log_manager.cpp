@@ -21,6 +21,25 @@ LogManager::~LogManager() {
     closeAll();
 }
 
+namespace {
+
+bool isEnvironmentalOpenError(const std::string& what) {
+    static const char* const MARKERS[] = {
+        "/LOCK",                  // RocksDB: "While lock file: <dir>/LOCK: ..."
+        "lock hold by current process",
+        "No locks available",     "Too many open files", "Resource temporarily unavailable",
+        "Permission denied",      "No space left",       "Read-only file system",
+        "Operation not permitted"};
+    for (const char* marker : MARKERS) {
+        if (what.find(marker) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
 Log* LogManager::getOrCreateLog(const std::string& topic, PartitionId partition) {
     TopicPartition tp{topic, partition};
     
@@ -42,11 +61,8 @@ Log* LogManager::getOrCreateLog(const std::string& topic, PartitionId partition)
         return it->second.get();
     }
 
-    // Create new log. If the on-disk state is corrupted or contains
-    // incompatible data from a previous run, opening the log may throw.
-    // In that case, attempt a best-effort recovery by removing the
-    // existing directory and recreating a fresh log so the broker can
-    // continue (suitable for demo/quick-start flows).
+    // Create new log. Opening may throw on corrupted on-disk state (handled
+    // by quarantining the directory) or on environmental errors (rethrown).
     std::string log_dir = getLogDir(topic, partition);
     // 0A.4: prefer the per-topic config registered via setTopicConfig() so
     // that cleanup.policy and friends from CreateTopics are honored.
@@ -70,15 +86,31 @@ Log* LogManager::getOrCreateLog(const std::string& topic, PartitionId partition)
                      effective_config.cleanup_policy_compact ? "compact" : "");
         return log_ptr;
     } catch (const std::exception& ex) {
-        Logger::warn(
-            "Failed to open log for {}-{} at {}: {}. Recreating directory.", topic,
-            partition, log_dir, ex.what());
+        // Never destroy data on open failure. Environmental errors (RocksDB
+        // LOCK held by another process, fd exhaustion, permissions, full disk)
+        // must surface: "recovering" them would either wipe a healthy log or
+        // pull it out from under the process that holds it.
+        if (isEnvironmentalOpenError(ex.what())) {
+            Logger::error("Failed to open log for {}-{} at {}: {}", topic, partition, log_dir,
+                          ex.what());
+            throw;
+        }
+        // Anything else is treated as on-disk corruption: quarantine the
+        // directory (kept for forensics / manual recovery) and start fresh.
+        std::string quarantine =
+            log_dir + ".corrupt-" +
+            std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count());
+        Logger::error("Failed to open log for {}-{} at {}: {}. Quarantining it as {} and "
+                      "recreating an empty log.",
+                      topic, partition, log_dir, ex.what(), quarantine);
         try {
             std::error_code ec;
-            std::filesystem::remove_all(log_dir, ec);
-            if (ec) {
-                Logger::warn(
-                    "Could not remove {}, proceeding to recreate: {}", log_dir, ec.message());
+            std::filesystem::rename(log_dir, quarantine, ec);
+            if (ec && std::filesystem::exists(log_dir)) {
+                Logger::error("Could not quarantine {}: {}", log_dir, ec.message());
+                throw;
             }
             auto log = std::make_unique<Log>(topic, partition, log_dir, effective_config);
             if (change_listener_) {
