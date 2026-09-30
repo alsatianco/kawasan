@@ -72,12 +72,8 @@ Log* LogManager::getOrCreateLog(const std::string& topic, PartitionId partition)
         effective_config = cfg_it->second;
     }
     try {
-        auto log = std::make_unique<Log>(topic, partition, log_dir, effective_config);
-        if (change_listener_) {
-            log->setChangeListener(change_listener_);
-        }
-        Log* log_ptr = log.get();
-        logs_[tp] = std::move(log);
+        Log* log_ptr = registerLogLocked(
+            tp, std::make_unique<Log>(topic, partition, log_dir, effective_config));
         Logger::info("Created log for topic {} partition {} (cleanup.policy: {}{}{})",
                      topic, partition,
                      effective_config.cleanup_policy_delete ? "delete" : "",
@@ -112,12 +108,8 @@ Log* LogManager::getOrCreateLog(const std::string& topic, PartitionId partition)
                 Logger::error("Could not quarantine {}: {}", log_dir, ec.message());
                 throw;
             }
-            auto log = std::make_unique<Log>(topic, partition, log_dir, effective_config);
-            if (change_listener_) {
-                log->setChangeListener(change_listener_);
-            }
-            Log* log_ptr = log.get();
-            logs_[tp] = std::move(log);
+            Log* log_ptr = registerLogLocked(
+                tp, std::make_unique<Log>(topic, partition, log_dir, effective_config));
             Logger::info("Recreated log for topic {} partition {}", topic, partition);
             return log_ptr;
         } catch (const std::exception& ex2) {
@@ -126,6 +118,31 @@ Log* LogManager::getOrCreateLog(const std::string& topic, PartitionId partition)
                 "Failed to recover log for {}-{} at {}: {}", topic, partition, log_dir,
                 ex2.what());
             throw;
+        }
+    }
+}
+
+Log* LogManager::registerLogLocked(const TopicPartition& tp, std::unique_ptr<Log> log) {
+    if (recover_hw_to_log_end_) {
+        log->setHighWatermark(log->logEndOffset());
+    }
+    if (change_listener_) {
+        log->setChangeListener(change_listener_);
+    }
+    Log* log_ptr = log.get();
+    logs_[tp] = std::move(log);
+    return log_ptr;
+}
+
+void LogManager::flushCheckpoints() {
+    // Hold the map lock (like cleanupAll) so deleteLog can't free a log mid-flush.
+    std::shared_lock<std::shared_mutex> read_lock(mutex_);
+    for (auto& [_, log] : logs_) {
+        try {
+            log->flushCheckpoint();
+        } catch (const std::exception& e) {
+            Logger::error("Failed to checkpoint {}-{}: {}", log->topic(), log->partition(),
+                          e.what());
         }
     }
 }
@@ -251,6 +268,7 @@ void LogManager::start() {
         stop_requested_ = false;
     }
     cleanup_thread_ = std::thread(&LogManager::cleanupThread, this);
+    checkpoint_thread_ = std::thread(&LogManager::checkpointThread, this);
     Logger::info("Started LogManager");
 }
 
@@ -266,6 +284,10 @@ void LogManager::stop() {
     if (cleanup_thread_.joinable()) {
         cleanup_thread_.join();
     }
+    if (checkpoint_thread_.joinable()) {
+        checkpoint_thread_.join();
+    }
+    flushCheckpoints();
     {
         std::lock_guard<std::mutex> lock(cleanup_mutex_);
         running_ = false;
@@ -313,6 +335,19 @@ void LogManager::cleanupThread() {
         } catch (const std::exception& e) {
             Logger::error("Error in cleanup thread: {}", e.what());
         }
+        lock.lock();
+    }
+}
+
+void LogManager::checkpointThread() {
+    std::unique_lock<std::mutex> lock(cleanup_mutex_);
+    while (!stop_requested_) {
+        if (cleanup_cv_.wait_for(lock, std::chrono::milliseconds(checkpoint_interval_ms_),
+                                 [this]() { return stop_requested_; })) {
+            break;
+        }
+        lock.unlock();
+        flushCheckpoints();
         lock.lock();
     }
 }

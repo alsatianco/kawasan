@@ -123,6 +123,7 @@ Read in `src/broker/kawasan_broker.cpp`. Time-based keys are resolved most-speci
 | `log.cleanup.policy` | string | `delete` | Inert | Accepted; `delete` vs `compact` selection is per-topic, not driven by this broker-level key. |
 | `log.retention.check.interval.ms` | long | `300000` | Inert | Accepted; sweep cadence is `log.cleaner.interval.ms`. |
 | `log.durability` | string | `sync` | Honored | Partition-log write durability. `sync` (default) fsyncs each acked produce (`WriteOptions.sync=true`) so an acknowledged record survives a power loss / OS crash; `async` is WAL-buffered only (lower latency, but a machine crash before the next flush loses the tail). |
+| `replica.high.watermark.checkpoint.interval.ms` | long | `5000` | Honored | How often each partition's high-watermark checkpoint (`checkpoint.meta`) is rewritten if it changed. Before this key existed, the checkpoint was fsynced on every append, which was about 95% of the cost of an async append. It is also flushed on clean shutdown and immediately for durability-critical internal writes. On a single node, HW is recovered to the log end at open, so a lagging checkpoint never hides records. |
 | `log.flush.interval.messages` | long | `10000` | Inert | Accepted; not applied. Durability is controlled by `log.durability`. |
 | `log.flush.interval.ms` | long | `1000` | Inert | Accepted; not applied. |
 | `offsets.topic.num.partitions` | int | `16` | Honored | Partition count for the internal `__consumer_offsets` topic. Each partition is its own RocksDB instance, so a lower count reduces the startup file-descriptor footprint (Kafka's default is 50). Fixed at first creation. |
@@ -131,7 +132,7 @@ Read in `src/broker/kawasan_broker.cpp`. Time-based keys are resolved most-speci
 | `transaction.abort.timed.out.transaction.cleanup.interval.ms` | long | `10000` | Honored | Interval of the background sweep that auto-aborts transactions that exceeded their client-requested `transaction.timeout.ms` (M2). Clamped to a 1s floor. The sweep starts after startup transaction-state replay. |
 | `compression.type` | string | `none` | Inert (validated) | Accepted; value is validated against `none/gzip/snappy/lz4/zstd` but compression selection is per-batch from the client. |
 
-Durability note: with `log.durability=sync` (the default) message/log writes are fsynced (`sync=true`) before the produce is acknowledged, as are offset commits, for at-least-once durability; consumer-group metadata uses async writes (`sync=false`) protected by the WAL. The high-watermark checkpoint is written atomically (temp file + fsync + rename). See [./OPERATIONS.md](./OPERATIONS.md) for the durability model.
+Durability note: with `log.durability=sync` (the default) message/log writes are fsynced (`sync=true`) before the produce is acknowledged, as are offset commits, for at-least-once durability; consumer-group metadata uses async writes (`sync=false`) protected by the WAL. The high-watermark checkpoint is written atomically (temp file + fsync + rename), periodically (`replica.high.watermark.checkpoint.interval.ms`) rather than per append. Log start and end offsets are always rebuilt from the segments. See [./OPERATIONS.md](./OPERATIONS.md) for the durability model.
 
 ## Replication and Raft
 

@@ -38,6 +38,20 @@ public:
     /// can set this much lower (e.g. 5000) to observe compaction quickly.
     void setCleanupIntervalMs(int64_t ms) { cleanup_interval_ms_ = ms; }
 
+    /// @brief How often dirty high-watermark checkpoints are written (Kafka's
+    /// `replica.high.watermark.checkpoint.interval.ms`, default 5000). Set
+    /// before start().
+    void setCheckpointIntervalMs(int64_t ms) { checkpoint_interval_ms_ = ms; }
+
+    /// @brief When true, every log opened from now on has its high watermark
+    /// recovered to its log-end offset. Correct when every partition is a sole
+    /// replica (single-node): all appended records were committed, so a lagging
+    /// on-disk checkpoint (written periodically) must not hide them.
+    void setRecoverHighWatermarkToLogEnd(bool enabled) { recover_hw_to_log_end_ = enabled; }
+
+    /// @brief Writes every dirty high-watermark checkpoint now.
+    void flushCheckpoints();
+
     // Non-copyable/movable
     LogManager(const LogManager&) = delete;
     LogManager& operator=(const LogManager&) = delete;
@@ -112,6 +126,8 @@ public:
 private:
     std::string getLogDir(const std::string& topic, PartitionId partition) const;
     void cleanupThread();
+    void checkpointThread();
+    Log* registerLogLocked(const TopicPartition& tp, std::unique_ptr<Log> log);
 
     std::string base_log_dir_;
     LogConfig default_config_;
@@ -126,6 +142,9 @@ private:
     std::mutex cleanup_mutex_;
     std::condition_variable cleanup_cv_;
     std::thread cleanup_thread_;
+    int64_t checkpoint_interval_ms_ = 5000;
+    std::thread checkpoint_thread_;
+    bool recover_hw_to_log_end_ = false;
 
     // Phase EX-1 metrics.
     std::atomic<bool> cleanup_running_{false};

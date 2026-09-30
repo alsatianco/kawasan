@@ -447,6 +447,11 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
     {
         const int64_t cleanup_ms = config_.get<int64_t>("log.cleaner.interval.ms", 300000);
         log_manager_->setCleanupIntervalMs(cleanup_ms);
+        log_manager_->setCheckpointIntervalMs(std::max<int64_t>(
+            1, config_.get<int64_t>("replica.high.watermark.checkpoint.interval.ms", 5000)));
+        // Single-node: every partition is its own sole replica, so HW == LEO by
+        // definition; don't let a lagging periodic checkpoint hide records.
+        log_manager_->setRecoverHighWatermarkToLogEnd(cluster_size_ == 1);
     }
     {
         const auto threads = config_.get<int32_t>("fetch.purgatory.threads", 2);

@@ -182,7 +182,13 @@ Offset Log::append(const std::vector<Record>& records, bool force_sync) {
 
     // Update high watermark (simplified - in reality this is managed by replication)
     high_watermark_ = segment->nextOffset();
-    persistCheckpointLocked();
+    // Durability-critical writers get a synchronous checkpoint; everyone else
+    // is flushed periodically by LogManager (see flushCheckpoint()).
+    if (force_sync) {
+        persistCheckpointLocked();
+    } else {
+        checkpoint_dirty_ = true;
+    }
     notifyChangeLocked();
 
     return offset;
@@ -209,7 +215,7 @@ Offset Log::appendBatch(RecordBatch batch, bool advance_high_watermark) {
     if (advance_high_watermark) {
         high_watermark_ = segment->nextOffset();
     }
-    persistCheckpointLocked();
+    checkpoint_dirty_ = true;
     notifyChangeLocked();
     return offset;
 }
@@ -245,7 +251,7 @@ Log::ReplicaAppendResult Log::appendReplicatedBatch(const RecordBatch& batch) {
     // so the segment keys the record at the leader's offset and it is preserved.
     // Do NOT advance the high watermark — a follower's HW is leader-driven.
     segment->append(batch, config_.flush_mode == FlushMode::kSync);
-    persistCheckpointLocked();
+    checkpoint_dirty_ = true;
     notifyChangeLocked();
     return ReplicaAppendResult::kAppended;
 }
@@ -329,6 +335,15 @@ void Log::flush() {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& segment : segments_) {
         segment->flush();
+    }    if (checkpoint_dirty_ && !closed_) {
+        persistCheckpointLocked();
+    }
+}
+
+void Log::flushCheckpoint() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (checkpoint_dirty_ && !closed_) {
+        persistCheckpointLocked();
     }
 }
 
@@ -750,6 +765,7 @@ void Log::loadCheckpoint() {
 }
 
 void Log::persistCheckpointLocked() const {
+    checkpoint_dirty_ = false;
     const Offset start = startOffsetUnlocked();
     const Offset end = endOffsetUnlocked();
     const std::string path = checkpointPath();
@@ -865,8 +881,8 @@ void Log::setHighWatermark(Offset offset) {
     const Offset clamped = std::clamp(offset, startOffsetUnlocked(), endOffsetUnlocked());
     const bool changed = clamped != high_watermark_;
     high_watermark_ = clamped;
-    persistCheckpointLocked();
     if (changed) {
+        checkpoint_dirty_ = true;
         notifyChangeLocked();
     }
 }

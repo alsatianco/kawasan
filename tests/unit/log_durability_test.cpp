@@ -16,6 +16,7 @@
 
 #include "kawasan/common/logger.h"
 #include "kawasan/storage/log.h"
+#include "kawasan/storage/log_manager.h"
 #include "kawasan/storage/record_batch.h"
 
 namespace kawasan::storage {
@@ -59,6 +60,22 @@ protected:
     }
     std::string dir_;
 };
+
+int64_t checkpointHw(const std::filesystem::path& file) {
+    std::ifstream in(file);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.rfind("high_watermark=", 0) == 0) {
+            return std::stoll(line.substr(15));
+        }
+    }
+    return -1;
+}
+
+void writeStaleCheckpoint(const std::filesystem::path& file, int64_t end) {
+    std::ofstream(file, std::ios::trunc)
+        << "log_start_offset=0\nlog_end_offset=" << end << "\nhigh_watermark=0\n";
+}
 
 size_t countRecords(Log& log) {
     size_t n = 0;
@@ -116,6 +133,73 @@ TEST_F(LogDurabilityTest, CheckpointSurvivesStaleTempFile) {
     EXPECT_EQ(2, reopened.logEndOffset());
     EXPECT_EQ(2, reopened.highWatermark());
     EXPECT_EQ(2u, countRecords(reopened));
+}
+
+// The HW checkpoint is written lazily (periodic, like Kafka's
+// replica.high.watermark.checkpoint.interval.ms) instead of fsync'd on every
+// append; flushCheckpoint() persists only what changed.
+TEST_F(LogDurabilityTest, CheckpointIsWrittenLazilyAndFlushedOnDemand) {
+    Log log("durable-topic", 0, dir_);
+    const auto checkpoint = std::filesystem::path(dir_) / "checkpoint.meta";
+    const int64_t initial = checkpointHw(checkpoint);
+    log.appendBatch(makeBatch("a"));
+    log.appendBatch(makeBatch("b"));
+    EXPECT_EQ(initial, checkpointHw(checkpoint));  // not rewritten per append
+
+    log.flushCheckpoint();
+    EXPECT_EQ(2, checkpointHw(checkpoint));
+}
+
+// Durability-critical internal writes (force_sync) keep a synchronous checkpoint.
+TEST_F(LogDurabilityTest, ForceSyncAppendPersistsCheckpointImmediately) {
+    Log log("durable-topic", 0, dir_);
+    Record record;
+    record.timestamp = 0;
+    record.value = std::vector<uint8_t>{'x'};
+    log.append({record}, /*force_sync=*/true);
+    EXPECT_EQ(1, checkpointHw(std::filesystem::path(dir_) / "checkpoint.meta"));
+}
+
+// After a crash the checkpoint may lag the log. Single-node brokers recover HW
+// to the log end (every record was committed by the sole replica); otherwise
+// the stored HW is kept (clamped) and replication re-advances it.
+TEST_F(LogDurabilityTest, StaleCheckpointHighWatermarkRecoveryModes) {
+    {
+        LogManager manager(dir_);
+        auto* log = manager.getOrCreateLog("t", 0);
+        log->appendBatch(makeBatch("a"));
+        log->appendBatch(makeBatch("b"));
+        log->appendBatch(makeBatch("c"));
+    }
+    const auto checkpoint = std::filesystem::path(dir_) / "t-0" / "checkpoint.meta";
+
+    writeStaleCheckpoint(checkpoint, 3);
+    {
+        LogManager replicated(dir_);
+        EXPECT_EQ(0, replicated.getOrCreateLog("t", 0)->highWatermark());
+    }
+
+    writeStaleCheckpoint(checkpoint, 3);
+    {
+        LogManager single_node(dir_);
+        single_node.setRecoverHighWatermarkToLogEnd(true);
+        auto* log = single_node.getOrCreateLog("t", 0);
+        EXPECT_EQ(3, log->logEndOffset());
+        EXPECT_EQ(3, log->highWatermark());
+    }
+}
+
+// LogManager::stop() flushes dirty checkpoints (a clean shutdown never leaves a
+// stale HW behind even if the periodic flusher hasn't run yet).
+TEST_F(LogDurabilityTest, LogManagerStopFlushesDirtyCheckpoints) {
+    LogManager manager(dir_);
+    manager.setCheckpointIntervalMs(3600 * 1000);
+    manager.start();
+    auto* log = manager.getOrCreateLog("t", 0);
+    log->appendBatch(makeBatch("a"));
+    log->appendBatch(makeBatch("b"));
+    manager.stop();
+    EXPECT_EQ(2, checkpointHw(std::filesystem::path(dir_) / "t-0" / "checkpoint.meta"));
 }
 
 }  // namespace kawasan::storage

@@ -133,8 +133,16 @@ public:
     /// @brief Sets the high watermark
     void setHighWatermark(Offset offset);
 
-    /// @brief Flushes all segments to disk
+    /// @brief Flushes all segments to disk (and a dirty HW checkpoint)
     void flush();
+
+    /// @brief Writes the high-watermark checkpoint if it changed since the last
+    /// write. Appends/HW updates only mark it dirty (Kafka checkpoints HW
+    /// periodically too); LogManager calls this every
+    /// `replica.high.watermark.checkpoint.interval.ms` and close() always
+    /// persists. Only the HW is recovered from the checkpoint — log start/end
+    /// are rebuilt from the segments.
+    void flushCheckpoint();
 
     /// @brief Closes the log
     void close();
@@ -213,6 +221,7 @@ private:
     std::chrono::steady_clock::time_point last_roll_time_;
     bool last_roll_time_initialized_ = false;
     bool closed_ = false;
+    mutable bool checkpoint_dirty_ = false;
     ChangeListener change_listener_;
 };
 

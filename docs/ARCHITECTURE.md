@@ -98,7 +98,7 @@ Log-structured, append-only storage backed by RocksDB.
 | Class | Responsibility |
 |-------|----------------|
 | `LogManager` (`log_manager.h`) | Owns every per-topic-partition `Log`. Resolves/creates log directories, holds per-topic `LogConfig` overrides, runs the background cleanup thread, and exposes `flushAll` / `cleanupAll`. |
-| `Log` (`log.h`) | One topic-partition. Holds an ordered list of `LogSegment`s, tracks the high watermark (checkpointed atomically to `checkpoint.meta`), appends record batches (`appendBatch`, plus the offset-preserving `appendReplicatedBatch` used by follower replication), truncates its tail (`truncateSuffix`), serves reads, rolls new segments, and applies retention/compaction. |
+| `Log` (`log.h`) | One topic-partition. Holds an ordered list of `LogSegment`s, tracks the high watermark (checkpointed atomically to `checkpoint.meta`, periodically rather than per append; single-node recovers HW = log end on open), appends record batches (`appendBatch`, plus the offset-preserving `appendReplicatedBatch` used by follower replication), truncates its tail (`truncateSuffix`), serves reads, rolls new segments, and applies retention/compaction. |
 | `LogSegment` (`log_segment.h`) | A single segment, named by its base offset and backed by its own RocksDB instance (`std::unique_ptr<rocksdb::DB>`). Stores encoded record batches, serves both decoded `RecordBatch` reads and raw byte reads, and supports tail truncation (`truncateTo`). |
 | `RecordBatch` (`record_batch.h`) | The Kafka record-batch unit of storage and transfer. |
 | `lz4_decoder.h` | Decodes LZ4-compressed batches; other codecs (gzip, snappy, zstd) are handled via the linked compression libraries. |
@@ -187,6 +187,7 @@ The broker is event-driven on top of one Boost.Asio `io_context`. The number of 
 | Network IO threads | `TcpServer` / `io_context` | Accept connections, read request frames, run the dispatcher handler **inline**, and write responses. There is no separate request-handler thread pool — a handler runs to completion on the IO thread that read its frame. |
 | Fetch purgatory workers | `DelayedOperationPurgatory` | `fetch.purgatory.threads` (default 2) workers that hold long-poll Fetches (see below) and complete them when a watched partition changes or `max_wait_ms` expires. |
 | IO context thread | `KawasanBroker` | Drives `io_context_.run()` for the Raft transport; kept alive by a work guard so it does not exit when idle. |
+| HW checkpoint thread | `LogManager` | Writes dirty high-watermark checkpoints every `replica.high.watermark.checkpoint.interval.ms` (default 5 s); final flush on `stop()`. |
 | Log cleanup thread | `LogManager` | Periodic retention/compaction sweep across all logs (interval from `cleanup_interval_ms_`, default 5 minutes). |
 | Group cleanup thread | `GroupCoordinator` | Expires empty groups and times out stale members (`startCleanupThread`). |
 | Replica fetcher thread | `ReplicaManager` | Multi-broker only (started only when `raft.peers` is non-empty — never created single-node): each cycle reconciles replica assignments from Raft metadata, fetches from partition leaders for followed partitions, and runs the leader-side ISR maintenance pass. |
