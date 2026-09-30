@@ -1,5 +1,7 @@
 #include "kawasan/broker/transaction_state_manager.h"
 
+#include "kawasan/broker/coordinator_routing.h"
+
 #include <algorithm>
 #include <stdexcept>
 #include <unordered_map>
@@ -115,13 +117,7 @@ TransactionCoordinator::TxnSnapshot TransactionStateManager::deserialize(
 }
 
 int TransactionStateManager::partitionFor(const std::string& transactional_id, int num_partitions) {
-    const int parts = std::max(1, num_partitions);
-    // Java String.hashCode: h = 31*h + c, over unsigned bytes.
-    int32_t h = 0;
-    for (unsigned char c : transactional_id) {
-        h = 31 * h + static_cast<int32_t>(c);
-    }
-    return static_cast<int>(static_cast<uint32_t>(h) % static_cast<uint32_t>(parts));
+    return coordinatorPartitionFor(transactional_id, num_partitions);
 }
 
 void TransactionStateManager::persist(const TransactionCoordinator::TxnSnapshot& snapshot) {

@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "kawasan/broker/acl_store.h"
+#include "kawasan/broker/coordinator_routing.h"
 #include "kawasan/broker/fetch_session_manager.h"
 #include "kawasan/broker/isolation_tracker.h"
 #include "kawasan/broker/peer_client.h"
@@ -3462,21 +3463,13 @@ Buffer KawasanBroker::handleOffsetCommit(RequestDispatcher::RequestContext& cont
     // Phase 3.1: also append a record to the __consumer_offsets topic so
     // `kcat -t __consumer_offsets -C` and similar tooling see the commit
     // stream. **Hash-route** the partition by group_id using the same
-    // algorithm Kafka uses internally (Java's `String.hashCode()` mod 50).
+    // Java `String.hashCode()` routing as FindCoordinator (coordinatorPartitionFor).
     // That matches what `kafka-consumer-groups.sh --describe` expects, so
     // a Kawasan deployment is observably identical to Kafka for offset
     // browsing.
     if (overall_error == ErrorCode::NONE && log_manager_ != nullptr) {
-        // Java String.hashCode():  for each char c, h = 31*h + c. We treat
-        // the group_id as Latin-1 / ASCII bytes (matching kafka-clients).
-        int32_t h = 0;
-        for (unsigned char c : request.groupId()) {
-            h = 31 * h + static_cast<int32_t>(c);
-        }
-        const uint32_t offsets_partitions =
-            static_cast<uint32_t>(std::max(1, offsets_topic_num_partitions_));
         const int32_t target_partition =
-            static_cast<int32_t>(static_cast<uint32_t>(h) % offsets_partitions);
+            coordinatorPartitionFor(request.groupId(), offsets_topic_num_partitions_);
         auto* offsets_log = log_manager_->getLog("__consumer_offsets", target_partition);
         if (offsets_log != nullptr) {
             std::vector<Record> commit_records;
@@ -5249,14 +5242,9 @@ Buffer KawasanBroker::handleAddOffsetsToTxn(RequestDispatcher::RequestContext& c
                                                            req.producerEpoch(),
                                                            /*timeout=*/60000);
         }
-        // Route the group to its __consumer_offsets partition (same hash as
-        // offset-commit routing: Java String.hashCode of group_id, mod count).
-        int32_t h = 0;
-        for (unsigned char c : req.groupId()) {
-            h = 31 * h + static_cast<int32_t>(c);
-        }
-        const uint32_t parts = static_cast<uint32_t>(std::max(1, offsets_topic_num_partitions_));
-        const int32_t target = static_cast<int32_t>(static_cast<uint32_t>(h) % parts);
+        // Route the group to its __consumer_offsets partition (same routing
+        // as offset-commit mirroring and FindCoordinator).
+        const int32_t target = coordinatorPartitionFor(req.groupId(), offsets_topic_num_partitions_);
         // first_offset = -1: the __consumer_offsets partition gets a control
         // marker at EndTxn but is not an LSO hold for data consumers.
         transaction_coordinator_->addPartitions(req.transactionalId(),
