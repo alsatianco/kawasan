@@ -489,7 +489,10 @@ void RaftNode::electionThread() {
         // re-evaluated each iteration so an updated heartbeat correctly
         // extends the wait.
         auto wait_for = election_timeout_;
-        {
+        // A leader receives no heartbeats, so last_heartbeat_ goes stale and
+        // the elapsed-based wait below would be 0 forever — a busy spin that
+        // pinned a full core on every idle single-node broker.
+        if (state_ != NodeState::LEADER) {
             const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - last_heartbeat_);
             if (elapsed < election_timeout_) {
