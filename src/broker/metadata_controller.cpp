@@ -52,6 +52,21 @@ TopicOperationResult MetadataController::createTopic(const TopicSpecification& s
     MetadataCommand command;
     command.type = MetadataCommandType::CREATE_TOPIC;
     command.topic_spec = spec;
+    // M8-A2: in a cluster the controller decides the assignment and ships it in
+    // the replicated command, so every broker applies identical leadership even
+    // if their broker lists ever differ. Single-node commands stay unchanged.
+    auto& stamped = command.topic_spec;
+    const auto known = store_.brokers();
+    if (stamped.assignments.empty() && known.size() > 1 && stamped.replication_factor > 0 &&
+        stamped.replication_factor <= static_cast<int16_t>(known.size())) {
+        std::vector<BrokerId> ids;
+        ids.reserve(known.size());
+        for (const auto& broker : known) {
+            ids.push_back(broker.id);
+        }
+        stamped.assignments = roundRobinAssignments(std::move(ids), 0, stamped.num_partitions,
+                                                    stamped.replication_factor);
+    }
     return replicateAndAwait(command);
 }
 

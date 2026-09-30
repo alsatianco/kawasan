@@ -3749,6 +3749,12 @@ std::pair<std::optional<TopicMetadata>, ErrorCode> KawasanBroker::getTopicMetada
     if (!allow_auto_create || lookup_error != ErrorCode::UNKNOWN_TOPIC_OR_PARTITION) {
         return {std::nullopt, lookup_error};
     }
+    // M8-A2: internal topics are created only by ensureInternalTopics (with
+    // their configured partition count, which is the coordinator-routing
+    // modulus). A client racing startup gets a retriable error instead.
+    if (topic_name == "__consumer_offsets" || topic_name == "__transaction_state") {
+        return {std::nullopt, ErrorCode::LEADER_NOT_AVAILABLE};
+    }
 
     TopicSpecification spec;
     spec.name = topic_name;

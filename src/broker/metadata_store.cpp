@@ -18,6 +18,30 @@ namespace fs = std::filesystem;
 
 namespace kawasan::broker {
 
+std::vector<std::vector<BrokerId>> roundRobinAssignments(std::vector<BrokerId> broker_ids,
+                                                         int32_t first_partition, int32_t count,
+                                                         int16_t replication_factor) {
+    std::vector<std::vector<BrokerId>> result;
+    if (broker_ids.empty() || count <= 0) {
+        return result;
+    }
+    std::sort(broker_ids.begin(), broker_ids.end());
+    const size_t n = broker_ids.size();
+    const size_t rf =
+        std::clamp<size_t>(static_cast<size_t>(std::max<int16_t>(1, replication_factor)), 1, n);
+    result.reserve(static_cast<size_t>(count));
+    for (int32_t partition = first_partition; partition < first_partition + count; ++partition) {
+        const size_t start = static_cast<size_t>(partition) % n;
+        std::vector<BrokerId> replicas;
+        replicas.reserve(rf);
+        for (size_t i = 0; i < rf; ++i) {
+            replicas.push_back(broker_ids[(start + i) % n]);
+        }
+        result.push_back(std::move(replicas));
+    }
+    return result;
+}
+
 namespace {
 
 constexpr const char* kMetadataFileName = "topics.json";
@@ -78,11 +102,8 @@ TopicMetadata buildTopicMetadata(const TopicSpecification& spec,
         return metadata;
     }
 
-    // Auto-assign replicas using round-robin
-    const int16_t replication_factor = spec.replication_factor;
-
-    // If only one broker or replication factor is 1, assign all to local broker
-    if (brokers.size() == 1 || replication_factor == 1) {
+    // Single broker: everything is local (single-node stays byte-identical).
+    if (brokers.size() <= 1) {
         for (int32_t partition = 0; partition < spec.num_partitions; ++partition) {
             PartitionMetadata pm;
             pm.error_code = ErrorCode::NONE;
@@ -97,34 +118,22 @@ TopicMetadata buildTopicMetadata(const TopicSpecification& spec,
         return metadata;
     }
 
-    // Multi-broker round-robin assignment
+    // Multi-broker: deterministic round-robin (M8-A2), including RF=1 — the
+    // result must not depend on which broker applies the command.
     std::vector<BrokerId> broker_ids;
     broker_ids.reserve(brokers.size());
     for (const auto& broker : brokers) {
         broker_ids.push_back(broker.id);
     }
-
-    // Sort broker IDs for deterministic assignment
-    std::sort(broker_ids.begin(), broker_ids.end());
-
+    const auto assignments = roundRobinAssignments(std::move(broker_ids), 0, spec.num_partitions,
+                                                   spec.replication_factor);
     for (int32_t partition = 0; partition < spec.num_partitions; ++partition) {
         PartitionMetadata pm;
         pm.error_code = ErrorCode::NONE;
         pm.partition = partition;
-
-        // Round-robin assignment: start at partition % num_brokers
-        size_t start_index = partition % broker_ids.size();
-
-        // Assign replicas
-        pm.replicas.clear();
-        for (int16_t i = 0; i < replication_factor && i < static_cast<int16_t>(broker_ids.size());
-             ++i) {
-            size_t broker_index = (start_index + i) % broker_ids.size();
-            pm.replicas.push_back(broker_ids[broker_index]);
-        }
-
+        pm.replicas = assignments[static_cast<size_t>(partition)];
         // First replica is the leader
-        pm.leader = pm.replicas.empty() ? local_broker_id : pm.replicas[0];
+        pm.leader = pm.replicas.front();
         pm.leader_epoch = 0;
         // Initially, all replicas are in-sync
         pm.isr = pm.replicas;
@@ -325,21 +334,22 @@ TopicOperationResult MetadataStore::applyIncreasePartitions(const std::string& t
         metadata.partitions.empty()
             ? static_cast<int16_t>(1)
             : static_cast<int16_t>(metadata.partitions.front().replicas.size());
+    // Deterministic across brokers (M8-A2); single broker stays local.
+    const auto assignments =
+        broker_ids.size() <= 1
+            ? std::vector<std::vector<BrokerId>>{}
+            : roundRobinAssignments(broker_ids, current_count, new_total_count - current_count,
+                                    replication_factor);
 
     for (int32_t partition = current_count; partition < new_total_count; ++partition) {
         PartitionMetadata pm;
         pm.error_code = ErrorCode::NONE;
         pm.partition = partition;
         pm.leader_epoch = 0;
-        if (broker_ids.size() <= 1 || replication_factor <= 1) {
+        if (assignments.empty()) {
             pm.replicas = {local_broker_id_};
         } else {
-            const size_t start_index = static_cast<size_t>(partition) % broker_ids.size();
-            for (int16_t i = 0;
-                 i < replication_factor && i < static_cast<int16_t>(broker_ids.size()); ++i) {
-                const size_t broker_index = (start_index + i) % broker_ids.size();
-                pm.replicas.push_back(broker_ids[broker_index]);
-            }
+            pm.replicas = assignments[static_cast<size_t>(partition - current_count)];
         }
         pm.leader = pm.replicas.empty() ? local_broker_id_ : pm.replicas[0];
         pm.isr = pm.replicas;

@@ -302,6 +302,8 @@ The metadata command set (`MetadataCommandType`, `include/kawasan/broker/metadat
 | `INCREASE_PARTITIONS` | Applies a `CreatePartitions` count increase. |
 | `UPDATE_LEADER` | Sets the partition leader (assigned replicas only) and bumps `leader_epoch` — the primitive behind `ElectLeaders`. |
 
+Replica assignment is deterministic. Partition *p* of a topic takes RF consecutive brokers starting at index *p* mod N over the sorted broker ids (`roundRobinAssignments`, `metadata_store.h`), and the first replica is the leader. In a cluster, the controller writes this assignment into the `CREATE_TOPIC` command. `INCREASE_PARTITIONS` recomputes the same function from each broker's broker list, which is seeded identically from `raft.peers`. So every broker applies the same leadership, including for RF=1 topics and the internal `__consumer_offsets` / `__transaction_state` topics. Clients can't auto-create those two internal topics; only the controller's bootstrap creates them, with their configured partition counts.
+
 A `RaftNode` is always in one of three states — `FOLLOWER`, `CANDIDATE`, or `LEADER`:
 
 ```

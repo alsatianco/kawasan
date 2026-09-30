@@ -10,6 +10,7 @@
 #include <chrono>
 #include <filesystem>
 #include <set>
+#include <vector>
 
 #include "kawasan/broker/metadata_store.h"
 
@@ -101,20 +102,69 @@ TEST(ReplicaAssignmentTest, Rf2UsesTwoDistinctBrokers) {
     fs::remove_all(dir);
 }
 
-TEST(ReplicaAssignmentTest, Rf1KeepsEverythingLocal) {
-    const auto dir = makeDir();
-    auto store = storeWithBrokers(dir, 3);
-
-    auto result = store->applyCreate(topicSpec("t1", /*partitions=*/3, /*rf=*/1));
-    ASSERT_EQ(result.error_code, kawasan::ErrorCode::NONE);
-
-    auto md = store->describeTopics({"t1"});
-    for (const auto& p : md.front().partitions) {
-        ASSERT_EQ(p.replicas.size(), 1u);
-        EXPECT_EQ(p.replicas.front(), 0);  // local broker
-        EXPECT_EQ(p.leader, 0);
+// M8-A2: the same CREATE_TOPIC command applied on every broker must produce the
+// same leadership. RF=1 used to assign the partition to whichever broker applied
+// it, so each broker believed it led every RF=1 partition (incl. internal topics).
+TEST(ReplicaAssignmentTest, Rf1AssignmentIsIdenticalOnEveryBroker) {
+    std::vector<std::vector<kawasan::BrokerId>> leaders_per_broker;
+    for (kawasan::BrokerId local : {0, 1, 2}) {
+        const auto dir = makeDir();
+        MetadataStore store(dir, "test-cluster", broker(local), /*log_manager=*/nullptr);
+        store.load();
+        for (kawasan::BrokerId id : {0, 1, 2}) {
+            store.registerBroker(broker(id));
+        }
+        ASSERT_EQ(store.applyCreate(topicSpec("t1", /*partitions=*/4, /*rf=*/1)).error_code,
+                  kawasan::ErrorCode::NONE);
+        std::vector<kawasan::BrokerId> leaders;
+        const auto md = store.describeTopics({"t1"});
+        for (const auto& p : md.front().partitions) {
+            ASSERT_EQ(p.replicas.size(), 1u);
+            EXPECT_EQ(p.leader, p.replicas.front());
+            EXPECT_EQ(p.isr, p.replicas);
+            leaders.push_back(p.leader);
+        }
+        leaders_per_broker.push_back(leaders);
+        fs::remove_all(dir);
     }
-    fs::remove_all(dir);
+    // Round-robin over sorted broker ids, identical everywhere.
+    const std::vector<kawasan::BrokerId> expected{0, 1, 2, 0};
+    for (const auto& leaders : leaders_per_broker) {
+        EXPECT_EQ(leaders, expected);
+    }
+}
+
+TEST(ReplicaAssignmentTest, IncreasePartitionsRf1IsIdenticalOnEveryBroker) {
+    for (kawasan::BrokerId local : {0, 2}) {
+        const auto dir = makeDir();
+        MetadataStore store(dir, "test-cluster", broker(local), /*log_manager=*/nullptr);
+        store.load();
+        for (kawasan::BrokerId id : {0, 1, 2}) {
+            store.registerBroker(broker(id));
+        }
+        ASSERT_EQ(store.applyCreate(topicSpec("grow", /*partitions=*/1, /*rf=*/1)).error_code,
+                  kawasan::ErrorCode::NONE);
+        ASSERT_EQ(store.applyIncreasePartitions("grow", 3).error_code, kawasan::ErrorCode::NONE);
+        std::vector<kawasan::BrokerId> leaders;
+        const auto md = store.describeTopics({"grow"});
+        for (const auto& p : md.front().partitions) {
+            leaders.push_back(p.leader);
+        }
+        EXPECT_EQ(leaders, (std::vector<kawasan::BrokerId>{0, 1, 2})) << "local=" << local;
+        fs::remove_all(dir);
+    }
+}
+
+TEST(ReplicaAssignmentTest, RoundRobinAssignmentsPureFunction) {
+    // Unsorted input is sorted; start rotates with the partition index.
+    auto a = roundRobinAssignments({2, 0, 1}, /*first_partition=*/0, /*count=*/4, /*rf=*/2);
+    EXPECT_EQ(a, (std::vector<std::vector<kawasan::BrokerId>>{{0, 1}, {1, 2}, {2, 0}, {0, 1}}));
+    auto b = roundRobinAssignments({5, 7}, /*first_partition=*/3, /*count=*/2, /*rf=*/1);
+    EXPECT_EQ(b, (std::vector<std::vector<kawasan::BrokerId>>{{7}, {5}}));
+    // RF is clamped to [1, broker count].
+    auto c = roundRobinAssignments({0, 1}, 0, 1, /*rf=*/5);
+    EXPECT_EQ(c, (std::vector<std::vector<kawasan::BrokerId>>{{0, 1}}));
+    EXPECT_TRUE(roundRobinAssignments({}, 0, 2, 1).empty());
 }
 
 TEST(ReplicaAssignmentTest, RfExceedingBrokerCountIsRejected) {

@@ -10,6 +10,15 @@
 
 namespace kawasan::broker {
 
+/// @brief M8-A2: deterministic replica assignment for partitions
+/// [first_partition, first_partition + count). Broker ids are sorted; partition
+/// p's replicas start at index p % N and take the next RF brokers (RF clamped to
+/// [1, N]); the first replica is the preferred leader. Depends only on its
+/// inputs, so every broker computes the same assignment. Empty if no brokers.
+std::vector<std::vector<BrokerId>> roundRobinAssignments(std::vector<BrokerId> broker_ids,
+                                                         int32_t first_partition, int32_t count,
+                                                         int16_t replication_factor);
+
 /// @brief Owns the authoritative metadata cache and on-disk persistence.
 class MetadataStore {
 public:
