@@ -97,6 +97,7 @@ public:
     /// @brief Updates the ISR for a partition
     /// @param tp The topic-partition
     /// @param isr Vector of broker IDs that should be in the ISR
+    /// On a partition this broker leads, a shrink may advance the high watermark.
     void updateISR(const TopicPartition& tp, const std::vector<BrokerId>& isr);
 
     /// @brief Gets the log for a partition
@@ -156,7 +157,10 @@ public:
     /// `leader != local id` the partition is a FOLLOWER and the fetcher thread
     /// will replicate it from the leader. For a single-node RF=1 partition this
     /// registers leader=self / ISR={self}, identical to the lazy path.
-    void reconcileReplica(const TopicPartition& tp, std::shared_ptr<storage::Log> log,
+    /// Returns true if the partition is new or its leader/ISR/epoch changed (the
+    /// caller wakes requests parked on it). A changed ISR on a partition this
+    /// broker leads may advance the high watermark.
+    bool reconcileReplica(const TopicPartition& tp, std::shared_ptr<storage::Log> log,
                           BrokerId leader, const std::vector<BrokerId>& isr, int32_t leader_epoch);
 
     /// @brief M6: compute a proposed ISR for a partition THIS broker leads, from
@@ -209,6 +213,8 @@ private:
     /// they report progress, matching Kafka's "HW only advances past offsets all
     /// in-sync replicas have" rule.
     Offset computeHighWatermarkLocked(const ReplicaInfo& info) const;
+    /// Raises the log's HW to computeHighWatermarkLocked (never lowers it).
+    Offset maybeAdvanceHighWatermarkLocked(ReplicaInfo& info);
 
     /// @brief Background thread for follower fetching
     void fetcherThreadLoop();

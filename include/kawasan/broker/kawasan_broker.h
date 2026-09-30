@@ -357,6 +357,9 @@ private:
     // changes (see LogManager::setChangeListener). Shared so the log listener
     // can hold it safely for the logs' whole lifetime.
     std::shared_ptr<DelayedOperationPurgatory> delayed_fetch_purgatory_;
+    // P4: parks acks=all produces waiting for the ISR off the IO threads; woken
+    // by high-watermark changes and by leader/ISR reconciliation.
+    std::shared_ptr<DelayedOperationPurgatory> delayed_produce_purgatory_;
     // Phase EX-10: read_committed isolation tracker. Holds per-partition
     // in-flight transactional state so Fetch can report LSO + aborted
     // transactions correctly, and so read_committed consumers filter

@@ -457,10 +457,13 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
         const auto threads = config_.get<int32_t>("fetch.purgatory.threads", 2);
         delayed_fetch_purgatory_ =
             std::make_shared<DelayedOperationPurgatory>(static_cast<size_t>(std::max(1, threads)));
+        // Completing a produce is cheap (an HW comparison + response encode).
+        delayed_produce_purgatory_ = std::make_shared<DelayedOperationPurgatory>(1);
         log_manager_->setChangeListener(
-            [purgatory = delayed_fetch_purgatory_](const std::string& topic,
-                                                   PartitionId partition) {
-                purgatory->notify(topic, partition);
+            [fetches = delayed_fetch_purgatory_, produces = delayed_produce_purgatory_](
+                const std::string& topic, PartitionId partition) {
+                fetches->notify(topic, partition);
+                produces->notify(topic, partition);
             });
     }
     replica_manager_ = std::make_unique<ReplicaManager>();
@@ -1556,6 +1559,9 @@ void KawasanBroker::stopServices() {
     if (delayed_fetch_purgatory_) {
         delayed_fetch_purgatory_->stop();
     }
+    if (delayed_produce_purgatory_) {
+        delayed_produce_purgatory_->stop();
+    }
 
     if (tcp_server_) {
         tcp_server_->stop();
@@ -2150,7 +2156,6 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
         return invalid_acks;
     }
 
-    protocol::ProduceResponse response;
     // Client quota: record the produced bytes and surface any throttle delay so
     // an over-quota producer backs off. No-op (0) when producer quota disabled.
     int32_t produce_throttle_ms = 0;
@@ -2158,7 +2163,17 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
         produce_throttle_ms = quota_manager_->recordAndThrottleMs(
             QuotaManager::Type::kProducer, context.header.clientId(), context.frame_size_bytes);
     }
-    response.setThrottleTimeMs(produce_throttle_ms);
+
+    // P4: acks=all batches on a replicated (ISR>1) partition that are not yet
+    // committed. Resolved below — possibly after this handler returns.
+    struct PendingAck {
+        size_t topic_index;
+        size_t partition_index;
+        TopicPartition tp;
+        Offset required_offset;  // committed once the ISR has everything before this
+    };
+    std::vector<protocol::ProduceTopicResponse> topic_responses;
+    std::vector<PendingAck> pending_acks;
 
     const auto now_ms = []() -> Timestamp {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2185,7 +2200,7 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                 pr.error_code = ErrorCode::TOPIC_AUTHORIZATION_FAILED;
                 topic_response.partitions.push_back(pr);
             }
-            response.addTopic(topic_response);
+            topic_responses.push_back(std::move(topic_response));
             has_error = true;
             continue;
         }
@@ -2353,31 +2368,13 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                 partition_response.error_code = ErrorCode::NONE;
 
                 // acks=-1 (all): the write is acknowledged only once every in-sync
-                // replica has it — i.e. the HW has advanced past this batch. With
-                // only the leader in the ISR the HW already covers it and this
-                // returns immediately. With followers, wait (bounded by the
-                // producer's timeout) for them to fetch up to this offset; if they
-                // don't, return REQUEST_TIMED_OUT rather than falsely acking.
-                if (acks == -1) {
-                    const auto isr = replica_manager_->getISR(tp);
-                    if (isr.size() > 1) {
-                        const Offset target = log->logEndOffset();
-                        int32_t timeout_ms = request.timeoutMs();
-                        if (timeout_ms <= 0 || timeout_ms > 30000) {
-                            timeout_ms = 30000;
-                        }
-                        const auto deadline = std::chrono::steady_clock::now() +
-                                              std::chrono::milliseconds(timeout_ms);
-                        auto committed = replica_manager_->isrCommittedOffset(tp).value_or(0);
-                        while (committed < target && std::chrono::steady_clock::now() < deadline) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                            committed = replica_manager_->isrCommittedOffset(tp).value_or(0);
-                        }
-                        if (committed < target) {
-                            partition_response.error_code = ErrorCode::REQUEST_TIMED_OUT;
-                            has_error = true;
-                        }
-                    }
+                // replica has it. With only the leader in the ISR the append
+                // already advanced the HW past it; otherwise it is resolved below.
+                if (acks == -1 && isr_size > 1) {
+                    pending_acks.push_back(PendingAck{topic_responses.size(),
+                                                      topic_response.partitions.size(), tp,
+                                                      base_offset +
+                                                          static_cast<Offset>(record_count)});
                 }
             } catch (const StorageException& ex) {
                 Logger::error("Storage error while appending to {}-{}: {}", topic_data.topic,
@@ -2408,29 +2405,119 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
             topic_response.partitions.push_back(partition_response);
         }
 
-        response.addTopic(topic_response);
+        topic_responses.push_back(std::move(topic_response));
     }
 
-    const int16_t version = std::clamp<int16_t>(context.header.apiVersion(), 0, kProduceMaxVersion);
-    RequestDispatcher::HandlerResult result;
-    result.suppress_response = (acks == 0 && !has_error);
-    if (!result.suppress_response) {
-        result.payload =
-            encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
+    // Everything a deferred completion needs lives on the heap: a parked
+    // produce is resolved from the purgatory after this call returns.
+    struct ProduceState {
+        RequestDispatcher::RequestContext context;
+        std::vector<protocol::ProduceTopicResponse> topics;
+        std::vector<PendingAck> pending;
+        bool has_error = false;
+    };
+    auto state = std::make_shared<ProduceState>();
+    state->context.header = context.header;
+    state->context.peer_identity = context.peer_identity;
+    state->context.connection = context.connection;
+    state->topics = std::move(topic_responses);
+    state->pending = std::move(pending_acks);
+    state->has_error = has_error;
+
+    // Kafka DelayedProduce semantics: a pending batch succeeds once the
+    // ISR-committed offset covers it, fails with NOT_LEADER_FOR_PARTITION if
+    // this broker lost leadership, and with REQUEST_TIMED_OUT at expiry rather
+    // than being falsely acked. Returns true once nothing is pending.
+    auto resolve = [this](ProduceState& st, bool expired) -> bool {
+        auto unresolved = std::remove_if(
+            st.pending.begin(), st.pending.end(), [&](const PendingAck& ack) {
+                auto& pr = st.topics[ack.topic_index].partitions[ack.partition_index];
+                if (!replica_manager_->isLeader(ack.tp)) {
+                    pr.error_code = ErrorCode::NOT_LEADER_FOR_PARTITION;
+                } else if (replica_manager_->isrCommittedOffset(ack.tp).value_or(0) >=
+                           ack.required_offset) {
+                    return true;
+                } else if (expired) {
+                    pr.error_code = ErrorCode::REQUEST_TIMED_OUT;
+                } else {
+                    return false;
+                }
+                st.has_error = true;
+                return true;
+            });
+        st.pending.erase(unresolved, st.pending.end());
+        return st.pending.empty();
+    };
+
+    auto finish = [this, state, start_time, acks,
+                   produce_throttle_ms]() -> RequestDispatcher::HandlerResult {
+        protocol::ProduceResponse response;
+        response.setThrottleTimeMs(produce_throttle_ms);
+        for (const auto& topic_response : state->topics) {
+            response.addTopic(topic_response);
+        }
+        const int16_t version =
+            std::clamp<int16_t>(state->context.header.apiVersion(), 0, kProduceMaxVersion);
+        RequestDispatcher::HandlerResult result;
+        result.suppress_response = (acks == 0 && !state->has_error);
+        if (!result.suppress_response) {
+            result.payload = encodeResponse(
+                state->context, [&](Buffer& buffer) { response.encode(buffer, version); });
+        }
+
+        // Record produce latency
+        if (monitoring_manager_ && monitoring_manager_->metricsCollector()) {
+            auto end_time = std::chrono::steady_clock::now();
+            auto duration_ms =
+                std::chrono::duration<double, std::milli>(end_time - start_time).count();
+            monitoring_manager_->metricsCollector()->recordProduceLatency(duration_ms);
+            monitoring_manager_->metricsCollector()->incrementRequestsTotal("Produce");
+            if (state->has_error) {
+                monitoring_manager_->metricsCollector()->incrementRequestErrors("Produce");
+            }
+        }
+        return result;
+    };
+
+    if (resolve(*state, /*expired=*/false)) {
+        return finish();
     }
 
-    // Record produce latency
-    if (monitoring_manager_ && monitoring_manager_->metricsCollector()) {
-        auto end_time = std::chrono::steady_clock::now();
-        auto duration_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-        monitoring_manager_->metricsCollector()->recordProduceLatency(duration_ms);
-        monitoring_manager_->metricsCollector()->incrementRequestsTotal("Produce");
-        if (has_error) {
-            monitoring_manager_->metricsCollector()->incrementRequestErrors("Produce");
+    int32_t timeout_ms = request.timeoutMs();
+    if (timeout_ms <= 0 || timeout_ms > 30000) {
+        timeout_ms = 30000;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+
+    // Park the wait in the purgatory instead of holding this network IO thread:
+    // it is retried whenever a pending partition's HW, leader or ISR changes and
+    // answered at the deadline regardless.
+    if (context.complete && delayed_produce_purgatory_) {
+        std::vector<TopicPartition> keys;
+        keys.reserve(state->pending.size());
+        for (const auto& ack : state->pending) {
+            keys.push_back(ack.tp);
+        }
+        auto complete = context.complete;
+        auto try_complete = [state, resolve, finish, complete](bool expired) -> bool {
+            if (!resolve(*state, expired)) {
+                return false;
+            }
+            complete(finish());
+            return true;
+        };
+        if (delayed_produce_purgatory_->watch(keys, deadline, std::move(try_complete))) {
+            RequestDispatcher::HandlerResult parked;
+            parked.deferred = true;
+            return parked;
         }
     }
 
-    return result;
+    // No deferral seam (direct handler invocation): poll on this thread.
+    while (!resolve(*state, std::chrono::steady_clock::now() >= deadline)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return finish();
 }
 
 Buffer KawasanBroker::buildProduceError(const RequestDispatcher::RequestContext& context,
@@ -3557,8 +3644,12 @@ void KawasanBroker::reconcileReplicas() {
             // leader == broker_id_ => this broker leads (ISR = assigned replicas,
             // so acks=all waits for followers); otherwise it is a follower and the
             // fetcher thread will replicate from pm.leader.
-            replica_manager_->reconcileReplica({tm.name, pm.partition}, log_ptr, pm.leader, pm.isr,
-                                               pm.leader_epoch);
+            const bool changed = replica_manager_->reconcileReplica(
+                {tm.name, pm.partition}, log_ptr, pm.leader, pm.isr, pm.leader_epoch);
+            if (changed && delayed_produce_purgatory_) {
+                // A lost leadership or shrunk ISR resolves parked acks=all produces.
+                delayed_produce_purgatory_->notify(tm.name, pm.partition);
+            }
         }
     }
 }

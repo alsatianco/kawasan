@@ -7,6 +7,7 @@
 
 #include "kawasan/broker/replica_manager.h"
 #include "kawasan/storage/log.h"
+#include "kawasan/storage/record_batch.h"
 
 namespace fs = std::filesystem;
 
@@ -366,6 +367,51 @@ TEST_F(ISRManagementTest, IsrCommittedOffsetFollowerWithNoStateHoldsAtLogStart) 
     // offset at the log start (it is not safe to consider its data replicated).
     replica_manager_->updateISR(tp, {0, 1});
     EXPECT_EQ(replica_manager_->isrCommittedOffset(tp).value_or(-1), 0);
+}
+
+// Appends n records WITHOUT advancing the high watermark (a replicated leader's
+// un-committed tail).
+void appendUncommitted(std::shared_ptr<kawasan::storage::Log>& log, int n) {
+    kawasan::storage::RecordBatch batch;
+    batch.setMagic(2);
+    for (int i = 0; i < n; ++i) {
+        kawasan::Record rec;
+        rec.value = std::vector<uint8_t>{'u', static_cast<uint8_t>(i)};
+        rec.timestamp = 0;
+        batch.addRecord(rec);
+    }
+    log->appendBatch(std::move(batch), /*advance_high_watermark=*/false);
+}
+
+// P4: dropping a lagging follower from the ISR commits what it was holding back,
+// so the leader's HW advances immediately (this wakes parked acks=all produces).
+TEST_F(ISRManagementTest, IsrShrinkAdvancesLeaderHighWatermark) {
+    TopicPartition tp{"test-topic", 0};
+    auto log = createTestLog(tp.topic, tp.partition);
+    replica_manager_->addReplica(tp, log);
+    appendN(log, 10);
+    replica_manager_->updateISR(tp, {0, 1});
+    appendUncommitted(log, 5);
+    ASSERT_EQ(log->logEndOffset(), 15);
+    ASSERT_EQ(log->highWatermark(), 10);
+
+    replica_manager_->updateISR(tp, {0});
+    EXPECT_EQ(log->highWatermark(), 15);
+}
+
+TEST_F(ISRManagementTest, ReconcileReplicaReportsChangesAndAdvancesHwOnShrink) {
+    TopicPartition tp{"test-topic", 0};
+    auto log = createTestLog(tp.topic, tp.partition);
+    EXPECT_TRUE(replica_manager_->reconcileReplica(tp, log, 0, {0, 1}, 1));  // new
+    EXPECT_FALSE(replica_manager_->reconcileReplica(tp, log, 0, {0, 1}, 1));  // unchanged
+
+    appendUncommitted(log, 5);
+    ASSERT_EQ(log->highWatermark(), 0);
+    EXPECT_TRUE(replica_manager_->reconcileReplica(tp, log, 0, {0}, 1));  // ISR shrink
+    EXPECT_EQ(log->highWatermark(), 5);
+
+    EXPECT_TRUE(replica_manager_->reconcileReplica(tp, log, 1, {1}, 2));  // lost leadership
+    EXPECT_FALSE(replica_manager_->isLeader(tp));
 }
 
 }  // namespace kawasan::broker

@@ -11,6 +11,8 @@
 //     the leader's high watermark, after which the consumer sees the record.
 //   - An acks=all produce is rejected with NOT_ENOUGH_REPLICAS when the ISR is
 //     smaller than min.insync.replicas.
+//   - P4: an acks=all produce waiting on the ISR is parked off the IO thread and
+//     completes on follower catch-up / ISR shrink, or times out.
 #include <arpa/inet.h>
 #include <gtest/gtest.h>
 
@@ -19,7 +21,9 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "kawasan/broker/kawasan_broker.h"
@@ -32,7 +36,9 @@
 #include "kawasan/common/types.h"
 #include "kawasan/protocol/create_topics_request.h"
 #include "kawasan/protocol/fetch_request.h"
+#include "kawasan/protocol/produce_request.h"
 #include "kawasan/protocol/request_header.h"
+#include "kawasan/storage/record_batch.h"
 
 namespace asio = boost::asio;
 
@@ -192,6 +198,57 @@ asio::ip::tcp::socket connect(asio::io_context& io, int32_t port) {
     return socket;
 }
 
+// Sends an acks=all Produce (v3) of one record WITHOUT reading the response, so
+// the caller can do other work on other connections while it is outstanding.
+void sendAcksAllProduce(asio::ip::tcp::socket& socket, const std::string& topic,
+                        const std::string& value, int32_t timeout_ms, int32_t corr) {
+    kawasan::storage::RecordBatch batch;
+    batch.setMagic(2);
+    batch.setFirstTimestamp(0);
+    kawasan::Record record;
+    record.timestamp = 0;
+    record.value = std::vector<uint8_t>(value.begin(), value.end());
+    batch.addRecord(record);
+
+    kawasan::Buffer payload;
+    kawasan::protocol::RequestHeader header(kawasan::protocol::ApiKey::PRODUCE, /*api_version=*/3,
+                                            corr, "p4-test");
+    header.encode(payload);
+    kawasan::protocol::ProduceRequest request;
+    request.setAcks(-1);
+    request.setTimeoutMs(timeout_ms);
+    kawasan::protocol::ProducePartitionData pd;
+    pd.partition = 0;
+    pd.record_batch = batch.serialize();
+    kawasan::protocol::ProduceTopicData td;
+    td.topic = topic;
+    td.partitions.push_back(pd);
+    request.addTopic(td);
+    request.encode(payload, 3);
+
+    kawasan::Buffer frame;
+    frame.writeInt32(static_cast<int32_t>(payload.size()));
+    const auto& pb = payload.vector();
+    frame.writeBytes(pb.data(), pb.size());
+    const auto& rb = frame.vector();
+    asio::write(socket, asio::buffer(rb.data(), rb.size()));
+}
+
+kawasan::ErrorCode readProduceError(asio::ip::tcp::socket& socket) {
+    std::array<uint8_t, 4> size_bytes{};
+    asio::read(socket, asio::buffer(size_bytes));
+    uint32_t net = 0;
+    std::memcpy(&net, size_bytes.data(), 4);
+    std::vector<uint8_t> body(ntohl(net));
+    asio::read(socket, asio::buffer(body));
+    kawasan::Buffer buf(body);
+    kawasan::protocol::ResponseHeader rh;
+    rh.decode(buf);
+    kawasan::protocol::ProduceResponse pr;
+    pr.decode(buf, 3);
+    return pr.topics().front().partitions.front().error_code;
+}
+
 }  // namespace
 
 // Consumer sees only committed (below-HW) records; a follower fetch advances the
@@ -285,4 +342,105 @@ TEST(ReplicaFetchTest, AcksAllRejectedBelowMinInsyncReplicas) {
     admin.close();
     broker.stop();
     std::filesystem::remove_all(log_dir);
+}
+
+namespace {
+
+// Single IO thread + a topic whose ISR includes a (simulated) follower that has
+// not fetched yet, so an acks=all produce must wait for replication.
+struct ParkedProduceFixture {
+    std::string log_dir = makeLogDir();
+    kawasan::broker::KawasanBroker broker{makeConfig(log_dir, /*min_insync=*/1)};
+    asio::io_context io;
+    std::unique_ptr<asio::ip::tcp::socket> admin;
+    const std::string topic;
+    const kawasan::TopicPartition tp;
+
+    explicit ParkedProduceFixture(std::string name) : topic(std::move(name)), tp{topic, 0} {
+        ensureLogger();
+        broker.start();
+        admin = std::make_unique<asio::ip::tcp::socket>(connect(io, broker.port()));
+        createTopic(*admin, topic, /*corr=*/1);
+        // The seed produce registers the partition with the replica manager;
+        // then a follower that has not fetched yet joins the ISR.
+        kawasan::client::ProducerConfig pc;
+        pc.bootstrap_servers = "127.0.0.1:" + std::to_string(broker.port());
+        pc.client_id = "p4-seed";
+        pc.acks = 1;
+        kawasan::client::Producer seed(pc);
+        EXPECT_EQ(seed.send(topic, "", "seed").get().offset, 0);
+        broker.replicaManager()->updateISR(tp, {kBrokerId, kFollowerId});
+    }
+    ~ParkedProduceFixture() {
+        admin->close();
+        broker.stop();
+        std::filesystem::remove_all(log_dir);
+    }
+};
+
+}  // namespace
+
+// P4: an acks=all produce waiting on the ISR must NOT hold the (only) network IO
+// thread — a follower fetch on another connection is served meanwhile, advances
+// the high watermark, and that completes the parked produce successfully.
+TEST(ReplicaFetchTest, AcksAllParkedOffIoThreadCompletesWhenFollowerCatchesUp) {
+    ParkedProduceFixture f("p4-follower-catchup");
+
+    auto producer = connect(f.io, f.broker.port());
+    const auto start = std::chrono::steady_clock::now();
+    sendAcksAllProduce(producer, f.topic, "m1", /*timeout_ms=*/5000, /*corr=*/20);
+    // Let the produce reach the broker and append (offset 1) before the follower
+    // reports having both records.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    auto follower = connect(f.io, f.broker.port());
+    auto fr = fetchAs(follower, f.topic, /*replica_id=*/kFollowerId, /*offset=*/2, /*corr=*/21);
+    EXPECT_EQ(fr.error, kawasan::ErrorCode::NONE);
+    EXPECT_EQ(fr.high_watermark, 2);
+
+    EXPECT_EQ(readProduceError(producer), kawasan::ErrorCode::NONE);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(2));
+    follower.close();
+    producer.close();
+}
+
+// P4: with the follower never catching up, the parked produce answers
+// REQUEST_TIMED_OUT at its timeout — and other requests are served meanwhile.
+TEST(ReplicaFetchTest, AcksAllParkedTimesOutWhenFollowerNeverCatchesUp) {
+    ParkedProduceFixture f("p4-timeout");
+
+    auto producer = connect(f.io, f.broker.port());
+    const auto start = std::chrono::steady_clock::now();
+    sendAcksAllProduce(producer, f.topic, "m1", /*timeout_ms=*/1500, /*corr=*/30);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    auto consumer = connect(f.io, f.broker.port());
+    const auto fetch_start = std::chrono::steady_clock::now();
+    auto c = fetchAs(consumer, f.topic, /*replica_id=*/-1, /*offset=*/0, /*corr=*/31);
+    EXPECT_EQ(c.error, kawasan::ErrorCode::NONE);
+    EXPECT_EQ(c.high_watermark, 1);  // m1 is not committed
+    EXPECT_LT(std::chrono::steady_clock::now() - fetch_start, std::chrono::milliseconds(1000));
+
+    EXPECT_EQ(readProduceError(producer), kawasan::ErrorCode::REQUEST_TIMED_OUT);
+    EXPECT_GE(std::chrono::steady_clock::now() - start, std::chrono::milliseconds(1400));
+    consumer.close();
+    producer.close();
+}
+
+// P4: an ISR shrink that drops the lagging follower commits the parked batch
+// immediately (HW advances on the ISR change and wakes the purgatory).
+TEST(ReplicaFetchTest, AcksAllParkedCompletesWhenIsrShrinks) {
+    ParkedProduceFixture f("p4-isr-shrink");
+
+    auto producer = connect(f.io, f.broker.port());
+    const auto start = std::chrono::steady_clock::now();
+    sendAcksAllProduce(producer, f.topic, "m1", /*timeout_ms=*/10000, /*corr=*/40);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    f.broker.replicaManager()->updateISR(f.tp, {kBrokerId});
+
+    EXPECT_EQ(readProduceError(producer), kawasan::ErrorCode::NONE);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(2));
+    EXPECT_EQ(f.broker.replicaManager()->getHighWatermark(f.tp).value_or(-1), 2);
+    producer.close();
 }

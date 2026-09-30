@@ -126,12 +126,17 @@ Offset ReplicaManager::maybeAdvanceHighWatermark(const TopicPartition& tp) {
     if (it == replicas_.end()) {
         return 0;
     }
-    const Offset new_hw = computeHighWatermarkLocked(it->second);
-    const Offset current_hw = it->second.log->highWatermark();
+    return maybeAdvanceHighWatermarkLocked(it->second);
+}
+
+Offset ReplicaManager::maybeAdvanceHighWatermarkLocked(ReplicaInfo& info) {
+    if (!info.log) {
+        return 0;
+    }
+    const Offset new_hw = computeHighWatermarkLocked(info);
+    const Offset current_hw = info.log->highWatermark();
     if (new_hw > current_hw) {
-        it->second.log->setHighWatermark(new_hw);
-        spdlog::trace("Advanced high watermark for {}-{} to {} (from {})", tp.topic, tp.partition,
-                      new_hw, current_hw);
+        info.log->setHighWatermark(new_hw);
         return new_hw;
     }
     return current_hw;  // HW never moves backward
@@ -190,6 +195,10 @@ void ReplicaManager::updateISR(const TopicPartition& tp, const std::vector<Broke
 
     it->second.isr = isr;
     spdlog::debug("Updated ISR for {}-{}, new ISR size={}", tp.topic, tp.partition, isr.size());
+    if (it->second.leader == local_broker_id_) {
+        // An ISR shrink can commit records the dropped replica was holding back.
+        maybeAdvanceHighWatermarkLocked(it->second);
+    }
 }
 
 std::shared_ptr<storage::Log> ReplicaManager::getLog(const TopicPartition& tp) const {
@@ -422,7 +431,7 @@ void ReplicaManager::updateFollowerFetchOffset(const TopicPartition& tp, BrokerI
                   tp.partition, offset);
 }
 
-void ReplicaManager::reconcileReplica(const TopicPartition& tp, std::shared_ptr<storage::Log> log,
+bool ReplicaManager::reconcileReplica(const TopicPartition& tp, std::shared_ptr<storage::Log> log,
                                       BrokerId leader, const std::vector<BrokerId>& isr,
                                       int32_t leader_epoch) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -439,16 +448,23 @@ void ReplicaManager::reconcileReplica(const TopicPartition& tp, std::shared_ptr<
         replicas_[tp] = std::move(info);
         spdlog::debug("Reconciled NEW replica {}-{} leader={} isr={} (follower={})", tp.topic,
                       tp.partition, leader, isr.size(), leader != local_broker_id_);
-        return;
+        return true;
     }
     // Existing: update role/ISR/epoch but preserve fetch progress + follower_states.
     auto& info = it->second;
     if (!info.log && log) {
         info.log = std::move(log);
     }
+    const bool changed =
+        info.leader != leader || info.isr != isr || info.leader_epoch != leader_epoch;
     info.leader = leader;
     info.isr = isr;
     info.leader_epoch = leader_epoch;
+    if (changed && leader == local_broker_id_) {
+        // An ISR shrink can commit records the dropped replica was holding back.
+        maybeAdvanceHighWatermarkLocked(info);
+    }
+    return changed;
 }
 
 std::optional<std::vector<BrokerId>> ReplicaManager::computeIsrUpdate(const TopicPartition& tp,
