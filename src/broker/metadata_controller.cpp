@@ -1,11 +1,17 @@
 #include "kawasan/broker/metadata_controller.h"
 
+#include <chrono>
+
 #include <nlohmann/json.hpp>
 
 #include "kawasan/common/error.h"
 #include "kawasan/common/logger.h"
 
 namespace kawasan::broker {
+
+namespace {
+constexpr std::chrono::seconds REPLICATE_TIMEOUT{30};
+}  // namespace
 
 MetadataController::MetadataController(std::string metadata_dir, std::string cluster_id,
                                        const BrokerMetadata& local_broker,
@@ -18,18 +24,24 @@ MetadataController::~MetadataController() {
 }
 
 void MetadataController::start() {
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        stopped_ = false;
+    }
     store_.load();
     installCommitCallback();
 }
 
 void MetadataController::stop() {
     std::lock_guard<std::mutex> lock(pending_mutex_);
+    stopped_ = true;
     for (auto& [_, promise] : pending_) {
         promise.set_value(
             TopicOperationResult::failure(ErrorCode::BROKER_NOT_AVAILABLE, "Broker shutting down"));
     }
     pending_.clear();
     completed_.clear();
+    abandoned_.clear();
     if (raft_node_ && commit_callback_installed_) {
         raft_node_->setCommitCallback(nullptr);
         commit_callback_installed_ = false;
@@ -114,9 +126,30 @@ TopicOperationResult MetadataController::replicateAndAwait(const MetadataCommand
             promise.set_value(result);
             return future.get();
         }
+        // stop() may have already run while we were waiting for the append;
+        // a promise registered after it would never be fulfilled and would
+        // hang shutdown (the bootstrap thread is joined in KawasanBroker::stop).
+        if (stopped_) {
+            return TopicOperationResult::failure(ErrorCode::BROKER_NOT_AVAILABLE,
+                                                 "Broker shutting down");
+        }
         pending_.emplace(log_index, std::move(promise));
     }
-    return future.get();
+    // Bounded: without a quorum the entry may never commit, and callers run on
+    // request-handling threads.
+    if (future.wait_for(REPLICATE_TIMEOUT) == std::future_status::ready) {
+        return future.get();
+    }
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    auto it = pending_.find(log_index);
+    if (it == pending_.end()) {
+        // Fulfilled between the timeout and taking the lock.
+        return future.get();
+    }
+    pending_.erase(it);
+    abandoned_.insert(log_index);
+    return TopicOperationResult::failure(ErrorCode::REQUEST_TIMED_OUT,
+                                         "Timed out waiting for metadata commit");
 }
 
 TopicOperationResult MetadataController::applyCommand(const MetadataCommand& command) {
@@ -237,6 +270,9 @@ void MetadataController::fulfillPending(int64_t index, TopicOperationResult resu
     if (it != pending_.end()) {
         it->second.set_value(result);
         pending_.erase(it);
+        return;
+    }
+    if (abandoned_.erase(index) > 0) {
         return;
     }
     completed_[index] = std::move(result);

@@ -111,13 +111,28 @@ cmd_logs() {
 
 cmd_down() {
   echo "[harness] stopping cluster"
+  local pids=()
   for i in $(seq 0 $((N - 1))); do
     local pidf="$BASE/broker-$i/broker.pid"
     if [ -f "$pidf" ]; then
-      kill "$(cat "$pidf")" 2>/dev/null && echo "  killed broker $i"
+      local pid
+      pid="$(cat "$pidf")"
+      kill "$pid" 2>/dev/null && echo "  killed broker $i" && pids+=("$pid")
     fi
   done
-  sleep 1
+  # Wait for real exit so a following `up` can rebind the ports.
+  local waited=0
+  for pid in "${pids[@]+"${pids[@]}"}"; do
+    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 300 ]; do
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "  broker pid $pid did not exit within 30s; sending SIGKILL"
+      kill -9 "$pid" 2>/dev/null
+    fi
+  done
+  echo "  brokers exited after ~$((waited / 10)).$((waited % 10))s"
   rm -rf "$BASE"
   echo "[harness] cleaned $BASE"
 }

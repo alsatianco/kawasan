@@ -3,6 +3,7 @@
 #include <future>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "kawasan/broker/metadata_store.h"
@@ -82,6 +83,9 @@ private:
     mutable std::mutex pending_mutex_;
     std::unordered_map<int64_t, std::promise<TopicOperationResult>> pending_;
     std::unordered_map<int64_t, TopicOperationResult> completed_;
+    // Indices whose waiter timed out; their eventual commit is dropped.
+    std::unordered_set<int64_t> abandoned_;
+    bool stopped_ = false;
 };
 
 }  // namespace kawasan::broker
