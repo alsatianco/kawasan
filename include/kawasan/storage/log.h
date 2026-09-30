@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -175,7 +176,20 @@ public:
     /// Returns the new log-end-offset. DESTRUCTIVE — the removed records are gone.
     Offset truncateSuffix(Offset target_offset);
 
+    /// @brief Invoked (under the log lock — must be cheap and must not call back
+    /// into this Log) whenever the readable state may have changed: an append,
+    /// a high-watermark move, or a truncation. Used to wake parked long-poll
+    /// fetches (DelayedFetchPurgatory).
+    using ChangeListener = std::function<void(const std::string& topic, PartitionId partition)>;
+    void setChangeListener(ChangeListener listener);
+
 private:
+    void notifyChangeLocked() const {
+        if (change_listener_) {
+            change_listener_(topic_, partition_);
+        }
+    }
+
     void loadSegments();
     void rollNewSegment();
     LogSegment* activeSegment();
@@ -199,6 +213,7 @@ private:
     std::chrono::steady_clock::time_point last_roll_time_;
     bool last_roll_time_initialized_ = false;
     bool closed_ = false;
+    ChangeListener change_listener_;
 };
 
 }  // namespace kawasan::storage

@@ -19,6 +19,7 @@ add_library(kawasan_broker OBJECT
     transaction_coordinator.cpp
     transaction_state_manager.cpp
     fetch_session_manager.cpp
+    delayed_operation_purgatory.cpp
     isolation_tracker.cpp
     quota_manager.cpp
 )

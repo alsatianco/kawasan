@@ -448,6 +448,16 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
         const int64_t cleanup_ms = config_.get<int64_t>("log.cleaner.interval.ms", 300000);
         log_manager_->setCleanupIntervalMs(cleanup_ms);
     }
+    {
+        const auto threads = config_.get<int32_t>("fetch.purgatory.threads", 2);
+        delayed_fetch_purgatory_ =
+            std::make_shared<DelayedOperationPurgatory>(static_cast<size_t>(std::max(1, threads)));
+        log_manager_->setChangeListener(
+            [purgatory = delayed_fetch_purgatory_](const std::string& topic,
+                                                   PartitionId partition) {
+                purgatory->notify(topic, partition);
+            });
+    }
     replica_manager_ = std::make_unique<ReplicaManager>();
     // M4: give the replica manager this broker's real id BEFORE any partition is
     // registered, so leader/ISR identity and the leader-side follower-offset
@@ -1536,6 +1546,12 @@ void KawasanBroker::stopServices() {
         Logger::info("Monitoring server stopped");
     }
 
+    // Drop parked long-polls before the network layer goes away; their
+    // connections are closed by the TCP server stop below.
+    if (delayed_fetch_purgatory_) {
+        delayed_fetch_purgatory_->stop();
+    }
+
     if (tcp_server_) {
         tcp_server_->stop();
         tcp_server_.reset();
@@ -2435,8 +2451,18 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
     RequestDispatcher::RequestContext& context) {
     const auto start_time = std::chrono::steady_clock::now();
 
-    protocol::FetchRequest request;
-    request.decode(context.payload, context.header.apiVersion());
+    // Everything a (possibly deferred) re-evaluation needs lives on the heap:
+    // a parked fetch is retried from the purgatory after this call returns.
+    struct FetchState {
+        protocol::FetchRequest request;
+        RequestDispatcher::RequestContext context;
+    };
+    auto state = std::make_shared<FetchState>();
+    state->request.decode(context.payload, context.header.apiVersion());
+    state->context.header = context.header;
+    state->context.peer_identity = context.peer_identity;
+    state->context.connection = context.connection;
+    const auto& request = state->request;
 
     const int32_t max_wait_ms = std::max<int32_t>(0, request.maxWaitMs());
     const size_t min_bytes = static_cast<size_t>(std::max<int32_t>(0, request.minBytes()));
@@ -2501,8 +2527,9 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
     };
 
     const auto serialize_batches =
-        [&](const std::vector<storage::RecordBatch>& batches) -> std::vector<uint8_t> {
-        if (context.header.apiVersion() <= 3) {
+        [state, make_legacy_messageset](
+            const std::vector<storage::RecordBatch>& batches) -> std::vector<uint8_t> {
+        if (state->context.header.apiVersion() <= 3) {
             return make_legacy_messageset(batches);
         }
 
@@ -2514,7 +2541,10 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
         return payload;
     };
 
-    auto build_response = [&](protocol::FetchResponse& response) -> size_t {
+    auto build_response = [this, state, request_max_bytes, is_follower,
+                           serialize_batches](protocol::FetchResponse& response) -> size_t {
+        const auto& request = state->request;
+        auto& context = state->context;
         size_t total_bytes = 0;
         size_t remaining_request_bytes = request_max_bytes;
 
@@ -2850,61 +2880,111 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
         result.close_connection = false;
         return result;
     }
-    while (true) {
-        response = protocol::FetchResponse();
-        response.setThrottleTimeMs(0);
-        response.setSessionId(resp_session_id);
-        bytes_returned = build_response(response);
+    auto attempt = [build_response, resp_session_id](protocol::FetchResponse& out) -> size_t {
+        out = protocol::FetchResponse();
+        out.setThrottleTimeMs(0);
+        out.setSessionId(resp_session_id);
+        return build_response(out);
+    };
 
-        // M4: follower (replica) fetches do not long-poll — the leader answers
-        // immediately with whatever is available up to its LEO so the follower
-        // can pipeline the next fetch. Only consumer fetches honor min_bytes/
-        // max_wait long-polling.
-        if (is_follower) {
-            break;
+    // Kafka DelayedFetch semantics: answer now if enough bytes are available,
+    // the client does not want to wait, or any partition hit an error.
+    auto satisfied = [is_follower, min_bytes, max_wait_ms](const protocol::FetchResponse& r,
+                                                           size_t bytes) {
+        if (is_follower || min_bytes == 0 || bytes >= min_bytes || max_wait_ms == 0) {
+            return true;
         }
-        if (bytes_returned >= min_bytes || min_bytes == 0) {
-            break;
+        for (const auto& topic : r.topics()) {
+            for (const auto& partition : topic.partitions) {
+                if (partition.error_code != ErrorCode::NONE) {
+                    return true;
+                }
+            }
         }
-        if (max_wait_ms == 0) {
-            break;
+        return false;
+    };
+
+    auto finish = [this, state, start_time](protocol::FetchResponse& out,
+                                            size_t bytes) -> RequestDispatcher::HandlerResult {
+        const auto& ctx = state->context;
+        // throttle_time_ms is a quota back-off instruction (KIP-219 clients mute
+        // the connection for that long); long-poll wait time is not throttling.
+        int32_t fetch_throttle_ms = 0;
+        if (quota_manager_) {
+            fetch_throttle_ms = quota_manager_->recordAndThrottleMs(
+                QuotaManager::Type::kConsumer, ctx.header.clientId(), bytes);
         }
-        if (std::chrono::steady_clock::now() >= deadline) {
-            break;
+        out.setThrottleTimeMs(fetch_throttle_ms);
+
+        const int16_t version = std::clamp<int16_t>(ctx.header.apiVersion(), 0, kFetchMaxVersion);
+        RequestDispatcher::HandlerResult result;
+        result.payload =
+            encodeResponse(ctx, [&](Buffer& buffer) { out.encode(buffer, version); });
+
+        if (monitoring_manager_ && monitoring_manager_->metricsCollector()) {
+            auto end_time = std::chrono::steady_clock::now();
+            auto duration_ms =
+                std::chrono::duration<double, std::milli>(end_time - start_time).count();
+            monitoring_manager_->metricsCollector()->recordFetchLatency(duration_ms);
+            monitoring_manager_->metricsCollector()->incrementRequestsTotal("Fetch");
         }
-        // Sleep 1ms for better balance between CPU usage and latency
+        return result;
+    };
+
+    bytes_returned = attempt(response);
+    if (satisfied(response, bytes_returned)) {
+        return finish(response, bytes_returned);
+    }
+
+    // Park the long-poll in the purgatory instead of holding this network IO
+    // thread: it is retried whenever a fetched partition changes and answered
+    // at the deadline regardless.
+    if (context.complete && delayed_fetch_purgatory_) {
+        std::vector<TopicPartition> keys;
+        for (const auto& topic : response.topics()) {
+            for (const auto& partition : topic.partitions) {
+                keys.push_back(TopicPartition{topic.topic, partition.partition});
+            }
+        }
+        auto complete = context.complete;
+        auto try_complete = [this, state, attempt, satisfied, finish,
+                             complete](bool expired) -> bool {
+            protocol::FetchResponse out;
+            size_t bytes = 0;
+            try {
+                bytes = attempt(out);
+            } catch (const std::exception& ex) {
+                if (!expired) {
+                    return false;
+                }
+                Logger::error("Delayed fetch from {} failed: {}", state->context.peer_identity,
+                              ex.what());
+                RequestDispatcher::HandlerResult error;
+                error.payload = buildFetchError(
+                    state->context, ErrorCode::KAFKA_STORAGE_ERROR,
+                    std::clamp<int16_t>(state->context.header.apiVersion(), 0, kFetchMaxVersion));
+                complete(std::move(error));
+                return true;
+            }
+            if (!expired && !satisfied(out, bytes)) {
+                return false;
+            }
+            complete(finish(out, bytes));
+            return true;
+        };
+        if (delayed_fetch_purgatory_->watch(keys, deadline, std::move(try_complete))) {
+            RequestDispatcher::HandlerResult parked;
+            parked.deferred = true;
+            return parked;
+        }
+    }
+
+    // No deferral seam (direct handler invocation): poll on this thread.
+    while (!satisfied(response, bytes_returned) && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        bytes_returned = attempt(response);
     }
-
-    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::steady_clock::now() - start_time)
-                                .count();
-    int32_t fetch_throttle_ms =
-        static_cast<int32_t>(std::min<int64_t>(elapsed_ms, std::numeric_limits<int32_t>::max()));
-    // Consumer quota: record the fetched bytes; if the client is over its
-    // configured rate, raise the throttle so it backs off. No-op when the
-    // consumer quota is disabled (the default), preserving prior behavior.
-    if (quota_manager_) {
-        const int32_t quota_throttle = quota_manager_->recordAndThrottleMs(
-            QuotaManager::Type::kConsumer, context.header.clientId(), bytes_returned);
-        fetch_throttle_ms = std::max(fetch_throttle_ms, quota_throttle);
-    }
-    response.setThrottleTimeMs(fetch_throttle_ms);
-
-    const int16_t version = std::clamp<int16_t>(context.header.apiVersion(), 0, kFetchMaxVersion);
-    RequestDispatcher::HandlerResult result;
-    result.payload =
-        encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
-
-    // Record fetch latency and request metrics
-    if (monitoring_manager_ && monitoring_manager_->metricsCollector()) {
-        auto end_time = std::chrono::steady_clock::now();
-        auto duration_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-        monitoring_manager_->metricsCollector()->recordFetchLatency(duration_ms);
-        monitoring_manager_->metricsCollector()->incrementRequestsTotal("Fetch");
-    }
-
-    return result;
+    return finish(response, bytes_returned);
 }
 
 Buffer KawasanBroker::buildFetchError(const RequestDispatcher::RequestContext& context,

@@ -87,6 +87,7 @@ Read in `src/broker/kawasan_broker.cpp`; also surfaced through DescribeConfigs.
 | Key | Type | Default | Status | Description |
 |-----|------|---------|--------|-------------|
 | `network.io_threads` | int | hardware concurrency (≥1) | Honored | TCP server I/O thread count. Values `<= 0` fall back to the hardware default. |
+| `fetch.purgatory.threads` | int | `2` | Honored | Worker threads that complete parked long-poll Fetches (woken by partition appends/HW changes or `max_wait_ms` expiry). Parked fetches no longer occupy `network.io_threads`. |
 | `network.max_frame_bytes` | long | `16777216` (16 MiB) | Honored | Maximum accepted request frame size. |
 | `network.tcp_nodelay` | bool | `true` | Honored | Sets `TCP_NODELAY` on accepted client sockets (disables Nagle; Kafka parity). |
 | `network.tcp_keepalive` | bool | `true` | Honored | Sets `SO_KEEPALIVE` on accepted client sockets so half-open peers are detected. |

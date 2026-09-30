@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "kawasan/broker/delayed_operation_purgatory.h"
 #include "kawasan/broker/group_coordinator.h"
 #include "kawasan/broker/metadata_controller.h"
 #include "kawasan/broker/metrics/request_metrics.h"
@@ -352,6 +353,10 @@ private:
     // fetch session_ids; the Fetch response uses these to maintain a
     // stable handle across polls.
     std::unique_ptr<class FetchSessionManager> fetch_session_manager_;
+    // P4: parks long-poll fetches off the network IO threads; woken by log
+    // changes (see LogManager::setChangeListener). Shared so the log listener
+    // can hold it safely for the logs' whole lifetime.
+    std::shared_ptr<DelayedOperationPurgatory> delayed_fetch_purgatory_;
     // Phase EX-10: read_committed isolation tracker. Holds per-partition
     // in-flight transactional state so Fetch can report LSO + aborted
     // transactions correctly, and so read_committed consumers filter

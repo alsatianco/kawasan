@@ -26,26 +26,40 @@ public:
         std::optional<std::string> authenticated_principal;  // e.g. "User:alice"
     };
 
-    struct RequestContext {
-        protocol::RequestHeader header;
-        Buffer payload;
-        size_t frame_size_bytes = 0;
-        std::string peer_identity;
-        // Points to the owning connection's state (nullptr only in unit tests
-        // that build a context directly). Valid for the duration of dispatch.
-        ConnectionContext* connection = nullptr;
-    };
-
     struct DispatchResult {
         std::vector<uint8_t> frame;
         bool close_connection = false;
         bool suppress_response = false;
+        // The handler parked the request; the response arrives later through
+        // RequestContext::deferred_sink. The transport must not read the next
+        // request until then (preserves per-connection response ordering).
+        bool deferred = false;
     };
 
     struct HandlerResult {
         Buffer payload;
         bool close_connection = false;
         bool suppress_response = false;
+        // See DispatchResult::deferred. A handler may only return deferred=true
+        // when RequestContext::complete is set, and must then call it exactly once.
+        bool deferred = false;
+    };
+
+    struct RequestContext {
+        protocol::RequestHeader header;
+        Buffer payload;
+        size_t frame_size_bytes = 0;
+        std::string peer_identity;
+        // Points to the owning connection's state (nullptr only in unit tests
+        // that build a context directly). Valid for the duration of dispatch,
+        // and — when deferred_sink is set — for as long as the sink is alive.
+        ConnectionContext* connection = nullptr;
+        // Set by a transport that supports deferred responses (may be invoked
+        // from any thread). Empty when unsupported, e.g. direct handler calls.
+        std::function<void(DispatchResult)> deferred_sink;
+        // Set by dispatch() when deferred_sink is present: framing + metrics
+        // wrapper a deferring handler uses to deliver its eventual response.
+        std::function<void(HandlerResult)> complete;
     };
 
     using HandlerFunc = std::function<HandlerResult(RequestContext&)>;
@@ -79,6 +93,8 @@ private:
                              const RequestContext& context, ErrorCode code,
                              int16_t response_version) const;
     std::vector<uint8_t> wrapFrame(const Buffer& payload) const;
+    DispatchResult finalize(protocol::ApiKey api_key, size_t request_bytes,
+                            const HandlerResult& result) const;
 
     std::unordered_map<int16_t, HandlerList> handlers_;
     std::shared_ptr<metrics::RequestMetrics> metrics_;

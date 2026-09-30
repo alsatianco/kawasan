@@ -196,13 +196,32 @@ private:
         context.peer_identity = peer_identity_;
         context.connection = &conn_state_;
 
-        auto dispatch_result = server_.dispatchRequest(context);
+        context.deferred_sink = [self = shared_from_this()](
+                                    RequestDispatcher::DispatchResult result) {
+            // May be invoked from any thread; hop onto the socket's executor.
+            // No read is armed while a response is deferred, so this write is
+            // the only operation on the socket.
+            boost::asio::post(self->socket_.get_executor(),
+                              [self, result = std::move(result)]() mutable {
+                                  self->deliver(std::move(result));
+                              });
+        };
+
+        auto dispatch_result = server_.dispatchRequest(std::move(context));
+        if (dispatch_result.deferred) {
+            return;
+        }
+        deliver(std::move(dispatch_result));
+    }
+
+    void deliver(RequestDispatcher::DispatchResult dispatch_result) {
+        if (stopped_) {
+            return;
+        }
         const bool close_after_write = dispatch_result.close_connection;
 
         if (close_after_write) {
-            Logger::info("Connection {} will be closed after response (API key={}, version={})",
-                         peer_identity_, static_cast<int16_t>(context.header.apiKey()),
-                         context.header.apiVersion());
+            Logger::info("Connection {} will be closed after response", peer_identity_);
         }
 
         if (dispatch_result.suppress_response) {

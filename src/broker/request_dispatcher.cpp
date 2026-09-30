@@ -28,19 +28,8 @@ RequestDispatcher::DispatchResult RequestDispatcher::dispatch(
 
     auto build_and_record = [&](const Buffer& payload, bool close_connection,
                                 bool suppress_response) {
-        if (suppress_response) {
-            if (metrics_) {
-                metrics_->record(context.header.apiKey(), context.frame_size_bytes, 0);
-            }
-            return DispatchResult{{}, close_connection, true};
-        }
-
-        auto frame = wrapFrame(payload);
-        if (metrics_) {
-            metrics_->record(context.header.apiKey(), context.frame_size_bytes,
-                             frame.size());
-        }
-        return DispatchResult{std::move(frame), close_connection, false};
+        return finalize(context.header.apiKey(), context.frame_size_bytes,
+                        HandlerResult{payload, close_connection, suppress_response, false});
     };
 
     if (!handlers) {
@@ -62,8 +51,20 @@ RequestDispatcher::DispatchResult RequestDispatcher::dispatch(
         return build_and_record(payload, false, false);
     }
 
+    if (context.deferred_sink) {
+        context.complete = [this, sink = context.deferred_sink, api_key = context.header.apiKey(),
+                            request_bytes = context.frame_size_bytes](HandlerResult result) {
+            sink(finalize(api_key, request_bytes, result));
+        };
+    }
+
     try {
         auto handler_result = registration->handler(context);
+        if (handler_result.deferred) {
+            DispatchResult deferred;
+            deferred.deferred = true;
+            return deferred;
+        }
         return build_and_record(handler_result.payload, handler_result.close_connection,
                                 handler_result.suppress_response);
     } catch (const ProtocolException& ex) {
@@ -145,6 +146,22 @@ Buffer RequestDispatcher::buildErrorPayload(
         return registration->error_builder(context, code, response_version);
     }
     return buildLegacyErrorPayload(context, code);
+}
+
+RequestDispatcher::DispatchResult RequestDispatcher::finalize(protocol::ApiKey api_key,
+                                                             size_t request_bytes,
+                                                             const HandlerResult& result) const {
+    if (result.suppress_response) {
+        if (metrics_) {
+            metrics_->record(api_key, request_bytes, 0);
+        }
+        return DispatchResult{{}, result.close_connection, true, false};
+    }
+    auto frame = wrapFrame(result.payload);
+    if (metrics_) {
+        metrics_->record(api_key, request_bytes, frame.size());
+    }
+    return DispatchResult{std::move(frame), result.close_connection, false, false};
 }
 
 std::vector<uint8_t> RequestDispatcher::wrapFrame(const Buffer& payload) const {

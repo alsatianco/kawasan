@@ -131,6 +131,7 @@ Log::Log(Log&& other) noexcept {
     segments_ = std::move(other.segments_);
     high_watermark_ = other.high_watermark_;
     closed_ = other.closed_;
+    change_listener_ = std::move(other.change_listener_);
 }
 
 Log& Log::operator=(Log&& other) noexcept {
@@ -146,6 +147,7 @@ Log& Log::operator=(Log&& other) noexcept {
     segments_ = std::move(other.segments_);
     high_watermark_ = other.high_watermark_;
     closed_ = other.closed_;
+    change_listener_ = std::move(other.change_listener_);
     return *this;
 }
 
@@ -181,6 +183,7 @@ Offset Log::append(const std::vector<Record>& records, bool force_sync) {
     // Update high watermark (simplified - in reality this is managed by replication)
     high_watermark_ = segment->nextOffset();
     persistCheckpointLocked();
+    notifyChangeLocked();
 
     return offset;
 }
@@ -207,6 +210,7 @@ Offset Log::appendBatch(RecordBatch batch, bool advance_high_watermark) {
         high_watermark_ = segment->nextOffset();
     }
     persistCheckpointLocked();
+    notifyChangeLocked();
     return offset;
 }
 
@@ -242,6 +246,7 @@ Log::ReplicaAppendResult Log::appendReplicatedBatch(const RecordBatch& batch) {
     // Do NOT advance the high watermark — a follower's HW is leader-driven.
     segment->append(batch, config_.flush_mode == FlushMode::kSync);
     persistCheckpointLocked();
+    notifyChangeLocked();
     return ReplicaAppendResult::kAppended;
 }
 
@@ -410,6 +415,7 @@ Offset Log::truncatePrefix(Offset new_start_offset) {
 
     if (modified) {
         persistCheckpointLocked();
+        notifyChangeLocked();
     }
     return startOffsetUnlocked();
 }
@@ -448,6 +454,7 @@ Offset Log::truncateSuffix(Offset target_offset) {
         high_watermark_ = new_end;
     }
     persistCheckpointLocked();
+    notifyChangeLocked();
     Logger::info("Truncated {}-{} suffix to offset {} (log end now {})", topic_, partition_, target,
                  new_end);
     return new_end;
@@ -856,8 +863,17 @@ std::string Log::checkpointPath() const {
 void Log::setHighWatermark(Offset offset) {
     std::lock_guard<std::mutex> lock(mutex_);
     const Offset clamped = std::clamp(offset, startOffsetUnlocked(), endOffsetUnlocked());
+    const bool changed = clamped != high_watermark_;
     high_watermark_ = clamped;
     persistCheckpointLocked();
+    if (changed) {
+        notifyChangeLocked();
+    }
+}
+
+void Log::setChangeListener(ChangeListener listener) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    change_listener_ = std::move(listener);
 }
 
 }  // namespace kawasan::storage

@@ -105,6 +105,10 @@ public:
     void incrementCompactionsTotal();
     void recordDedupeBufferSize(int64_t size);
 
+    /// @brief Installs a change listener on every current and future log (see
+    /// Log::setChangeListener). Set once, before serving traffic.
+    void setChangeListener(Log::ChangeListener listener);
+
 private:
     std::string getLogDir(const std::string& topic, PartitionId partition) const;
     void cleanupThread();
@@ -115,6 +119,7 @@ private:
     // 0A.4: per-topic config overrides (cleanup.policy etc. from CreateTopics).
     std::unordered_map<std::string, LogConfig> topic_configs_;
     mutable std::shared_mutex mutex_;  // Changed to shared_mutex for better concurrency
+    Log::ChangeListener change_listener_;
     bool running_ = false;
     bool stop_requested_ = false;
     int64_t cleanup_interval_ms_ = 300000;  // 5 minutes default

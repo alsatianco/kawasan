@@ -57,6 +57,9 @@ Log* LogManager::getOrCreateLog(const std::string& topic, PartitionId partition)
     }
     try {
         auto log = std::make_unique<Log>(topic, partition, log_dir, effective_config);
+        if (change_listener_) {
+            log->setChangeListener(change_listener_);
+        }
         Log* log_ptr = log.get();
         logs_[tp] = std::move(log);
         Logger::info("Created log for topic {} partition {} (cleanup.policy: {}{}{})",
@@ -78,6 +81,9 @@ Log* LogManager::getOrCreateLog(const std::string& topic, PartitionId partition)
                     "Could not remove {}, proceeding to recreate: {}", log_dir, ec.message());
             }
             auto log = std::make_unique<Log>(topic, partition, log_dir, effective_config);
+            if (change_listener_) {
+                log->setChangeListener(change_listener_);
+            }
             Log* log_ptr = log.get();
             logs_[tp] = std::move(log);
             Logger::info("Recreated log for topic {} partition {}", topic, partition);
@@ -89,6 +95,14 @@ Log* LogManager::getOrCreateLog(const std::string& topic, PartitionId partition)
                 ex2.what());
             throw;
         }
+    }
+}
+
+void LogManager::setChangeListener(Log::ChangeListener listener) {
+    std::unique_lock<std::shared_mutex> write_lock(mutex_);
+    change_listener_ = std::move(listener);
+    for (auto& [_, log] : logs_) {
+        log->setChangeListener(change_listener_);
     }
 }
 

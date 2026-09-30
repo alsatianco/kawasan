@@ -164,3 +164,8 @@ add_test(NAME CodegenGoldenBytesTest COMMAND codegen_golden_bytes_test)
 add_executable(group_coordinator_test group_coordinator_test.cpp)
 target_link_libraries(group_coordinator_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME GroupCoordinatorTest COMMAND group_coordinator_test)
+
+# DelayedOperationPurgatory (long-poll Fetch parking)
+add_executable(delayed_operation_purgatory_test delayed_operation_purgatory_test.cpp)
+target_link_libraries(delayed_operation_purgatory_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME DelayedOperationPurgatoryTest COMMAND delayed_operation_purgatory_test)

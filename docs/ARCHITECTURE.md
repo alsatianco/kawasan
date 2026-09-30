@@ -185,6 +185,7 @@ The broker is event-driven on top of one Boost.Asio `io_context`. The number of 
 | Thread(s) | Owner | Role |
 |-----------|-------|------|
 | Network IO threads | `TcpServer` / `io_context` | Accept connections, read request frames, run the dispatcher handler **inline**, and write responses. There is no separate request-handler thread pool — a handler runs to completion on the IO thread that read its frame. |
+| Fetch purgatory workers | `DelayedOperationPurgatory` | `fetch.purgatory.threads` (default 2) workers that hold long-poll Fetches (see below) and complete them when a watched partition changes or `max_wait_ms` expires. |
 | IO context thread | `KawasanBroker` | Drives `io_context_.run()` for the Raft transport; kept alive by a work guard so it does not exit when idle. |
 | Log cleanup thread | `LogManager` | Periodic retention/compaction sweep across all logs (interval from `cleanup_interval_ms_`, default 5 minutes). |
 | Group cleanup thread | `GroupCoordinator` | Expires empty groups and times out stale members (`startCleanupThread`). |
@@ -197,6 +198,10 @@ The broker is event-driven on top of one Boost.Asio `io_context`. The number of 
 | Monitoring HTTP thread | `MonitoringManager` | Serves `/metrics` and health endpoints (Boost.Beast). |
 
 Because handlers run inline on IO threads, shared subsystems (`LogManager`, `GroupCoordinator`, `OffsetManager`, `ReplicaManager`) provide their own internal synchronization — for example `LogManager` guards its log map with a `std::shared_mutex` and each `Log` guards its segments with a mutex.
+
+### Delayed (parked) Fetch responses
+
+A Fetch that can't be answered yet (below `min_bytes`, no error, `max_wait_ms > 0`) is not polled on the IO thread. `handleFetch` parks it in `DelayedOperationPurgatory`, keyed by its topic-partitions, and returns `HandlerResult{deferred=true}`. The session doesn't re-arm its read, so each connection still has one request in flight and responses stay in order. `LogManager` installs a change listener on every `Log`. Appends, replicated appends, truncation, and high-watermark changes call `purgatory.notify(topic, partition)` (a single atomic load when nothing is parked). A worker then re-runs the fetch. When the fetch is satisfied or its deadline passes, the response goes through `RequestContext::complete` → `RequestDispatcher::finalize` → `TcpSession::deliver`, which is posted back to the socket's executor. Retries for one operation are coalesced, and it never runs concurrently with itself. On shutdown the purgatory stops before the TCP server and drops parked ops. Handlers called without a transport sink (unit tests) fall back to the old in-handler wait loop. `throttle_time_ms` in the response carries only quota throttling, never the long-poll wait. The `acks=all` produce wait still blocks its IO thread; making it a delayed op too is the other half of P4.
 
 ## On-disk storage layout
 
