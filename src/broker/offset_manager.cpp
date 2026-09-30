@@ -1,4 +1,5 @@
 #include "kawasan/broker/offset_manager.h"
+#include "kawasan/common/rocksdb_compat.h"
 
 #include <cstring>
 
@@ -39,15 +40,15 @@ OffsetManager::OffsetManager(const std::string& db_path)
     // Disable compression for now (Snappy may not be available on all systems)
     options.compression = rocksdb::kNoCompression;
     
-    rocksdb::DB* db_raw = nullptr;
-    rocksdb::Status status = rocksdb::DB::Open(options, db_path, &db_raw);
+    std::unique_ptr<rocksdb::DB> db_raw;
+    rocksdb::Status status = openRocksDb(options, db_path, db_raw);
     
     if (!status.ok()) {
         throw std::runtime_error("Failed to open offset RocksDB at " + db_path + 
                                 ": " + status.ToString());
     }
     
-    db_.reset(db_raw);
+    db_ = std::move(db_raw);
     Logger::info("OffsetManager initialized with db_path={}, retention={}ms", 
                  db_path, retention_ms_);
 }

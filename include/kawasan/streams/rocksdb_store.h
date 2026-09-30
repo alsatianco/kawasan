@@ -1,5 +1,6 @@
 #pragma once
 
+#include "kawasan/common/rocksdb_compat.h"
 #include "state_store.h"
 #include <rocksdb/db.h>
 #include <memory>
@@ -181,14 +182,14 @@ void RocksDBKeyValueStore<K, V>::init() {
     options.create_if_missing = true;
     options.error_if_exists = false;
     
-    rocksdb::DB* db_ptr = nullptr;
-    rocksdb::Status status = rocksdb::DB::Open(options, db_path_, &db_ptr);
+    std::unique_ptr<rocksdb::DB> db_ptr;
+    rocksdb::Status status = openRocksDb(options, db_path_, db_ptr);
     
     if (!status.ok()) {
         throw std::runtime_error("Failed to open RocksDB: " + status.ToString());
     }
     
-    db_.reset(db_ptr);
+    db_ = std::move(db_ptr);
 }
 
 template<typename K, typename V>

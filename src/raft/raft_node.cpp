@@ -1,4 +1,5 @@
 #include "kawasan/raft/raft_node.h"
+#include "kawasan/common/rocksdb_compat.h"
 
 #include <algorithm>
 #include <cstring>
@@ -888,14 +889,14 @@ void RaftNode::openPersistence() {
     opts.create_if_missing = true;
     opts.error_if_exists = false;
     opts.compression = rocksdb::kNoCompression;
-    rocksdb::DB* db_raw = nullptr;
-    auto status = rocksdb::DB::Open(opts, data_dir_, &db_raw);
+    std::unique_ptr<rocksdb::DB> db_raw;
+    auto status = openRocksDb(opts, data_dir_, db_raw);
     if (!status.ok()) {
         Logger::error("Failed to open Raft persistence at {}: {}", data_dir_,
                       status.ToString());
         return;
     }
-    persist_db_.reset(db_raw);
+    persist_db_ = std::move(db_raw);
     Logger::info("Opened Raft persistence at {}", data_dir_);
 }
 

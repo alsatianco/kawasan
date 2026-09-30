@@ -1,4 +1,5 @@
 #include "kawasan/storage/log_segment.h"
+#include "kawasan/common/rocksdb_compat.h"
 
 #include <rocksdb/cache.h>
 #include <rocksdb/db.h>
@@ -120,14 +121,14 @@ void LogSegment::open() {
     table_opts.cache_index_and_filter_blocks = true;
     options.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_opts));
 
-    rocksdb::DB* db_ptr;
-    rocksdb::Status status = rocksdb::DB::Open(options, path_, &db_ptr);
+    std::unique_ptr<rocksdb::DB> db_ptr;
+    rocksdb::Status status = openRocksDb(options, path_, db_ptr);
     if (!status.ok()) {
         throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR,
                                "Failed to open log segment: " + status.ToString());
     }
 
-    db_.reset(db_ptr);
+    db_ = std::move(db_ptr);
 
     // Scan existing entries to compute sizes and next offset
     rocksdb::ReadOptions read_options;
