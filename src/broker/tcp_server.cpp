@@ -165,6 +165,7 @@ private:
     }
 
     void processRequest() {
+        const size_t frame_size = frame_buffer_.size();
         Buffer buffer(std::move(frame_buffer_));
         protocol::RequestHeader header;
 
@@ -185,14 +186,14 @@ private:
             return;
         }
 
-        Logger::info("Client {} request api_key={} version={} correlation_id={} client_id={}",
+        Logger::debug("Client {} request api_key={} version={} correlation_id={} client_id={}",
                      peer_identity_, static_cast<int16_t>(header.apiKey()), header.apiVersion(),
                      header.correlationId(), header.clientId());
 
         RequestDispatcher::RequestContext context;
         context.header = header;
         context.payload = std::move(buffer);
-        context.frame_size_bytes = frame_buffer_.size();
+        context.frame_size_bytes = frame_size;
         context.peer_identity = peer_identity_;
         context.connection = &conn_state_;
 

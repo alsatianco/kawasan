@@ -20,6 +20,7 @@
 #include "kawasan/protocol/api_versions.h"
 #include "kawasan/protocol/create_topics_request.h"
 #include "kawasan/protocol/metadata_request.h"
+#include "kawasan/protocol/produce_request.h"
 #include "kawasan/protocol/request_header.h"
 
 namespace {
@@ -247,6 +248,52 @@ TEST(TcpFrontDoorTest, HandlesMetadataRequest) {
     EXPECT_EQ(created_partition.leader, config.get<int32_t>("broker.id"));
     EXPECT_EQ(created_partition.replicas.size(), 1);
     EXPECT_EQ(created_partition.replicas.front(), config.get<int32_t>("broker.id"));
+
+    socket.close();
+    broker.stop();
+    std::filesystem::remove_all(log_dir);
+}
+
+// The request size handed to handlers must be the real frame size: the producer
+// byte-rate quota is charged from it. (It used to be read after the frame buffer
+// was moved out, so every request counted as 0 bytes and quotas never engaged.)
+TEST(TcpFrontDoorTest, ProducerQuotaChargesRealRequestSize) {
+    ensureLoggerInitialized();
+    const auto log_dir = makeLogDir();
+    auto config = makeConfig(log_dir);
+    config.setLong("quota.producer.default", 100);  // bytes/sec
+    kawasan::broker::KawasanBroker broker(config);
+    broker.start();
+
+    boost::asio::io_context io;
+    boost::asio::ip::tcp::socket socket(io);
+    socket.connect(boost::asio::ip::tcp::endpoint(boost::asio::ip::make_address("127.0.0.1"),
+                                                  static_cast<uint16_t>(broker.port())));
+
+    kawasan::Buffer payload;
+    kawasan::protocol::RequestHeader header(kawasan::protocol::ApiKey::PRODUCE,
+                                            /*api_version=*/3, /*correlation_id=*/7, "quota");
+    header.encode(payload);
+    kawasan::protocol::ProduceRequest request;
+    request.setAcks(1);
+    request.setTimeoutMs(1000);
+    kawasan::protocol::ProducePartitionData pd;
+    pd.partition = 0;
+    pd.record_batch = std::vector<uint8_t>(2048, 0);  // content irrelevant: quota is charged first
+    kawasan::protocol::ProduceTopicData td;
+    td.topic = "quota-topic";
+    td.partitions.push_back(pd);
+    request.addTopic(td);
+    request.encode(payload, 3);
+
+    auto body = sendKafkaRequest(socket, payload);
+    kawasan::Buffer buf(body);
+    kawasan::protocol::ResponseHeader rh;
+    rh.decode(buf);
+    EXPECT_EQ(rh.correlationId(), 7);
+    kawasan::protocol::ProduceResponse response;
+    response.decode(buf, 3);
+    EXPECT_GT(response.throttleTimeMs(), 0);
 
     socket.close();
     broker.stop();

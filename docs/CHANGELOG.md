@@ -44,6 +44,8 @@ Single-node production-hardening (durability, security, quotas), durable single-
 
 ### Fixed
 
+- **Producer byte-rate quotas never engaged over TCP.** The request size handed to handlers was read after the frame buffer had been moved out, so every request counted as 0 bytes. `quota.producer.default` was inert, and request-size metrics read 0. Both now use the real frame size.
+- **Per-request `info` log on the network hot path.** Each request logged its API key and correlation id at `info`. That message is now `debug`.
 - **A partition's data could be silently wiped on open failure.** `LogManager::getOrCreateLog` used to `remove_all` the partition directory and start an empty log after *any* open error. That included environmental errors such as a RocksDB `LOCK` held by another process, fd exhaustion, permissions, or a full disk. Environmental errors now propagate with the data left untouched. Other failures, treated as corruption, rename the directory to `<topic>-<partition>.corrupt-<epoch_ms>` for manual recovery before an empty log is created.
 - **Idle broker pinned a full CPU core.** When the node was the Raft leader (always true single-node), `RaftNode::electionThread` computed a zero wait from the stale `last_heartbeat_` and spun. A leader now sleeps a full election-timeout period, and idle CPU dropped from 100% to about 0%.
 - **Fetch `throttle_time_ms` reported the long-poll wait time.** KIP-219 clients treat that field as a quota throttle and muted the connection for that long. It now carries only quota throttling.
