@@ -107,16 +107,19 @@ void RaftNode::start() {
     // Start transport server
     transport_->start(raft_port_);
 
-    election_thread_ = std::thread(&RaftNode::electionThread, this);
-    heartbeat_thread_ = std::thread(&RaftNode::heartbeatThread, this);
-    Logger::info("Started Raft node {} on port {} (term={}, log_size={})", id_,
-                 raft_port_, current_term_.load(), log_.size());
-
-    // If no peers, immediately become leader (single-node mode)
+    // Single-node: become leader BEFORE the election thread exists. Doing it
+    // after let a loaded machine time out first and run an election, briefly
+    // flipping the node to CANDIDATE — a window where metadata writes failed
+    // with NOT_CONTROLLER.
     if (peers_.empty()) {
         Logger::info("Single-node mode: becoming leader immediately");
         becomeLeader();
     }
+
+    election_thread_ = std::thread(&RaftNode::electionThread, this);
+    heartbeat_thread_ = std::thread(&RaftNode::heartbeatThread, this);
+    Logger::info("Started Raft node {} on port {} (term={}, log_size={})", id_,
+                 raft_port_, current_term_.load(), log_.size());
 }
 
 void RaftNode::stop() {
