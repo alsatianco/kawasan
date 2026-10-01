@@ -445,26 +445,52 @@ bool ReplicaManager::reconcileReplica(const TopicPartition& tp, std::shared_ptr<
         // A follower starts fetching from its current log-end; a leader's
         // fetch_offset is unused.
         info.fetch_offset = (leader != local_broker_id_) ? info.log->logEndOffset() : 0;
-        replicas_[tp] = std::move(info);
+        auto& stored = replicas_[tp] = std::move(info);
+        if (leader == local_broker_id_) {
+            // A sole-replica leader commits its whole log (a periodic HW
+            // checkpoint may lag the log after a restart).
+            maybeAdvanceHighWatermarkLocked(stored);
+        }
         spdlog::debug("Reconciled NEW replica {}-{} leader={} isr={} (follower={})", tp.topic,
                       tp.partition, leader, isr.size(), leader != local_broker_id_);
         return true;
     }
-    // Existing: update role/ISR/epoch but preserve fetch progress + follower_states.
+    // Existing: update role/ISR/epoch. Fetch progress survives unless the role
+    // or leadership changed.
     auto& info = it->second;
     if (!info.log && log) {
         info.log = std::move(log);
     }
     const bool changed =
         info.leader != leader || info.isr != isr || info.leader_epoch != leader_epoch;
+    const bool was_leader = info.leader == local_broker_id_;
+    const bool is_leader = leader == local_broker_id_;
+    if (was_leader && !is_leader && info.log) {
+        // Demoted (M8-D): resume replication from our own log end, not the
+        // unused offset from our leader days.
+        info.fetch_offset = info.log->logEndOffset();
+    }
+    if (was_leader != is_leader || (is_leader && leader_epoch != info.leader_epoch)) {
+        // Follower progress was reported against an earlier leadership.
+        info.follower_states.clear();
+    }
     info.leader = leader;
     info.isr = isr;
     info.leader_epoch = leader_epoch;
-    if (changed && leader == local_broker_id_) {
+    if (changed && is_leader) {
         // An ISR shrink can commit records the dropped replica was holding back.
         maybeAdvanceHighWatermarkLocked(info);
     }
     return changed;
+}
+
+std::optional<Offset> ReplicaManager::getFetchOffset(const TopicPartition& tp) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = replicas_.find(tp);
+    if (it == replicas_.end()) {
+        return std::nullopt;
+    }
+    return it->second.fetch_offset;
 }
 
 std::optional<std::vector<BrokerId>> ReplicaManager::computeIsrUpdate(const TopicPartition& tp,

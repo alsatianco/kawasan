@@ -414,4 +414,60 @@ TEST_F(ISRManagementTest, ReconcileReplicaReportsChangesAndAdvancesHwOnShrink) {
     EXPECT_FALSE(replica_manager_->isLeader(tp));
 }
 
+// M8-D: a leader demoted to follower must start fetching from its own log end
+// (not the unused 0 from its leader days) and forget the follower progress it
+// tracked as leader.
+TEST_F(ISRManagementTest, DemotionReseedsFetchOffsetAndClearsFollowerStates) {
+    TopicPartition tp{"test-topic", 0};
+    auto log = createTestLog(tp.topic, tp.partition);
+    ASSERT_TRUE(replica_manager_->reconcileReplica(tp, log, 0, {0, 1}, 0));  // we lead
+    appendN(log, 7);
+    replica_manager_->updateFollowerFetchOffset(tp, 1, 7);
+    ASSERT_TRUE(replica_manager_->getFollowerLag(tp, 1).has_value());
+    ASSERT_EQ(replica_manager_->getFetchOffset(tp).value_or(-1), 0);
+
+    ASSERT_TRUE(replica_manager_->reconcileReplica(tp, log, 1, {0, 1}, 1));  // demoted
+    EXPECT_EQ(replica_manager_->getFetchOffset(tp).value_or(-1), 7);
+
+    // Promoted again (new epoch): stale follower states from the previous
+    // leadership must not survive.
+    ASSERT_TRUE(replica_manager_->reconcileReplica(tp, log, 0, {0, 1}, 2));
+    EXPECT_FALSE(replica_manager_->getFollowerLag(tp, 1).has_value());
+}
+
+// M8-D: a promoted follower drops follower progress left over from an earlier
+// leadership — those offsets were reported against a different leader's log.
+TEST_F(ISRManagementTest, PromotionClearsStaleFollowerStates) {
+    TopicPartition tp{"test-topic", 0};
+    auto log = createTestLog(tp.topic, tp.partition);
+    ASSERT_TRUE(replica_manager_->reconcileReplica(tp, log, 0, {0, 1}, 0));
+    replica_manager_->updateFollowerFetchOffset(tp, 1, 0);
+    ASSERT_TRUE(replica_manager_->reconcileReplica(tp, log, 1, {1, 0}, 1));  // follower
+    ASSERT_TRUE(replica_manager_->reconcileReplica(tp, log, 0, {0, 1}, 2));  // leader again
+    EXPECT_FALSE(replica_manager_->getFollowerLag(tp, 1).has_value());
+}
+
+// M8-D: a partition registered as led-by-us with ISR {self} commits its whole
+// log immediately (e.g. an RF=1 partition after restart whose stored HW is a
+// stale periodic checkpoint).
+TEST_F(ISRManagementTest, NewSoleReplicaLeaderRecoversHighWatermarkToLogEnd) {
+    TopicPartition tp{"test-topic", 0};
+    auto log = createTestLog(tp.topic, tp.partition);
+    appendUncommitted(log, 4);
+    ASSERT_EQ(log->highWatermark(), 0);
+    ASSERT_TRUE(replica_manager_->reconcileReplica(tp, log, 0, {0}, 0));
+    EXPECT_EQ(log->highWatermark(), 4);
+}
+
+// A follower re-registered with unchanged metadata keeps its fetch progress.
+TEST_F(ISRManagementTest, UnchangedFollowerKeepsFetchProgress) {
+    TopicPartition tp{"test-topic", 0};
+    auto log = createTestLog(tp.topic, tp.partition);
+    ASSERT_TRUE(replica_manager_->reconcileReplica(tp, log, 1, {1, 0}, 3));
+    EXPECT_EQ(replica_manager_->getFetchOffset(tp).value_or(-1), 0);
+    appendN(log, 5);  // replicated meanwhile; fetcher would have advanced it
+    EXPECT_FALSE(replica_manager_->reconcileReplica(tp, log, 1, {1, 0}, 3));
+    EXPECT_EQ(replica_manager_->getFetchOffset(tp).value_or(-1), 0);
+}
+
 }  // namespace kawasan::broker

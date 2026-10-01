@@ -152,8 +152,11 @@ public:
     /// @brief M5: upsert a replica's leader/ISR/epoch from the Raft-committed
     /// metadata. This is the single registration path used by the broker's
     /// metadata reconciliation: it registers the partition (if new) with the
-    /// given role and, if it already exists, updates leader/ISR/epoch WITHOUT
-    /// disturbing follower-fetch progress (fetch_offset, follower_states). When
+    /// given role and, if it already exists, updates leader/ISR/epoch. Fetch
+    /// progress is preserved unless leadership changed (M8-D): a demoted leader
+    /// re-seeds fetch_offset to its log end, and any role flip or new epoch on
+    /// the leader clears follower_states. A new partition we lead has its HW
+    /// recomputed from the ISR (a sole replica commits its whole log). When
     /// `leader != local id` the partition is a FOLLOWER and the fetcher thread
     /// will replicate it from the leader. For a single-node RF=1 partition this
     /// registers leader=self / ISR={self}, identical to the lazy path.
@@ -162,6 +165,10 @@ public:
     /// broker leads may advance the high watermark.
     bool reconcileReplica(const TopicPartition& tp, std::shared_ptr<storage::Log> log,
                           BrokerId leader, const std::vector<BrokerId>& isr, int32_t leader_epoch);
+
+    /// @brief The offset a follower replica will fetch from next (unused, 0, on
+    /// a leader); nullopt if the partition is unmanaged.
+    std::optional<Offset> getFetchOffset(const TopicPartition& tp) const;
 
     /// @brief M6: compute a proposed ISR for a partition THIS broker leads, from
     /// tracked follower progress. A current ISR member is dropped only once its
