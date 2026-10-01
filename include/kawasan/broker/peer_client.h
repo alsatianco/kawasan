@@ -1,11 +1,13 @@
 #pragma once
 
 #include <boost/asio.hpp>
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include "kawasan/common/buffer.h"
 #include "kawasan/common/error.h"
 #include "kawasan/common/types.h"
 
@@ -15,8 +17,9 @@ namespace kawasan::broker {
 /// replica fetcher to pull data from a partition leader. It sends a Fetch
 /// request with `replica_id = this broker's id` (>= 0), which the leader treats
 /// as a follower fetch (serves up to the log-end-offset, records the follower's
-/// position, no long-poll). Synchronous and blocking — it runs on the dedicated
-/// replica-fetcher thread, one connection per peer.
+/// position, no long-poll). Synchronous — it runs on the dedicated
+/// replica-fetcher thread, one connection per peer — but every request is
+/// bounded by a deadline, so a frozen peer cannot stall the thread.
 ///
 /// Modeled on the producer client's framed request/response (4-byte big-endian
 /// length prefix + Kafka request/response headers). Fetch v4 is used on purpose:
@@ -61,6 +64,9 @@ public:
 private:
     void ensureConnected();
     void disconnect();
+    /// Sends one framed request and returns the framed response body, all within
+    /// `timeout`. Throws on any error (callers disconnect).
+    std::vector<uint8_t> exchange(const Buffer& payload, std::chrono::milliseconds timeout);
 
     std::string host_;
     int32_t port_;

@@ -2,12 +2,12 @@
 // Licensed under the Apache License, Version 2.0
 
 #include "kawasan/raft/raft_transport.h"
-#include <poll.h>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
-#include <cerrno>
 #include <stdexcept>
+
+#include "kawasan/common/socket_deadline.h"
 
 using boost::asio::ip::tcp;
 
@@ -160,46 +160,7 @@ void RaftTransport::remove_peer(int peer_id) {
 }
 
 namespace {
-
 using Clock = std::chrono::steady_clock;
-
-// Moves `len` bytes over a NON-blocking socket, waiting with poll() but never
-// past `deadline`. Asio's own sync read/write wait without any bound, which let
-// a frozen or partitioned peer wedge an RPC thread forever.
-void transferWithDeadline(tcp::socket& socket, bool writing, uint8_t* data, size_t len,
-                          Clock::time_point deadline) {
-    size_t done = 0;
-    while (done < len) {
-        boost::system::error_code ec;
-        const size_t n =
-            writing ? socket.write_some(boost::asio::buffer(data + done, len - done), ec)
-                    : socket.read_some(boost::asio::buffer(data + done, len - done), ec);
-        if (!ec) {
-            if (n == 0 && !writing) {
-                throw std::runtime_error("connection closed by peer");
-            }
-            done += n;
-            continue;
-        }
-        if (ec != boost::asio::error::would_block && ec != boost::asio::error::try_again) {
-            throw std::runtime_error(std::string(writing ? "write" : "read") +
-                                     " error: " + ec.message());
-        }
-        const auto remaining =
-            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now());
-        if (remaining.count() <= 0) {
-            throw std::runtime_error(std::string(writing ? "write" : "read") + " timed out");
-        }
-        pollfd pfd{};
-        pfd.fd = socket.native_handle();
-        pfd.events = writing ? POLLOUT : POLLIN;
-        const int rc = ::poll(&pfd, 1, static_cast<int>(remaining.count()));
-        if (rc < 0 && errno != EINTR) {
-            throw std::runtime_error("poll failed");
-        }
-    }
-}
-
 }  // namespace
 
 std::vector<uint8_t> RaftTransport::roundTrip(int peer_id, const std::vector<uint8_t>& request,

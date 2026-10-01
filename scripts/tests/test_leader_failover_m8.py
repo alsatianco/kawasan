@@ -231,6 +231,9 @@ def main():
             for b in range(N_BROKERS):
                 print(f"--- broker {b} log tail ---", file=sys.stderr)
                 print(harness("logs", str(b)).stdout[-1500:], file=sys.stderr)
+            keep = f"/tmp/m8-failure-{int(time.time())}"
+            subprocess.run(["cp", "-R", BASE, keep])
+            print(f"cluster state preserved in {keep}", file=sys.stderr)
             harness("down")
             sys.exit(1)
         harness("down")

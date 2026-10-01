@@ -55,6 +55,11 @@ add_executable(leader_epoch_fencing_test leader_epoch_fencing_test.cpp)
 target_link_libraries(leader_epoch_fencing_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME LeaderEpochFencingTest COMMAND leader_epoch_fencing_test)
 
+# Broker-to-broker client (replication, AlterPartition, OffsetForLeaderEpoch)
+add_executable(peer_client_test peer_client_test.cpp)
+target_link_libraries(peer_client_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME PeerClientTest COMMAND peer_client_test)
+
 add_executable(admin_surface_test admin_surface_test.cpp)
 target_link_libraries(admin_surface_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME AdminSurfaceTest COMMAND admin_surface_test)
