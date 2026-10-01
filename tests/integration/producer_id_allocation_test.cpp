@@ -1,0 +1,117 @@
+// InitProducerId allocation: single-node ids stay 1, 2, 3, ... and survive a
+// restart; in a cluster each broker issues ids from its own range (see
+// clusterProducerId) so no two brokers ever hand out the same producer id.
+#include <arpa/inet.h>
+#include <gtest/gtest.h>
+
+#include <array>
+#include <boost/asio.hpp>
+#include <chrono>
+#include <cstring>
+#include <filesystem>
+
+#include "kawasan/broker/kawasan_broker.h"
+#include "kawasan/broker/producer_id.h"
+#include "kawasan/common/buffer.h"
+#include "kawasan/common/config.h"
+#include "kawasan/common/logger.h"
+#include "kawasan/protocol/request_header.h"
+
+namespace asio = boost::asio;
+
+namespace {
+
+int freePort() {
+    asio::io_context io;
+    asio::ip::tcp::acceptor a(io, asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
+    return a.local_endpoint().port();
+}
+
+kawasan::Config config(const std::string& dir, int32_t broker_id, const std::string& peers) {
+    kawasan::Config c;
+    c.setInt("broker.id", broker_id);
+    c.setString("host", "127.0.0.1");
+    c.setInt("port", 0);
+    c.setString("log.dirs", dir);
+    c.setInt("network.io_threads", 1);
+    if (peers.empty()) {
+        c.setInt("raft.port", 0);
+    } else {
+        c.setString("raft.peers", peers);
+    }
+    return c;
+}
+
+// InitProducerId v0 (non-transactional) over a raw socket; returns producer_id.
+int64_t initProducerId(int32_t port) {
+    asio::io_context io;
+    asio::ip::tcp::socket socket(io);
+    socket.connect(
+        asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), static_cast<uint16_t>(port)));
+    kawasan::Buffer payload;
+    kawasan::protocol::RequestHeader header(kawasan::protocol::ApiKey::INIT_PRODUCER_ID, 0, 1,
+                                            "pid-test");
+    header.encode(payload);
+    payload.writeInt16(-1);     // transactional_id = null
+    payload.writeInt32(60000);  // transaction_timeout_ms
+    kawasan::Buffer frame;
+    frame.writeInt32(static_cast<int32_t>(payload.size()));
+    frame.writeBytes(payload.vector().data(), payload.size());
+    asio::write(socket, asio::buffer(frame.vector().data(), frame.size()));
+    std::array<uint8_t, 4> size_bytes{};
+    asio::read(socket, asio::buffer(size_bytes));
+    uint32_t net = 0;
+    std::memcpy(&net, size_bytes.data(), 4);
+    std::vector<uint8_t> body(ntohl(net));
+    asio::read(socket, asio::buffer(body));
+    kawasan::Buffer buf(body);
+    (void)buf.readInt32();  // correlation id
+    (void)buf.readInt32();  // throttle_time_ms
+    EXPECT_EQ(buf.readInt16(), 0);
+    return buf.readInt64();
+}
+
+class ProducerIdAllocationTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        static const bool logger_ready = [] {
+            kawasan::Logger::init("warn");
+            return true;
+        }();
+        (void)logger_ready;
+        const auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
+        dir_ = (std::filesystem::temp_directory_path() / ("kawasan-pid-" + std::to_string(ts)))
+                   .string();
+        std::filesystem::create_directories(dir_);
+    }
+    void TearDown() override { std::filesystem::remove_all(dir_); }
+    std::string dir_;
+};
+
+}  // namespace
+
+TEST_F(ProducerIdAllocationTest, SingleNodeIdsAreSequentialAcrossRestarts) {
+    {
+        kawasan::broker::KawasanBroker broker(config(dir_, 1, ""));
+        broker.start();
+        EXPECT_EQ(initProducerId(broker.port()), 1);
+        EXPECT_EQ(initProducerId(broker.port()), 2);
+        broker.stop();
+    }
+    kawasan::broker::KawasanBroker broker(config(dir_, 1, ""));
+    broker.start();
+    EXPECT_EQ(initProducerId(broker.port()), 3);
+    broker.stop();
+}
+
+TEST_F(ProducerIdAllocationTest, ClusterBrokerIssuesIdsFromItsOwnRange) {
+    // Broker 2 of a two-broker cluster whose peer never starts; InitProducerId
+    // is answered locally.
+    const std::string peers = "2:127.0.0.1:" + std::to_string(freePort()) + ",5:127.0.0.1:" +
+                              std::to_string(freePort());
+    kawasan::broker::KawasanBroker broker(config(dir_, 2, peers));
+    broker.start();
+    EXPECT_EQ(initProducerId(broker.port()), kawasan::broker::clusterProducerId(2, 1));
+    EXPECT_EQ(initProducerId(broker.port()), kawasan::broker::clusterProducerId(2, 2));
+    broker.stop();
+}

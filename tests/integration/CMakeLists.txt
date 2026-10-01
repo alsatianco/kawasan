@@ -60,6 +60,11 @@ add_executable(peer_client_test peer_client_test.cpp)
 target_link_libraries(peer_client_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME PeerClientTest COMMAND peer_client_test)
 
+# InitProducerId allocation (single-node sequence, per-broker ranges in a cluster)
+add_executable(producer_id_allocation_test producer_id_allocation_test.cpp)
+target_link_libraries(producer_id_allocation_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME ProducerIdAllocationTest COMMAND producer_id_allocation_test)
+
 add_executable(admin_surface_test admin_surface_test.cpp)
 target_link_libraries(admin_surface_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME AdminSurfaceTest COMMAND admin_surface_test)

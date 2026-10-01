@@ -25,6 +25,7 @@
 #include "kawasan/broker/isolation_tracker.h"
 #include "kawasan/broker/leader_election_policy.h"
 #include "kawasan/broker/peer_client.h"
+#include "kawasan/broker/producer_id.h"
 #include "kawasan/broker/producer_state_manager.h"
 #include "kawasan/broker/producer_state_snapshot.h"
 #include "kawasan/broker/quota_manager.h"
@@ -33,6 +34,7 @@
 #include "kawasan/broker/transaction_coordinator.h"
 #include "kawasan/broker/transaction_state_manager.h"
 #include "kawasan/common/error.h"
+#include "kawasan/common/file_util.h"
 #include "kawasan/common/logger.h"
 #include "kawasan/protocol/admin_misc_requests.h"
 #include "kawasan/protocol/admin_stubs.h"
@@ -4138,14 +4140,14 @@ int64_t KawasanBroker::allocateNextProducerId() {
     const int64_t next = current + 1;
     next_producer_id_.store(next);
     std::filesystem::create_directories(metadata_dir_);
-    std::ofstream out(counter_path, std::ios::trunc);
-    if (out.is_open()) {
-        out << next;
-        out.close();
-    } else {
+    // Crash-atomic and durable: re-issuing an id after a crash would make the
+    // new producer's first batches look like duplicates of the old one's.
+    if (!writeFileAtomically(counter_path, std::to_string(next))) {
         Logger::error("Failed to persist producer_id counter to {}", counter_path);
     }
-    return allocated;
+    // In a cluster every broker issues ids from its own range (see
+    // clusterProducerId); single-node ids stay plain sequential.
+    return cluster_brokers_.empty() ? allocated : clusterProducerId(broker_id_, allocated);
 }
 
 Buffer KawasanBroker::handleInitProducerId(RequestDispatcher::RequestContext& context) {

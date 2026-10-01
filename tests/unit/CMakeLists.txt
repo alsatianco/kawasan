@@ -95,6 +95,11 @@ add_executable(coordinator_routing_test coordinator_routing_test.cpp)
 target_link_libraries(coordinator_routing_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME CoordinatorRoutingTest COMMAND coordinator_routing_test)
 
+# Cluster-unique producer ids
+add_executable(producer_id_test producer_id_test.cpp)
+target_link_libraries(producer_id_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME ProducerIdTest COMMAND producer_id_test)
+
 # Quota manager test (Phase A6: client byte-rate throttling)
 add_executable(quota_manager_test quota_manager_test.cpp)
 target_link_libraries(quota_manager_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
