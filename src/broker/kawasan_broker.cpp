@@ -2735,6 +2735,14 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
                     continue;
                 }
 
+                if (const auto epoch_error = checkLeaderEpoch(partition.current_leader_epoch,
+                                                              partition_it->leader_epoch);
+                    epoch_error != ErrorCode::NONE) {
+                    partition_response.error_code = epoch_error;  // M8-E2 (KIP-320)
+                    finalize_partition(0);
+                    continue;
+                }
+
                 if (!log_manager_) {
                     partition_response.error_code = ErrorCode::KAFKA_STORAGE_ERROR;
                     finalize_partition(0);
@@ -3129,9 +3137,14 @@ RequestDispatcher::HandlerResult KawasanBroker::handleListOffsets(
     protocol::ListOffsetsResponse response;
     response.setThrottleTimeMs(0);
 
+    const bool metadata_current = dataPlaneCurrent();  // M8-E1
     for (const auto& topic : request.topics()) {
         protocol::ListOffsetsTopicResponse topic_response;
         topic_response.topic = topic.topic;
+        std::vector<TopicMetadata> topic_metadata;
+        if (metadata_controller_) {
+            topic_metadata = metadata_controller_->describeTopics({topic.topic});
+        }
 
         for (const auto& partition : topic.partitions) {
             protocol::ListOffsetsPartitionResponse partition_response;
@@ -3140,6 +3153,28 @@ RequestDispatcher::HandlerResult KawasanBroker::handleListOffsets(
             partition_response.timestamp = -1;
             partition_response.offset = -1;
             partition_response.leader_epoch = -1;
+
+            // Offsets come from the partition leader's log (a follower's HW and
+            // log end lag). Only enforced where metadata knows the partition.
+            if (!topic_metadata.empty() && topic_metadata.front().error_code == ErrorCode::NONE) {
+                const auto& parts = topic_metadata.front().partitions;
+                auto pm = std::find_if(parts.begin(), parts.end(), [&](const PartitionMetadata& m) {
+                    return m.partition == partition.partition;
+                });
+                if (pm != parts.end()) {
+                    ErrorCode gate = ErrorCode::NONE;
+                    if (pm->leader != broker_id_ || !metadata_current) {
+                        gate = ErrorCode::NOT_LEADER_FOR_PARTITION;
+                    } else {
+                        gate = checkLeaderEpoch(partition.current_leader_epoch, pm->leader_epoch);
+                    }
+                    if (gate != ErrorCode::NONE) {
+                        partition_response.error_code = gate;
+                        topic_response.partitions.push_back(partition_response);
+                        continue;
+                    }
+                }
+            }
 
             // Get the log for this partition
             auto* log = log_manager_->getLog(topic.topic, partition.partition);

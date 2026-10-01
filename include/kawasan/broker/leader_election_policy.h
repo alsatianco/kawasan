@@ -35,4 +35,10 @@ std::vector<PartitionLeadershipChange> computeLeadershipChanges(
     const std::vector<TopicMetadata>& topics, const std::set<BrokerId>& dead,
     bool unclean_enabled);
 
+/// @brief M8-E2: KIP-320 check of a request's `current_leader_epoch` against
+/// the partition's epoch. -1 (client did not say) passes; an older epoch is
+/// FENCED_LEADER_EPOCH (client must refresh metadata); a newer one is
+/// UNKNOWN_LEADER_EPOCH (this broker has not caught up yet; retriable).
+ErrorCode checkLeaderEpoch(int32_t requested, int32_t current);
+
 }  // namespace kawasan::broker

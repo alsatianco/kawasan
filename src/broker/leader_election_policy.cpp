@@ -65,4 +65,11 @@ std::vector<PartitionLeadershipChange> computeLeadershipChanges(
     return changes;
 }
 
+ErrorCode checkLeaderEpoch(int32_t requested, int32_t current) {
+    if (requested < 0 || requested == current) {
+        return ErrorCode::NONE;
+    }
+    return requested < current ? ErrorCode::FENCED_LEADER_EPOCH : ErrorCode::UNKNOWN_LEADER_EPOCH;
+}
+
 }  // namespace kawasan::broker

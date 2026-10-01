@@ -109,3 +109,14 @@ TEST(LeaderElectionPolicyTest, ScansEveryTopicAndPartition) {
     EXPECT_FALSE(changes[1].new_leader.has_value());
     EXPECT_EQ(changes[1].new_isr, (std::optional<std::vector<BrokerId>>{{1}}));
 }
+
+// M8-E2: a request carrying the client's view of the leader epoch is fenced if
+// that view is older than ours, and told to wait if it is newer.
+TEST(LeaderElectionPolicyTest, LeaderEpochCheck) {
+    using kawasan::ErrorCode;
+    using kawasan::broker::checkLeaderEpoch;
+    EXPECT_EQ(checkLeaderEpoch(-1, 3), ErrorCode::NONE);  // client did not say
+    EXPECT_EQ(checkLeaderEpoch(3, 3), ErrorCode::NONE);
+    EXPECT_EQ(checkLeaderEpoch(2, 3), ErrorCode::FENCED_LEADER_EPOCH);
+    EXPECT_EQ(checkLeaderEpoch(4, 3), ErrorCode::UNKNOWN_LEADER_EPOCH);
+}

@@ -85,6 +85,7 @@ public:
 
     /// @brief Returns the replica manager (leader/ISR/high-watermark state).
     ReplicaManager* replicaManager() { return replica_manager_.get(); }
+    MetadataController* metadataController() { return metadata_controller_.get(); }
 
     /// @brief M5: resolve a peer broker's Kafka listener address (host, port)
     /// from cluster metadata. Used by the replica fetcher to reach a partition

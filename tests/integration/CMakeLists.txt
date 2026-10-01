@@ -50,6 +50,11 @@ add_executable(replica_fetch_test replica_fetch_test.cpp)
 target_link_libraries(replica_fetch_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME ReplicaFetchTest COMMAND replica_fetch_test)
 
+# M8-E2: Fetch / ListOffsets current_leader_epoch fencing
+add_executable(leader_epoch_fencing_test leader_epoch_fencing_test.cpp)
+target_link_libraries(leader_epoch_fencing_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME LeaderEpochFencingTest COMMAND leader_epoch_fencing_test)
+
 add_executable(admin_surface_test admin_surface_test.cpp)
 target_link_libraries(admin_surface_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME AdminSurfaceTest COMMAND admin_surface_test)

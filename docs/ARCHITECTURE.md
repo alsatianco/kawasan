@@ -317,6 +317,8 @@ The Raft leader records when each peer last answered an AppendEntries, whether o
 
 This closes two windows. A restarted broker would otherwise act on its pre-crash metadata file, and a cut-off broker on its last view. Because the lease is shorter than the controller's liveness timeout, an isolated broker stops serving before the controller fails its partitions over. `/ready` reports the same condition. Single-node is always current.
 
+**Request epoch fencing (M8-E2).** Fetch (v9+) and ListOffsets (v4+) partitions carry the client's `current_leader_epoch`. `checkLeaderEpoch` (`leader_election_policy.h`) compares it with the partition's epoch from the metadata store, after the leader and currency gates. An older epoch gets `FENCED_LEADER_EPOCH`, a newer one `UNKNOWN_LEADER_EPOCH`, and `-1` skips the check. Replica fetches pass the same gate, though the follower's `PeerClient` still speaks Fetch v4 and so sends no epoch (that is M8-E3). ListOffsets still returns `leader_epoch = -1` until `OffsetForLeaderEpoch` answers from a real epoch cache (M8-F).
+
 A `RaftNode` is always in one of three states — `FOLLOWER`, `CANDIDATE`, or `LEADER`:
 
 ```
