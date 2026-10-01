@@ -470,4 +470,30 @@ TEST_F(ISRManagementTest, UnchangedFollowerKeepsFetchProgress) {
     EXPECT_EQ(replica_manager_->getFetchOffset(tp).value_or(-1), 0);
 }
 
+// M8-F3: becoming leader at a new epoch records where that epoch starts (the
+// log end at that moment), so an idle new epoch still answers
+// OffsetForLeaderEpoch. Followers do not record here (they learn from stamps).
+TEST_F(ISRManagementTest, BecomingLeaderRecordsEpochStart) {
+    TopicPartition tp{"test-topic", 0};
+    auto log = createTestLog(tp.topic, tp.partition);
+    ASSERT_TRUE(replica_manager_->reconcileReplica(tp, log, 1, {1, 0}, 3));  // follower
+    EXPECT_FALSE(log->latestLeaderEpoch().has_value());
+    appendN(log, 4);
+    ASSERT_TRUE(replica_manager_->reconcileReplica(tp, log, 0, {0, 1}, 4));  // promoted
+    EXPECT_EQ(log->latestLeaderEpoch(), std::optional<int32_t>(4));
+    EXPECT_EQ(log->epochEndOffset(4), (std::pair<int32_t, Offset>{4, 4}));
+    appendN(log, 2);
+    ASSERT_TRUE(replica_manager_->reconcileReplica(tp, log, 0, {0, 1}, 5));  // re-elected
+    EXPECT_EQ(log->epochEndOffset(4), (std::pair<int32_t, Offset>{4, 6}));
+    EXPECT_EQ(log->latestLeaderEpoch(), std::optional<int32_t>(5));
+}
+
+TEST_F(ISRManagementTest, NewLeaderReplicaRecordsEpochStart) {
+    TopicPartition tp{"test-topic", 0};
+    auto log = createTestLog(tp.topic, tp.partition);
+    appendN(log, 3);
+    ASSERT_TRUE(replica_manager_->reconcileReplica(tp, log, 0, {0}, 2));
+    EXPECT_EQ(log->epochEndOffset(2), (std::pair<int32_t, Offset>{2, 3}));
+}
+
 }  // namespace kawasan::broker

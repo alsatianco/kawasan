@@ -164,3 +164,59 @@ TEST_F(LeaderEpochCacheTest, LogOwnsCacheAndTruncationsMaintainIt) {
     EXPECT_EQ(reopened.latestLeaderEpoch(), std::optional<int32_t>(1));
     EXPECT_TRUE(fs::exists(dir_ + "/leader-epoch-checkpoint"));
 }
+
+namespace {
+kawasan::storage::RecordBatch batchOf(int n, int32_t stamped_epoch = -1) {
+    kawasan::storage::RecordBatch b;
+    b.setMagic(2);
+    b.setPartitionLeaderEpoch(stamped_epoch);
+    for (int i = 0; i < n; ++i) {
+        kawasan::Record r;
+        r.value = std::vector<uint8_t>{'y'};
+        b.addRecord(r);
+    }
+    return b;
+}
+std::vector<int32_t> stamps(kawasan::storage::Log& log) {
+    std::vector<int32_t> out;
+    for (const auto& b : log.read(0, 64 * 1024 * 1024)) {
+        out.push_back(b.partitionLeaderEpoch());
+    }
+    return out;
+}
+}  // namespace
+
+// M8-F2: leader appends carry the leader epoch they were written in; a log with
+// no epoch history (single-node) leaves batches unstamped (-1), as before.
+TEST_F(LeaderEpochCacheTest, LeaderAppendsAreStampedWithTheLatestEpoch) {
+    kawasan::storage::Log log("t", 0, dir_);
+    log.appendBatch(batchOf(2));
+    log.assignLeaderEpochStart(4, log.logEndOffset());
+    log.appendBatch(batchOf(2));
+    kawasan::Record r;
+    r.value = std::vector<uint8_t>{'z'};
+    log.append({r});
+    EXPECT_EQ(stamps(log), (std::vector<int32_t>{-1, 4, 4}));
+}
+
+// M8-F3: a follower learns epoch boundaries from the leader's stamps on the
+// batches it replicates, so it can answer OffsetForLeaderEpoch after a failover.
+TEST_F(LeaderEpochCacheTest, ReplicatedBatchesRecordEpochStarts) {
+    kawasan::storage::Log log("t", 0, dir_);
+    auto at = [](kawasan::storage::RecordBatch b, kawasan::Offset base) {
+        b.setBaseOffset(base);
+        return b;
+    };
+    ASSERT_EQ(log.appendReplicatedBatch(at(batchOf(3, 1), 0)),
+              kawasan::storage::Log::ReplicaAppendResult::kAppended);
+    ASSERT_EQ(log.appendReplicatedBatch(at(batchOf(2, 1), 3)),
+              kawasan::storage::Log::ReplicaAppendResult::kAppended);
+    ASSERT_EQ(log.appendReplicatedBatch(at(batchOf(4, 3), 5)),
+              kawasan::storage::Log::ReplicaAppendResult::kAppended);
+    ASSERT_EQ(log.appendReplicatedBatch(at(batchOf(1, -1), 9)),  // unstamped: no change
+              kawasan::storage::Log::ReplicaAppendResult::kAppended);
+    EXPECT_EQ(log.epochEndOffset(1), (std::pair<int32_t, kawasan::Offset>{1, 5}));
+    EXPECT_EQ(log.epochEndOffset(3), (std::pair<int32_t, kawasan::Offset>{3, 10}));
+    // Replicated batches keep the leader's stamp byte-for-byte.
+    EXPECT_EQ(stamps(log), (std::vector<int32_t>{1, 1, 3, -1}));
+}

@@ -170,6 +170,7 @@ Offset Log::append(const std::vector<Record>& records, bool force_sync) {
     RecordBatch batch;
     batch.setBaseOffset(endOffsetUnlocked());
     batch.setFirstTimestamp(records[0].timestamp);
+    stampLeaderEpochLocked(batch);
 
     for (const auto& record : records) {
         batch.addRecord(record);
@@ -207,6 +208,7 @@ Offset Log::appendBatch(RecordBatch batch, bool advance_high_watermark) {
 
     // Assign the next available offset to this pre-built batch.
     batch.setBaseOffset(endOffsetUnlocked());
+    stampLeaderEpochLocked(batch);
 
     auto* segment = activeSegment();
     if (shouldRollForTime() || (segment && segment->size() >= config_.segment_size)) {
@@ -259,6 +261,9 @@ Log::ReplicaAppendResult Log::appendReplicatedBatch(const RecordBatch& batch) {
     // so the segment keys the record at the leader's offset and it is preserved.
     // Do NOT advance the high watermark — a follower's HW is leader-driven.
     segment->append(batch, config_.flush_mode == FlushMode::kSync);
+    // M8-F3: learn epoch boundaries from the leader's stamps (assign ignores
+    // unstamped, stale and repeated epochs).
+    epoch_cache_->assign(batch.partitionLeaderEpoch(), wire_base);
     checkpoint_dirty_ = true;
     notifyChangeLocked();
     return ReplicaAppendResult::kAppended;
@@ -898,6 +903,14 @@ void Log::setHighWatermark(Offset offset) {
     if (changed) {
         checkpoint_dirty_ = true;
         notifyChangeLocked();
+    }
+}
+
+void Log::stampLeaderEpochLocked(RecordBatch& batch) const {
+    // M8-F2: a leader append belongs to the latest epoch in our history. With
+    // no history (single-node) batches stay unstamped (-1), as before.
+    if (const auto epoch = epoch_cache_->latestEpoch()) {
+        batch.setPartitionLeaderEpoch(*epoch);
     }
 }
 

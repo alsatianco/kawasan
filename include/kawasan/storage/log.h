@@ -218,6 +218,7 @@ private:
     std::chrono::steady_clock::time_point now() const;
     Offset endOffsetUnlocked() const;
     Offset startOffsetUnlocked() const;
+    void stampLeaderEpochLocked(RecordBatch& batch) const;
     void loadCheckpoint();
     void persistCheckpointLocked() const;
     std::optional<std::tuple<Offset, Offset, Offset>> readCheckpointFromDisk() const;

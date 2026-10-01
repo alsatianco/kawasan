@@ -450,6 +450,8 @@ bool ReplicaManager::reconcileReplica(const TopicPartition& tp, std::shared_ptr<
         info.fetch_offset = (leader != local_broker_id_) ? info.log->logEndOffset() : 0;
         auto& stored = replicas_[tp] = std::move(info);
         if (leader == local_broker_id_) {
+            // M8-F3: our epoch starts at our log end.
+            stored.log->assignLeaderEpochStart(leader_epoch, stored.log->logEndOffset());
             // A sole-replica leader commits its whole log (a periodic HW
             // checkpoint may lag the log after a restart).
             maybeAdvanceHighWatermarkLocked(stored);
@@ -476,6 +478,12 @@ bool ReplicaManager::reconcileReplica(const TopicPartition& tp, std::shared_ptr<
     if (was_leader != is_leader || (is_leader && leader_epoch != info.leader_epoch)) {
         // Follower progress was reported against an earlier leadership.
         info.follower_states.clear();
+    }
+    if (is_leader && info.log) {
+        // M8-F3: becoming leader (or re-elected at a higher epoch): the new
+        // epoch starts at our current log end. Recording it now — not at the
+        // first append — keeps an idle epoch answerable. Repeats are ignored.
+        info.log->assignLeaderEpochStart(leader_epoch, info.log->logEndOffset());
     }
     info.leader = leader;
     info.isr = isr;
