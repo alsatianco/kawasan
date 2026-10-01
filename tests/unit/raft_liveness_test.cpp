@@ -13,6 +13,7 @@
 
 #include "kawasan/common/logger.h"
 #include "kawasan/raft/raft_node.h"
+#include "kawasan/raft/raft_transport.h"
 
 using namespace kawasan::raft;
 using namespace std::chrono_literals;
@@ -145,4 +146,72 @@ TEST(RaftLivenessTest, NewLeaderGrantsEveryPeerAGraceWindow) {
     std::this_thread::sleep_for(1200ms);
     ages = cluster.nodes[new_leader]->peerAckAgesMs();
     EXPECT_GT(ages.at(old_leader), 900);  // and then grows, since it is dead
+}
+
+// Regression (found by the M8 SIGSTOP nemesis): RaftTransport ran outgoing RPCs
+// as blocking reads with no timeout on the same single io thread that serves
+// incoming RPCs. One unresponsive peer then wedged that thread forever, and two
+// nodes calling each other at once deadlocked. Outgoing RPCs must now be
+// bounded, and must never stop the node from answering others.
+TEST(RaftLivenessTest, UnresponsivePeerNeitherHangsRpcsNorBlocksServing) {
+    // A "frozen" peer: accepts connections, never answers.
+    boost::asio::io_context hole_io;
+    boost::asio::ip::tcp::acceptor hole(
+        hole_io, boost::asio::ip::tcp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 0));
+    const int hole_port = hole.local_endpoint().port();
+    boost::asio::ip::tcp::socket held(hole_io);
+    std::thread hole_thread([&] {
+        boost::system::error_code ec;
+        hole.accept(held, ec);
+    });
+
+    // Node A: one io thread, exactly like a broker.
+    boost::asio::io_context a_io;
+    auto a_guard = boost::asio::make_work_guard(a_io);
+    std::thread a_thread([&] { a_io.run(); });
+    const int a_port = freePort();
+    RaftTransport a(a_io, 1);
+    a.setRequestVoteHandler([](const RequestVoteRequest& req) {
+        RequestVoteResponse resp;
+        resp.term = req.term;
+        resp.vote_granted = true;
+        return resp;
+    });
+    a.start(a_port);
+    a.add_peer(9, "127.0.0.1", hole_port);
+
+    RequestVoteRequest req;
+    req.term = 7;
+    req.candidate_id = 1;
+    auto stuck = a.sendRequestVote(9, req);
+
+    // While A's RPC to the frozen peer is outstanding, B can still get an answer
+    // from A.
+    boost::asio::io_context b_io;
+    auto b_guard = boost::asio::make_work_guard(b_io);
+    std::thread b_thread([&] { b_io.run(); });
+    RaftTransport b(b_io, 2);
+    b.start(freePort());
+    b.add_peer(1, "127.0.0.1", a_port);
+    std::this_thread::sleep_for(100ms);
+    auto answered = b.sendRequestVote(1, req);
+    ASSERT_EQ(answered.wait_for(2s), std::future_status::ready);
+    EXPECT_TRUE(answered.get().vote_granted);
+
+    // And the RPC to the frozen peer fails within its deadline instead of
+    // hanging forever.
+    ASSERT_EQ(stuck.wait_for(5s), std::future_status::ready);
+    EXPECT_THROW(stuck.get(), std::exception);
+
+    a.stop();
+    b.stop();
+    a_guard.reset();
+    b_guard.reset();
+    a_io.stop();
+    b_io.stop();
+    a_thread.join();
+    b_thread.join();
+    hole.close();
+    hole_io.stop();
+    hole_thread.join();
 }

@@ -2,8 +2,11 @@
 // Licensed under the Apache License, Version 2.0
 
 #include "kawasan/raft/raft_transport.h"
+#include <poll.h>
 #include <spdlog/spdlog.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <stdexcept>
 
 using boost::asio::ip::tcp;
@@ -19,13 +22,23 @@ RaftTransport::RaftTransport(boost::asio::io_context& io_context, int local_peer
     : io_context_(io_context)
     , local_peer_id_(local_peer_id)
     , running_(false)
-    , listen_port_(0) {
-    
+    , listen_port_(0)
+    , client_guard_(boost::asio::make_work_guard(client_io_)) {
+    for (int i = 0; i < kClientThreads; ++i) {
+        client_threads_.emplace_back([this] { client_io_.run(); });
+    }
     spdlog::info("RaftTransport created for peer {}", local_peer_id_);
 }
 
 RaftTransport::~RaftTransport() {
     stop();
+    client_guard_.reset();
+    client_io_.stop();
+    for (auto& t : client_threads_) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
 }
 
 void RaftTransport::start(int port) {
@@ -146,232 +159,157 @@ void RaftTransport::remove_peer(int peer_id) {
     }
 }
 
-std::future<AppendEntriesResponse> RaftTransport::sendAppendEntries(
-    int peer_id,
-    const AppendEntriesRequest& request) {
+namespace {
 
-    auto promise = std::make_shared<std::promise<AppendEntriesResponse>>();
-    auto future = promise->get_future();
+using Clock = std::chrono::steady_clock;
 
-    // Post work to io_context to avoid blocking
-    boost::asio::post(io_context_, [this, peer_id, request, promise]() {
-        // 0A.9: lock the per-peer RPC mutex so concurrent RPCs on the same
-        // socket cannot interleave their write/read frames.
-        std::shared_ptr<std::mutex> rpc_mu;
-        {
-            std::lock_guard<std::mutex> lock(peers_mutex_);
-            auto it = peers_.find(peer_id);
-            if (it != peers_.end()) {
-                rpc_mu = it->second.rpc_mutex;
+// Moves `len` bytes over a NON-blocking socket, waiting with poll() but never
+// past `deadline`. Asio's own sync read/write wait without any bound, which let
+// a frozen or partitioned peer wedge an RPC thread forever.
+void transferWithDeadline(tcp::socket& socket, bool writing, uint8_t* data, size_t len,
+                          Clock::time_point deadline) {
+    size_t done = 0;
+    while (done < len) {
+        boost::system::error_code ec;
+        const size_t n =
+            writing ? socket.write_some(boost::asio::buffer(data + done, len - done), ec)
+                    : socket.read_some(boost::asio::buffer(data + done, len - done), ec);
+        if (!ec) {
+            if (n == 0 && !writing) {
+                throw std::runtime_error("connection closed by peer");
             }
+            done += n;
+            continue;
         }
-        std::unique_lock<std::mutex> rpc_lock;
-        if (rpc_mu) {
-            rpc_lock = std::unique_lock<std::mutex>(*rpc_mu);
+        if (ec != boost::asio::error::would_block && ec != boost::asio::error::try_again) {
+            throw std::runtime_error(std::string(writing ? "write" : "read") +
+                                     " error: " + ec.message());
         }
-
-        // opus2 Item 2: single-retry on connection error. When a peer
-        // restarts, the first attempt may use a stale cached socket
-        // and fail with EOF/broken-pipe. We must reconnect and retry
-        // exactly once before failing the RPC. This matches the
-        // behavior real Raft transports rely on for membership
-        // changes and rolling restarts.
-        std::exception_ptr last_error;
-        for (int attempt = 0; attempt < 2; ++attempt) {
-            try {
-                // Get connection to peer
-                auto socket = get_connection(peer_id);
-
-                // Serialize request using codec
-                std::vector<uint8_t> request_data = AppendEntriesRequestCodec::encode(request);
-
-                // Prepend 4-byte length header
-                uint32_t length = static_cast<uint32_t>(request_data.size());
-                std::vector<uint8_t> message;
-                message.reserve(4 + request_data.size());
-
-                // Big-endian length
-                message.push_back((length >> 24) & 0xFF);
-                message.push_back((length >> 16) & 0xFF);
-                message.push_back((length >> 8) & 0xFF);
-                message.push_back(length & 0xFF);
-
-                message.insert(message.end(), request_data.begin(), request_data.end());
-
-                // Send request
-                boost::system::error_code ec;
-                boost::asio::write(*socket, boost::asio::buffer(message), ec);
-
-                if (ec) {
-                    throw std::runtime_error("Write error: " + ec.message());
-                }
-
-                // Read response length (4 bytes)
-                uint8_t length_buf[4];
-                boost::asio::read(*socket, boost::asio::buffer(length_buf, 4), ec);
-
-                if (ec) {
-                    throw std::runtime_error("Read length error: " + ec.message());
-                }
-
-                uint32_t response_length =
-                    (static_cast<uint32_t>(length_buf[0]) << 24) |
-                    (static_cast<uint32_t>(length_buf[1]) << 16) |
-                    (static_cast<uint32_t>(length_buf[2]) << 8) |
-                    static_cast<uint32_t>(length_buf[3]);
-
-                if (response_length > kMaxMessageSize) {
-                    throw std::runtime_error("Response too large: " + std::to_string(response_length));
-                }
-
-                // Read response body
-                std::vector<uint8_t> response_data(response_length);
-                boost::asio::read(*socket, boost::asio::buffer(response_data), ec);
-
-                if (ec) {
-                    throw std::runtime_error("Read body error: " + ec.message());
-                }
-
-                // Deserialize response using codec
-                AppendEntriesResponse response = AppendEntriesResponseCodec::decode(response_data);
-
-                // Fulfill promise
-                promise->set_value(std::move(response));
-                return;
-
-            } catch (const std::exception& e) {
-                last_error = std::current_exception();
-                if (attempt == 0) {
-                    spdlog::warn(
-                        "AppendEntries RPC to peer {} failed on first attempt: {} "
-                        "— invalidating cached connection and retrying once",
-                        peer_id, e.what());
-                } else {
-                    spdlog::error("AppendEntries RPC to peer {} failed after retry: {}",
-                                  peer_id, e.what());
-                }
-
-                // Mark connection as bad so get_connection() reconnects on retry.
-                std::lock_guard<std::mutex> lock(peers_mutex_);
-                auto it = peers_.find(peer_id);
-                if (it != peers_.end()) {
-                    it->second.connected = false;
-                    if (it->second.socket) {
-                        boost::system::error_code close_ec;
-                        it->second.socket->close(close_ec);
-                    }
-                    // Reset retry_count so connect_to_peer doesn't apply
-                    // its backoff on this immediate reconnect — backoff
-                    // is for persistent failures, not stale-cache cases.
-                    it->second.retry_count = 0;
-                }
-            }
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now());
+        if (remaining.count() <= 0) {
+            throw std::runtime_error(std::string(writing ? "write" : "read") + " timed out");
         }
-        promise->set_exception(last_error);
-    });
-
-    return future;
+        pollfd pfd{};
+        pfd.fd = socket.native_handle();
+        pfd.events = writing ? POLLOUT : POLLIN;
+        const int rc = ::poll(&pfd, 1, static_cast<int>(remaining.count()));
+        if (rc < 0 && errno != EINTR) {
+            throw std::runtime_error("poll failed");
+        }
+    }
 }
 
-std::future<RequestVoteResponse> RaftTransport::sendRequestVote(
-    int peer_id,
-    const RequestVoteRequest& request) {
-    
-    auto promise = std::make_shared<std::promise<RequestVoteResponse>>();
-    auto future = promise->get_future();
-    
-    // Post work to io_context to avoid blocking
-    boost::asio::post(io_context_, [this, peer_id, request, promise]() {
-        // 0A.9: same per-peer serialization as sendAppendEntries.
-        std::shared_ptr<std::mutex> rpc_mu;
-        {
-            std::lock_guard<std::mutex> lock(peers_mutex_);
-            auto it = peers_.find(peer_id);
-            if (it != peers_.end()) {
-                rpc_mu = it->second.rpc_mutex;
-            }
+}  // namespace
+
+std::vector<uint8_t> RaftTransport::roundTrip(int peer_id, const std::vector<uint8_t>& request,
+                                              std::chrono::milliseconds timeout,
+                                              std::chrono::steady_clock::time_point enqueued,
+                                              const char* rpc_name) {
+    const auto deadline = enqueued + timeout;
+    // 0A.9: serialize RPCs to the same peer so their frames never interleave
+    // on the shared socket.
+    std::shared_ptr<std::mutex> rpc_mu;
+    {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        auto it = peers_.find(peer_id);
+        if (it != peers_.end()) {
+            rpc_mu = it->second.rpc_mutex;
         }
-        std::unique_lock<std::mutex> rpc_lock;
-        if (rpc_mu) {
-            rpc_lock = std::unique_lock<std::mutex>(*rpc_mu);
+    }
+    std::unique_lock<std::mutex> rpc_lock;
+    if (rpc_mu) {
+        rpc_lock = std::unique_lock<std::mutex>(*rpc_mu);
+    }
+
+    std::vector<uint8_t> message;
+    message.reserve(4 + request.size());
+    const auto length = static_cast<uint32_t>(request.size());
+    message.push_back((length >> 24) & 0xFF);
+    message.push_back((length >> 16) & 0xFF);
+    message.push_back((length >> 8) & 0xFF);
+    message.push_back(length & 0xFF);
+    message.insert(message.end(), request.begin(), request.end());
+
+    // opus2 Item 2: a restarted peer leaves a stale cached socket, so retry
+    // once on a fresh connection before failing the RPC.
+    std::exception_ptr last_error;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (Clock::now() >= deadline) {
+            // Queued behind a slow RPC to the same peer for longer than the
+            // RPC is worth: the caller stopped waiting long ago.
+            throw std::runtime_error(std::string(rpc_name) + " to peer " +
+                                     std::to_string(peer_id) + " expired before sending");
         }
         try {
-            // Get connection to peer
             auto socket = get_connection(peer_id);
-
-            // Serialize request using codec
-            std::vector<uint8_t> request_data = RequestVoteRequestCodec::encode(request);
-            
-            // Prepend 4-byte length header
-            uint32_t length = static_cast<uint32_t>(request_data.size());
-            std::vector<uint8_t> message;
-            message.reserve(4 + request_data.size());
-            
-            // Big-endian length
-            message.push_back((length >> 24) & 0xFF);
-            message.push_back((length >> 16) & 0xFF);
-            message.push_back((length >> 8) & 0xFF);
-            message.push_back(length & 0xFF);
-            
-            message.insert(message.end(), request_data.begin(), request_data.end());
-            
-            // Send request
-            boost::system::error_code ec;
-            boost::asio::write(*socket, boost::asio::buffer(message), ec);
-            
-            if (ec) {
-                throw std::runtime_error("Write error: " + ec.message());
-            }
-            
-            // Read response length (4 bytes)
+            transferWithDeadline(*socket, true, message.data(), message.size(), deadline);
             uint8_t length_buf[4];
-            boost::asio::read(*socket, boost::asio::buffer(length_buf, 4), ec);
-            
-            if (ec) {
-                throw std::runtime_error("Read length error: " + ec.message());
-            }
-            
-            uint32_t response_length = 
-                (static_cast<uint32_t>(length_buf[0]) << 24) |
-                (static_cast<uint32_t>(length_buf[1]) << 16) |
-                (static_cast<uint32_t>(length_buf[2]) << 8) |
-                static_cast<uint32_t>(length_buf[3]);
-            
+            transferWithDeadline(*socket, false, length_buf, 4, deadline);
+            const uint32_t response_length = (static_cast<uint32_t>(length_buf[0]) << 24) |
+                                             (static_cast<uint32_t>(length_buf[1]) << 16) |
+                                             (static_cast<uint32_t>(length_buf[2]) << 8) |
+                                             static_cast<uint32_t>(length_buf[3]);
             if (response_length > kMaxMessageSize) {
                 throw std::runtime_error("Response too large: " + std::to_string(response_length));
             }
-            
-            // Read response body
-            std::vector<uint8_t> response_data(response_length);
-            boost::asio::read(*socket, boost::asio::buffer(response_data), ec);
-            
-            if (ec) {
-                throw std::runtime_error("Read body error: " + ec.message());
-            }
-            
-            // Deserialize response using codec
-            RequestVoteResponse response = RequestVoteResponseCodec::decode(response_data);
-            
-            // Fulfill promise
-            promise->set_value(std::move(response));
-            
+            std::vector<uint8_t> response(response_length);
+            transferWithDeadline(*socket, false, response.data(), response.size(), deadline);
+            return response;
         } catch (const std::exception& e) {
-            spdlog::error("RequestVote RPC to peer {} failed: {}", peer_id, e.what());
-            
-            // Mark connection as bad
-            {
-                std::lock_guard<std::mutex> lock(peers_mutex_);
-                auto it = peers_.find(peer_id);
-                if (it != peers_.end()) {
-                    it->second.connected = false;
+            last_error = std::current_exception();
+            spdlog::debug("{} RPC to peer {} failed (attempt {}): {}", rpc_name, peer_id,
+                          attempt + 1, e.what());
+            // A timed-out socket may still receive the late response: never
+            // reuse it, or the next RPC would read the wrong frame.
+            std::lock_guard<std::mutex> lock(peers_mutex_);
+            auto it = peers_.find(peer_id);
+            if (it != peers_.end()) {
+                it->second.connected = false;
+                if (it->second.socket) {
+                    boost::system::error_code close_ec;
+                    it->second.socket->close(close_ec);
                 }
+                it->second.retry_count = 0;
             }
-            
+        }
+    }
+    std::rethrow_exception(last_error);
+}
+
+template <typename Response, typename Decode>
+std::future<Response> RaftTransport::sendRpc(int peer_id, std::vector<uint8_t> request,
+                                             std::chrono::milliseconds timeout,
+                                             const char* rpc_name, Decode decode) {
+    auto promise = std::make_shared<std::promise<Response>>();
+    auto future = promise->get_future();
+    const auto enqueued = Clock::now();
+    // Client RPCs never run on the io_context that serves incoming RPCs: two
+    // nodes calling each other at once would otherwise both block in a read
+    // with no thread left to answer the other.
+    boost::asio::post(client_io_, [this, peer_id, request = std::move(request), timeout,
+                                   rpc_name, decode, promise, enqueued]() {
+        try {
+            promise->set_value(decode(roundTrip(peer_id, request, timeout, enqueued, rpc_name)));
+        } catch (...) {
             promise->set_exception(std::current_exception());
         }
     });
-    
     return future;
+}
+
+std::future<AppendEntriesResponse> RaftTransport::sendAppendEntries(
+    int peer_id, const AppendEntriesRequest& request) {
+    return sendRpc<AppendEntriesResponse>(
+        peer_id, AppendEntriesRequestCodec::encode(request), kRpcTimeout, "AppendEntries",
+        [](const std::vector<uint8_t>& data) { return AppendEntriesResponseCodec::decode(data); });
+}
+
+std::future<RequestVoteResponse> RaftTransport::sendRequestVote(int peer_id,
+                                                               const RequestVoteRequest& request) {
+    return sendRpc<RequestVoteResponse>(
+        peer_id, RequestVoteRequestCodec::encode(request), kRpcTimeout, "RequestVote",
+        [](const std::vector<uint8_t>& data) { return RequestVoteResponseCodec::decode(data); });
 }
 
 void RaftTransport::setAppendEntriesHandler(
@@ -399,71 +337,9 @@ void RaftTransport::setInstallSnapshotHandler(InstallSnapshotHandler handler) {
 
 std::future<InstallSnapshotResponse> RaftTransport::sendInstallSnapshot(
     int peer_id, const InstallSnapshotRequest& request) {
-
-    auto promise = std::make_shared<std::promise<InstallSnapshotResponse>>();
-    auto future = promise->get_future();
-
-    boost::asio::post(io_context_, [this, peer_id, request, promise]() {
-        std::shared_ptr<std::mutex> rpc_mu;
-        {
-            std::lock_guard<std::mutex> lock(peers_mutex_);
-            auto it = peers_.find(peer_id);
-            if (it != peers_.end()) {
-                rpc_mu = it->second.rpc_mutex;
-            }
-        }
-        std::unique_lock<std::mutex> rpc_lock;
-        if (rpc_mu) {
-            rpc_lock = std::unique_lock<std::mutex>(*rpc_mu);
-        }
-        try {
-            auto socket = get_connection(peer_id);
-            auto request_data = request.encode();
-            uint32_t length = static_cast<uint32_t>(request_data.size());
-            std::vector<uint8_t> message;
-            message.reserve(4 + request_data.size());
-            message.push_back((length >> 24) & 0xFF);
-            message.push_back((length >> 16) & 0xFF);
-            message.push_back((length >> 8) & 0xFF);
-            message.push_back(length & 0xFF);
-            message.insert(message.end(), request_data.begin(), request_data.end());
-
-            boost::system::error_code ec;
-            boost::asio::write(*socket, boost::asio::buffer(message), ec);
-            if (ec) throw std::runtime_error("Write error: " + ec.message());
-
-            uint8_t length_buf[4];
-            boost::asio::read(*socket, boost::asio::buffer(length_buf, 4), ec);
-            if (ec) throw std::runtime_error("Read length error: " + ec.message());
-
-            const uint32_t response_length =
-                (static_cast<uint32_t>(length_buf[0]) << 24) |
-                (static_cast<uint32_t>(length_buf[1]) << 16) |
-                (static_cast<uint32_t>(length_buf[2]) << 8) |
-                static_cast<uint32_t>(length_buf[3]);
-            if (response_length > kMaxMessageSize) {
-                throw std::runtime_error("Response too large");
-            }
-            std::vector<uint8_t> response_data(response_length);
-            boost::asio::read(*socket, boost::asio::buffer(response_data), ec);
-            if (ec) throw std::runtime_error("Read body error: " + ec.message());
-
-            auto response = InstallSnapshotResponse::decode(response_data);
-            promise->set_value(std::move(response));
-        } catch (const std::exception& e) {
-            spdlog::error("InstallSnapshot RPC to peer {} failed: {}", peer_id, e.what());
-            {
-                std::lock_guard<std::mutex> lock(peers_mutex_);
-                auto it = peers_.find(peer_id);
-                if (it != peers_.end()) {
-                    it->second.connected = false;
-                }
-            }
-            promise->set_exception(std::current_exception());
-        }
-    });
-
-    return future;
+    return sendRpc<InstallSnapshotResponse>(
+        peer_id, request.encode(), kSnapshotRpcTimeout, "InstallSnapshot",
+        [](const std::vector<uint8_t>& data) { return InstallSnapshotResponse::decode(data); });
 }
 
 
@@ -578,6 +454,15 @@ bool RaftTransport::connect_to_peer(int peer_id, PeerInfo& peer) {
             return false;
         }
         
+        // Client RPCs drive this socket with poll()-bounded non-blocking IO.
+        peer.socket->non_blocking(true, ec);
+        if (ec) {
+            spdlog::warn("Failed to make socket to peer {} non-blocking: {}", peer_id,
+                         ec.message());
+            peer.connected = false;
+            return false;
+        }
+
         // Success
         peer.connected = true;
         peer.retry_count = 0;

@@ -5,12 +5,15 @@
 
 #include "raft_protocol.h"
 #include <boost/asio.hpp>
+#include <chrono>
 #include <functional>
 #include <future>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace kawasan {
@@ -247,7 +250,25 @@ private:
     // existing field pair stable (see setInstallSnapshotHandler note).
     std::unique_ptr<InstallSnapshotHandler> install_snapshot_handler_;
 
+    // Client side: outgoing RPCs run on this private pool (never on the shared
+    // io_context that serves incoming RPCs), each bounded by a deadline.
+    std::vector<uint8_t> roundTrip(int peer_id, const std::vector<uint8_t>& request,
+                                   std::chrono::milliseconds timeout,
+                                   std::chrono::steady_clock::time_point enqueued,
+                                   const char* rpc_name);
+    template <typename Response, typename Decode>
+    std::future<Response> sendRpc(int peer_id, std::vector<uint8_t> request,
+                                  std::chrono::milliseconds timeout, const char* rpc_name,
+                                  Decode decode);
+    boost::asio::io_context client_io_;
+    std::optional<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>>
+        client_guard_;
+    std::vector<std::thread> client_threads_;
+
     // Configuration
+    static constexpr int kClientThreads = 4;
+    static constexpr std::chrono::milliseconds kRpcTimeout{1000};
+    static constexpr std::chrono::milliseconds kSnapshotRpcTimeout{10000};
     static constexpr int kMaxRetries = 3;
     static constexpr int kInitialBackoffMs = 100;
     static constexpr int kMaxBackoffMs = 5000;

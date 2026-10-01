@@ -862,6 +862,12 @@ void RaftNode::applyThread() {
                 }
                 cb = commit_callback_;
                 if (!cb) {
+                    if (!apply_running_.load()) {
+                        // Stopping with no state machine attached (it detached
+                        // first): nothing can apply these entries now. They stay
+                        // durable in the log and are re-delivered next start.
+                        return;
+                    }
                     // Callback not installed yet (startup window): leave the
                     // entry unapplied and re-wait (timed) until it's set.
                     break;
