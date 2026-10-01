@@ -43,9 +43,12 @@ public:
     };
 
     void decode(Buffer& buffer, int16_t api_version);
+    void encode(Buffer& buffer, int16_t api_version) const;
 
     int32_t replicaId() const { return replica_id_; }
     const std::vector<TopicQuery>& topics() const { return topics_; }
+    void setReplicaId(int32_t id) { replica_id_ = id; }
+    void addTopic(TopicQuery topic) { topics_.push_back(std::move(topic)); }
 
 private:
     int32_t replica_id_ = -1;  // v3+; "-1 = consumer"
@@ -69,6 +72,9 @@ public:
     void addTopic(TopicResult t) { topics_.push_back(std::move(t)); }
 
     void encode(Buffer& buffer, int16_t api_version) const;
+    void decode(Buffer& buffer, int16_t api_version);
+
+    const std::vector<TopicResult>& topics() const { return topics_; }
 
 private:
     int32_t throttle_time_ms_ = 0;

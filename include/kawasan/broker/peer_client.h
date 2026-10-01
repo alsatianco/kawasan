@@ -58,6 +58,21 @@ public:
                                             const std::vector<BrokerId>& new_isr,
                                             int32_t partition_epoch);
 
+    /// @brief M8-F4: KIP-101 — ask the partition leader where `leader_epoch`
+    /// ends in its log (OffsetForLeaderEpoch, API 23, v3 with replica_id = this
+    /// broker). `current_leader_epoch` is this follower's view of the leader's
+    /// epoch (fenced by the leader if stale). nullopt on a connection/protocol
+    /// error.
+    struct EpochEndOffset {
+        ErrorCode error = ErrorCode::NONE;
+        int32_t leader_epoch = -1;
+        Offset end_offset = -1;
+    };
+    std::optional<EpochEndOffset> offsetForLeaderEpoch(const std::string& topic,
+                                                       PartitionId partition,
+                                                       int32_t current_leader_epoch,
+                                                       int32_t leader_epoch);
+
     const std::string& host() const { return host_; }
     int32_t port() const { return port_; }
 

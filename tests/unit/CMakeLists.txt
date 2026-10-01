@@ -36,6 +36,11 @@ add_executable(leader_epoch_cache_test leader_epoch_cache_test.cpp)
 target_link_libraries(leader_epoch_cache_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME LeaderEpochCacheTest COMMAND leader_epoch_cache_test)
 
+# M8-F4: OffsetForLeaderEpoch codec, both directions, v0-v4
+add_executable(offset_for_leader_epoch_codec_test offset_for_leader_epoch_codec_test.cpp)
+target_link_libraries(offset_for_leader_epoch_codec_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME OffsetForLeaderEpochCodecTest COMMAND offset_for_leader_epoch_codec_test)
+
 add_executable(metadata_leader_election_test metadata_leader_election_test.cpp)
 target_link_libraries(metadata_leader_election_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME MetadataLeaderElectionTest COMMAND metadata_leader_election_test)

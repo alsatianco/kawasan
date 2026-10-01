@@ -13,6 +13,7 @@
 #include "kawasan/protocol/admin_stubs.h"
 #include "kawasan/protocol/api_keys.h"
 #include "kawasan/protocol/fetch_request.h"
+#include "kawasan/protocol/offset_for_leader_epoch_request.h"
 #include "kawasan/protocol/request_header.h"
 
 namespace kawasan::broker {
@@ -182,6 +183,42 @@ std::optional<ErrorCode> PeerClient::alterPartition(const std::string& topic, Pa
         return ar.errorCode();
     } catch (const std::exception& e) {
         Logger::warn("PeerClient alterPartition to {}:{} failed: {}", host_, port_, e.what());
+        disconnect();
+        return std::nullopt;
+    }
+}
+
+std::optional<PeerClient::EpochEndOffset> PeerClient::offsetForLeaderEpoch(
+    const std::string& topic, PartitionId partition, int32_t current_leader_epoch,
+    int32_t leader_epoch) {
+    constexpr int16_t kVersion = 3;  // replica_id field; non-flexible headers
+    try {
+        Buffer payload;
+        protocol::RequestHeader header(protocol::ApiKey::OFFSET_FOR_LEADER_EPOCH, kVersion,
+                                       ++correlation_id_,
+                                       "kawasan-replica-" + std::to_string(self_broker_id_));
+        header.encode(payload);
+        protocol::OffsetForLeaderEpochRequest request;
+        request.setReplicaId(self_broker_id_);
+        protocol::OffsetForLeaderEpochRequest::TopicQuery tq;
+        tq.name = topic;
+        tq.partitions.push_back({partition, current_leader_epoch, leader_epoch});
+        request.addTopic(std::move(tq));
+        request.encode(payload, kVersion);
+
+        Buffer resp(exchange(payload, kFetchTimeout));
+        protocol::ResponseHeader resp_header;
+        resp_header.decode(resp);
+        protocol::OffsetForLeaderEpochResponse response;
+        response.decode(resp, kVersion);
+        if (response.topics().empty() || response.topics().front().partitions.empty()) {
+            return std::nullopt;
+        }
+        const auto& pr = response.topics().front().partitions.front();
+        return EpochEndOffset{pr.error_code, pr.leader_epoch, pr.end_offset};
+    } catch (const std::exception& e) {
+        Logger::warn("PeerClient offsetForLeaderEpoch to {}:{} failed: {}", host_, port_,
+                     e.what());
         disconnect();
         return std::nullopt;
     }

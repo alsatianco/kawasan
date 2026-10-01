@@ -4226,27 +4226,55 @@ Buffer KawasanBroker::handleOffsetForLeaderEpoch(RequestDispatcher::RequestConte
 
     protocol::OffsetForLeaderEpochResponse response;
     response.setThrottleTimeMs(0);
+    const bool metadata_current = dataPlaneCurrent();  // M8-E1
 
     for (const auto& topic : request.topics()) {
         protocol::OffsetForLeaderEpochResponse::TopicResult tres;
         tres.name = topic.name;
+        std::vector<TopicMetadata> topic_metadata;
+        if (metadata_controller_) {
+            topic_metadata = metadata_controller_->describeTopics({topic.name});
+        }
         for (const auto& pq : topic.partitions) {
             protocol::OffsetForLeaderEpochResponse::PartitionResult pres;
             pres.partition = pq.partition;
-            // Phase 1.19: single-broker — always leader_epoch=0. If the consumer
-            // requested an epoch > 0 we still answer with 0 (truncation never
-            // happens for a persistent single-leader log). Return UNKNOWN
-            // if the partition doesn't exist.
+            pres.error_code = ErrorCode::NONE;
+            pres.leader_epoch = -1;
+            pres.end_offset = -1;
             auto* log = log_manager_ ? log_manager_->getLog(topic.name, pq.partition) : nullptr;
             if (log == nullptr) {
                 pres.error_code = ErrorCode::UNKNOWN_TOPIC_OR_PARTITION;
-                pres.leader_epoch = -1;
-                pres.end_offset = -1;
+                tres.partitions.push_back(pres);
+                continue;
+            }
+            // M8-F4: only the partition leader answers (followers and consumers
+            // ask it where an epoch ends), and only on a current, matching view.
+            if (!topic_metadata.empty() && topic_metadata.front().error_code == ErrorCode::NONE) {
+                const auto& parts = topic_metadata.front().partitions;
+                auto pm = std::find_if(parts.begin(), parts.end(), [&](const PartitionMetadata& m) {
+                    return m.partition == pq.partition;
+                });
+                if (pm != parts.end()) {
+                    if (pm->leader != broker_id_ || !metadata_current) {
+                        pres.error_code = ErrorCode::NOT_LEADER_FOR_PARTITION;
+                    } else {
+                        pres.error_code =
+                            checkLeaderEpoch(pq.current_leader_epoch, pm->leader_epoch);
+                    }
+                    if (pres.error_code != ErrorCode::NONE) {
+                        tres.partitions.push_back(pres);
+                        continue;
+                    }
+                }
+            }
+            if (log->latestLeaderEpoch().has_value()) {
+                // KIP-101: answer from the partition's epoch history.
+                const auto [epoch, end_offset] = log->epochEndOffset(pq.leader_epoch);
+                pres.leader_epoch = epoch;
+                pres.end_offset = end_offset;
             } else {
-                pres.error_code = ErrorCode::NONE;
-                // Report the tracked leader epoch (0 single-node; bumped on
-                // leadership change in a cluster) so clients using KIP-320
-                // fencing/truncation get a real value rather than a constant.
+                // No epoch history (single-node, or a log written before M8):
+                // a single uninterrupted leadership — the whole log is current.
                 const TopicPartition tp{topic.name, pq.partition};
                 pres.leader_epoch =
                     replica_manager_ ? replica_manager_->getLeaderEpoch(tp).value_or(0) : 0;

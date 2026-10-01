@@ -97,3 +97,53 @@ TEST(PeerClientDeadlineTest, UnresponsivePeerFailsInsteadOfHanging) {
     accepter.join();
 }
 
+// M8-F4: OffsetForLeaderEpoch with no epoch history (single-node / pre-M8 log)
+// keeps its legacy answer: the whole log belongs to the current epoch.
+TEST_F(PeerClientTest, OffsetForLeaderEpochWithoutHistoryReportsLogEnd) {
+    PeerClient client("127.0.0.1", broker_->port(), /*self=*/2);
+    auto r = client.offsetForLeaderEpoch(kTopic, 0, /*current=*/-1, /*epoch=*/0);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->error, ErrorCode::NONE);
+    EXPECT_EQ(r->leader_epoch, 0);
+    EXPECT_EQ(r->end_offset, 3);
+    auto missing = client.offsetForLeaderEpoch("no-such-topic", 0, -1, 0);
+    ASSERT_TRUE(missing.has_value());
+    EXPECT_EQ(missing->error, ErrorCode::UNKNOWN_TOPIC_OR_PARTITION);
+}
+
+// M8-F4: with an epoch history the leader answers KIP-101 style and fences the
+// caller's view of the current epoch.
+TEST_F(PeerClientTest, OffsetForLeaderEpochAnswersFromEpochHistory) {
+    auto* log = broker_->logManager()->getLog(kTopic, 0);
+    ASSERT_NE(log, nullptr);
+    log->assignLeaderEpochStart(0, 0);  // offsets 0..2 were written in epoch 0
+    ASSERT_EQ(broker_->metadataController()->updatePartitionLeader(kTopic, 0, kBrokerId).error_code,
+              ErrorCode::NONE);  // metadata epoch -> 1
+    log->assignLeaderEpochStart(1, log->logEndOffset());
+    kawasan::client::ProducerConfig pc;
+    pc.bootstrap_servers = "127.0.0.1:" + std::to_string(broker_->port());
+    pc.acks = 1;
+    kawasan::client::Producer producer(pc);
+    ASSERT_EQ(producer.send(kTopic, "", "e1-a").get().offset, 3);
+    ASSERT_EQ(producer.send(kTopic, "", "e1-b").get().offset, 4);
+
+    PeerClient client("127.0.0.1", broker_->port(), /*self=*/2);
+    auto ask = [&](int32_t current, int32_t epoch) {
+        auto r = client.offsetForLeaderEpoch(kTopic, 0, current, epoch);
+        EXPECT_TRUE(r.has_value());
+        return r.value_or(PeerClient::EpochEndOffset{ErrorCode::CORRUPT_MESSAGE, -9, -9});
+    };
+    auto e0 = ask(1, 0);
+    EXPECT_EQ(e0.error, ErrorCode::NONE);
+    EXPECT_EQ(e0.leader_epoch, 0);
+    EXPECT_EQ(e0.end_offset, 3);
+    auto e1 = ask(1, 1);
+    EXPECT_EQ(e1.leader_epoch, 1);
+    EXPECT_EQ(e1.end_offset, 5);
+    auto newer = ask(1, 2);
+    EXPECT_EQ(newer.error, ErrorCode::NONE);
+    EXPECT_EQ(newer.leader_epoch, -1);
+    EXPECT_EQ(newer.end_offset, -1);
+    EXPECT_EQ(ask(0, 0).error, ErrorCode::FENCED_LEADER_EPOCH);
+    EXPECT_EQ(ask(2, 0).error, ErrorCode::UNKNOWN_LEADER_EPOCH);
+}
