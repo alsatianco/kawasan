@@ -7,6 +7,7 @@
 #include <future>
 #include <thread>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -34,6 +35,9 @@ struct PeerInfo {
     int32_t port;
     int64_t next_index = 1;
     int64_t match_index = 0;
+    /// M8-B: when this peer last answered an AppendEntries from us as leader
+    /// (any answer proves liveness). Reset to "now" on becoming leader.
+    std::chrono::steady_clock::time_point last_ack{};
 };
 
 /// @brief Raft node for consensus
@@ -128,6 +132,12 @@ public:
 
     /// @brief Returns the commit index
     int64_t commitIndex() const { return commit_index_.load(); }
+
+    /// @brief M8-B: on the leader, milliseconds since each peer last answered an
+    /// AppendEntries (keyed by broker id). A newly elected leader starts every
+    /// peer at 0, giving it a full liveness window. Empty when not the leader —
+    /// only the controller may judge liveness. Policy (timeouts) is the caller's.
+    std::map<BrokerId, int64_t> peerAckAgesMs() const;
 
     /// @brief Sets the commit callback. Taken under log_mutex_ (out-of-line) so
     /// the apply thread never reads a torn std::function while it's being set.

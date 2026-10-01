@@ -709,6 +709,7 @@ void RaftNode::sendHeartbeats() {
         }
         for (auto& peer : peers_) {
             if (peer.id != peer_id) continue;
+            peer.last_ack = std::chrono::steady_clock::now();
             if (response.success) {
                 peer.match_index = response.last_log_index;
                 peer.next_index = response.last_log_index + 1;
@@ -756,16 +757,36 @@ void RaftNode::becomeCandidate() {
 }
 
 void RaftNode::becomeLeader() {
-    state_ = NodeState::LEADER;
-    leader_id_ = id_;
-
-    // Initialize peer state
-    for (auto& peer : peers_) {
-        peer.next_index = log_.empty() ? 1 : log_.back().index + 1;
-        peer.match_index = 0;
+    {
+        std::lock_guard<std::mutex> lock(log_mutex_);
+        // Initialize peer state before any heartbeat can observe LEADER.
+        const auto now = std::chrono::steady_clock::now();
+        for (auto& peer : peers_) {
+            peer.next_index = log_.empty() ? 1 : log_.back().index + 1;
+            peer.match_index = 0;
+            // Grace window: a new controller must not judge a peer dead before
+            // it has had a full liveness window to answer this leader.
+            peer.last_ack = now;
+        }
+        state_ = NodeState::LEADER;
+        leader_id_ = id_;
     }
 
     Logger::info("Node {} became leader for term {}", id_, current_term_.load());
+}
+
+std::map<BrokerId, int64_t> RaftNode::peerAckAgesMs() const {
+    std::map<BrokerId, int64_t> ages;
+    std::lock_guard<std::mutex> lock(log_mutex_);
+    if (state_ != NodeState::LEADER) {
+        return ages;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto& peer : peers_) {
+        ages[peer.id] =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - peer.last_ack).count();
+    }
+    return ages;
 }
 
 void RaftNode::resetElectionTimeout() {

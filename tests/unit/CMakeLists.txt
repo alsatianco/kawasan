@@ -95,6 +95,11 @@ add_executable(raft_election_test raft_election_test.cpp)
 target_link_libraries(raft_election_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME RaftElectionTest COMMAND raft_election_test)
 
+# M8-B: Raft-derived peer liveness (leader-side ack ages, grace on election)
+add_executable(raft_liveness_test raft_liveness_test.cpp)
+target_link_libraries(raft_liveness_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME RaftLivenessTest COMMAND raft_liveness_test)
+
 # Replica assignment test (Phase B: cross-broker RF>1 assignment)
 add_executable(replica_assignment_test replica_assignment_test.cpp)
 target_link_libraries(replica_assignment_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
