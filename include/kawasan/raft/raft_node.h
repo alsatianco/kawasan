@@ -133,6 +133,9 @@ public:
     /// @brief Returns the commit index
     int64_t commitIndex() const { return commit_index_.load(); }
 
+    /// @brief Index of the last entry in the (persisted) Raft log; 0 if empty.
+    int64_t lastLogIndex() const;
+
     /// @brief M8-B: on the leader, milliseconds since each peer last answered an
     /// AppendEntries (keyed by broker id). A newly elected leader starts every
     /// peer at 0, giving it a full liveness window. Empty when not the leader —

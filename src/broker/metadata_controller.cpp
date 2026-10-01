@@ -29,6 +29,14 @@ void MetadataController::start() {
         stopped_ = false;
     }
     store_.load();
+    if (raft_node_ && raft_node_->lastLogIndex() < store_.appliedIndex()) {
+        // The Raft log was replaced (e.g. its directory was wiped): its indexes
+        // restart, so the store's applied index no longer refers to it.
+        Logger::warn("Raft log ends at index {} but metadata was applied up to {}; resetting the "
+                     "applied index (Raft state was lost)",
+                     raft_node_->lastLogIndex(), store_.appliedIndex());
+        store_.resetAppliedIndex(raft_node_->lastLogIndex());
+    }
     installCommitCallback();
 }
 
@@ -261,9 +269,19 @@ void MetadataController::installCommitCallback() {
 }
 
 void MetadataController::handleCommit(const raft::LogEntry& entry) {
+    // Raft does not persist its commit/applied index, so after a restart every
+    // committed entry is delivered again. Entries already reflected in the
+    // persisted store must not re-apply (UPDATE_LEADER is not idempotent, and a
+    // replayed DELETE_TOPIC would delete a re-created topic's data).
+    if (entry.index <= store_.appliedIndex()) {
+        fulfillPending(entry.index, TopicOperationResult{});
+        return;
+    }
     try {
         auto command = deserializeCommand(entry.data);
+        store_.setAppliedIndex(entry.index);
         auto result = applyCommand(command);
+        store_.persistAppliedIndex();
 
         // Compute and log metadata checksum after applying command
         std::string checksum = store_.computeChecksum();

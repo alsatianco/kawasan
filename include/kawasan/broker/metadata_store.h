@@ -81,6 +81,23 @@ public:
     /// @brief Computes a checksum of all topics/partitions/configs.
     std::string computeChecksum() const;
 
+    /// @brief Highest Raft log index whose command is reflected in this store
+    /// (persisted atomically with the state; 0 = none / pre-tracking file).
+    int64_t appliedIndex() const;
+
+    /// @brief Records that the command at `index` is being applied. The next
+    /// persist (the command's own, or persistAppliedIndex) writes it together
+    /// with the resulting state, so a crash never separates the two.
+    void setAppliedIndex(int64_t index);
+
+    /// @brief Lowers the applied index (and persists it) — only for a replaced
+    /// Raft log whose indexes restarted.
+    void resetAppliedIndex(int64_t index);
+
+    /// @brief Persists the applied index if the command did not persist itself
+    /// (e.g. it was rejected by validation).
+    void persistAppliedIndex();
+
 private:
     struct TopicState {
         TopicMetadata metadata;
@@ -99,6 +116,8 @@ private:
     storage::LogManager* log_manager_;
 
     mutable std::mutex mutex_;
+    int64_t applied_index_ = 0;
+    mutable int64_t persisted_applied_index_ = 0;
     std::vector<BrokerMetadata> brokers_;
     std::map<std::string, TopicState, std::less<>> topics_;
 };

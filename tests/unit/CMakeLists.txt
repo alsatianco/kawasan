@@ -40,6 +40,11 @@ add_executable(leader_election_policy_test leader_election_policy_test.cpp)
 target_link_libraries(leader_election_policy_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME LeaderElectionPolicyTest COMMAND leader_election_policy_test)
 
+# M8-E1 prerequisite: committed metadata commands are not re-applied on restart
+add_executable(metadata_replay_test metadata_replay_test.cpp)
+target_link_libraries(metadata_replay_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME MetadataReplayTest COMMAND metadata_replay_test)
+
 # Log durability test (Phase A1: sync default + atomic checkpoint)
 add_executable(log_durability_test log_durability_test.cpp)
 target_link_libraries(log_durability_test PRIVATE kawasan GTest::gtest GTest::gtest_main)

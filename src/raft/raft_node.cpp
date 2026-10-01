@@ -775,6 +775,11 @@ void RaftNode::becomeLeader() {
     Logger::info("Node {} became leader for term {}", id_, current_term_.load());
 }
 
+int64_t RaftNode::lastLogIndex() const {
+    std::lock_guard<std::mutex> lock(log_mutex_);
+    return log_.empty() ? 0 : log_.back().index;
+}
+
 std::map<BrokerId, int64_t> RaftNode::peerAckAgesMs() const {
     std::map<BrokerId, int64_t> ages;
     std::lock_guard<std::mutex> lock(log_mutex_);

@@ -1,6 +1,10 @@
 #include "kawasan/broker/metadata_store.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <array>
 #include <filesystem>
 #include <fstream>
@@ -199,6 +203,8 @@ void MetadataStore::load() {
     in >> json;
 
     cluster_id_ = json.value("cluster_id", cluster_id_);
+    applied_index_ = json.value("applied_index", int64_t{0});
+    persisted_applied_index_ = applied_index_;
     brokers_.clear();
     if (json.contains("brokers")) {
         for (const auto& broker_json : json["brokers"]) {
@@ -600,12 +606,62 @@ void MetadataStore::persistLocked() const {
         json["topics"].push_back(std::move(topic_json));
     }
 
-    std::ofstream out(metadata_file_);
-    if (!out.is_open()) {
+    json["applied_index"] = applied_index_;
+
+    // Crash-atomic: write a temp file, fsync it, then rename over the old one,
+    // so a crash leaves either the previous or the new state, never a torn file.
+    const std::string payload = json.dump(2);
+    const std::string tmp = metadata_file_ + ".tmp";
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
         throw KawasanException(ErrorCode::KAFKA_STORAGE_ERROR,
                                "Failed to persist metadata to " + metadata_file_);
     }
-    out << json.dump(2);
+    size_t written = 0;
+    bool ok = true;
+    while (written < payload.size()) {
+        const ssize_t n = ::write(fd, payload.data() + written, payload.size() - written);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            ok = false;
+            break;
+        }
+        written += static_cast<size_t>(n);
+    }
+    ok = ok && ::fsync(fd) == 0;
+    ok = (::close(fd) == 0) && ok;
+    ok = ok && ::rename(tmp.c_str(), metadata_file_.c_str()) == 0;
+    if (!ok) {
+        ::unlink(tmp.c_str());
+        throw KawasanException(ErrorCode::KAFKA_STORAGE_ERROR,
+                               "Failed to persist metadata to " + metadata_file_);
+    }
+    persisted_applied_index_ = applied_index_;
+}
+
+int64_t MetadataStore::appliedIndex() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return applied_index_;
+}
+
+void MetadataStore::setAppliedIndex(int64_t index) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    applied_index_ = std::max(applied_index_, index);
+}
+
+void MetadataStore::resetAppliedIndex(int64_t index) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    applied_index_ = index;
+    persistLocked();
+}
+
+void MetadataStore::persistAppliedIndex() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (persisted_applied_index_ < applied_index_) {
+        persistLocked();
+    }
 }
 
 std::string MetadataStore::computeChecksum() const {
