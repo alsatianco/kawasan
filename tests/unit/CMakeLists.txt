@@ -31,6 +31,11 @@ add_executable(truncate_suffix_test truncate_suffix_test.cpp)
 target_link_libraries(truncate_suffix_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME TruncateSuffixTest COMMAND truncate_suffix_test)
 
+# M8-F1: KIP-101 leader-epoch cache + checkpoint
+add_executable(leader_epoch_cache_test leader_epoch_cache_test.cpp)
+target_link_libraries(leader_epoch_cache_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME LeaderEpochCacheTest COMMAND leader_epoch_cache_test)
+
 add_executable(metadata_leader_election_test metadata_leader_election_test.cpp)
 target_link_libraries(metadata_leader_election_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME MetadataLeaderElectionTest COMMAND metadata_leader_election_test)

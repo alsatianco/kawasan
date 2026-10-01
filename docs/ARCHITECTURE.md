@@ -215,6 +215,7 @@ Partition logs live under the directories named by `log.dirs`. Each topic-partit
 <log.dirs>/
   ├── orders-0/                 # topic "orders", partition 0
   │   ├── checkpoint.meta       # start/end offsets + high watermark (atomic temp+fsync+rename)
+  │   ├── leader-epoch-checkpoint  # KIP-101 epoch history "epoch start_offset" (multi-broker; atomic)
   │   ├── 0/                    # segment, base offset 0 (RocksDB instance)
   │   ├── 1048576/              # segment, base offset 1048576
   │   └── ...
@@ -223,6 +224,8 @@ Partition logs live under the directories named by `log.dirs`. Each topic-partit
 ```
 
 The directory for a partition is `<log.dirs>/<topic>-<partition>`; segment subdirectories are the base offset rendered as a plain decimal string. On startup `Log::loadSegments` scans the partition directory, parses each subdirectory name as a base offset, and reopens the segments in order. A new segment is rolled when the active segment exceeds `log.segment.bytes` (`LogConfig::segment_size`, default 1 GB) or, when enabled, the time bound `segment.ms` (`LogConfig::segment_ms`, default disabled). Retention (`retention.bytes` / time-based) and `cleanup.policy` (delete vs compact) are applied by the cleanup thread.
+
+`leader-epoch-checkpoint` (`LeaderEpochCache`, M8-F) records which leader epoch began at which offset, in Kafka's text format: a version line, a count line, then `epoch start_offset` lines. `Log` drops epochs that begin at or after a suffix truncation and clamps the oldest epoch on prefix deletion. If the file is missing or unreadable, the log starts with no epoch history. That's the case for logs written before M8.
 
 Consumer offsets and group metadata are stored in a separate RocksDB database (not under the partition log dirs) — see [Consumer offset storage](#consumer-offset-storage). Streams state stores keep their own RocksDB directories — see [Kawasan Streams](#kawasan-streams).
 

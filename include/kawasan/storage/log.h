@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "kawasan/common/types.h"
+#include "kawasan/storage/leader_epoch_cache.h"
 #include "kawasan/storage/log_segment.h"
 #include "kawasan/storage/record_batch.h"
 
@@ -184,6 +185,17 @@ public:
     /// Returns the new log-end-offset. DESTRUCTIVE — the removed records are gone.
     Offset truncateSuffix(Offset target_offset);
 
+    /// @brief M8-F1: records that leader `epoch` starts at `start_offset` in this
+    /// partition's epoch history (see LeaderEpochCache::assign).
+    void assignLeaderEpochStart(int32_t epoch, Offset start_offset);
+
+    /// @brief M8-F1: the latest leader epoch in this log's history, if any.
+    std::optional<int32_t> latestLeaderEpoch() const;
+
+    /// @brief M8-F1: KIP-101 end offset of `epoch` (see
+    /// LeaderEpochCache::endOffsetFor), using this log's end offset.
+    std::pair<int32_t, Offset> epochEndOffset(int32_t epoch) const;
+
     /// @brief Invoked (under the log lock — must be cheap and must not call back
     /// into this Log) whenever the readable state may have changed: an append,
     /// a high-watermark move, or a truncation. Used to wake parked long-poll
@@ -223,6 +235,8 @@ private:
     bool closed_ = false;
     mutable bool checkpoint_dirty_ = false;
     ChangeListener change_listener_;
+    // M8-F1: <log_dir>/leader-epoch-checkpoint; follows truncations.
+    std::unique_ptr<LeaderEpochCache> epoch_cache_;
 };
 
 }  // namespace kawasan::storage

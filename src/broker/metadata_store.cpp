@@ -1,10 +1,6 @@
 #include "kawasan/broker/metadata_store.h"
 
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <algorithm>
-#include <cerrno>
 #include <array>
 #include <filesystem>
 #include <fstream>
@@ -16,6 +12,7 @@
 #include <utility>
 
 #include "kawasan/common/error.h"
+#include "kawasan/common/file_util.h"
 #include "kawasan/common/logger.h"
 
 namespace fs = std::filesystem;
@@ -608,33 +605,9 @@ void MetadataStore::persistLocked() const {
 
     json["applied_index"] = applied_index_;
 
-    // Crash-atomic: write a temp file, fsync it, then rename over the old one,
-    // so a crash leaves either the previous or the new state, never a torn file.
-    const std::string payload = json.dump(2);
-    const std::string tmp = metadata_file_ + ".tmp";
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) {
-        throw KawasanException(ErrorCode::KAFKA_STORAGE_ERROR,
-                               "Failed to persist metadata to " + metadata_file_);
-    }
-    size_t written = 0;
-    bool ok = true;
-    while (written < payload.size()) {
-        const ssize_t n = ::write(fd, payload.data() + written, payload.size() - written);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            ok = false;
-            break;
-        }
-        written += static_cast<size_t>(n);
-    }
-    ok = ok && ::fsync(fd) == 0;
-    ok = (::close(fd) == 0) && ok;
-    ok = ok && ::rename(tmp.c_str(), metadata_file_.c_str()) == 0;
-    if (!ok) {
-        ::unlink(tmp.c_str());
+    // Crash-atomic: a crash leaves either the previous or the new state, never a
+    // torn file.
+    if (!writeFileAtomically(metadata_file_, json.dump(2))) {
         throw KawasanException(ErrorCode::KAFKA_STORAGE_ERROR,
                                "Failed to persist metadata to " + metadata_file_);
     }

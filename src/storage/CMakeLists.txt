@@ -4,6 +4,7 @@ add_library(kawasan_storage OBJECT
     log_segment.cpp
     log.cpp
     log_manager.cpp
+    leader_epoch_cache.cpp
 )
 
 target_include_directories(kawasan_storage PUBLIC

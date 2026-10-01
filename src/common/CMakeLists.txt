@@ -2,6 +2,7 @@ add_library(kawasan_common OBJECT
     error.cpp
     config.cpp
     logger.cpp
+    file_util.cpp
 )
 
 target_include_directories(kawasan_common PUBLIC

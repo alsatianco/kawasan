@@ -111,6 +111,12 @@ Log::Log(const std::string& topic, PartitionId partition, const std::string& log
     }
 
     loadCheckpoint();
+    epoch_cache_ = std::make_unique<LeaderEpochCache>(log_dir_ + "/leader-epoch-checkpoint");
+    {
+        // The log may have lost a tail the checkpoint still describes.
+        std::lock_guard<std::mutex> lock(mutex_);
+        epoch_cache_->truncateFromEnd(endOffsetUnlocked());
+    }
 
     last_roll_time_ = now();
     last_roll_time_initialized_ = true;
@@ -132,6 +138,7 @@ Log::Log(Log&& other) noexcept {
     high_watermark_ = other.high_watermark_;
     closed_ = other.closed_;
     change_listener_ = std::move(other.change_listener_);
+    epoch_cache_ = std::move(other.epoch_cache_);
 }
 
 Log& Log::operator=(Log&& other) noexcept {
@@ -148,6 +155,7 @@ Log& Log::operator=(Log&& other) noexcept {
     high_watermark_ = other.high_watermark_;
     closed_ = other.closed_;
     change_listener_ = std::move(other.change_listener_);
+    epoch_cache_ = std::move(other.epoch_cache_);
     return *this;
 }
 
@@ -429,6 +437,9 @@ Offset Log::truncatePrefix(Offset new_start_offset) {
     }
 
     if (modified) {
+        if (epoch_cache_) {
+            epoch_cache_->truncateFromStart(startOffsetUnlocked());
+        }
         persistCheckpointLocked();
         notifyChangeLocked();
     }
@@ -467,6 +478,9 @@ Offset Log::truncateSuffix(Offset target_offset) {
     const Offset new_end = endOffsetUnlocked();
     if (high_watermark_ > new_end) {
         high_watermark_ = new_end;
+    }
+    if (epoch_cache_) {
+        epoch_cache_->truncateFromEnd(new_end);
     }
     persistCheckpointLocked();
     notifyChangeLocked();
@@ -885,6 +899,20 @@ void Log::setHighWatermark(Offset offset) {
         checkpoint_dirty_ = true;
         notifyChangeLocked();
     }
+}
+
+void Log::assignLeaderEpochStart(int32_t epoch, Offset start_offset) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    epoch_cache_->assign(epoch, start_offset);
+}
+
+std::optional<int32_t> Log::latestLeaderEpoch() const {
+    return epoch_cache_->latestEpoch();
+}
+
+std::pair<int32_t, Offset> Log::epochEndOffset(int32_t epoch) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return epoch_cache_->endOffsetFor(epoch, endOffsetUnlocked());
 }
 
 void Log::setChangeListener(ChangeListener listener) {
