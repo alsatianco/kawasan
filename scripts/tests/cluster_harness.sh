@@ -12,8 +12,11 @@
 #   scripts/tests/cluster_harness.sh down      # stop cluster + clean temp dirs
 #   scripts/tests/cluster_harness.sh status    # show broker liveness + leader
 #   scripts/tests/cluster_harness.sh logs [id]  # tail a broker log
+#   scripts/tests/cluster_harness.sh kill|restart|pause|resume <id>
 #
-# Env: N=3 (broker count), BASE=/tmp/kawasan-cluster (work dir).
+# Env: N=3 (broker count), BASE=/tmp/kawasan-cluster (work dir), LAG_MS
+# (replica.lag.time.max.ms), MIN_ISR, LIVENESS_MS (broker.liveness.timeout.ms),
+# UNCLEAN (unclean.leader.election.enable), LOG_LEVEL.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -59,6 +62,8 @@ auto.create.topics.enable=true
 network.io_threads=2
 replica.lag.time.max.ms=${LAG_MS:-30000}
 min.insync.replicas=${MIN_ISR:-1}
+broker.liveness.timeout.ms=${LIVENESS_MS:-9000}
+unclean.leader.election.enable=${UNCLEAN:-false}
 EOF
 }
 
@@ -146,6 +151,18 @@ cmd_kill() {
   fi
 }
 
+# SIGSTOP/SIGCONT: a frozen broker keeps its sockets but stops responding — a
+# nemesis for stale-leader / divergence scenarios.
+cmd_pause() {
+  local id="${1:?usage: pause <broker-id>}"
+  kill -STOP "$(cat "$BASE/broker-$id/broker.pid")" && echo "[harness] paused broker $id"
+}
+
+cmd_resume() {
+  local id="${1:?usage: resume <broker-id>}"
+  kill -CONT "$(cat "$BASE/broker-$id/broker.pid")" && echo "[harness] resumed broker $id"
+}
+
 cmd_restart() {
   local id="${1:?usage: restart <broker-id>}"
   launch_broker "$id"
@@ -159,5 +176,7 @@ case "${1:-up}" in
   logs) cmd_logs "${2:-0}" ;;
   kill) cmd_kill "${2:-}" ;;
   restart) cmd_restart "${2:-}" ;;
+  pause) cmd_pause "${2:-}" ;;
+  resume) cmd_resume "${2:-}" ;;
   *) echo "usage: $0 {up|down|status|logs [id]|kill <id>|restart <id>}"; exit 1 ;;
 esac

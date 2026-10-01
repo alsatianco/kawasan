@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -104,6 +105,14 @@ public:
     /// controller, otherwise via an AlterPartition RPC to the controller. Called
     /// periodically by the replica-fetcher thread (multi-broker only).
     void maintainLeaderIsr();
+
+    /// @brief M8-C: controller-only failover sweep. Brokers whose Raft ack age
+    /// exceeds `broker.liveness.timeout.ms` are dead; partitions they lead get a
+    /// new leader from the live ISR (or go offline, leader -1, unless
+    /// `unclean.leader.election.enable`), and they are dropped from ISRs. See
+    /// computeLeadershipChanges. Called by the replica-fetcher thread
+    /// (multi-broker only); a no-op unless this broker is the Raft leader.
+    void maintainPartitionLeaders();
 
     /// @brief Returns the port the broker is bound to.
     int32_t port() const {
@@ -313,6 +322,14 @@ private:
     // M6: replica.lag.time.max.ms — a follower whose last fetch is older than
     // this is dropped from the ISR (shrink), unblocking acks=all.
     int64_t replica_lag_time_max_ms_ = 30000;
+    // M8-C: a peer whose last Raft ack is older than this is considered dead by
+    // the controller's failover sweep.
+    int64_t broker_liveness_timeout_ms_ = 9000;
+    // M8-C: allow electing an out-of-sync replica when no ISR member is alive
+    // (may lose acknowledged records). Off by default.
+    bool unclean_leader_election_enabled_ = false;
+    // M8-C: last dead set seen by the sweep (log transitions only).
+    std::set<BrokerId> dead_brokers_;
     std::string host_;
     std::string advertised_host_;
     int32_t port_;

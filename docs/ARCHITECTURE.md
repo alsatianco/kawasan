@@ -300,11 +300,13 @@ The metadata command set (`MetadataCommandType`, `include/kawasan/broker/metadat
 | `CREATE_TOPIC` / `DELETE_TOPIC` | Topic lifecycle. |
 | `UPDATE_ISR` | Commits an ISR shrink/expand proposed by the partition leader (directly or via the AlterPartition RPC). |
 | `INCREASE_PARTITIONS` | Applies a `CreatePartitions` count increase. |
-| `UPDATE_LEADER` | Sets the partition leader (assigned replicas only) and bumps `leader_epoch` — the primitive behind `ElectLeaders`. |
+| `UPDATE_LEADER` | Sets the partition leader (an assigned replica, or `-1` = offline) and bumps `leader_epoch`. This is the primitive behind `ElectLeaders` and automatic failover. |
 
 Replica assignment is deterministic. Partition *p* of a topic takes RF consecutive brokers starting at index *p* mod N over the sorted broker ids (`roundRobinAssignments`, `metadata_store.h`), and the first replica is the leader. In a cluster, the controller writes this assignment into the `CREATE_TOPIC` command. `INCREASE_PARTITIONS` recomputes the same function from each broker's broker list, which is seeded identically from `raft.peers`. So every broker applies the same leadership, including for RF=1 topics and the internal `__consumer_offsets` / `__transaction_state` topics. Clients can't auto-create those two internal topics; only the controller's bootstrap creates them, with their configured partition counts.
 
 The Raft leader records when each peer last answered an AppendEntries, whether or not it succeeded (`PeerInfo::last_ack`). `RaftNode::peerAckAgesMs()` reports these ages on the leader only and returns nothing on followers. On election the leader resets every peer's age to zero, so a new controller gives each broker a full liveness window before judging it dead. Policy, such as the timeout, lives in the broker.
+
+**Failover sweep (M8).** `KawasanBroker::maintainPartitionLeaders()` runs about every 100 ms on the replica-fetcher thread, so only in multi-broker mode. It does nothing unless this broker is the Raft leader. A peer whose ack age exceeds `broker.liveness.timeout.ms` is dead. The pure policy `computeLeadershipChanges` (`leader_election_policy.h`) scans all partitions. A partition whose leader is dead or offline gets the first live in-sync replica in assignment order as its leader, and its ISR becomes the live in-sync members. If no in-sync replica is alive, the partition is marked offline (`UPDATE_LEADER` with leader `-1`, ISR kept so its members stay eligible), unless unclean election is enabled. Partitions with a live leader just drop dead members from the ISR. Each change is one `UPDATE_LEADER` and/or `UPDATE_ISR` command. Every broker converges through `reconcileReplicas`: a demoted leader resumes fetching from its log end, and a promoted follower forgets stale follower progress.
 
 A `RaftNode` is always in one of three states — `FOLLOWER`, `CANDIDATE`, or `LEADER`:
 

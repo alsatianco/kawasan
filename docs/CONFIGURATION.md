@@ -153,6 +153,8 @@ Single-node is the primary, hardened mode. Multi-broker Raft replication exists 
 | `transaction.state.log.replication.factor` | int | `1` | Inert | Accepted; not applied. |
 | `transaction.state.log.min.isr` | int | `1` | Inert | Accepted; not applied. |
 | `replica.lag.time.max.ms` | long | `30000` | Honored (multi-broker) | M6: a follower whose last replica-fetch is older than this is dropped from the ISR by the partition leader (shrink), so a dead/slow follower stops blocking `acks=all`; it is re-added once it fetches again and catches up to the high watermark. Only active in multi-broker mode (the replica fetcher runs only when `raft.peers` is set). Clamped to a 1s floor. |
+| `broker.liveness.timeout.ms` | long | `9000` | Honored (multi-broker) | M8: the controller (Raft leader) considers a peer broker dead when it hasn't answered a Raft AppendEntries for this long. It then elects new leaders, from the in-sync replicas, for the partitions that broker led, and drops it from every ISR. A newly elected controller gives every peer one full window before judging it. Clamped to a 1 s floor. Only active in multi-broker mode. |
+| `unclean.leader.election.enable` | bool | `false` | Honored (multi-broker) | M8: when a partition's leader dies and no in-sync replica is alive, `false` leaves the partition **offline** (no leader; Metadata reports `LEADER_NOT_AVAILABLE`) until an in-sync replica returns. `true` elects the first live out-of-sync replica instead. That restores availability but **may lose acknowledged records**, and the controller logs an error. |
 | `num.replica.fetchers` | int | `1` | Inert | Accepted; not applied. |
 | `num.recovery.threads.per.data.dir` | int | `1` | Inert | Accepted; not applied. |
 

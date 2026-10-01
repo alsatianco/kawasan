@@ -11,6 +11,7 @@ add_library(kawasan_broker OBJECT
     group_coordinator.cpp
     offset_manager.cpp
     replica_manager.cpp
+    leader_election_policy.cpp
     producer_state_manager.cpp
     producer_state_snapshot.cpp
     peer_client.cpp

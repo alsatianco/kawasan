@@ -472,7 +472,7 @@ Guidance: more partitions = more parallelism but more per-partition overhead; do
 
 ### Horizontal scaling (experimental)
 
-Multi-broker Raft replication is **not production-hardened**. Followers replicate data, the ISR shrinks/expands automatically, and `acks=all` waits on the ISR — but there is **no automatic partition-leader failover**: killing a partition's leader strands that partition (availability loss, not acked-data loss) until leadership is manually re-elected (`ElectLeaders`) or the broker returns. The `docker-compose-cluster.yml` and `k8s` StatefulSet exist for experimentation and compatibility testing. If you run a multi-broker cluster:
+Multi-broker Raft replication is **not production-hardened**. Followers replicate data, the ISR shrinks and expands automatically, and `acks=all` waits on the ISR. When a partition leader stops answering Raft heartbeats for `broker.liveness.timeout.ms` (default 9 s), the controller automatically elects a new leader from the in-sync replicas. A partition with no live in-sync replica stays offline (`LEADER_NOT_AVAILABLE`) until one returns, unless `unclean.leader.election.enable=true`. Stale-leader fencing is **not** complete yet. A restarted or network-partitioned former leader can briefly serve requests from its old metadata, and consumer-group coordinators are not yet routed cluster-wide. The `docker-compose-cluster.yml` and `k8s` StatefulSet exist for experimentation and compatibility testing. If you run a multi-broker cluster:
 
 - Every broker needs a unique `broker.id`.
 - Configure `raft.port` and `raft.peers` (`id:host:port,...`) consistently across brokers.

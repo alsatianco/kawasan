@@ -35,6 +35,11 @@ add_executable(metadata_leader_election_test metadata_leader_election_test.cpp)
 target_link_libraries(metadata_leader_election_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME MetadataLeaderElectionTest COMMAND metadata_leader_election_test)
 
+# M8-C: controller failover policy (pure function)
+add_executable(leader_election_policy_test leader_election_policy_test.cpp)
+target_link_libraries(leader_election_policy_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME LeaderElectionPolicyTest COMMAND leader_election_policy_test)
+
 # Log durability test (Phase A1: sync default + atomic checkpoint)
 add_executable(log_durability_test log_durability_test.cpp)
 target_link_libraries(log_durability_test PRIVATE kawasan GTest::gtest GTest::gtest_main)

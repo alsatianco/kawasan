@@ -126,3 +126,29 @@ TEST_F(MetadataLeaderElectionTest, ElectionSurvivesReload) {
     EXPECT_EQ(reloaded.leader, new_leader);
     EXPECT_EQ(reloaded.leader_epoch, epoch_after);
 }
+
+// M8-C: leader = -1 marks a partition offline (no eligible leader). It bumps the
+// epoch like any election, persists, and a later election brings it back.
+TEST_F(MetadataLeaderElectionTest, OfflineMarkerAndRecovery) {
+    const auto before = partition0();
+    ASSERT_EQ(store_->applyUpdateLeader("t", 0, /*offline=*/-1).error_code, ErrorCode::NONE);
+    auto offline = partition0();
+    EXPECT_EQ(offline.leader, -1);
+    EXPECT_EQ(offline.leader_epoch, before.leader_epoch + 1);
+    EXPECT_EQ(offline.isr, before.isr);  // ISR kept: its members stay eligible
+
+    store_ = std::make_unique<MetadataStore>(
+        dir_, "cid", BrokerMetadata{0, "127.0.0.1", 9092, std::nullopt}, nullptr);
+    store_->load();
+    EXPECT_EQ(partition0().leader, -1);
+
+    ASSERT_EQ(store_->applyUpdateLeader("t", 0, before.replicas.back()).error_code,
+              ErrorCode::NONE);
+    EXPECT_EQ(partition0().leader, before.replicas.back());
+    EXPECT_EQ(partition0().leader_epoch, before.leader_epoch + 2);
+}
+
+TEST_F(MetadataLeaderElectionTest, RejectsOtherNegativeLeaders) {
+    EXPECT_EQ(store_->applyUpdateLeader("t", 0, -2).error_code,
+              ErrorCode::INVALID_REPLICA_ASSIGNMENT);
+}

@@ -266,6 +266,7 @@ void ReplicaManager::fetcherThreadLoop() {
             if (broker_) {
                 broker_->reconcileReplicas();
                 broker_->maintainLeaderIsr();
+                broker_->maintainPartitionLeaders();  // M8-C: controller only
             }
 
             // Snapshot the follower fetch work under the lock, so the blocking
@@ -275,7 +276,8 @@ void ReplicaManager::fetcherThreadLoop() {
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 for (auto& [tp, info] : replicas_) {
-                    if (info.leader != local_broker_id_ && info.log) {
+                    // leader < 0: offline partition, nothing to fetch from.
+                    if (info.leader != local_broker_id_ && info.leader >= 0 && info.log) {
                         tasks.push_back({tp, info.leader, info.fetch_offset, info.log});
                     }
                 }

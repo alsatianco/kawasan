@@ -23,6 +23,7 @@
 #include "kawasan/broker/coordinator_routing.h"
 #include "kawasan/broker/fetch_session_manager.h"
 #include "kawasan/broker/isolation_tracker.h"
+#include "kawasan/broker/leader_election_policy.h"
 #include "kawasan/broker/peer_client.h"
 #include "kawasan/broker/producer_state_manager.h"
 #include "kawasan/broker/producer_state_snapshot.h"
@@ -478,6 +479,10 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
     // before the leader drops it from the ISR (clamped to a sane floor).
     replica_lag_time_max_ms_ =
         std::max<int64_t>(1000, config_.get<int64_t>("replica.lag.time.max.ms", 30000));
+    broker_liveness_timeout_ms_ =
+        std::max<int64_t>(1000, config_.get<int64_t>("broker.liveness.timeout.ms", 9000));
+    unclean_leader_election_enabled_ =
+        config_.get<bool>("unclean.leader.election.enable", false);
 
     // Initialize OffsetManager with persistent storage
     const std::string offset_db_path = log_dir_ + "/consumer_offsets";
@@ -1973,6 +1978,13 @@ Buffer KawasanBroker::handleMetadata(RequestDispatcher::RequestContext& context)
         if (requested.empty() ||
             std::find(requested.begin(), requested.end(), fallback.name) != requested.end()) {
             topics.push_back(fallback);
+        }
+    }
+    for (auto& topic : topics) {
+        for (auto& partition : topic.partitions) {
+            if (partition.leader < 0 && partition.error_code == ErrorCode::NONE) {
+                partition.error_code = ErrorCode::LEADER_NOT_AVAILABLE;  // offline (M8)
+            }
         }
     }
     response.setTopics(topics);
@@ -3684,6 +3696,66 @@ void KawasanBroker::maintainLeaderIsr() {
                 PeerClient client(ep->first, ep->second, broker_id_);
                 client.alterPartition(tm.name, pm.partition, pm.leader_epoch, *proposed,
                                       /*partition_epoch=*/0);
+            }
+        }
+    }
+}
+
+void KawasanBroker::maintainPartitionLeaders() {
+    if (!metadata_controller_ || !raft_node_ || !raft_node_->isLeader()) {
+        return;
+    }
+    std::set<BrokerId> dead;
+    for (const auto& [id, age_ms] : raft_node_->peerAckAgesMs()) {
+        if (age_ms > broker_liveness_timeout_ms_) {
+            dead.insert(id);
+        }
+    }
+    if (dead != dead_brokers_) {
+        for (BrokerId id : dead) {
+            if (!dead_brokers_.count(id)) {
+                Logger::warn("Controller: broker {} is unresponsive for over {} ms; failing over "
+                             "its partitions",
+                             id, broker_liveness_timeout_ms_);
+            }
+        }
+        for (BrokerId id : dead_brokers_) {
+            if (!dead.count(id)) {
+                Logger::info("Controller: broker {} is responsive again", id);
+            }
+        }
+        dead_brokers_ = dead;
+    }
+
+    const auto changes = computeLeadershipChanges(metadata_controller_->describeTopics({}), dead,
+                                                  unclean_leader_election_enabled_);
+    for (const auto& change : changes) {
+        if (change.new_leader) {
+            if (*change.new_leader < 0) {
+                Logger::warn("Controller: {}-{} is offline (no live in-sync replica)",
+                             change.topic, change.partition);
+            } else if (change.unclean) {
+                Logger::error("Controller: UNCLEAN election of broker {} for {}-{} — records "
+                              "acknowledged by the lost in-sync replicas may be gone",
+                              *change.new_leader, change.topic, change.partition);
+            } else {
+                Logger::info("Controller: electing broker {} as leader of {}-{}",
+                             *change.new_leader, change.topic, change.partition);
+            }
+            const auto result = metadata_controller_->updatePartitionLeader(
+                change.topic, change.partition, *change.new_leader);
+            if (result.error_code != ErrorCode::NONE) {
+                Logger::warn("Controller: leader change for {}-{} failed: {}", change.topic,
+                             change.partition, KawasanException::toString(result.error_code));
+                continue;
+            }
+        }
+        if (change.new_isr) {
+            const auto result = metadata_controller_->updatePartitionISR(
+                change.topic, change.partition, *change.new_isr);
+            if (result.error_code != ErrorCode::NONE) {
+                Logger::warn("Controller: ISR change for {}-{} failed: {}", change.topic,
+                             change.partition, KawasanException::toString(result.error_code));
             }
         }
     }

@@ -417,10 +417,12 @@ TopicOperationResult MetadataStore::applyUpdateLeader(const std::string& topic_n
     for (auto& partition : it->second.metadata.partitions) {
         if (partition.partition == partition_id) {
             // The new leader must be an assigned replica (M7 elects among the
-            // partition's replicas). Bump the leader epoch on every change so
+            // partition's replicas), or -1 to mark the partition offline (M8:
+            // no eligible leader). Bump the leader epoch on every change so
             // followers can detect stale leadership (KIP-101).
-            if (std::find(partition.replicas.begin(), partition.replicas.end(), leader) ==
-                partition.replicas.end()) {
+            if (leader != -1 &&
+                std::find(partition.replicas.begin(), partition.replicas.end(), leader) ==
+                    partition.replicas.end()) {
                 return TopicOperationResult::failure(ErrorCode::INVALID_REPLICA_ASSIGNMENT,
                                                      "New leader is not an assigned replica");
             }

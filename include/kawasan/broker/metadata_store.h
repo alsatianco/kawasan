@@ -42,7 +42,8 @@ public:
                                         const std::vector<BrokerId>& isr);
 
     /// @brief M7: applies a leader-election command — sets the partition leader
-    /// (must be an assigned replica) and bumps its leader_epoch.
+    /// (must be an assigned replica, or -1 = offline, M8) and bumps its
+    /// leader_epoch. The ISR is untouched.
     TopicOperationResult applyUpdateLeader(const std::string& topic_name, PartitionId partition_id,
                                            BrokerId leader);
 
