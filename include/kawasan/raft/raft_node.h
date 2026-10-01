@@ -136,6 +136,15 @@ public:
     /// @brief Index of the last entry in the (persisted) Raft log; 0 if empty.
     int64_t lastLogIndex() const;
 
+    /// @brief M8-E1: whether this node's applied state machine is provably
+    /// current, so it may serve data-plane requests from it. A leader needs a
+    /// quorum (incl. itself) of peers that acked within `lease_ms`; a follower
+    /// must have applied up to the commit index a leader reported after this
+    /// process started, and have heard from a leader within `lease_ms`. A
+    /// candidate is never current. Single-node (no peers) is always current
+    /// once leader.
+    bool hasCurrentMetadata(int64_t lease_ms) const;
+
     /// @brief M8-B: on the leader, milliseconds since each peer last answered an
     /// AppendEntries (keyed by broker id). A newly elected leader starts every
     /// peer at 0, giving it a full liveness window. Empty when not the leader —
@@ -180,6 +189,10 @@ private:
     mutable std::mutex log_mutex_;
 
     std::chrono::steady_clock::time_point last_heartbeat_;
+    // M8-E1 (guarded by log_mutex_): last valid AppendEntries from a leader, and
+    // the leader_commit of the first successful one since start (-1 = none).
+    std::chrono::steady_clock::time_point last_leader_contact_{};
+    int64_t first_leader_commit_ = -1;
     std::chrono::milliseconds election_timeout_{150};
     std::chrono::milliseconds heartbeat_interval_{50};
 

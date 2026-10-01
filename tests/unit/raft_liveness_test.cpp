@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <boost/asio.hpp>
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <thread>
@@ -102,6 +103,7 @@ TEST(RaftLivenessTest, NonLeaderReportsNoAges) {
     boost::asio::io_context io;
     RaftNode node(1, {PeerInfo{2, "127.0.0.1", 1}}, io, 0, "");
     EXPECT_TRUE(node.peerAckAgesMs().empty());  // not started, not leader
+    EXPECT_FALSE(node.hasCurrentMetadata(1000));  // never heard from a leader
 }
 
 TEST(RaftLivenessTest, LeaderTracksPeerAcksAndDeadPeerAges) {
@@ -146,6 +148,83 @@ TEST(RaftLivenessTest, NewLeaderGrantsEveryPeerAGraceWindow) {
     std::this_thread::sleep_for(1200ms);
     ages = cluster.nodes[new_leader]->peerAckAgesMs();
     EXPECT_GT(ages.at(old_leader), 900);  // and then grows, since it is dead
+}
+
+// M8-E1: a node may serve its metadata view only while it is provably current:
+// a leader needs a quorum of recent acks, a follower needs to have caught up
+// with a leader since it started and to have heard from it recently.
+TEST(RaftLivenessTest, MetadataCurrencyNeedsQuorumOrLeaderContact) {
+    Cluster cluster;
+    const int leader = cluster.waitForLeader();
+    ASSERT_GE(leader, 0);
+    std::this_thread::sleep_for(500ms);
+    for (int id = 0; id < 3; ++id) {
+        EXPECT_TRUE(cluster.nodes[id]->hasCurrentMetadata(1000)) << "node " << id;
+    }
+
+    // One follower down: the leader still has a quorum, the other follower
+    // still hears from the leader.
+    const int f1 = (leader + 1) % 3;
+    const int f2 = (leader + 2) % 3;
+    cluster.nodes[f1]->stop();
+    std::this_thread::sleep_for(1500ms);
+    EXPECT_TRUE(cluster.nodes[leader]->hasCurrentMetadata(1000));
+    EXPECT_TRUE(cluster.nodes[f2]->hasCurrentMetadata(1000));
+
+    // Both followers down: the leader has lost its quorum.
+    cluster.nodes[f2]->stop();
+    std::this_thread::sleep_for(1500ms);
+    EXPECT_FALSE(cluster.nodes[leader]->hasCurrentMetadata(1000));
+}
+
+TEST(RaftLivenessTest, FollowerLosesCurrencyWithoutALeaderAndRegainsIt) {
+    Cluster cluster;
+    const int leader = cluster.waitForLeader();
+    ASSERT_GE(leader, 0);
+    std::this_thread::sleep_for(300ms);
+    cluster.nodes[leader]->stop();
+    // Immediately after, the followers are still within the lease...
+    // ...and a new leader is elected quickly; its follower is current again.
+    const int new_leader = cluster.waitForLeader(leader);
+    ASSERT_GE(new_leader, 0);
+    const int follower = 3 - leader - new_leader;
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (!cluster.nodes[follower]->hasCurrentMetadata(1000) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(20ms);
+    }
+    EXPECT_TRUE(cluster.nodes[follower]->hasCurrentMetadata(1000));
+    EXPECT_TRUE(cluster.nodes[new_leader]->hasCurrentMetadata(1000));
+}
+
+// M8-E1: a new leader commits a no-op of its own term, so entries committed by
+// the previous leader reach every state machine without waiting for a command.
+TEST(RaftLivenessTest, NewLeaderCommitsANoop) {
+    Cluster cluster;
+    std::vector<std::shared_ptr<std::atomic<int>>> noops;
+    for (int id = 0; id < 3; ++id) {
+        auto counter = std::make_shared<std::atomic<int>>(0);
+        noops.push_back(counter);
+        cluster.nodes[id]->setCommitCallback([counter](const LogEntry& entry) {
+            if (entry.command_type == "noop") {
+                counter->fetch_add(1);
+            }
+        });
+    }
+    ASSERT_GE(cluster.waitForLeader(), 0);
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    auto all_applied = [&] {
+        for (const auto& n : noops) {
+            if (n->load() == 0) {
+                return false;
+            }
+        }
+        return true;
+    };
+    while (!all_applied() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(20ms);
+    }
+    EXPECT_TRUE(all_applied());
 }
 
 // Regression (found by the M8 SIGSTOP nemesis): RaftTransport ran outgoing RPCs

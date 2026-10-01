@@ -267,6 +267,7 @@ void ReplicaManager::fetcherThreadLoop() {
                 broker_->reconcileReplicas();
                 broker_->maintainLeaderIsr();
                 broker_->maintainPartitionLeaders();  // M8-C: controller only
+                broker_->refreshReadiness();          // M8-E1
             }
 
             // Snapshot the follower fetch work under the lock, so the blocking

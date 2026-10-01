@@ -269,11 +269,12 @@ void MetadataController::installCommitCallback() {
 }
 
 void MetadataController::handleCommit(const raft::LogEntry& entry) {
-    // Raft does not persist its commit/applied index, so after a restart every
+    // A new Raft leader's no-op carries no command. Raft does not persist its
+    // commit/applied index, so after a restart every
     // committed entry is delivered again. Entries already reflected in the
     // persisted store must not re-apply (UPDATE_LEADER is not idempotent, and a
     // replayed DELETE_TOPIC would delete a re-created topic's data).
-    if (entry.index <= store_.appliedIndex()) {
+    if (entry.command_type == "noop" || entry.index <= store_.appliedIndex()) {
         fulfillPending(entry.index, TopicOperationResult{});
         return;
     }

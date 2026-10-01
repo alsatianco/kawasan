@@ -794,7 +794,9 @@ void KawasanBroker::start() {
     // because these flags defaulted to false and were never flipped.
     if (monitoring_manager_) {
         monitoring_manager_->setBrokerHealthy(true);
-        monitoring_manager_->setBrokerReady(true);
+        // Multi-broker: ready only once the metadata view is current (M8-E1);
+        // the replica-fetcher thread keeps this up to date.
+        monitoring_manager_->setBrokerReady(dataPlaneCurrent());
     }
 
     Logger::info("KawasanBroker started successfully on {}:{}", host_, port_);
@@ -2195,6 +2197,8 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
     };
 
     bool has_error = false;
+    // M8-E1: never accept writes on a metadata view that may be stale.
+    const bool metadata_current = dataPlaneCurrent();
 
     for (const auto& topic_data : request.topics()) {
         protocol::ProduceTopicResponse topic_response;
@@ -2250,7 +2254,7 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                 continue;
             }
 
-            if (partition_it->leader != broker_id_) {
+            if (partition_it->leader != broker_id_ || !metadata_current) {
                 partition_response.error_code = ErrorCode::NOT_LEADER_FOR_PARTITION;
                 topic_response.partitions.push_back(partition_response);
                 has_error = true;
@@ -2652,6 +2656,8 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
         auto& context = state->context;
         size_t total_bytes = 0;
         size_t remaining_request_bytes = request_max_bytes;
+        // M8-E1: a broker whose metadata view may be stale serves no partition.
+        const bool metadata_current = dataPlaneCurrent();
 
         for (const auto& topic : request.topics()) {
             protocol::FetchTopicResponse topic_response;
@@ -2723,7 +2729,7 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
                     continue;
                 }
 
-                if (partition_it->leader != broker_id_) {
+                if (partition_it->leader != broker_id_ || !metadata_current) {
                     partition_response.error_code = ErrorCode::NOT_LEADER_FOR_PARTITION;
                     finalize_partition(0);
                     continue;
@@ -3698,6 +3704,25 @@ void KawasanBroker::maintainLeaderIsr() {
                                       /*partition_epoch=*/0);
             }
         }
+    }
+}
+
+bool KawasanBroker::dataPlaneCurrent() const {
+    if (cluster_brokers_.empty() || !raft_node_) {
+        return true;  // single-node: this broker is the only source of truth
+    }
+    return raft_node_->hasCurrentMetadata(metadataLeaseMs());
+}
+
+int64_t KawasanBroker::metadataLeaseMs() const {
+    // Shorter than the controller's liveness timeout, so a cut-off broker stops
+    // serving before the controller fails its partitions over.
+    return std::max<int64_t>(500, broker_liveness_timeout_ms_ / 2);
+}
+
+void KawasanBroker::refreshReadiness() {
+    if (monitoring_manager_) {
+        monitoring_manager_->setBrokerReady(dataPlaneCurrent());
     }
 }
 

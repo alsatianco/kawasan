@@ -114,6 +114,17 @@ public:
     /// (multi-broker only); a no-op unless this broker is the Raft leader.
     void maintainPartitionLeaders();
 
+    /// @brief M8-E1: whether this broker may serve produce/fetch from its
+    /// metadata view. Always true single-node. Multi-broker: the Raft view must
+    /// be provably current (RaftNode::hasCurrentMetadata) within a lease of half
+    /// `broker.liveness.timeout.ms` — so a restarted or cut-off broker answers
+    /// NOT_LEADER_FOR_PARTITION instead of acting on stale leadership.
+    bool dataPlaneCurrent() const;
+
+    /// @brief M8-E1: sets the /ready probe from dataPlaneCurrent(). Called by
+    /// the replica-fetcher thread (multi-broker only).
+    void refreshReadiness();
+
     /// @brief Returns the port the broker is bound to.
     int32_t port() const {
         if (tcp_server_) {
@@ -325,6 +336,7 @@ private:
     // M8-C: a peer whose last Raft ack is older than this is considered dead by
     // the controller's failover sweep.
     int64_t broker_liveness_timeout_ms_ = 9000;
+    int64_t metadataLeaseMs() const;
     // M8-C: allow electing an out-of-sync replica when no ISR member is alive
     // (may lose acknowledged records). Off by default.
     bool unclean_leader_election_enabled_ = false;

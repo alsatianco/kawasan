@@ -268,6 +268,7 @@ AppendEntriesResponse RaftNode::handleAppendEntries(const AppendEntriesRequest& 
     // Reset election timeout on valid heartbeat
     resetElectionTimeout();
     leader_id_ = request.leader_id;
+    last_leader_contact_ = std::chrono::steady_clock::now();
 
     // If we're a candidate, revert to follower
     if (state_ == NodeState::CANDIDATE) {
@@ -318,6 +319,9 @@ AppendEntriesResponse RaftNode::handleAppendEntries(const AppendEntriesRequest& 
     response.success = true;
     response.last_log_index = log_.empty() ? 0 : log_.back().index;
     response.term = current_term_;
+    if (first_leader_commit_ < 0) {
+        first_leader_commit_ = request.leader_commit;
+    }
 
     return response;
 }
@@ -768,11 +772,45 @@ void RaftNode::becomeLeader() {
             // it has had a full liveness window to answer this leader.
             peer.last_ack = now;
         }
+        if (!peers_.empty()) {
+            // Raft §5.4.2: commit a no-op of our own term so entries committed
+            // by the previous leader (e.g. a failover) are applied promptly
+            // rather than when the next command happens to arrive.
+            LogEntry noop;
+            noop.term = current_term_;
+            noop.index = log_.empty() ? 1 : log_.back().index + 1;
+            noop.command_type = "noop";
+            log_.push_back(noop);
+            persistLogEntry(noop);
+        }
         state_ = NodeState::LEADER;
         leader_id_ = id_;
     }
 
     Logger::info("Node {} became leader for term {}", id_, current_term_.load());
+}
+
+bool RaftNode::hasCurrentMetadata(int64_t lease_ms) const {
+    std::lock_guard<std::mutex> lock(log_mutex_);
+    const auto now = std::chrono::steady_clock::now();
+    const auto lease = std::chrono::milliseconds(lease_ms);
+    switch (state_.load()) {
+        case NodeState::LEADER: {
+            size_t acked = 1;  // ourselves
+            for (const auto& peer : peers_) {
+                if (now - peer.last_ack <= lease) {
+                    ++acked;
+                }
+            }
+            return acked * 2 > peers_.size() + 1;
+        }
+        case NodeState::FOLLOWER:
+            return first_leader_commit_ >= 0 && last_applied_.load() >= first_leader_commit_ &&
+                   now - last_leader_contact_ <= lease;
+        case NodeState::CANDIDATE:
+            return false;
+    }
+    return false;
 }
 
 int64_t RaftNode::lastLogIndex() const {

@@ -310,6 +310,13 @@ The Raft leader records when each peer last answered an AppendEntries, whether o
 
 **Failover sweep (M8).** `KawasanBroker::maintainPartitionLeaders()` runs about every 100 ms on the replica-fetcher thread, so only in multi-broker mode. It does nothing unless this broker is the Raft leader. A peer whose ack age exceeds `broker.liveness.timeout.ms` is dead. The pure policy `computeLeadershipChanges` (`leader_election_policy.h`) scans all partitions. A partition whose leader is dead or offline gets the first live in-sync replica in assignment order as its leader, and its ISR becomes the live in-sync members. If no in-sync replica is alive, the partition is marked offline (`UPDATE_LEADER` with leader `-1`, ISR kept so its members stay eligible), unless unclean election is enabled. Partitions with a live leader just drop dead members from the ISR. Each change is one `UPDATE_LEADER` and/or `UPDATE_ISR` command. Every broker converges through `reconcileReplicas`: a demoted leader resumes fetching from its log end, and a promoted follower forgets stale follower progress.
 
+**Metadata currency gate (M8-E1).** A multi-broker broker serves Produce and Fetch, including replica fetches, only while `RaftNode::hasCurrentMetadata(lease)` holds, where the lease is half of `broker.liveness.timeout.ms`. Otherwise every partition answers `NOT_LEADER_FOR_PARTITION`, so clients refresh metadata and go elsewhere.
+- **Raft leader:** needs acks from a majority within the lease.
+- **Follower:** must have applied up to the first `leader_commit` it received after starting, and have heard from a leader within the lease.
+- **Candidate:** never current.
+
+This closes two windows. A restarted broker would otherwise act on its pre-crash metadata file, and a cut-off broker on its last view. Because the lease is shorter than the controller's liveness timeout, an isolated broker stops serving before the controller fails its partitions over. `/ready` reports the same condition. Single-node is always current.
+
 A `RaftNode` is always in one of three states — `FOLLOWER`, `CANDIDATE`, or `LEADER`:
 
 ```
@@ -335,7 +342,7 @@ There are six message types (`enum class RaftMessageType : uint8_t`):
 | `INSTALL_SNAPSHOT_REQ` | 5 | Leader ships a snapshot chunk to a lagging follower. |
 | `INSTALL_SNAPSHOT_RESP` | 6 | Snapshot-chunk acknowledgement. |
 
-Log entries (`struct LogEntry`) carry a term, index, command type, and serialized command bytes. For the exact per-field byte layout and encode/decode of each message, see `include/kawasan/raft/raft_protocol.h` (and the `encode`/`decode` functions in `src/raft/raft_protocol.cpp`) — that header is the authoritative wire spec rather than reproducing every field table here.
+Log entries (`struct LogEntry`) carry a term, index, command type, and serialized command bytes. For the exact per-field byte layout and encode/decode of each message, see `include/kawasan/raft/raft_protocol.h` (and the `encode`/`decode` functions in `src/raft/raft_protocol.cpp`) — that header is the authoritative wire spec rather than reproducing every field table here. In a multi-node group a newly elected leader first appends a `noop` entry of its own term (Raft §5.4.2), so entries committed by the previous leader reach every state machine without waiting for the next command. `MetadataController` ignores `noop` entries.
 
 Outgoing RPCs run on a private 4-thread client pool inside `RaftTransport`, never on the io_context that serves incoming RPCs. Each one is bounded by a deadline: 1 s, or 10 s for InstallSnapshot. Sockets are non-blocking and waits use `poll()`. An RPC still queued past its deadline fails without being sent, and a socket that timed out is never reused. Before this, the broker's single Raft io thread did blocking reads with no timeout. One frozen peer wedged it for good, and two nodes calling each other at once (for example two election candidates) deadlocked permanently.
 
