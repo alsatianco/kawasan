@@ -37,12 +37,14 @@ public:
     /// @param isr New ISR list
     /// @return Operation result
     TopicOperationResult updatePartitionISR(const std::string& topic, PartitionId partition,
-                                            const std::vector<BrokerId>& isr);
+                                            const std::vector<BrokerId>& isr,
+                                            int32_t expected_partition_epoch = -1);
 
     /// @brief M7: elect a new leader for a partition (Raft-replicated). Bumps the
     /// partition's leader_epoch. Only the active controller can commit.
     TopicOperationResult updatePartitionLeader(const std::string& topic, PartitionId partition,
-                                               BrokerId leader);
+                                               BrokerId leader,
+                                               int32_t expected_partition_epoch = -1);
 
     /// @brief Phase 4.1c: increases a topic's partition count to a new total.
     TopicOperationResult increasePartitions(const std::string& topic_name, int32_t new_total_count);

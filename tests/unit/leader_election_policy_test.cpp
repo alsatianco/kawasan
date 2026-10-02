@@ -52,7 +52,7 @@ TEST(LeaderElectionPolicyTest, NeverElectsOutsideIsrWhenUncleanDisabled) {
     auto changes = computeLeadershipChanges(topic({pm(0, 0, {0, 1, 2}, {0})}), {0, 1}, false);
     ASSERT_EQ(changes.size(), 1u);
     EXPECT_EQ(changes[0].new_leader, std::optional<BrokerId>(-1));  // offline
-    EXPECT_FALSE(changes[0].new_isr.has_value());                  // ISR kept
+    EXPECT_FALSE(changes[0].new_isr.has_value());                   // ISR kept
     EXPECT_FALSE(changes[0].unclean);
 }
 
@@ -119,4 +119,12 @@ TEST(LeaderElectionPolicyTest, LeaderEpochCheck) {
     EXPECT_EQ(checkLeaderEpoch(3, 3), ErrorCode::NONE);
     EXPECT_EQ(checkLeaderEpoch(2, 3), ErrorCode::FENCED_LEADER_EPOCH);
     EXPECT_EQ(checkLeaderEpoch(4, 3), ErrorCode::UNKNOWN_LEADER_EPOCH);
+}
+
+TEST(LeaderElectionPolicyTest, DecisionsCarryTheObservedPartitionVersion) {
+    auto p = pm(0, 0, {0, 1, 2}, {0, 1, 2});
+    p.partition_epoch = 17;
+    const auto changes = computeLeadershipChanges(topic({p}), {0}, false);
+    ASSERT_EQ(changes.size(), 1u);
+    EXPECT_EQ(changes.front().expected_partition_epoch, 17);
 }

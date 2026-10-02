@@ -39,13 +39,14 @@ public:
 
     /// @brief Applies an ISR update command.
     TopicOperationResult applyUpdateISR(const std::string& topic_name, PartitionId partition_id,
-                                        const std::vector<BrokerId>& isr);
+                                        const std::vector<BrokerId>& isr,
+                                        int32_t expected_partition_epoch = -1);
 
     /// @brief M7: applies a leader-election command — sets the partition leader
     /// (must be an assigned replica, or -1 = offline, M8) and bumps its
     /// leader_epoch. The ISR is untouched.
     TopicOperationResult applyUpdateLeader(const std::string& topic_name, PartitionId partition_id,
-                                           BrokerId leader);
+                                           BrokerId leader, int32_t expected_partition_epoch = -1);
 
     /// @brief Phase 4.1c: increases a topic's partition count.
     /// @param new_total_count The new total partition count (Kafka semantics:

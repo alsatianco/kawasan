@@ -152,3 +152,36 @@ TEST_F(MetadataLeaderElectionTest, RejectsOtherNegativeLeaders) {
     EXPECT_EQ(store_->applyUpdateLeader("t", 0, -2).error_code,
               ErrorCode::INVALID_REPLICA_ASSIGNMENT);
 }
+
+// A controller sweep can be delayed behind other Raft commands. An old ISR
+// decision must not resurrect a lagging replica, or elect that replica later.
+TEST_F(MetadataLeaderElectionTest, RejectsStaleIsrAndElectionDecisionsAtApply) {
+    const auto before = partition0();
+    const auto lagging = before.replicas.back();
+    std::vector<kawasan::BrokerId> caught_up = before.isr;
+    caught_up.erase(std::remove(caught_up.begin(), caught_up.end(), lagging), caught_up.end());
+    ASSERT_EQ(store_->applyUpdateISR("t", 0, caught_up, before.partition_epoch).error_code,
+              ErrorCode::NONE);
+    const auto shrunk = partition0();
+    EXPECT_EQ(store_->applyUpdateISR("t", 0, before.isr, before.partition_epoch).error_code,
+              ErrorCode::INVALID_UPDATE_VERSION);
+    EXPECT_EQ(store_->applyUpdateLeader("t", 0, lagging, before.partition_epoch).error_code,
+              ErrorCode::INVALID_UPDATE_VERSION);
+    EXPECT_EQ(partition0().isr, caught_up);
+    EXPECT_EQ(partition0().leader, before.leader);
+    EXPECT_EQ(shrunk.partition_epoch, before.partition_epoch + 1);
+}
+
+TEST_F(MetadataLeaderElectionTest, ElectionFencesOldIsrAndPersistsPartitionVersion) {
+    const auto before = partition0();
+    ASSERT_EQ(store_->applyUpdateLeader("t", 0, before.replicas.back(), before.partition_epoch)
+                  .error_code,
+              ErrorCode::NONE);
+    EXPECT_EQ(store_->applyUpdateISR("t", 0, {before.leader}, before.partition_epoch).error_code,
+              ErrorCode::INVALID_UPDATE_VERSION);
+    store_ = std::make_unique<MetadataStore>(
+        dir_, "cid", BrokerMetadata{0, "127.0.0.1", 9092, std::nullopt}, nullptr);
+    store_->load();
+    EXPECT_EQ(partition0().partition_epoch, before.partition_epoch + 1);
+    EXPECT_EQ(partition0().isr, before.isr);
+}

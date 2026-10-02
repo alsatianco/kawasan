@@ -3947,8 +3947,11 @@ void KawasanBroker::maintainLeaderIsr() {
             }
             const TopicPartition tp{tm.name, pm.partition};
             auto partition_write_lock = lockPartitionWrites(tp);
-            if (!isPartitionLeadership(tp, broker_id_, pm.leader_epoch))
+            const auto current = currentPartitionMetadata(tp);
+            if (!current || current->leader != broker_id_ ||
+                current->leader_epoch != pm.leader_epoch)
                 continue;
+            replica_manager_->updateISR(tp, current->isr);
             auto proposed = replica_manager_->computeIsrUpdate(tp, replica_lag_time_max_ms_, now);
             if (!proposed) {
                 continue;  // ISR already correct
@@ -3961,7 +3964,8 @@ void KawasanBroker::maintainLeaderIsr() {
 
             if (controller == broker_id_) {
                 // We are the controller: commit directly through Raft metadata.
-                metadata_controller_->updatePartitionISR(tm.name, pm.partition, *proposed);
+                metadata_controller_->updatePartitionISR(tm.name, pm.partition, *proposed,
+                                                         current->partition_epoch);
             } else {
                 // Send an AlterPartition RPC to the controller broker.
                 auto ep = peerEndpoint(controller);
@@ -3970,7 +3974,7 @@ void KawasanBroker::maintainLeaderIsr() {
                 }
                 PeerClient client(ep->first, ep->second, broker_id_);
                 client.alterPartition(tm.name, pm.partition, pm.leader_epoch, *proposed,
-                                      /*partition_epoch=*/0);
+                                      current->partition_epoch);
             }
         }
     }
@@ -4068,7 +4072,8 @@ void KawasanBroker::maintainPartitionLeaders() {
                              *change.new_leader, change.topic, change.partition);
             }
             const auto result = metadata_controller_->updatePartitionLeader(
-                change.topic, change.partition, *change.new_leader);
+                change.topic, change.partition, *change.new_leader,
+                change.expected_partition_epoch);
             if (result.error_code != ErrorCode::NONE) {
                 Logger::warn("Controller: leader change for {}-{} failed: {}", change.topic,
                              change.partition, KawasanException::toString(result.error_code));
@@ -4077,7 +4082,8 @@ void KawasanBroker::maintainPartitionLeaders() {
         }
         if (change.new_isr) {
             const auto result = metadata_controller_->updatePartitionISR(
-                change.topic, change.partition, *change.new_isr);
+                change.topic, change.partition, *change.new_isr,
+                change.expected_partition_epoch + (change.new_leader ? 1 : 0));
             if (result.error_code != ErrorCode::NONE) {
                 Logger::warn("Controller: ISR change for {}-{} failed: {}", change.topic,
                              change.partition, KawasanException::toString(result.error_code));
@@ -4872,7 +4878,8 @@ Buffer KawasanBroker::handleElectLeaders(RequestDispatcher::RequestContext& cont
             pr.error_code = ErrorCode::NOT_CONTROLLER;
             return pr;
         }
-        auto result = metadata_controller_->updatePartitionLeader(topic, pm.partition, preferred);
+        auto result = metadata_controller_->updatePartitionLeader(topic, pm.partition, preferred,
+                                                                  pm.partition_epoch);
         pr.error_code = result.error_code;
         return pr;
     };
@@ -5241,14 +5248,21 @@ Buffer KawasanBroker::handleAlterPartition(RequestDispatcher::RequestContext& co
                 continue;
             }
 
+            if (p.partition_epoch != pm->partition_epoch) {
+                pr.error_code = ErrorCode::INVALID_UPDATE_VERSION;
+                tr.partitions.push_back(std::move(pr));
+                continue;
+            }
+
             std::vector<BrokerId> new_isr(p.new_isr.begin(), p.new_isr.end());
-            auto result =
-                metadata_controller_->updatePartitionISR(t.topic_name, p.partition_index, new_isr);
+            auto result = metadata_controller_->updatePartitionISR(t.topic_name, p.partition_index,
+                                                                   new_isr, p.partition_epoch);
             pr.error_code = result.error_code;
             pr.leader_id = pm->leader;
             pr.leader_epoch = pm->leader_epoch;
             pr.isr = p.new_isr;
-            pr.partition_epoch = p.partition_epoch;
+            const auto committed = currentPartitionMetadata({t.topic_name, p.partition_index});
+            pr.partition_epoch = committed ? committed->partition_epoch : p.partition_epoch;
             if (result.error_code == ErrorCode::NONE) {
                 Logger::info("AlterPartition committed ISR for {}-{}: {} members", t.topic_name,
                              p.partition_index, new_isr.size());

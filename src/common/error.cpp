@@ -170,6 +170,8 @@ std::string KawasanException::toString(ErrorCode code) {
             return "Group max size reached";
         case ErrorCode::FENCED_INSTANCE_ID:
             return "Fenced instance ID";
+        case ErrorCode::INVALID_UPDATE_VERSION:
+            return "Invalid partition update version";
         default:
             return "Unknown error";
     }

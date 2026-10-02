@@ -107,7 +107,8 @@ TEST(MetadataReplayTest, RestartDoesNotReapplyCommittedCommands) {
     }
     {
         Node node(dir);
-        ASSERT_EQ(node.logs->getOrCreateLog("gone", 0)->logEndOffset(), 1);  // open, as a broker does
+        ASSERT_EQ(node.logs->getOrCreateLog("gone", 0)->logEndOffset(),
+                  1);  // open, as a broker does
         // A new command makes the restarted single-node leader commit (and
         // deliver) every earlier entry again.
         ASSERT_EQ(node.controller->createTopic(spec("after-restart", 1)).error_code,
@@ -157,6 +158,33 @@ TEST(MetadataReplayTest, LostRaftLogResetsAppliedIndex) {
         Node node(dir);
         ASSERT_EQ(node.controller->createTopic(spec("c", 1)).error_code, ErrorCode::NONE);
         EXPECT_EQ(node.controller->describeTopics({"c"}).front().error_code, ErrorCode::NONE);
+    }
+    fs::remove_all(dir);
+}
+
+TEST(MetadataReplayTest, VersionFenceSurvivesRaftSerializationAndRestart) {
+    // Logger is initialized by the suite's first test.
+    const auto dir = makeDir();
+    {
+        Node node(dir);
+        ASSERT_EQ(node.controller->createTopic(spec("versioned", 3)).error_code, ErrorCode::NONE);
+        ASSERT_EQ(node.controller->updatePartitionISR("versioned", 0, {0, 1}, 0).error_code,
+                  ErrorCode::NONE);
+        EXPECT_EQ(node.controller->updatePartitionISR("versioned", 0, {0, 1, 2}, 0).error_code,
+                  ErrorCode::INVALID_UPDATE_VERSION);
+        EXPECT_EQ(node.controller->updatePartitionLeader("versioned", 0, 2, 0).error_code,
+                  ErrorCode::INVALID_UPDATE_VERSION);
+        EXPECT_EQ(node.partition("versioned").leader, 0);
+        EXPECT_EQ(node.partition("versioned").partition_epoch, 1);
+    }
+    {
+        Node node(dir);
+        EXPECT_EQ(node.partition("versioned").isr, (std::vector<BrokerId>{0, 1}));
+        ASSERT_EQ(node.controller->updatePartitionLeader("versioned", 0, 1, 1).error_code,
+                  ErrorCode::NONE);
+        EXPECT_EQ(node.partition("versioned").partition_epoch, 2);
+        EXPECT_EQ(node.controller->updatePartitionISR("versioned", 0, {0}, 1).error_code,
+                  ErrorCode::INVALID_UPDATE_VERSION);
     }
     fs::remove_all(dir);
 }

@@ -19,6 +19,7 @@ struct PartitionLeadershipChange {
     std::optional<std::vector<BrokerId>> new_isr;
     /// The new leader was NOT in the ISR (acked records may be lost).
     bool unclean = false;
+    int32_t expected_partition_epoch = 0;
 };
 
 /// @brief M8-C: the controller's failover policy, a pure function.
@@ -32,8 +33,7 @@ struct PartitionLeadershipChange {
 ///  - leader alive: drop dead brokers from the ISR.
 /// Returns only partitions that need a change, in metadata order.
 std::vector<PartitionLeadershipChange> computeLeadershipChanges(
-    const std::vector<TopicMetadata>& topics, const std::set<BrokerId>& dead,
-    bool unclean_enabled);
+    const std::vector<TopicMetadata>& topics, const std::set<BrokerId>& dead, bool unclean_enabled);
 
 /// @brief M8-E2: KIP-320 check of a request's `current_leader_epoch` against
 /// the partition's epoch. -1 (client did not say) passes; an older epoch is

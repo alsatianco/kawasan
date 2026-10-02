@@ -100,6 +100,7 @@ enum class ErrorCode : int16_t {
     PREFERRED_LEADER_NOT_AVAILABLE = 80,
     GROUP_MAX_SIZE_REACHED = 81,
     FENCED_INSTANCE_ID = 82,
+    INVALID_UPDATE_VERSION = 95,
 };
 
 // Compression types
@@ -185,6 +186,7 @@ struct PartitionMetadata {
     std::vector<BrokerId> replicas;
     std::vector<BrokerId> isr;  // In-sync replicas
     std::vector<BrokerId> offline_replicas;
+    int32_t partition_epoch = 0;  // Version of leader and ISR metadata mutations.
 };
 
 // Topic metadata

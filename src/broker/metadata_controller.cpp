@@ -1,7 +1,6 @@
 #include "kawasan/broker/metadata_controller.h"
 
 #include <chrono>
-
 #include <nlohmann/json.hpp>
 
 #include "kawasan/common/error.h"
@@ -87,23 +86,27 @@ TopicOperationResult MetadataController::deleteTopic(const std::string& topic_na
 
 TopicOperationResult MetadataController::updatePartitionISR(const std::string& topic,
                                                             PartitionId partition,
-                                                            const std::vector<BrokerId>& isr) {
+                                                            const std::vector<BrokerId>& isr,
+                                                            int32_t expected_partition_epoch) {
     MetadataCommand command;
     command.type = MetadataCommandType::UPDATE_ISR;
     command.topic_name = topic;
     command.partition_id = partition;
     command.isr = isr;
+    command.expected_partition_epoch = expected_partition_epoch;
     return replicateAndAwait(command);
 }
 
 TopicOperationResult MetadataController::updatePartitionLeader(const std::string& topic,
                                                                PartitionId partition,
-                                                               BrokerId leader) {
+                                                               BrokerId leader,
+                                                               int32_t expected_partition_epoch) {
     MetadataCommand command;
     command.type = MetadataCommandType::UPDATE_LEADER;
     command.topic_name = topic;
     command.partition_id = partition;
     command.leader = leader;
+    command.expected_partition_epoch = expected_partition_epoch;
     return replicateAndAwait(command);
 }
 
@@ -182,12 +185,13 @@ TopicOperationResult MetadataController::applyCommand(const MetadataCommand& com
         case MetadataCommandType::DELETE_TOPIC:
             return store_.applyDelete(command.topic_name);
         case MetadataCommandType::UPDATE_ISR:
-            return store_.applyUpdateISR(command.topic_name, command.partition_id, command.isr);
+            return store_.applyUpdateISR(command.topic_name, command.partition_id, command.isr,
+                                         command.expected_partition_epoch);
         case MetadataCommandType::INCREASE_PARTITIONS:
             return store_.applyIncreasePartitions(command.topic_name, command.new_partition_count);
         case MetadataCommandType::UPDATE_LEADER:
             return store_.applyUpdateLeader(command.topic_name, command.partition_id,
-                                            command.leader);
+                                            command.leader, command.expected_partition_epoch);
     }
     TopicOperationResult unknown;
     unknown.error_code = ErrorCode::INVALID_REQUEST;
@@ -221,6 +225,10 @@ std::vector<uint8_t> MetadataController::serializeCommand(const MetadataCommand&
         json["topic_name"] = command.topic_name;
         json["partition_id"] = command.partition_id;
         json["leader"] = command.leader;
+    }
+    if (command.type == MetadataCommandType::UPDATE_ISR ||
+        command.type == MetadataCommandType::UPDATE_LEADER) {
+        json["expected_partition_epoch"] = command.expected_partition_epoch;
     }
     auto dump = json.dump();
     return std::vector<uint8_t>(dump.begin(), dump.end());
@@ -257,6 +265,7 @@ MetadataCommand MetadataController::deserializeCommand(const std::vector<uint8_t
         command.partition_id = json.at("partition_id").get<PartitionId>();
         command.leader = json.at("leader").get<BrokerId>();
     }
+    command.expected_partition_epoch = json.value("expected_partition_epoch", -1);
     return command;
 }
 

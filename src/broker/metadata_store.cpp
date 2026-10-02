@@ -150,6 +150,7 @@ nlohmann::json partitionToJson(const PartitionMetadata& partition) {
     j["partition"] = partition.partition;
     j["leader"] = partition.leader;
     j["leader_epoch"] = partition.leader_epoch;
+    j["partition_epoch"] = partition.partition_epoch;
     j["replicas"] = partition.replicas;
     j["isr"] = partition.isr;
     j["offline_replicas"] = partition.offline_replicas;
@@ -162,6 +163,7 @@ PartitionMetadata partitionFromJson(const nlohmann::json& j) {
     metadata.partition = j.at("partition").get<int32_t>();
     metadata.leader = j.at("leader").get<int32_t>();
     metadata.leader_epoch = j.value("leader_epoch", 0);
+    metadata.partition_epoch = j.value("partition_epoch", 0);
     metadata.replicas = j.at("replicas").get<std::vector<int32_t>>();
     metadata.isr = j.at("isr").get<std::vector<int32_t>>();
     metadata.offline_replicas = j.value("offline_replicas", std::vector<int32_t>{});
@@ -376,7 +378,8 @@ TopicOperationResult MetadataStore::applyIncreasePartitions(const std::string& t
 
 TopicOperationResult MetadataStore::applyUpdateISR(const std::string& topic_name,
                                                    PartitionId partition_id,
-                                                   const std::vector<BrokerId>& isr) {
+                                                   const std::vector<BrokerId>& isr,
+                                                   int32_t expected_partition_epoch) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     auto it = topics_.find(topic_name);
@@ -388,7 +391,15 @@ TopicOperationResult MetadataStore::applyUpdateISR(const std::string& topic_name
     bool partition_found = false;
     for (auto& partition : it->second.metadata.partitions) {
         if (partition.partition == partition_id) {
-            partition.isr = isr;
+            if (expected_partition_epoch >= 0 &&
+                expected_partition_epoch != partition.partition_epoch) {
+                return TopicOperationResult::failure(ErrorCode::INVALID_UPDATE_VERSION,
+                                                     "Partition metadata changed since planning");
+            }
+            if (partition.isr != isr) {
+                partition.isr = isr;
+                ++partition.partition_epoch;
+            }
             partition_found = true;
             break;
         }
@@ -408,7 +419,8 @@ TopicOperationResult MetadataStore::applyUpdateISR(const std::string& topic_name
 }
 
 TopicOperationResult MetadataStore::applyUpdateLeader(const std::string& topic_name,
-                                                      PartitionId partition_id, BrokerId leader) {
+                                                      PartitionId partition_id, BrokerId leader,
+                                                      int32_t expected_partition_epoch) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     auto it = topics_.find(topic_name);
@@ -419,18 +431,23 @@ TopicOperationResult MetadataStore::applyUpdateLeader(const std::string& topic_n
 
     for (auto& partition : it->second.metadata.partitions) {
         if (partition.partition == partition_id) {
+            if (expected_partition_epoch >= 0 &&
+                expected_partition_epoch != partition.partition_epoch) {
+                return TopicOperationResult::failure(ErrorCode::INVALID_UPDATE_VERSION,
+                                                     "Partition metadata changed since planning");
+            }
             // The new leader must be an assigned replica (M7 elects among the
             // partition's replicas), or -1 to mark the partition offline (M8:
             // no eligible leader). Bump the leader epoch on every change so
             // followers can detect stale leadership (KIP-101).
-            if (leader != -1 &&
-                std::find(partition.replicas.begin(), partition.replicas.end(), leader) ==
-                    partition.replicas.end()) {
+            if (leader != -1 && std::find(partition.replicas.begin(), partition.replicas.end(),
+                                          leader) == partition.replicas.end()) {
                 return TopicOperationResult::failure(ErrorCode::INVALID_REPLICA_ASSIGNMENT,
                                                      "New leader is not an assigned replica");
             }
             partition.leader = leader;
             partition.leader_epoch += 1;
+            ++partition.partition_epoch;
             persistLocked();
             Logger::info("Elected leader {} for {}-{} (leader_epoch now {})", leader, topic_name,
                          partition_id, partition.leader_epoch);
@@ -666,6 +683,7 @@ std::string MetadataStore::computeChecksum() const {
             part_json["partition"] = partition.partition;
             part_json["leader"] = partition.leader;
             part_json["leader_epoch"] = partition.leader_epoch;
+            part_json["partition_epoch"] = partition.partition_epoch;
             part_json["replicas"] = partition.replicas;
             part_json["isr"] = partition.isr;
             part_json["offline_replicas"] = partition.offline_replicas;

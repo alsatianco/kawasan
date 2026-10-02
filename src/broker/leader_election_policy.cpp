@@ -14,6 +14,7 @@ std::vector<PartitionLeadershipChange> computeLeadershipChanges(
             PartitionLeadershipChange change;
             change.topic = tm.name;
             change.partition = pm.partition;
+            change.expected_partition_epoch = pm.partition_epoch;
 
             if (pm.leader < 0 || is_dead(pm.leader)) {
                 std::vector<BrokerId> live_isr;

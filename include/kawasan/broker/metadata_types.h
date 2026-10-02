@@ -57,6 +57,8 @@ struct MetadataCommand {
     int32_t new_partition_count = 0;
     // For UPDATE_LEADER command (M7): the newly-elected leader for partition_id.
     BrokerId leader = -1;
+    // -1 preserves replay of historical commands; new decisions carry a version.
+    int32_t expected_partition_epoch = -1;
 };
 
 }  // namespace kawasan::broker
