@@ -331,6 +331,8 @@ private:
         const std::string& topic_name, bool allow_auto_create);
 
     Config config_;
+    // Must outlive Raft sockets: members are destroyed in reverse order.
+    boost::asio::io_context io_context_;
     BrokerId broker_id_;
     // M4: min.insync.replicas — an acks=all produce is rejected with
     // NOT_ENOUGH_REPLICAS when the partition's ISR has fewer members than this.
@@ -504,8 +506,6 @@ private:
 
     std::atomic<bool> running_{false};
 
-    // IO context for Raft transport
-    boost::asio::io_context io_context_;
     // 0A.13: Work guard keeps io_context_.run() alive even when there is no
     // outstanding work (e.g. single-node mode where Raft transport has no
     // sessions). Reset in stop() before io_context_.stop() to let run() return.

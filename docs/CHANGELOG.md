@@ -53,6 +53,8 @@ Single-node production-hardening (durability, security, quotas), durable single-
 
 ### Fixed
 
+- Broker destruction keeps its Asio context alive until Raft transports and peer sockets are destroyed, preventing a crash on clean cluster shutdown.
+
 - Raft elections serialize timer and term changes, reject obsolete vote replies, and collect heartbeats independently per peer. A frozen peer no longer stretches healthy-peer heartbeat timing or queues repeated AppendEntries. ISR maintenance waits for current metadata after a broker resumes.
 
 - **Raft could fail to elect a leader, or lose it repeatedly, while one peer was frozen.** Four bugs, each found with the M8 SIGSTOP nemesis:

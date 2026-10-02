@@ -107,11 +107,39 @@ TEST_F(ProducerIdAllocationTest, SingleNodeIdsAreSequentialAcrossRestarts) {
 TEST_F(ProducerIdAllocationTest, ClusterBrokerIssuesIdsFromItsOwnRange) {
     // Broker 2 of a two-broker cluster whose peer never starts; InitProducerId
     // is answered locally.
-    const std::string peers = "2:127.0.0.1:" + std::to_string(freePort()) + ",5:127.0.0.1:" +
-                              std::to_string(freePort());
+    const std::string peers =
+        "2:127.0.0.1:" + std::to_string(freePort()) + ",5:127.0.0.1:" + std::to_string(freePort());
     kawasan::broker::KawasanBroker broker(config(dir_, 2, peers));
     broker.start();
     EXPECT_EQ(initProducerId(broker.port()), kawasan::broker::clusterProducerId(2, 1));
     EXPECT_EQ(initProducerId(broker.port()), kawasan::broker::clusterProducerId(2, 2));
     broker.stop();
+}
+
+// Actual peer sockets must be destroyed while their Asio context still lives.
+TEST_F(ProducerIdAllocationTest, ConnectedClusterBrokersDestroyCleanly) {
+    const int p0 = freePort();
+    const int p1 = freePort();
+    const std::string peers =
+        "0:127.0.0.1:" + std::to_string(p0) + ",1:127.0.0.1:" + std::to_string(p1);
+    auto c0 = config(dir_ + "/0", 0, peers);
+    auto c1 = config(dir_ + "/1", 1, peers);
+    c0.setInt("raft.port", p0);
+    c1.setInt("raft.port", p1);
+    c0.setBool("monitoring.enabled", false);
+    c1.setBool("monitoring.enabled", false);
+    kawasan::broker::KawasanBroker first(c0);
+    kawasan::broker::KawasanBroker second(c1);
+    first.start();
+    second.start();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!(first.raftNode()->hasCurrentMetadata(1000) &&
+             second.raftNode()->hasCurrentMetadata(1000)) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_TRUE(first.raftNode()->hasCurrentMetadata(1000));
+    EXPECT_TRUE(second.raftNode()->hasCurrentMetadata(1000));
+    first.stop();
+    second.stop();
 }
