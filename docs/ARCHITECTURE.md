@@ -240,6 +240,8 @@ The configuration loader (`src/common/config.cpp`) accepts **two** file formats 
 
 Both formats produce the same typed config map, so `broker.id`, `log.dirs`, and the rest behave identically regardless of format. String values in either format support environment-variable substitution with `${VAR}` and `${VAR:default}` syntax. The full key reference is in [./CONFIGURATION.md](./CONFIGURATION.md).
 
+Abort history is reconstructed from retained transactional data and ABORT control markers before startup serves traffic. The index keeps each transaction's first offset and marker offset, so a Fetch starting inside an aborted range includes its earlier start. EndTxn updates the index; Fetch prunes entries whose markers precede the retained log start. The historical 1,000-entry eviction limit is removed. Rebuilding this index currently requires a full retained-log scan at startup; producer-state snapshots still bound producer sequence replay, but do not checkpoint abort history. Coordinator replay independently restores in-flight LSO holds. Cross-broker transaction recovery remains M10.
+
 In a cluster, promotion rebuilds producer sequence state from the retained partition log before the replica becomes writable. A per-partition lock serializes promotion, Produce and replica ingestion/truncation. Followers do not write producer snapshots; control batches do not advance producer sequence state. This recovery scan currently reads the full retained log on promotion.
 
 ## Durability trade-offs

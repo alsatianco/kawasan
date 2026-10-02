@@ -1065,6 +1065,12 @@ void KawasanBroker::initializeMetadata() {
                     }
                 }
                 replayProducerStateFromLog(tm.name, pm.partition, psnap_offset);
+                // Terminal coordinator snapshots do not retain old aborts.
+                // Data-log control markers are the durable source of history.
+                if (isolation_tracker_ && !tm.name.starts_with("__")) {
+                    isolation_tracker_->recoverAbortedTransactions(
+                        tm.name, pm.partition, *log_manager_->getLog(tm.name, pm.partition));
+                }
                 ++restored;
             }
         }
@@ -1300,7 +1306,13 @@ void KawasanBroker::finishTxnCompletion(
         if (committed) {
             isolation_tracker_->commitInFlightTxns(pairs, producer_id);
         } else {
-            isolation_tracker_->abortInFlightTxns(pairs, producer_id);
+            for (const auto& tp : participating) {
+                auto* log = log_manager_ ? log_manager_->getLog(tp.topic, tp.partition) : nullptr;
+                const Offset marker_offset =
+                    log ? log->logEndOffset() - 1 : std::numeric_limits<Offset>::max();
+                isolation_tracker_->abortInFlightTxns({{tp.topic, tp.partition}}, producer_id,
+                                                      marker_offset);
+            }
         }
     }
 
@@ -2847,7 +2859,7 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
                 // (fetch_offset, last_stable_offset] window.
                 if (isolation_tracker_ && context.header.apiVersion() >= 4) {
                     auto aborts = isolation_tracker_->abortedTransactions(
-                        lookup_name, partition.partition, partition.fetch_offset);
+                        lookup_name, partition.partition, partition.fetch_offset, log_start);
                     for (const auto& a : aborts) {
                         protocol::FetchAbortedTransaction at;
                         at.producer_id = a.producer_id;

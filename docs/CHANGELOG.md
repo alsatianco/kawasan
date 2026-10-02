@@ -12,6 +12,8 @@ Single-node durability, security and quotas; durable single-node transactions (M
 
 ### Fixed
 
+- Restore historical aborted transaction ranges from durable data/control batches before serving traffic. Fetch includes aborts when reading inside a transaction, retains history beyond 1,000 entries, and prunes ranges only after log retention passes their markers. M9 commit/abort/crash checks now survive repeated SIGKILLs without exposing aborted records.
+
 - Rebuild idempotent producer state from the retained log before a follower becomes a writable leader. Partition writes, replica ingestion/truncation and promotion replay share a lock; follower snapshots are skipped and transaction control markers no longer overwrite sequence state. The M9 three-broker checker passes all six pause/SIGKILL role combinations after this fix.
 
 - OffsetFetch reads durable group offsets even without JoinGroup membership, including after restart. M9 transaction checks exposed that manual consumers could commit offsets successfully yet read the unset sentinel.
