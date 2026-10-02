@@ -279,8 +279,12 @@ def observe_offsets(admin, topic, partitions, ledger):
     for tp, future in futures.items():
         try:
             offset = future.result(5).offset
-        except KafkaException as exc:
-            ledger.append(dict(type='unavailable', partition=tp.partition, error=str(exc)))
+        except (KafkaException, TimeoutError) as exc:
+            # A Python Future can hit its deadline before librdkafka completes
+            # its request future. During faults this is an unavailable sample,
+            # just like a Kafka transport timeout; it is never an I3 observation.
+            ledger.append(dict(type='unavailable', partition=tp.partition,
+                               error=f'{type(exc).__name__}: {exc}'))
             continue
         if offset < 0:
             # librdkafka can return OFFSET_INVALID during leader discovery.

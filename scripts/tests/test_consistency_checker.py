@@ -79,6 +79,28 @@ class CheckerTest(unittest.TestCase):
         self.assertEqual(event['type'], 'unavailable')
         self.assertEqual(event['offset'], -1001)
 
+    def test_offset_future_timeout_is_unavailable_and_sampling_recovers(self):
+        from types import SimpleNamespace
+        import sys
+        fake_kafka = SimpleNamespace(IsolationLevel=SimpleNamespace(READ_COMMITTED=1),
+                                     TopicPartition=lambda t, p: None, KafkaException=RuntimeError)
+        class Partition:
+            partition = 0
+        future = Mock()
+        future.result.side_effect = [TimeoutError(), SimpleNamespace(offset=9)]
+        admin = Mock()
+        admin.list_offsets.return_value = {Partition(): future}
+        ledger = Mock()
+        with patch.dict(sys.modules, {'confluent_kafka': fake_kafka,
+                         'confluent_kafka.admin': SimpleNamespace(
+                             OffsetSpec=SimpleNamespace(latest=lambda: -1))}):
+            self.assertEqual(observe_offsets(admin, 't', [], ledger), {})
+            self.assertEqual(observe_offsets(admin, 't', [], ledger), {0: 9})
+        events = [call.args[0] for call in ledger.append.call_args_list]
+        self.assertEqual(events[0]['type'], 'unavailable')
+        self.assertIn('TimeoutError', events[0]['error'])
+        self.assertEqual(events[1], dict(type='watermark', partition=0, offset=9))
+
     def test_each_partition_is_checked_independently(self):
         events = [dict(type='watermark', partition=p, offset=o)
                   for p, o in [(0, 4), (1, 2), (0, 5), (1, 3)]]
