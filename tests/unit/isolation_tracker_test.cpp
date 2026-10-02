@@ -137,6 +137,15 @@ TEST(IsolationTrackerTest, RestoresAbortRangesFromDurableMarkersAcrossProducerRe
     EXPECT_EQ(inside[0].first_offset, 5);
     EXPECT_TRUE(restored.abortedTransactions("t", 0, 9).empty());
     EXPECT_EQ(restored.inFlightCount(), 0u);
+    // A crash after the ABORT marker but before the terminal coordinator
+    // snapshot re-drives the same completion. Do not enqueue a second abort
+    // that could incorrectly consume the next transaction's marker.
+    restored.recordInFlightTxn(7, "t", 0, 5);
+    restored.abortInFlightTxns({{"t", 0}}, 7, 8);
+    EXPECT_EQ(restored.abortedTransactions("t", 0, 0).size(), 2u);
+    const auto retained = restored.abortedTransactions("t", 0, 0, 3);
+    ASSERT_EQ(retained.size(), 1u);
+    EXPECT_EQ(retained[0].first_offset, 5);
 }
 
 TEST(IsolationTrackerTest, IdempotentRecordingForSamePidAndPartition) {

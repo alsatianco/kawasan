@@ -43,7 +43,13 @@ void IsolationTracker::abortInFlightTxns(
         // Move from in-flight to aborted ring.
         const Offset first_offset = pit->second;
         state.in_flight.erase(pit);
-        state.aborted.push_back({producer_id, first_offset, last_offset});
+        const bool recovered =
+            std::any_of(state.aborted.begin(), state.aborted.end(),
+                        [producer_id, last_offset](const AbortedTxn& txn) {
+                            return txn.producer_id == producer_id && txn.last_offset == last_offset;
+                        });
+        if (!recovered)
+            state.aborted.push_back({producer_id, first_offset, last_offset});
     }
 }
 
