@@ -771,25 +771,6 @@ cd tests/ecosystem
 
 `run_all.sh` selects the compose file (`docker-compose.kafka.yml` vs `docker-compose.kawasan.yml`), brings the broker up, runs the numbered smoke scripts in `scripts/` (`01_apicompat.sh` … `21_streams_eos.sh`, covering producer/idempotent/transactional paths, admin/ACLs, compaction, internal topics, cooperative-sticky rebalance, `kcat`, schema registry, Kafka UI, Kafka Connect, ksqlDB, durability, SASL/PLAIN, read-committed, and Streams EOS), and tears down. Exit `0` requires all 21 checks to pass with no skips; readiness errors, service startup failures and skips fail the gate. Logs and separate PASS/FAIL/SKIP results are retained in the printed evidence directory (`ECOSYSTEM_LOG_DIR` overrides it). The CI workflow is blocking. Auxiliary services and Java CLI containers share the selected broker’s network namespace so advertised localhost endpoints are reachable from both host clients and container clients. The SIGKILL check restarts that broker with its data intact; SASL starts an isolated container of the selected implementation on 9097. The Streams EOS script uses librdkafka, not a JVM Streams application.
 
-### Consistency evidence (M9)
-
-`scripts/tests/consistency_checker.py` keeps a new JSONL ledger, flushing and fsyncing every acknowledgement and observation. The checker compares acknowledged keys and values at their exact partition offsets (I1), rejects gaps or regressing scan offsets in a fresh nontransactional log (I2), and rejects regressing committed ListOffsets samples (I3). Transaction checks allow control/aborted-record gaps and require all-or-nothing visibility with matching staged group offsets (I4). Ambiguous unacknowledged writes may remain in the log.
-
-The local cluster harness supports `kill9 <id>`, `pause <id>`, `resume <id>`, and `restart <id>`. Signals verify that each PID still belongs to the configured broker. `KEEP_DATA=1` retains logs/data on `down`; frozen brokers are resumed before shutdown. `N=1` starts a true single-node broker without `raft.peers`. `KAFKA_BASE`, `RAFT_BASE`, and `MON_BASE` override the default 9092/9093/9094 port bases (broker IDs add 100).
-
-The M9 nemesis allows one unavailable broker at a time, checks surviving ISR members for every partition and a surviving Raft majority, and requires a full ISR after healing. Its seeded schedule covers follower, partition-leader and controller victims with both SIGKILL and SIGSTOP before randomizing further faults.
-
-Saved evidence can be checked without a broker:
-
-```bash
-python3 scripts/tests/consistency_checker.py --verify-only /path/to/evidence
-ctest --test-dir build -R 'ConsistencyCheckerTest|NemesisTest|ChaosKillTest' --output-on-failure
-```
-
-`ChaosKillTest` forks a broker, acknowledges 50 idempotent records, SIGKILLs it without destructors, and reopens its data. It verifies exact offsets/values, duplicate suppression and the next producer sequence, plus persistent transactional ID/epoch fencing. Failure retains the child log/data directory.
-
-The evidence directory must contain `ledger.jsonl` and `scan.json`. The independent fixtures deliberately hide an acknowledged tail (a seeded HW error), insert gaps, regress offsets, expose partial/aborted transactions, and corrupt a ledger; these must fail. Multi-broker failover remains experimental until seven consecutive scheduled nightly chaos runs pass. Coordinator failover and multi-broker EOS remain M10.
-
 ### Per-language client compatibility
 
 `tests/compatibility/` checks individual Kafka client libraries against a running Kawasan broker. The runner builds/starts a broker, runs each available test, and cleans up:
@@ -834,6 +815,10 @@ Use a new artifact directory for every run. Evidence includes an immutable execu
 The nemesis permits one fault at a time only when the remaining live ISR meets minISR and the remaining brokers retain a Raft majority. It resumes/restarts the victim and waits for readiness plus the full ISR before choosing another fault. Incomplete role/action coverage, failed healing, missing samples and undrained delivery callbacks fail the run.
 
 `.github/workflows/chaos-nightly.yml` runs the 30-minute cluster workload, both single-node modes, native regressions and the live HW proof. It archives evidence for 14 days, including on failure and retained native SIGKILL test data. Its optional dispatch seed reproduces victim/hold choices; client and election timing can still differ. **Seven consecutive scheduled green nightlies remain the failover acceptance gate.** Local runs and repeated dispatches do not establish that history, and clustering stays experimental until the gate is met.
+
+The local cluster harness supports `kill9 <id>`, `pause <id>`, `resume <id>`, and `restart <id>`. Signals verify that each PID still belongs to the configured broker. `KEEP_DATA=1` retains logs/data on `down`; frozen brokers are resumed before shutdown. `N=1` starts a true single-node broker without `raft.peers`. `KAFKA_BASE`, `RAFT_BASE`, and `MON_BASE` override the default 9092/9093/9094 port bases (broker IDs add 100).
+
+`ChaosKillTest` forks a broker, acknowledges 50 idempotent records, SIGKILLs it without destructors, and reopens its data. It verifies exact offsets/values, duplicate suppression and the next producer sequence, plus persistent transactional ID/epoch fencing. Failure retains the child log/data directory.
 
 ### Unit and integration tests
 

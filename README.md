@@ -49,13 +49,13 @@ Known limitations: client/broker **TLS is not implemented** (the broker refuses 
 
 ## Building (Linux & macOS)
 
-CI-verified on current Ubuntu and macOS runners (Intel and Apple Silicon). Requires a modern compiler (GCC ≥ 11 or Clang ≥ 13) and CMake ≥ 3.20.
+CI-verified on current Ubuntu and macOS runners (Intel and Apple Silicon). Requires a modern compiler (GCC ≥ 11 or Clang ≥ 13) and CMake ≥ 3.20. Building the test suites also requires Python 3.
 
 **Install prerequisites**
 
 ```bash
 # Linux (Ubuntu/Debian)
-sudo apt update && sudo apt install -y build-essential cmake ninja-build git pkg-config \
+sudo apt update && sudo apt install -y build-essential cmake ninja-build git pkg-config python3 \
     libboost-all-dev libssl-dev librocksdb-dev libspdlog-dev nlohmann-json3-dev \
     libgtest-dev zlib1g-dev libsnappy-dev liblz4-dev libzstd-dev
 

@@ -16,10 +16,9 @@ namespace kawasan::broker {
 //
 // Tracks the last seen (producer_epoch, base_sequence, last_offset) per
 // (partition, producer_id) for idempotent producer dedup. The state is
-// in-memory only — restart resets it, which matches a server that has
-// never seen the producer before. Persistence belongs to the
-// `__producer_snapshot` (Kafka calls it the producer-state snapshot file)
-// follow-up.
+// held in memory and restored by the broker from producer snapshots plus
+// the durable log tail on restart. Cluster promotion clears and rebuilds the
+// partition state from its retained log before accepting writes.
 //
 // Decisions match Kafka's `ProducerStateManager` semantics:
 //
