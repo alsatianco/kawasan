@@ -165,9 +165,16 @@ class Cluster:
         self.directory = Path(directory).resolve()
         self.n = 1 if single_node else 3
         self.port_base = port_base
-        self.broker_bin = Path(broker_bin or self.root / 'build/tools/kawasan-broker').resolve()
-        if not self.broker_bin.is_file():
-            raise RuntimeError(f'broker binary missing: {self.broker_bin}')
+        self.source_broker_bin = Path(broker_bin or self.root / 'build/tools/kawasan-broker').resolve()
+        if not self.source_broker_bin.is_file():
+            raise RuntimeError(f'broker binary missing: {self.source_broker_bin}')
+        # Restart always executes this immutable run copy, even if the developer
+        # rebuilds the source executable while a long checker run is in progress.
+        import shutil
+        snapshot_dir = self.directory.parent / 'broker-bin'
+        snapshot_dir.mkdir(exist_ok=False)
+        self.broker_bin = snapshot_dir / 'kawasan-broker'
+        shutil.copy2(self.source_broker_bin, self.broker_bin)
         self.env = dict(os.environ, BASE=str(self.directory), N=str(self.n), KEEP_DATA='1',
                         BROKER_BIN=str(self.broker_bin), KAFKA_BASE=str(port_base),
                         RAFT_BASE=str(port_base + 1), MON_BASE=str(port_base + 2),
@@ -553,6 +560,8 @@ def run_live(args):
                'git_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=cluster.root,
                                                    text=True).strip(),
                'broker_sha256': hashlib.sha256(cluster.broker_bin.read_bytes()).hexdigest(),
+               'source_broker_bin': str(cluster.source_broker_bin),
+               'nemesis_sha256': hashlib.sha256(Path(__file__).with_name('nemesis.py').read_bytes()).hexdigest(),
                'checker_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
     started = time.monotonic()
     try:

@@ -12,6 +12,8 @@ Single-node durability, security and quotas; durable single-node transactions (M
 
 ### Fixed
 
+- Pin the executable in every chaos evidence directory so rebuilding the worktree cannot change the candidate between restarts. Record the nemesis hash alongside the binary and checker hashes.
+
 - Keep abort-history completion idempotent when recovery re-drives a transaction whose ABORT marker is already durable, so duplicate abort entries cannot hide a later committed transaction.
 
 - Restore historical aborted transaction ranges from durable data/control batches before serving traffic. Fetch includes aborts when reading inside a transaction, retains history beyond 1,000 entries, and prunes ranges only after log retention passes their markers. M9 commit/abort/crash checks now survive repeated SIGKILLs without exposing aborted records.

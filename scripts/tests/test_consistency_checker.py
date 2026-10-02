@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch, Mock
 
-from consistency_checker import Ledger, Violation, verify_records, verify_watermarks, verify_transactions, observe_offsets
+from consistency_checker import Ledger, Violation, verify_records, verify_watermarks, verify_transactions, observe_offsets, Cluster
 
 
 def record(offset, key=None, partition=0):
@@ -103,6 +103,19 @@ class CheckerTest(unittest.TestCase):
         verify_transactions(events, [record(0, 'a'), record(1, 'b')], 2)
         with self.assertRaisesRegex(Violation, 'I4'):
             verify_transactions(events, [record(0, 'a')], 2)
+
+    def test_run_pins_binary_across_rebuilds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'candidate'
+            source.write_bytes(b'original candidate')
+            artifacts = root / 'evidence'
+            artifacts.mkdir()
+            cluster = Cluster(artifacts / 'cluster', True, source, 29092)
+            self.assertNotEqual(cluster.broker_bin, source)
+            source.write_bytes(b'new build')
+            self.assertEqual(cluster.broker_bin.read_bytes(), b'original candidate')
+            self.assertEqual(cluster.env['BROKER_BIN'], str(cluster.broker_bin))
 
     def test_ledger_fsyncs_every_event_and_reloads_exactly(self):
         with tempfile.TemporaryDirectory() as d:
