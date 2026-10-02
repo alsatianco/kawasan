@@ -35,11 +35,11 @@ Then point any Kafka client at `localhost:9092`. Prometheus metrics scrape from 
 | **Core broker** | Topics, Produce/Fetch (acks 0/1/-1), Metadata, compression (Gzip/Snappy/LZ4/Zstd) | Stable |
 | **Consumer groups** | Persistent offsets (RocksDB), rebalancing, lag tracking | Stable |
 | **Storage** | RocksDB-backed segmented logs, time/size retention | Stable |
-| **Transactions** | Idempotent producers, two-phase transaction coordinator, read-committed isolation | Partial — single-node transaction state is **durable across restart** (persisted to `__transaction_state`, replayed on startup); `__transaction_state` replicates over the follower-fetch path, but the transaction coordinator does not yet fail over between brokers |
+| **Transactions** | Idempotent producers, two-phase transaction coordinator, read-committed isolation | Partial — single-node transaction state is **durable across restart** (persisted to `__transaction_state`, replayed on startup); internal topics remain RF=1 and coordinator state does not yet fail over between brokers |
 | **Streams** | DSL (KStream/KTable), windowing, joins | Experimental — the topology/DSL builds, but the task **runtime is incomplete** (does not yet run end-to-end) |
 | **Connect** | Source/sink connector + task + worker framework | Experimental — framework only; **no REST API**, standalone, cannot host JVM Connect plugins |
 | **Security** | SASL/PLAIN + SASL/SCRAM (SHA-256/512) auth; ACL **enforcement** (opt-in via `authorizer.enabled`); per-client quotas (opt-in) | Implemented (no client/broker TLS — see below) |
-| **Consensus & replication** | Raft metadata (no ZooKeeper); data replication with follower fetch, ISR shrink/expand, ISR-governed `acks=all`, and manual preferred-replica election — but **no automatic leader failover yet**, so multi-broker is experimental | Partial |
+| **Consensus & replication** | Raft metadata (no ZooKeeper); data replication with follower fetch, ISR shrink/expand, ISR-governed `acks=all`, automatic leader failover, stale-leader fencing, epoch-based divergence recovery, and coordinator routing; multi-broker remains experimental | Partial |
 | **Monitoring** | Prometheus metrics, health endpoints, Grafana dashboard | Stable |
 | **Deployment** | Docker, Compose, systemd, macOS launchd, Helm, k8s manifests | Stable |
 

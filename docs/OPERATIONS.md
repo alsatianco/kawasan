@@ -24,6 +24,7 @@ The **single-node broker is the primary, supported deployment**. Multi-broker Ra
 - [Backup and restore](#backup-and-restore)
 - [Scaling](#scaling)
 - [Troubleshooting playbook](#troubleshooting-playbook)
+- [Cluster failover and recovery](#cluster-failover-and-recovery)
 - [Incident severity](#incident-severity)
 - [Performance tuning](#performance-tuning)
   - [Targets](#targets)
@@ -472,7 +473,7 @@ Guidance: more partitions = more parallelism but more per-partition overhead; do
 
 ### Horizontal scaling (experimental)
 
-Multi-broker Raft replication is **not production-hardened**. Followers replicate data, the ISR shrinks and expands automatically, and `acks=all` waits on the ISR. When a partition leader stops answering Raft heartbeats for `broker.liveness.timeout.ms` (default 9 s), the controller automatically elects a new leader from the in-sync replicas. A partition with no live in-sync replica stays offline (`LEADER_NOT_AVAILABLE`) until one returns, unless `unclean.leader.election.enable=true`. A broker that can't confirm its metadata is current (it can't reach the Raft quorum or leader within half the liveness timeout, or it has just restarted and not caught up yet) refuses Produce/Fetch with `NOT_LEADER_FOR_PARTITION` and returns 503 from `/ready`. A broker that stays not-ready therefore usually can't reach its Raft peers on `raft.port`. Consumer-group coordinators are not yet routed cluster-wide. The `docker-compose-cluster.yml` and `k8s` StatefulSet exist for experimentation and compatibility testing. If you run a multi-broker cluster:
+Multi-broker Raft replication is **not production-hardened**. Followers replicate data, the ISR shrinks and expands automatically, and `acks=all` waits on the ISR. When a partition leader stops answering Raft heartbeats for `broker.liveness.timeout.ms` (default 9 s), the controller automatically elects a new leader from the in-sync replicas. A partition with no live in-sync replica stays offline (`LEADER_NOT_AVAILABLE`) until one returns, unless `unclean.leader.election.enable=true`. A broker that can't confirm its metadata is current (it can't reach the Raft quorum or leader within half the liveness timeout, or it has just restarted and not caught up yet) refuses Produce/Fetch with `NOT_LEADER_FOR_PARTITION` and returns 503 from `/ready`. A broker that stays not-ready therefore usually can't reach its Raft peers on `raft.port`. Group and transaction coordinators are routed to their internal-topic partition leaders, but internal topics remain RF=1 and coordinator-state failover is deferred to M10. The `docker-compose-cluster.yml` and `k8s` StatefulSet exist for experimentation and compatibility testing. If you run a multi-broker cluster:
 
 - Every broker needs a unique `broker.id`.
 - Configure `raft.port` and `raft.peers` (`id:host:port,...`) consistently across brokers.
@@ -592,6 +593,32 @@ ldb --db=/var/lib/kawasan/data/meta compact
 ./build/tools/kawasan-metadata-check --brokers localhost:9092 localhost:9192 localhost:9292
 # Reports "✓ All brokers have consistent metadata" when aligned.
 ```
+
+---
+
+## Cluster failover and recovery
+
+Multi-broker is experimental. Automatic partition failover is implemented; randomized-fault validation (M9) and durable coordinator failover (M10) remain ahead.
+
+For replicated user topics, use RF=3, `min.insync.replicas=2`, producer `acks=all`, and `log.durability=sync`. Keep `unclean.leader.election.enable=false` to require an in-sync successor. A surviving Raft majority is required to commit leadership changes.
+
+1. Check broker processes, `/ready`, and Metadata. The controller considers a broker dead after `broker.liveness.timeout.ms` (default 9 s); a newly elected controller waits a full liveness window before failing peers over. Allow time for replica reconciliation and client metadata refresh as well.
+2. With a live ISR member, the controller elects a successor and increments the partition epoch. Clients refresh metadata and retry. Stale brokers refuse data and coordinator requests; their readiness endpoint returns 503. If no eligible replica survives, Metadata reports an offline leader (`-1`) and clients receive `LEADER_NOT_AVAILABLE`.
+3. Restart the failed broker with the same broker ID, peer configuration and data directory. Its follower fetcher reconciles epoch history, removes divergent tail records and catches up. Wait for it to rejoin the ISR before making another topology change.
+4. Check metadata consistency with `kawasan-metadata-check` and verify previously acknowledged records with a consumer. Preferred-replica `ElectLeaders` is optional after catch-up: contact the current controller and ensure the preferred replica is in the ISR. Retry `NOT_CONTROLLER` after refreshing controller metadata.
+
+`__consumer_offsets` and `__transaction_state` remain RF=1. FindCoordinator reports `COORDINATOR_NOT_AVAILABLE` when their owner is offline; groups and transactional IDs recover when that broker returns with its data. M8 does not transfer coordinator state to another broker or provide cross-broker EOS. Enabling unclean election can select a replica missing acknowledged records and does not supply coordinator-state recovery.
+
+Reproduce the supported scenarios against a local build:
+
+```bash
+python3 scripts/tests/test_leader_failover_m8.py --iterations 20
+python3 scripts/tests/test_divergence_truncation_m8.py
+python3 scripts/tests/test_stale_leader_fencing_m8.py
+python3 scripts/tests/test_group_single_coordinator.py
+```
+
+These scripts own their three-broker harness and fixed ports; run them serially. On macOS, prefix with `caffeinate -i` to keep test timing stable. Failures preserve broker logs and data in the path printed by each script.
 
 ---
 

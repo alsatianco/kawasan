@@ -2,7 +2,7 @@
 
 Kawasan is a C++20 message streaming platform that is wire-protocol compatible with Apache Kafka. A single broker process embeds the Kafka protocol layer, RocksDB-backed log storage, a Raft consensus implementation for metadata, consumer-group coordination, and a Prometheus monitoring endpoint. The same source tree also ships a producer client, a Kawasan Streams DSL, and a Connect framework as separate library modules.
 
-The single-node broker is the primary, fully supported mode. Multi-broker replication works end-to-end for the data plane — followers fetch from leaders, `acks=all` is governed by the ISR, the ISR shrinks/expands under controller authority, a divergent follower truncates and re-syncs, and preferred-replica election is available via `ElectLeaders` — but **automatic partition-leader failover is not implemented**: a leader loss strands the partition until leadership is manually re-elected. Treat multi-broker as experimental.
+The single-node broker is the primary supported mode. Multi-broker replication includes follower fetch, ISR-governed `acks=all`, automatic clean leader failover, stale-metadata and leader-epoch fencing, epoch-based divergence recovery, and deterministic coordinator ownership. Multi-broker remains experimental pending randomized-fault validation (M9) and durable coordinator failover / cross-broker transactions (M10).
 
 This document explains how the system is structured and how the pieces fit together. For installing, configuring, and operating a broker see [./OPERATIONS.md](./OPERATIONS.md) and [./CONFIGURATION.md](./CONFIGURATION.md); for the full set of supported protocol APIs see [./api_coverage_matrix.md](./api_coverage_matrix.md).
 

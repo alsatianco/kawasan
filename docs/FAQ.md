@@ -51,7 +51,7 @@ Yes, partially. SASL/PLAIN (credentials from `sasl.plain.credentials.file` or in
 
 ## Is it single-node or multi-broker today?
 
-The single-node broker is the primary, production-intended mode and is fully functional. Multi-broker replication is substantially implemented — followers replicate partition data from the leader (follower fetch), the ISR shrinks and expands automatically, `acks=all` genuinely waits on the ISR, a divergent follower truncates and re-syncs, manual preferred-replica election works, and a 3-broker Docker Compose ships — but it is **not** production-hardened: there is **no automatic partition-leader failover or stale-leader fencing yet**, so killing a partition's leader strands that partition (availability loss, not acked-data loss) until leadership is manually re-elected. Treat clustering as experimental.
+The single-node broker is the primary supported mode. Multi-broker replication includes follower fetch, ISR-governed `acks=all`, automatic leader failover, stale-leader fencing, epoch-based divergence recovery, and deterministic coordinator routing. Clustering remains experimental: randomized-fault validation is M9, and durable coordinator failover and cross-broker transactions are M10. Internal topics remain RF=1, so a failed coordinator is unavailable until its broker returns. See the [cluster recovery runbook](./OPERATIONS.md#cluster-failover-and-recovery).
 
 ## Where is data stored?
 
