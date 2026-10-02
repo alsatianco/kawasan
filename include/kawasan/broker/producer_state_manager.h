@@ -65,15 +65,16 @@ public:
     /// @return ErrorCode::NONE if the batch is acceptable; otherwise a
     ///         specific error. The caller is responsible for actually
     ///         appending the batch and then calling `recordAppend()`.
-    CheckResult check(const std::string& topic, PartitionId partition,
-                      int64_t producer_id, int16_t producer_epoch,
-                      int32_t base_sequence, int32_t record_count) const;
+    CheckResult check(const std::string& topic, PartitionId partition, int64_t producer_id,
+                      int16_t producer_epoch, int32_t base_sequence, int32_t record_count) const;
 
     /// @brief Records that a batch was successfully appended.
-    void recordAppend(const std::string& topic, PartitionId partition,
-                      int64_t producer_id, int16_t producer_epoch,
-                      int32_t base_sequence, int32_t record_count,
+    void recordAppend(const std::string& topic, PartitionId partition, int64_t producer_id,
+                      int16_t producer_epoch, int32_t base_sequence, int32_t record_count,
                       Offset base_offset);
+
+    /// @brief Discard a partition's cached state before rebuilding its retained log.
+    void clearPartition(const std::string& topic, PartitionId partition);
 
     /// @brief Clears all state. Test-only.
     void clear();
@@ -137,8 +138,8 @@ private:
         PartitionId partition;
         int64_t producer_id;
         bool operator==(const Key& other) const {
-            return producer_id == other.producer_id &&
-                   partition == other.partition && topic == other.topic;
+            return producer_id == other.producer_id && partition == other.partition &&
+                   topic == other.topic;
         }
     };
 

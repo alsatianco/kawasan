@@ -12,6 +12,8 @@ Single-node durability, security and quotas; durable single-node transactions (M
 
 ### Fixed
 
+- Rebuild idempotent producer state from the retained log before a follower becomes a writable leader. Partition writes, replica ingestion/truncation and promotion replay share a lock; follower snapshots are skipped and transaction control markers no longer overwrite sequence state. The M9 three-broker checker passes all six pause/SIGKILL role combinations after this fix.
+
 - OffsetFetch reads durable group offsets even without JoinGroup membership, including after restart. M9 transaction checks exposed that manual consumers could commit offsets successfully yet read the unset sentinel.
 
 ### Added

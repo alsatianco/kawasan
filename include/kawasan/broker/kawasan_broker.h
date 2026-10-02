@@ -4,6 +4,7 @@
 #include <boost/asio.hpp>
 #include <condition_variable>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -92,6 +93,10 @@ public:
     /// from cluster metadata. Used by the replica fetcher to reach a partition
     /// leader. Returns nullopt if the broker id is unknown.
     std::optional<std::pair<std::string, int32_t>> peerEndpoint(BrokerId broker_id) const;
+
+    /// @brief Serialize clustered produce, replica ingestion and role transitions
+    /// for one partition. Returns an unlocked guard in single-node mode.
+    std::unique_lock<std::mutex> lockPartitionWrites(const TopicPartition& tp);
 
     /// @brief M5: reconcile ReplicaManager against the Raft-committed metadata —
     /// for every partition this broker replicates, register it as leader (ISR =
@@ -464,6 +469,8 @@ private:
     std::atomic<bool> producer_snapshot_stop_{false};
     std::thread producer_snapshot_thread_;
     std::mutex producer_snapshot_mutex_;
+    std::mutex partition_write_mutex_map_mutex_;
+    std::map<TopicPartition, std::unique_ptr<std::mutex>> partition_write_mutexes_;
     std::condition_variable producer_snapshot_cv_;
     int64_t producer_snapshot_interval_ms_ = 60000;
 

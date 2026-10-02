@@ -1,9 +1,9 @@
-#include <gtest/gtest.h>
-
 #include "kawasan/broker/producer_state_manager.h"
 
-using kawasan::broker::ProducerStateManager;
+#include <gtest/gtest.h>
+
 using kawasan::ErrorCode;
+using kawasan::broker::ProducerStateManager;
 
 namespace {
 
@@ -71,6 +71,17 @@ TEST(ProducerStateManagerTest, DifferentPartitionsTrackedSeparately) {
     // Partition 1 has never seen this producer — should accept seq=0.
     auto r = psm.check(kTopic, /*part=*/1, kPid, kEpoch, /*base_seq=*/0, /*records=*/1);
     EXPECT_EQ(r.error, ErrorCode::NONE);
+}
+
+TEST(ProducerStateManagerTest, PartitionResetDropsDivergentStateWithoutAffectingOtherLogs) {
+    ProducerStateManager psm;
+    psm.recordAppend(kTopic, 0, kPid, kEpoch, 0, 2, 100);
+    psm.recordAppend(kTopic, 1, kPid, kEpoch, 0, 2, 200);
+    psm.clearPartition(kTopic, 0);
+    // Rebuild from the retained committed prefix, omitting the truncated sequence 1.
+    psm.recordAppend(kTopic, 0, kPid, kEpoch, 0, 1, 100);
+    EXPECT_EQ(psm.check(kTopic, 0, kPid, kEpoch, 1, 1).error, ErrorCode::NONE);
+    EXPECT_EQ(psm.check(kTopic, 1, kPid, kEpoch, 0, 2).duplicate_offset, 200);
 }
 
 }  // namespace

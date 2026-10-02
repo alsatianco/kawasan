@@ -1,12 +1,11 @@
 #include "kawasan/broker/replica_manager.h"
 
-#include "kawasan/broker/follower_truncation.h"
-
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <chrono>
 
+#include "kawasan/broker/follower_truncation.h"
 #include "kawasan/broker/kawasan_broker.h"
 #include "kawasan/broker/peer_client.h"
 #include "kawasan/common/buffer.h"
@@ -351,8 +350,7 @@ bool ReplicaManager::fetchPartitionFromLeader(const FetchTask& task) {
         }
         fetch_offset = task.log->logEndOffset();
     }
-    auto result =
-        client->fetch(task.tp.topic, task.tp.partition, fetch_offset, task.leader_epoch);
+    auto result = client->fetch(task.tp.topic, task.tp.partition, fetch_offset, task.leader_epoch);
     if (!result) {
         // Connection/protocol error: drop the cached client so next cycle
         // reconnects; the loop sleep provides the backoff.
@@ -384,6 +382,10 @@ bool ReplicaManager::fetchPartitionFromLeader(const FetchTask& task) {
     if (!broker_->isPartitionLeadership(task.tp, task.leader, task.leader_epoch)) {
         return true;
     }
+
+    auto partition_write_lock = broker_->lockPartitionWrites(task.tp);
+    if (!broker_->isPartitionLeadership(task.tp, task.leader, task.leader_epoch))
+        return true;
 
     // Ingest the leader's raw batches, offset-preserved. Stop on a gap (the
     // follower diverged; reconcile with the leader first).
@@ -457,6 +459,9 @@ bool ReplicaManager::reconcileWithLeader(const FetchTask& task, PeerClient& clie
     if (!broker_->isPartitionLeadership(task.tp, task.leader, task.leader_epoch)) {
         return false;  // leadership moved since the snapshot; re-check next cycle
     }
+    auto partition_write_lock = broker_->lockPartitionWrites(task.tp);
+    if (!broker_->isPartitionLeadership(task.tp, task.leader, task.leader_epoch))
+        return false;
     const Offset leo = task.log->logEndOffset();
     const Offset hw = task.log->highWatermark();
     const Offset target = followerTruncationOffset(latest, leader_answer, own, leo, hw);

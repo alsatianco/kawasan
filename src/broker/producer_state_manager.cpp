@@ -12,20 +12,21 @@ namespace {
 // here in practice (INT32_MAX ≈ 2.1 B batches), but the math is the same
 // as Kafka's `RecordBatch.incrementSequence`.
 int32_t incrementSequence(int32_t seq) {
-    if (seq == INT32_MAX) return 0;
+    if (seq == INT32_MAX)
+        return 0;
     return seq + 1;
 }
 
 }  // namespace
 
 ProducerStateManager::CheckResult ProducerStateManager::check(
-    const std::string& topic, PartitionId partition,
-    int64_t producer_id, int16_t producer_epoch,
+    const std::string& topic, PartitionId partition, int64_t producer_id, int16_t producer_epoch,
     int32_t base_sequence, int32_t record_count) const {
     CheckResult result;
 
     // Non-idempotent producer: nothing to track. Accept.
-    if (producer_id < 0) return result;
+    if (producer_id < 0)
+        return result;
 
     std::lock_guard<std::mutex> lock(mutex_);
     Key key{topic, partition, producer_id};
@@ -78,12 +79,12 @@ ProducerStateManager::CheckResult ProducerStateManager::check(
     return result;
 }
 
-void ProducerStateManager::recordAppend(
-    const std::string& topic, PartitionId partition,
-    int64_t producer_id, int16_t producer_epoch,
-    int32_t base_sequence, int32_t record_count,
-    Offset base_offset) {
-    if (producer_id < 0 || record_count <= 0) return;
+void ProducerStateManager::recordAppend(const std::string& topic, PartitionId partition,
+                                        int64_t producer_id, int16_t producer_epoch,
+                                        int32_t base_sequence, int32_t record_count,
+                                        Offset base_offset) {
+    if (producer_id < 0 || record_count <= 0)
+        return;
     std::lock_guard<std::mutex> lock(mutex_);
     Key key{topic, partition, producer_id};
     State& s = states_[key];
@@ -94,15 +95,14 @@ void ProducerStateManager::recordAppend(
     s.last_base_offset = base_offset;
 }
 
-std::vector<ProducerStateManager::ActiveProducer>
-ProducerStateManager::listProducers(const std::string& topic,
-                                    PartitionId partition) const {
+std::vector<ProducerStateManager::ActiveProducer> ProducerStateManager::listProducers(
+    const std::string& topic, PartitionId partition) const {
     std::vector<ActiveProducer> out;
     std::lock_guard<std::mutex> lock(mutex_);
     for (const auto& [key, state] : states_) {
         if (key.topic == topic && key.partition == partition) {
-            out.push_back({key.producer_id, state.last_epoch,
-                           state.last_sequence, state.last_base_offset});
+            out.push_back(
+                {key.producer_id, state.last_epoch, state.last_sequence, state.last_base_offset});
         }
     }
     return out;
@@ -136,10 +136,16 @@ void ProducerStateManager::restoreEntries(const std::string& topic, PartitionId 
     }
 }
 
+void ProducerStateManager::clearPartition(const std::string& topic, PartitionId partition) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::erase_if(states_, [&](const auto& entry) {
+        return entry.first.topic == topic && entry.first.partition == partition;
+    });
+}
+
 void ProducerStateManager::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
-    evictions_total_.fetch_add(static_cast<int64_t>(states_.size()),
-                               std::memory_order_relaxed);
+    evictions_total_.fetch_add(static_cast<int64_t>(states_.size()), std::memory_order_relaxed);
     states_.clear();
 }
 

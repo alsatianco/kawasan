@@ -1212,6 +1212,11 @@ void KawasanBroker::writeAllProducerSnapshots() {
     const auto topics = metadata_controller_->describeTopics({});
     for (const auto& tm : topics) {
         for (const auto& pm : tm.partitions) {
+            const TopicPartition tp{tm.name, pm.partition};
+            auto partition_write_lock = lockPartitionWrites(tp);
+            // Followers rebuild on promotion; their cached state may lag the log.
+            if (!cluster_brokers_.empty() && !replica_manager_->isLeader(tp))
+                continue;
             auto* log = log_manager_->getLog(tm.name, pm.partition);
             if (!log)
                 continue;
@@ -1367,7 +1372,7 @@ void KawasanBroker::replayProducerStateFromLog(const std::string& topic, Partiti
             if (base + count > next) {
                 next = base + count;
             }
-            if (batch.producerId() >= 0 && count > 0) {
+            if (batch.producerId() >= 0 && count > 0 && !batch.isControlBatch()) {
                 producer_state_manager_->recordAppend(topic, partition, batch.producerId(),
                                                       batch.producerEpoch(), batch.baseSequence(),
                                                       count, base);
@@ -2270,6 +2275,8 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                 continue;
             }
 
+            auto partition_write_lock = lockPartitionWrites(
+                {topic_data.topic, partition_data.partition});
             try {
                 storage::RecordBatch batch = storage::RecordBatch::deserializeFromProduceRequest(
                     partition_data.record_batch);
@@ -2281,6 +2288,15 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
 
                 // Register replica with ReplicaManager if not already registered
                 TopicPartition tp{topic_data.topic, partition_data.partition};
+                if (!cluster_brokers_.empty() &&
+                    (!replica_manager_->isLeader(tp) ||
+                     replica_manager_->getLeaderEpoch(tp) != partition_it->leader_epoch ||
+                     !isPartitionLeadership(tp, broker_id_, partition_it->leader_epoch))) {
+                    partition_response.error_code = ErrorCode::NOT_LEADER_FOR_PARTITION;
+                    topic_response.partitions.push_back(partition_response);
+                    has_error = true;
+                    continue;
+                }
                 if (!replica_manager_->isLeader(tp)) {
                     // Create a shared_ptr wrapper for the log (LogManager owns the actual log)
                     // We use a non-owning shared_ptr to track it in ReplicaManager
@@ -3766,6 +3782,19 @@ std::optional<std::pair<std::string, int32_t>> KawasanBroker::peerEndpoint(
     return std::nullopt;
 }
 
+std::unique_lock<std::mutex> KawasanBroker::lockPartitionWrites(const TopicPartition& tp) {
+    if (cluster_brokers_.empty()) return {};
+    std::mutex* mutex;
+    {
+        std::lock_guard<std::mutex> map_lock(partition_write_mutex_map_mutex_);
+        auto& entry = partition_write_mutexes_[tp];
+        if (!entry)
+            entry = std::make_unique<std::mutex>();
+        mutex = entry.get();
+    }
+    return std::unique_lock<std::mutex>(*mutex);
+}
+
 void KawasanBroker::reconcileReplicas() {
     if (!metadata_controller_ || !log_manager_ || !replica_manager_) {
         return;
@@ -3779,6 +3808,8 @@ void KawasanBroker::reconcileReplicas() {
             if (!local_is_replica) {
                 continue;
             }
+            const TopicPartition tp{tm.name, pm.partition};
+            auto partition_write_lock = lockPartitionWrites(tp);
             auto* log = log_manager_->getOrCreateLog(tm.name, pm.partition);
             if (!log) {
                 continue;
@@ -3787,6 +3818,14 @@ void KawasanBroker::reconcileReplicas() {
             // leader == broker_id_ => this broker leads (ISR = assigned replicas,
             // so acks=all waits for followers); otherwise it is a follower and the
             // fetcher thread will replicate from pm.leader.
+            if (!cluster_brokers_.empty() && pm.leader == broker_id_ &&
+                (!replica_manager_->isLeader(tp) ||
+                 replica_manager_->getLeaderEpoch(tp) != pm.leader_epoch)) {
+                // The authoritative log includes replication and any truncation.
+                // Control markers carry no producer data sequence.
+                producer_state_manager_->clearPartition(tm.name, pm.partition);
+                replayProducerStateFromLog(tm.name, pm.partition);
+            }
             const bool changed = replica_manager_->reconcileReplica(
                 {tm.name, pm.partition}, log_ptr, pm.leader, pm.isr, pm.leader_epoch);
             if (changed && delayed_produce_purgatory_) {

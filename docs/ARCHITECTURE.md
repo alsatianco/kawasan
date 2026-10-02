@@ -6,8 +6,6 @@ The single-node broker is the primary supported mode. Multi-broker replication i
 
 This document explains how the system is structured and how the pieces fit together. For installing, configuring, and operating a broker see [./OPERATIONS.md](./OPERATIONS.md) and [./CONFIGURATION.md](./CONFIGURATION.md); for the full set of supported protocol APIs see [./api_coverage_matrix.md](./api_coverage_matrix.md).
 
-Manual assignment and transactional offset commits do not require an in-memory joined group. OffsetFetch reads the persistent OffsetManager directly; a genuinely uncommitted partition returns -1, including after restart.
-
 ## Contents
 
 - [System overview](#system-overview)
@@ -242,6 +240,8 @@ The configuration loader (`src/common/config.cpp`) accepts **two** file formats 
 
 Both formats produce the same typed config map, so `broker.id`, `log.dirs`, and the rest behave identically regardless of format. String values in either format support environment-variable substitution with `${VAR}` and `${VAR:default}` syntax. The full key reference is in [./CONFIGURATION.md](./CONFIGURATION.md).
 
+In a cluster, promotion rebuilds producer sequence state from the retained partition log before the replica becomes writable. A per-partition lock serializes promotion, Produce and replica ingestion/truncation. Followers do not write producer snapshots; control batches do not advance producer sequence state. This recovery scan currently reads the full retained log on promotion.
+
 ## Durability trade-offs
 
 Kawasan tunes RocksDB write durability per data class to balance at-least-once safety against throughput:
@@ -255,6 +255,9 @@ Kawasan tunes RocksDB write durability per data class to balance at-least-once s
 In short: offsets are always synchronous and messages are synchronous by default; group metadata is asynchronous but WAL-protected, with a small (~WAL-flush-interval) loss window on crash. After a crash the RocksDB WAL replays all writes, including the async group-metadata ones.
 
 ## Consumer offset storage
+
+Manual assignment and transactional offset commits do not require an in-memory joined group. OffsetFetch reads the persistent OffsetManager directly; a genuinely uncommitted partition returns -1, including after restart.
+
 
 `OffsetManager` (`include/kawasan/broker/offset_manager.h`, `src/broker/offset_manager.cpp`) persists committed offsets and consumer-group state to RocksDB, so groups survive broker restarts. It uses a dedicated RocksDB database opened with `OptimizeForPointLookup` (64 MB block cache); `GroupCoordinator` calls into it on commit/fetch and on group state changes.
 
