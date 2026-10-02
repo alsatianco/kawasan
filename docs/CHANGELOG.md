@@ -12,6 +12,8 @@ Single-node durability, security and quotas; durable single-node transactions (M
 
 ### Added
 
+- M8 acceptance verified with 69/69 CTest tests, 20 consecutive leader/controller failover iterations, 20 consecutive divergence recoveries, and a real two-consumer single-coordinator proof. The operations guide includes cluster recovery steps.
+
 - Coordinator ownership guards (M8-G2) reject misrouted group and transaction requests with NOT_COORDINATOR before accessing local state. Batched OffsetFetch checks each group independently; stale brokers refuse coordinator traffic. Nontransactional producer-ID allocation remains local.
 
 - FindCoordinator routes group and transaction keys to the leader of their hashed internal-topic partition (M8-G1), including per-key v4 responses. Missing or offline owners return COORDINATOR_NOT_AVAILABLE; single-node routing stays local.
