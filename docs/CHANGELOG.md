@@ -12,6 +12,8 @@ Single-node durability, security and quotas; durable single-node transactions (M
 
 ### Added
 
+- M9 subprocess SIGKILL regression proves exact acknowledged record recovery, idempotent producer sequence replay/deduplication, and durable transactional producer epochs without graceful shutdown.
+
 - M9 seeded nemesis planner preserves min ISR and Raft quorum, requires healing between faults, and covers leader/follower/controller kills and pauses. The process harness adds validated SIGKILL, safe restarts, configurable port bases, retained failure data, and true single-node mode.
 
 - M9 durable JSONL acknowledgement ledger and independent I1–I4 consistency checks, including offline evidence replay and corruption fixtures registered with CTest.

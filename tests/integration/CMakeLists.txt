@@ -131,3 +131,9 @@ add_test(NAME ConnectSourceTest COMMAND connect_source_test)
 add_executable(find_coordinator_routing_test find_coordinator_routing_test.cpp)
 target_link_libraries(find_coordinator_routing_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME FindCoordinatorRoutingTest COMMAND find_coordinator_routing_test)
+
+# M9 real process death: exact acknowledgements and durable producer/txn state.
+add_executable(chaos_kill_test chaos_kill_test.cpp)
+target_link_libraries(chaos_kill_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME ChaosKillTest COMMAND chaos_kill_test)
+set_tests_properties(ChaosKillTest PROPERTIES TIMEOUT 60)

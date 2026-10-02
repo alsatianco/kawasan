@@ -783,8 +783,10 @@ Saved evidence can be checked without a broker:
 
 ```bash
 python3 scripts/tests/consistency_checker.py --verify-only /path/to/evidence
-ctest --test-dir build -R ConsistencyCheckerTest --output-on-failure
+ctest --test-dir build -R 'ConsistencyCheckerTest|NemesisTest|ChaosKillTest' --output-on-failure
 ```
+
+`ChaosKillTest` forks a broker, acknowledges 50 idempotent records, SIGKILLs it without destructors, and reopens its data. It verifies exact offsets/values, duplicate suppression and the next producer sequence, plus persistent transactional ID/epoch fencing. Failure retains the child log/data directory.
 
 The evidence directory must contain `ledger.jsonl` and `scan.json`. The independent fixtures deliberately hide an acknowledged tail (a seeded HW error), insert gaps, regress offsets, expose partial/aborted transactions, and corrupt a ledger; these must fail. Multi-broker failover remains experimental until seven consecutive scheduled nightly chaos runs pass. Coordinator failover and multi-broker EOS remain M10.
 
