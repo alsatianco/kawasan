@@ -97,6 +97,15 @@ class CheckerTest(unittest.TestCase):
             with self.subTest(records=records), self.assertRaisesRegex(Violation, 'I4'):
                 verify_transactions(txns, records, group_offset)
 
+    def test_visible_unknown_transaction_still_requires_exact_acked_payload(self):
+        events = [dict(type='txn', id='x', keys=['a'], decision='unknown', input_offset=1),
+                  ack(0, 'a', txn='x')]
+        verify_records(events, [], {0: 1}, transactional=True)
+        verify_records(events, [record(0, 'a')], {0: 1}, transactional=True)
+        for records in [[dict(record(0, 'a'), value='corrupt')], [record(1, 'a')]]:
+            with self.subTest(records=records), self.assertRaisesRegex(Violation, 'I1'):
+                verify_records(events, records, {0: 2}, transactional=True)
+
     def test_unknown_commit_must_be_all_or_nothing(self):
         events = [dict(type='txn', id='x', keys=['a', 'b'], decision='unknown', input_offset=2)]
         verify_transactions(events, [], -1)

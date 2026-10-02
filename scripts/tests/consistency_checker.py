@@ -65,8 +65,11 @@ def verify_records(events, records, end_offsets, transactional=False):
     offsets are legal gaps and are checked by I4 instead of requiring contiguity.
     The input is an ordered scan, deliberately not a dict that hides duplicates.
     """
+    visible_keys = {record['key'] for record in records}
     commits = {key for key, value in transactions(events).items()
-               if value['decision'] == 'commit'}
+               if value['decision'] == 'commit' or
+               (value['decision'] == 'unknown' and
+                all(key in visible_keys for key in value['keys']))}
     acked = {}
     for event in events:
         if event['type'] != 'ack':

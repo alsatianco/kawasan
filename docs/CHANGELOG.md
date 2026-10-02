@@ -12,6 +12,8 @@ Single-node durability, security and quotas; durable single-node transactions (M
 
 ### Fixed
 
+- Check the exact acknowledged offsets and payloads of fully visible transactions even when their commit result is ambiguous; all-or-nothing visibility alone cannot validate their data.
+
 - Pin the executable in every chaos evidence directory so rebuilding the worktree cannot change the candidate between restarts. Record the nemesis hash alongside the binary and checker hashes.
 
 - Keep abort-history completion idempotent when recovery re-drives a transaction whose ABORT marker is already durable, so duplicate abort entries cannot hide a later committed transaction.
