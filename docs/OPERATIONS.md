@@ -833,7 +833,7 @@ Use a new artifact directory for every run. Evidence includes an immutable execu
 
 The nemesis permits one fault at a time only when the remaining live ISR meets minISR and the remaining brokers retain a Raft majority. It resumes/restarts the victim and waits for readiness plus the full ISR before choosing another fault. Incomplete role/action coverage, failed healing, missing samples and undrained delivery callbacks fail the run.
 
-`.github/workflows/chaos-nightly.yml` runs the 30-minute cluster workload, both single-node modes, native regressions and the live HW proof. It archives evidence for 14 days, including on failure. Its optional dispatch seed reproduces victim/hold choices; client and election timing can still differ. **Seven consecutive scheduled green nightlies remain the failover acceptance gate.** Local runs and repeated dispatches do not establish that history, and clustering stays experimental until the gate is met.
+`.github/workflows/chaos-nightly.yml` runs the 30-minute cluster workload, both single-node modes, native regressions and the live HW proof. It archives evidence for 14 days, including on failure and retained native SIGKILL test data. Its optional dispatch seed reproduces victim/hold choices; client and election timing can still differ. **Seven consecutive scheduled green nightlies remain the failover acceptance gate.** Local runs and repeated dispatches do not establish that history, and clustering stays experimental until the gate is met.
 
 ### Unit and integration tests
 

@@ -62,6 +62,15 @@ jobs:
         run: |
           python3 scripts/tests/check_seeded_hw_bug.py \
             --jobs 2 --artifacts chaos-evidence/seeded-hw
+      - name: Collect retained native crash evidence
+        if: always()
+        run: |
+          mkdir -p chaos-evidence/native-crash
+          for directory in /tmp/kawasan-chaos-kill-*; do
+            if [ -d "$directory" ]; then
+              cp -a "$directory" chaos-evidence/native-crash/
+            fi
+          done
       - name: Archive ledgers, scans, summaries and broker data
         if: always()
         uses: actions/upload-artifact@v4
