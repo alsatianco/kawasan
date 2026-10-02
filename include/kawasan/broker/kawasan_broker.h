@@ -237,6 +237,7 @@ private:
     RequestDispatcher::HandlerResult handleListOffsets(RequestDispatcher::RequestContext& context);
     Buffer buildListOffsetsError(const RequestDispatcher::RequestContext& context, ErrorCode code,
                                  int16_t response_version) const;
+    bool isCoordinatorFor(const std::string& key, protocol::CoordinatorType type) const;
     protocol::FindCoordinatorResponse::Coordinator resolveCoordinator(
         const std::string& key, protocol::CoordinatorType type) const;
 

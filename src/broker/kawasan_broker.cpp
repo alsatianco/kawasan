@@ -3310,6 +3310,13 @@ Buffer KawasanBroker::buildListOffsetsError(const RequestDispatcher::RequestCont
     return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
+bool KawasanBroker::isCoordinatorFor(const std::string& key, protocol::CoordinatorType type) const {
+    if (cluster_brokers_.empty())
+        return true;
+    const auto coordinator = resolveCoordinator(key, type);
+    return coordinator.error_code == ErrorCode::NONE && coordinator.node_id == broker_id_;
+}
+
 protocol::FindCoordinatorResponse::Coordinator KawasanBroker::resolveCoordinator(
     const std::string& key, protocol::CoordinatorType type) const {
     protocol::FindCoordinatorResponse::Coordinator result;
@@ -3394,6 +3401,10 @@ Buffer KawasanBroker::buildFindCoordinatorError(const RequestDispatcher::Request
 Buffer KawasanBroker::handleJoinGroup(RequestDispatcher::RequestContext& context) {
     protocol::JoinGroupRequest request;
     request.decode(context.payload, context.header.apiVersion());
+    if (!isCoordinatorFor(request.groupId(), protocol::CoordinatorType::GROUP)) {
+        return buildJoinGroupError(context, ErrorCode::NOT_COORDINATOR, context.header.apiVersion());
+    }
+
 
     // 0A.10: forward the real client identity so DescribeGroups returns
     // something useful instead of "unknown".
@@ -3442,6 +3453,10 @@ Buffer KawasanBroker::buildJoinGroupError(const RequestDispatcher::RequestContex
 Buffer KawasanBroker::handleSyncGroup(RequestDispatcher::RequestContext& context) {
     protocol::SyncGroupRequest request;
     request.decode(context.payload, context.header.apiVersion());
+    if (!isCoordinatorFor(request.groupId(), protocol::CoordinatorType::GROUP)) {
+        return buildSyncGroupError(context, ErrorCode::NOT_COORDINATOR,
+                                   context.header.apiVersion());
+    }
 
     Logger::info("SyncGroup request: group='{}' generation={} member='{}' {} assignments",
                  request.groupId(), request.generationId(), request.memberId(),
@@ -3481,6 +3496,10 @@ Buffer KawasanBroker::buildSyncGroupError(const RequestDispatcher::RequestContex
 Buffer KawasanBroker::handleHeartbeat(RequestDispatcher::RequestContext& context) {
     protocol::HeartbeatRequest request;
     request.decode(context.payload, context.header.apiVersion());
+    if (!isCoordinatorFor(request.groupId(), protocol::CoordinatorType::GROUP)) {
+        return buildHeartbeatError(context, ErrorCode::NOT_COORDINATOR,
+                                   context.header.apiVersion());
+    }
 
     const ErrorCode error = group_coordinator_->handleHeartbeat(request);
 
@@ -3504,6 +3523,10 @@ Buffer KawasanBroker::buildHeartbeatError(const RequestDispatcher::RequestContex
 Buffer KawasanBroker::handleLeaveGroup(RequestDispatcher::RequestContext& context) {
     protocol::LeaveGroupRequest request;
     request.decode(context.payload, context.header.apiVersion());
+    if (!isCoordinatorFor(request.groupId(), protocol::CoordinatorType::GROUP)) {
+        return buildLeaveGroupError(context, ErrorCode::NOT_COORDINATOR,
+                                    context.header.apiVersion());
+    }
 
     // Phase 1.10: v3+ accepts a batch of members. Call coordinator once per
     // member; aggregate per-member results into the v3+ response shape. For
@@ -3541,6 +3564,21 @@ Buffer KawasanBroker::buildLeaveGroupError(const RequestDispatcher::RequestConte
 Buffer KawasanBroker::handleOffsetCommit(RequestDispatcher::RequestContext& context) {
     protocol::OffsetCommitRequest request;
     request.decode(context.payload, context.header.apiVersion());
+    if (!isCoordinatorFor(request.groupId(), protocol::CoordinatorType::GROUP)) {
+        protocol::OffsetCommitResponse response;
+        std::vector<protocol::OffsetCommitResponse::Topic> topics;
+        for (const auto& t : request.topics()) {
+            protocol::OffsetCommitResponse::Topic topic;
+            topic.topic = t.topic;
+            for (const auto& p : t.partitions) {
+                topic.partitions.push_back({p.partition, ErrorCode::NOT_COORDINATOR});
+            }
+            topics.push_back(std::move(topic));
+        }
+        response.setTopics(topics);
+        return encodeResponse(
+            context, [&](Buffer& buffer) { response.encode(buffer, context.header.apiVersion()); });
+    }
 
     Logger::info("OffsetCommit request: group='{}' generation={} member='{}' {} topics",
                  request.groupId(), request.generationId(), request.memberId(),
@@ -3618,6 +3656,26 @@ Buffer KawasanBroker::handleOffsetFetch(RequestDispatcher::RequestContext& conte
     protocol::OffsetFetchRequest request;
     request.decode(context.payload, context.header.apiVersion());
 
+    auto fetch_owned = [&](const protocol::OffsetFetchRequest& req, ErrorCode& error) {
+        if (isCoordinatorFor(req.groupId(), protocol::CoordinatorType::GROUP)) {
+            return group_coordinator_->handleOffsetFetch(req, error);
+        }
+        error = ErrorCode::NOT_COORDINATOR;
+        std::vector<protocol::OffsetFetchResponse::Topic> topics;
+        for (const auto& t : req.topics()) {
+            protocol::OffsetFetchResponse::Topic topic;
+            topic.topic = t.topic;
+            for (const auto& p : t.partitions) {
+                protocol::OffsetFetchResponse::Partition partition;
+                partition.partition = p.partition;
+                partition.error = error;
+                topic.partitions.push_back(std::move(partition));
+            }
+            topics.push_back(std::move(topic));
+        }
+        return topics;
+    };
+
     const int16_t api_v = context.header.apiVersion();
     protocol::OffsetFetchResponse response;
 
@@ -3635,7 +3693,7 @@ Buffer KawasanBroker::handleOffsetFetch(RequestDispatcher::RequestContext& conte
             }
             single.setRequireStable(request.requireStable());
             ErrorCode group_error = ErrorCode::NONE;
-            const auto topics = group_coordinator_->handleOffsetFetch(single, group_error);
+            const auto topics = fetch_owned(single, group_error);
             protocol::OffsetFetchResponse::Group rg;
             rg.group_id = g.group_id;
             rg.error_code = group_error;
@@ -3653,7 +3711,7 @@ Buffer KawasanBroker::handleOffsetFetch(RequestDispatcher::RequestContext& conte
                  request.topics().size());
 
     ErrorCode overall_error = ErrorCode::NONE;
-    const auto topics = group_coordinator_->handleOffsetFetch(request, overall_error);
+    const auto topics = fetch_owned(request, overall_error);
 
     Logger::info("OffsetFetch response: overall_error={} {} topics",
                  static_cast<int>(overall_error), topics.size());
@@ -4227,6 +4285,14 @@ Buffer KawasanBroker::handleInitProducerId(RequestDispatcher::RequestContext& co
     int16_t producer_epoch;
     const bool transactional =
         request.transactionalId().has_value() && !request.transactionalId()->empty();
+    if (transactional &&
+        !isCoordinatorFor(*request.transactionalId(), protocol::CoordinatorType::TRANSACTION)) {
+        response.setErrorCode(ErrorCode::NOT_COORDINATOR);
+        response.setProducerId(-1);
+        response.setProducerEpoch(-1);
+        return encodeResponse(
+            context, [&](Buffer& buffer) { response.encode(buffer, context.header.apiVersion()); });
+    }
     if (transactional && transaction_coordinator_) {
         const std::string& txn_id = *request.transactionalId();
         auto prior = transaction_coordinator_->describe(txn_id);
@@ -5363,7 +5429,13 @@ Buffer KawasanBroker::handleAddPartitionsToTxn(RequestDispatcher::RequestContext
     Logger::info("AddPartitionsToTxn: transactional_id='{}' pid={} epoch={} {} topics",
                  req.transactionalId(), req.producerId(), req.producerEpoch(), req.topics().size());
     // M2: fence a zombie producer whose epoch is older than the current one.
-    if (txnEpochFenced(req.transactionalId(), req.producerEpoch())) {
+    const ErrorCode txn_error =
+        !isCoordinatorFor(req.transactionalId(), protocol::CoordinatorType::TRANSACTION)
+            ? ErrorCode::NOT_COORDINATOR
+        : txnEpochFenced(req.transactionalId(), req.producerEpoch())
+            ? ErrorCode::INVALID_PRODUCER_EPOCH
+            : ErrorCode::NONE;
+    if (txn_error != ErrorCode::NONE) {
         protocol::AddPartitionsToTxnResponse resp;
         resp.setThrottleTimeMs(0);
         for (const auto& t : req.topics()) {
@@ -5372,7 +5444,7 @@ Buffer KawasanBroker::handleAddPartitionsToTxn(RequestDispatcher::RequestContext
             for (int32_t p : t.partitions) {
                 protocol::AddPartitionsToTxnResponse::PartitionResult pr;
                 pr.partition = p;
-                pr.error_code = ErrorCode::INVALID_PRODUCER_EPOCH;
+                pr.error_code = txn_error;
                 tr.partitions.push_back(pr);
             }
             resp.addTopic(std::move(tr));
@@ -5445,10 +5517,16 @@ Buffer KawasanBroker::handleAddOffsetsToTxn(RequestDispatcher::RequestContext& c
                  req.groupId(), req.producerId(), req.producerEpoch());
 
     // M2: fence a zombie producer with a stale epoch.
-    if (txnEpochFenced(req.transactionalId(), req.producerEpoch())) {
+    const ErrorCode txn_error =
+        !isCoordinatorFor(req.transactionalId(), protocol::CoordinatorType::TRANSACTION)
+            ? ErrorCode::NOT_COORDINATOR
+        : txnEpochFenced(req.transactionalId(), req.producerEpoch())
+            ? ErrorCode::INVALID_PRODUCER_EPOCH
+            : ErrorCode::NONE;
+    if (txn_error != ErrorCode::NONE) {
         protocol::AddOffsetsToTxnResponse resp;
         resp.setThrottleTimeMs(0);
-        resp.setErrorCode(ErrorCode::INVALID_PRODUCER_EPOCH);
+        resp.setErrorCode(txn_error);
         return encodeResponse(context,
                               [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
     }
@@ -5466,7 +5544,8 @@ Buffer KawasanBroker::handleAddOffsetsToTxn(RequestDispatcher::RequestContext& c
         }
         // Route the group to its __consumer_offsets partition (same routing
         // as offset-commit mirroring and FindCoordinator).
-        const int32_t target = coordinatorPartitionFor(req.groupId(), offsets_topic_num_partitions_);
+        const int32_t target =
+            coordinatorPartitionFor(req.groupId(), offsets_topic_num_partitions_);
         // first_offset = -1: the __consumer_offsets partition gets a control
         // marker at EndTxn but is not an LSO hold for data consumers.
         transaction_coordinator_->addPartitions(req.transactionalId(),
@@ -5493,6 +5572,12 @@ Buffer KawasanBroker::handleEndTxn(RequestDispatcher::RequestContext& context) {
     // A crash between the two leaves a Prepare* snapshot that startup replay
     // re-drives to completion (finishTxnCompletion).
     ErrorCode end_error = ErrorCode::NONE;
+    if (!isCoordinatorFor(req.transactionalId(), protocol::CoordinatorType::TRANSACTION)) {
+        protocol::EndTxnResponse response;
+        response.setErrorCode(ErrorCode::NOT_COORDINATOR);
+        return encodeResponse(
+            context, [&](Buffer& buffer) { response.encode(buffer, context.header.apiVersion()); });
+    }
     if (transaction_coordinator_ && !req.transactionalId().empty()) {
         // M2: fence a stale-epoch (zombie) producer.
         if (txnEpochFenced(req.transactionalId(), req.producerEpoch())) {
@@ -5537,8 +5622,13 @@ Buffer KawasanBroker::handleTxnOffsetCommit(RequestDispatcher::RequestContext& c
                  req.transactionalId(), req.groupId(), req.producerId(), req.producerEpoch(),
                  req.topics().size());
     // M2: fence a stale-epoch (zombie) producer before staging any offsets.
-    const bool txn_fenced = txnEpochFenced(req.transactionalId(), req.producerEpoch());
-    if (txn_fenced) {
+    const ErrorCode txn_error =
+        !isCoordinatorFor(req.transactionalId(), protocol::CoordinatorType::TRANSACTION)
+            ? ErrorCode::NOT_COORDINATOR
+        : txnEpochFenced(req.transactionalId(), req.producerEpoch())
+            ? ErrorCode::INVALID_PRODUCER_EPOCH
+            : ErrorCode::NONE;
+    if (txn_error != ErrorCode::NONE) {
         protocol::TxnOffsetCommitResponse resp;
         resp.setThrottleTimeMs(0);
         for (const auto& t : req.topics()) {
@@ -5547,7 +5637,7 @@ Buffer KawasanBroker::handleTxnOffsetCommit(RequestDispatcher::RequestContext& c
             for (const auto& p : t.partitions) {
                 protocol::TxnOffsetCommitResponse::PartitionResult pr;
                 pr.partition = p.partition;
-                pr.error_code = ErrorCode::INVALID_PRODUCER_EPOCH;
+                pr.error_code = txn_error;
                 tr.partitions.push_back(pr);
             }
             resp.addTopic(std::move(tr));

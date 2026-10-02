@@ -13,6 +13,8 @@
 #include "kawasan/broker/metadata_controller.h"
 #include "kawasan/common/logger.h"
 #include "kawasan/protocol/find_coordinator_request.h"
+#include "kawasan/protocol/offset_commit_request.h"
+#include "kawasan/protocol/offset_fetch_request.h"
 #include "kawasan/protocol/request_header.h"
 
 namespace asio = boost::asio;
@@ -70,6 +72,7 @@ protected:
             config.setString("raft.peers", peers);
             config.setString("log.dirs", (dir / std::to_string(id)).string());
             config.setBool("monitoring.enabled", false);
+            config.setInt("broker.liveness.timeout.ms", 2000);
             config.setInt("offsets.topic.num.partitions", 3);
             config.setInt("transaction.state.topic.num.partitions", 2);
             brokers.push_back(std::make_unique<broker::KawasanBroker>(config));
@@ -216,5 +219,148 @@ TEST_F(FindCoordinatorRoutingTest, SingleNodeKeepsItsOwnEndpoint) {
             }
         }
     }
+}
+
+TEST_F(FindCoordinatorRoutingTest, MisroutedGroupRequestsAreRejectedBeforeCreatingState) {
+    // "b" belongs to broker 2 for groups, and broker 0 for transactions.
+    for (const auto api :
+         {ApiKey::JOIN_GROUP, ApiKey::SYNC_GROUP, ApiKey::HEARTBEAT, ApiKey::LEAVE_GROUP}) {
+        Buffer body;
+        body.writeString("b");
+        if (api == ApiKey::JOIN_GROUP) {
+            body.writeInt32(6000);
+            body.writeString("");
+            body.writeString("consumer");
+            body.writeInt32(0);
+        } else {
+            if (api != ApiKey::LEAVE_GROUP)
+                body.writeInt32(0);
+            body.writeString("ghost");
+            if (api == ApiKey::SYNC_GROUP)
+                body.writeInt32(0);
+        }
+        auto response = exchange(0, api, 0, body);
+        EXPECT_EQ(response.readInt16(), static_cast<int16_t>(ErrorCode::NOT_COORDINATOR));
+    }
+    // JoinGroup must not even create an empty local group on the wrong broker.
+    Buffer empty;
+    auto listed = exchange(0, ApiKey::LIST_GROUPS, 0, empty);
+    EXPECT_EQ(listed.readInt16(), 0);
+    EXPECT_EQ(listed.readInt32(), 0);
+
+    OffsetCommitRequest commit;
+    commit.setGroupId("b");
+    commit.setTopics({{"requested-topic", {{7, 42, -1, -1, "metadata"}}}});
+    Buffer body;
+    commit.encode(body, 0);
+    auto bytes = exchange(0, ApiKey::OFFSET_COMMIT, 0, body);
+    OffsetCommitResponse committed;
+    committed.decode(bytes, 0);
+    ASSERT_EQ(committed.topics().size(), 1);
+    EXPECT_EQ(committed.topics()[0].topic, "requested-topic");
+    ASSERT_EQ(committed.topics()[0].partitions.size(), 1);
+    EXPECT_EQ(committed.topics()[0].partitions[0].partition, 7);
+    EXPECT_EQ(committed.topics()[0].partitions[0].error, ErrorCode::NOT_COORDINATOR);
+
+    for (int version : {0, 1, 2, 6, 7}) {
+        OffsetFetchRequest fetch;
+        fetch.setGroupId("b");
+        fetch.setTopics({{"requested-topic", {{7}}}});
+        Buffer data;
+        fetch.encode(data, version);
+        auto reply = exchange(0, ApiKey::OFFSET_FETCH, version, data);
+        OffsetFetchResponse fetched;
+        fetched.decode(reply, version);
+        ASSERT_EQ(fetched.topics().size(), 1);
+        EXPECT_EQ(fetched.topics()[0].partitions[0].error, ErrorCode::NOT_COORDINATOR);
+        EXPECT_EQ(fetched.topics()[0].partitions[0].offset, -1);
+        if (version >= 2)
+            EXPECT_EQ(fetched.errorCode(), ErrorCode::NOT_COORDINATOR);
+    }
+}
+
+TEST_F(FindCoordinatorRoutingTest, MultiGroupOffsetFetchChecksEachOwner) {
+    OffsetFetchRequest request;
+    OffsetFetchRequest::Group local;
+    local.group_id = "a";
+    local.fetch_all_topics = true;
+    request.addGroup(local);
+    local.group_id = "b";
+    request.addGroup(local);
+    Buffer data;
+    request.encode(data, 8);
+    auto bytes = exchange(1, ApiKey::OFFSET_FETCH, 8, data);
+    OffsetFetchResponse response;
+    response.decode(bytes, 8);
+    ASSERT_EQ(response.groups().size(), 2);
+    EXPECT_EQ(response.groups()[0].error_code, ErrorCode::NONE);
+    EXPECT_EQ(response.groups()[1].error_code, ErrorCode::NOT_COORDINATOR);
+    EXPECT_TRUE(response.groups()[1].topics.empty());
+}
+
+TEST_F(FindCoordinatorRoutingTest, MisroutedTransactionsDoNotAllocateProducerIds) {
+    Buffer init;
+    init.writeString("b");
+    init.writeInt32(60000);
+    auto rejected = exchange(1, ApiKey::INIT_PRODUCER_ID, 0, init);
+    (void)rejected.readInt32();
+    EXPECT_EQ(rejected.readInt16(), static_cast<int16_t>(ErrorCode::NOT_COORDINATOR));
+    for (auto api : {ApiKey::ADD_OFFSETS_TO_TXN, ApiKey::END_TXN}) {
+        Buffer body;
+        body.writeString("b");
+        body.writeInt64(1);
+        body.writeInt16(0);
+        if (api == ApiKey::END_TXN)
+            body.writeInt8(1);
+        else
+            body.writeString("a");
+        auto bytes = exchange(1, api, 0, body);
+        (void)bytes.readInt32();
+        EXPECT_EQ(bytes.readInt16(), static_cast<int16_t>(ErrorCode::NOT_COORDINATOR));
+    }
+    for (auto api : {ApiKey::ADD_PARTITIONS_TO_TXN, ApiKey::TXN_OFFSET_COMMIT}) {
+        Buffer body;
+        body.writeString("b");
+        if (api == ApiKey::TXN_OFFSET_COMMIT)
+            body.writeString("a");
+        body.writeInt64(1);
+        body.writeInt16(0);
+        body.writeInt32(1);
+        body.writeString("requested-topic");
+        body.writeInt32(1);
+        body.writeInt32(7);
+        if (api == ApiKey::TXN_OFFSET_COMMIT) {
+            body.writeInt64(42);
+            body.writeString("metadata");
+        }
+        auto bytes = exchange(1, api, 0, body);
+        (void)bytes.readInt32();
+        ASSERT_EQ(bytes.readInt32(), 1);
+        EXPECT_EQ(bytes.readString(), "requested-topic");
+        ASSERT_EQ(bytes.readInt32(), 1);
+        EXPECT_EQ(bytes.readInt32(), 7);
+        EXPECT_EQ(bytes.readInt16(), static_cast<int16_t>(ErrorCode::NOT_COORDINATOR));
+    }
+    Buffer nontransactional;
+    nontransactional.writeInt16(-1);
+    nontransactional.writeInt32(60000);
+    auto allocated = exchange(1, ApiKey::INIT_PRODUCER_ID, 0, nontransactional);
+    (void)allocated.readInt32();
+    EXPECT_EQ(allocated.readInt16(), 0);
+    EXPECT_EQ(allocated.readInt64(), (int64_t{1} << 32) | 1);
+}
+
+TEST_F(FindCoordinatorRoutingTest, StaleBrokerCannotServeCoordinatorState) {
+    const int stale = brokers[0]->raftNode()->isLeader() ? 1 : 0;
+    brokers[stale]->raftNode()->stop();
+    std::this_thread::sleep_for(1100ms);
+    EXPECT_EQ(find(stale, 1, CoordinatorType::GROUP, {"c"}).errorCode(),
+              ErrorCode::COORDINATOR_NOT_AVAILABLE);
+    Buffer body;
+    body.writeString(stale == 0 ? "c" : "a");
+    body.writeInt32(0);
+    body.writeString("ghost");
+    auto response = exchange(stale, ApiKey::HEARTBEAT, 0, body);
+    EXPECT_EQ(response.readInt16(), static_cast<int16_t>(ErrorCode::NOT_COORDINATOR));
 }
 }  // namespace

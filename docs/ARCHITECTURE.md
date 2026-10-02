@@ -298,6 +298,8 @@ The relevant `OffsetManager` API includes `commitOffset` / `commitOffsetBatch`, 
 
 FindCoordinator hashes group IDs to `__consumer_offsets` and transactional IDs to `__transaction_state` with `coordinatorPartitionFor`, using each topic's actual partition count. Its owner is the partition leader in committed metadata, resolved to a Kafka endpoint through `peerEndpoint`. All brokers return the same owner; v4 resolves each requested key separately. Missing, offline, or stale metadata returns `COORDINATOR_NOT_AVAILABLE`. Single-node lookups retain the local endpoint.
 
+Group and transaction handlers check the same ownership lookup before accessing coordinator state. A wrong or stale owner returns `NOT_COORDINATOR`, with per-group or per-partition errors where the protocol requires them. Internal topics remain RF=1; coordinator state recovery and cross-broker transaction completion remain M10 work.
+
 ## Raft consensus
 
 Election timers and term/state transitions are guarded by the Raft log mutex. Election results are accepted only for the active candidate term. The heartbeat thread retains at most one outstanding AppendEntries RPC per peer and harvests ready replies without waiting on other peers; successful replies acknowledge only the entries sent in that RPC.
