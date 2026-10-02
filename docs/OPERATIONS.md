@@ -78,7 +78,7 @@ It performs the following:
 
 ### Docker
 
-The repository ships a multi-stage `Dockerfile`. The image exposes the Kafka port `9092` and the Raft port `9093`, runs `kawasan-broker --config /etc/kawasan/server.properties`, and includes a `nc -z localhost 9092` health check.
+The repository ships a multi-stage Ubuntu 24.04 `Dockerfile` (Boost 1.83, Clang 18). It builds only tools, with four compiler jobs by default; use `--build-arg BUILD_JOBS=2` on smaller Docker hosts. The image exposes the Kafka port `9092` and the Raft port `9093`, runs `kawasan-broker --config /etc/kawasan/server.properties`, and includes a `nc -z localhost 9092` health check.
 
 ```bash
 docker build -t kawasan:latest .
@@ -90,7 +90,7 @@ docker run -d \
   kawasan:latest
 ```
 
-The image's baked-in `/etc/kawasan/server.properties` already points `log.dirs` at `/var/lib/kawasan/data`, matching the volume above. If you mount your own config over it, make sure its `log.dirs` is `/var/lib/kawasan/data` — and note that `config/broker.docker.properties` is **not** suitable for this (it configures a broker running on the host with clients in Docker: `log.dirs=/tmp/...`, `advertised.host=host.docker.internal`).
+The image's baked-in `/etc/kawasan/server.properties` comes from `config/broker.container.properties`, binds `0.0.0.0`, and supports `KAWASAN_BROKER_ID`, `KAWASAN_ADVERTISED_HOST` (default `localhost`), `KAWASAN_PORT`, and `KAWASAN_LOG_DIR` through config substitution. It already points `log.dirs` at `/var/lib/kawasan/data`, matching the volume above. If you mount your own config over it, make sure its `log.dirs` is `/var/lib/kawasan/data` — and note that `config/broker.docker.properties` is **not** suitable for this (it configures a broker running on the host with clients in Docker: `log.dirs=/tmp/...`, `advertised.host=host.docker.internal`).
 
 A single-broker `docker-compose.yml` is also provided (service `kawasan-broker-1`, additional brokers commented out as a starting point).
 

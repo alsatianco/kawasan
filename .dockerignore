@@ -1,0 +1,8 @@
+.git
+build*
+external
+AI-TEMP
+.claude
+__pycache__
+*.pyc
+.DS_Store

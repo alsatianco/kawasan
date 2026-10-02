@@ -34,7 +34,7 @@ public:
 
     void writeInt64(int64_t value) {
         // Network byte order for 64-bit
-        uint64_t net_value = htobe64(static_cast<uint64_t>(value));
+        uint64_t net_value = hostToBigEndian64(static_cast<uint64_t>(value));
         writeBytes(reinterpret_cast<const uint8_t*>(&net_value), sizeof(net_value));
     }
 
@@ -259,7 +259,7 @@ public:
         uint64_t net_value;
         std::memcpy(&net_value, &data_[read_pos_], sizeof(net_value));
         read_pos_ += 8;
-        return static_cast<int64_t>(be64toh(net_value));
+        return static_cast<int64_t>(bigEndianToHost64(net_value));
     }
 
     std::string readString() {
@@ -371,7 +371,7 @@ private:
         }
     }
 
-    static uint64_t htobe64(uint64_t value) {
+    static uint64_t hostToBigEndian64(uint64_t value) {
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
         return __builtin_bswap64(value);
 #else
@@ -379,7 +379,7 @@ private:
 #endif
     }
 
-    static uint64_t be64toh(uint64_t value) { return htobe64(value); }
+    static uint64_t bigEndianToHost64(uint64_t value) { return hostToBigEndian64(value); }
 
     static uint32_t encodeZigZag32(int32_t value) {
         return (static_cast<uint32_t>(value) << 1) ^ static_cast<uint32_t>(value >> 31);

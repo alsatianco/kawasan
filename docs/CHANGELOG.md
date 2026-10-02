@@ -12,6 +12,8 @@ Single-node durability, security and quotas; durable single-node transactions (M
 
 ### Added
 
+- Docker builds use Ubuntu 24.04 and bounded compiler parallelism, omit local artifacts, and ship a container config with persistent storage and environment substitution. Linux builds normalize distro zstd targets and avoid glibc endian-macro collisions and transitive-header assumptions.
+
 - M8 acceptance verified with 69/69 CTest tests, 20 consecutive leader/controller failover iterations, 20 consecutive divergence recoveries, and a real two-consumer single-coordinator proof. The operations guide includes cluster recovery steps.
 
 - Coordinator ownership guards (M8-G2) reject misrouted group and transaction requests with NOT_COORDINATOR before accessing local state. Batched OffsetFetch checks each group independently; stale brokers refuse coordinator traffic. Nontransactional producer-ID allocation remains local.

@@ -90,6 +90,16 @@ if(NOT lz4_FOUND)
 endif()
 
 find_package(zstd CONFIG REQUIRED)
+# Ubuntu exports shared/static targets; Homebrew and vcpkg also provide libzstd.
+if(NOT TARGET zstd::libzstd)
+    if(TARGET zstd::libzstd_shared)
+        add_library(zstd::libzstd ALIAS zstd::libzstd_shared)
+    elseif(TARGET zstd::libzstd_static)
+        add_library(zstd::libzstd ALIAS zstd::libzstd_static)
+    else()
+        message(FATAL_ERROR "zstd package exports no supported library target")
+    endif()
+endif()
 
 if(KAWASAN_BUILD_TESTS)
     find_package(GTest REQUIRED)

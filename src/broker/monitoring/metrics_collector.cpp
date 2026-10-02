@@ -1,5 +1,6 @@
 #include "kawasan/broker/monitoring/metrics_collector.h"
 
+#include <cmath>
 #include <iomanip>
 #include <sstream>
 
