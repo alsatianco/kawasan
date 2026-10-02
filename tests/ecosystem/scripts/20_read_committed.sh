@@ -105,8 +105,8 @@ if not all(r.startswith("committed-") for r in rc_records):
     print(f"FAIL: read_committed leaked aborted records: {rc_records}", file=sys.stderr)
     sys.exit(1)
 
-if len(ru_records) < len(rc_records):
-    print(f"FAIL: read_uncommitted ({len(ru_records)}) saw fewer than read_committed ({len(rc_records)})", file=sys.stderr)
+if len(ru_records) != 10:
+    print(f"FAIL: read_uncommitted ({len(ru_records)}) expected all 10 committed and aborted records", file=sys.stderr)
     sys.exit(1)
 
 print()

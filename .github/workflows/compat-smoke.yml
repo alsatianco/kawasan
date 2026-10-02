@@ -1,14 +1,3 @@
-# 0B.5: compat-smoke CI job.
-#
-# Runs the ecosystem compatibility harness against the locally-built
-# Kawasan broker on every PR. Allowed-to-fail until Phase 4 lands the
-# admin APIs that close the last few baseline-failures.md rows. Once the
-# matrix is fully green, drop the `continue-on-error` block to make it
-# blocking.
-#
-# Security note: this workflow uses NO github.event.* interpolations into
-# shell run: blocks (no command-injection surface).
-
 name: compat-smoke
 
 on:
@@ -22,10 +11,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Install python kafka client
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install kafka-python confluent-kafka
+          python3 -m pip install -r tests/ecosystem/requirements.txt
+          sudo apt-get update && sudo apt-get install -y kcat
       - name: Run harness against Kafka oracle
         working-directory: tests/ecosystem
         run: ./scripts/run_all.sh kafka
@@ -34,15 +27,16 @@ jobs:
     name: Kawasan candidate
     runs-on: ubuntu-latest
     needs: oracle
-    # As of Phase 3.1, all 6 harness scripts pass — see
-    # docs/improv/baseline-failures.md. This job is now blocking; any
-    # regression in the compat surface fails the PR.
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Install python kafka client
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install kafka-python confluent-kafka
+          python3 -m pip install -r tests/ecosystem/requirements.txt
+          sudo apt-get update && sudo apt-get install -y kcat
       - name: Run harness against Kawasan candidate
         working-directory: tests/ecosystem
         run: ./scripts/run_all.sh kawasan

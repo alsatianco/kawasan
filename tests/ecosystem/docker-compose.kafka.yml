@@ -19,6 +19,12 @@ services:
     hostname: kafka
     ports:
       - "9092:9092"
+      # Auxiliary services share this broker's network namespace so Metadata
+      # localhost endpoints work for host clients and container clients alike.
+      - "8081:8081"
+      - "8082:8080"
+      - "8083:8083"
+      - "8088:8088"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -30,6 +36,10 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTHORIZER_CLASS_NAME: org.apache.kafka.metadata.authorizer.StandardAuthorizer
+      KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "true"
+      KAFKA_SUPER_USERS: User:ANONYMOUS
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       CLUSTER_ID: kawasan-harness-oracle-001
     healthcheck:

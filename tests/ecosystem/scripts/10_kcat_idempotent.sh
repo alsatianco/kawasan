@@ -21,9 +21,7 @@ BROKERS="localhost:9092"
 for i in $(seq 1 10); do
     echo "idem-msg-$i" | kcat -b "$BROKERS" -t "$TOPIC" -P \
         -X enable.idempotence=true \
-        -X message.timeout.ms=5000 \
-        -X delivery.timeout.ms=10000 \
-        2>&1 | head -3 || true
+        -X message.timeout.ms=5000
 done
 echo "Produced 10 idempotent messages via kcat"
 
@@ -31,7 +29,7 @@ sleep 1
 
 # Read them back; expect at least 10 (could be more if any retried but
 # the dedup path treats retries as already-stored).
-got=$(kcat -b "$BROKERS" -t "$TOPIC" -C -e -q 2>/dev/null | wc -l | tr -d ' ')
+got=$(kcat -b "$BROKERS" -t "$TOPIC" -C -e -q -X isolation.level=read_committed 2>/dev/null | wc -l | tr -d ' ')
 echo "kcat -C read $got messages"
 
 if [ "$got" -lt 10 ]; then

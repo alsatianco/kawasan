@@ -28,7 +28,7 @@ cleanup() {
 trap cleanup EXIT
 
 # Bring Schema Registry up against the host-running Kawasan.
-docker compose -f "$COMPOSE_FILE" up -d schema-registry >/dev/null 2>&1
+docker compose -f "$COMPOSE_FILE" up -d schema-registry
 echo "Schema Registry starting..."
 
 # Wait for it to be ready (up to 60s — SR takes a while to boot)
@@ -41,18 +41,9 @@ for i in $(seq 1 60); do
 done
 
 if ! curl -sf http://localhost:8081/subjects >/dev/null 2>&1; then
-    # Phase 2.2 gap: Schema Registry uses Kafka consumer groups for
-    # leader election. The leader-election JoinGroup times out because
-    # the broker's group state machine doesn't yet implement the full
-    # PreparingRebalance → CompletingRebalance sync barrier required
-    # to complete a single-member rebalance with assignment delivery.
-    # The connectivity layer works (SR connected, created `_schemas`
-    # topic, sent Fetch v12 + JoinGroup repeatedly) — the failure is
-    # at the protocol-completeness layer, not the wire layer. Marking
-    # SKIP rather than FAIL so the harness is honest about the gap.
-    echo "SKIP: Schema Registry leader election timed out (Phase 2.2 group state machine gap; topic was created, Fetch/JoinGroup wire layer works)"
+    echo "FAIL: Schema Registry leader election timed out"
     docker logs kawasan-schema-registry 2>&1 | tail -3
-    exit 0
+    exit 1
 fi
 
 # Register an Avro schema

@@ -756,16 +756,20 @@ If the UI still shows the cluster offline: check `docker logs kafka-ui`, confirm
 
 ### Ecosystem compatibility harness (dual-broker oracle)
 
-`tests/ecosystem/` is the contract for "drop-in replacement for single-server Kafka". Every smoke test runs against **both** brokers — **Apache Kafka 4.2.0** (`apache/kafka:4.2.0`) as the behavioral oracle and **Kawasan** as the candidate — so the diff between PASS-on-Kafka and PASS-on-Kawasan answers "real bug or test bug?". It requires a working Docker host.
+`tests/ecosystem/` is the contract for "drop-in replacement for single-server Kafka". Every smoke test runs against **both** brokers — **Apache Kafka 4.2.0** (`apache/kafka:4.2.0`) as the behavioral oracle and **Kawasan** as the candidate — so the diff between PASS-on-Kafka and PASS-on-Kawasan answers "real bug or test bug?". It requires a working Docker host, `kcat`, and the pinned Python clients in `tests/ecosystem/requirements.txt`. Host ports 9092, 9094, 9097 and 8081–8083/8088 must be free.
 
 ```bash
+python3 -m venv /tmp/kawasan-ecosystem-venv
+source /tmp/kawasan-ecosystem-venv/bin/activate
+pip install -r tests/ecosystem/requirements.txt
+# Install kcat with your system package manager.
 cd tests/ecosystem
 ./scripts/run_all.sh kafka              # oracle baseline (expected all-PASS)
 ./scripts/run_all.sh kawasan            # candidate (some checks may still be RED)
 ./scripts/run_all.sh kawasan --keep-up  # leave the stack running for debugging
 ```
 
-`run_all.sh` selects the compose file (`docker-compose.kafka.yml` vs `docker-compose.kawasan.yml`), brings the broker up, runs the numbered smoke scripts in `scripts/` (`01_apicompat.sh` … `21_streams_eos.sh`, covering producer/idempotent/transactional paths, admin/ACLs, compaction, internal topics, cooperative-sticky rebalance, `kcat`, schema registry, Kafka UI, Kafka Connect, ksqlDB, durability, SASL/PLAIN, read-committed, and Streams EOS), and tears down. Exit `0` = all passed, `1` = at least one failed, `2` = usage error. The harness is allowed-to-fail today because the broker has known gaps; treat its status as a regression signal across changes.
+`run_all.sh` selects the compose file (`docker-compose.kafka.yml` vs `docker-compose.kawasan.yml`), brings the broker up, runs the numbered smoke scripts in `scripts/` (`01_apicompat.sh` … `21_streams_eos.sh`, covering producer/idempotent/transactional paths, admin/ACLs, compaction, internal topics, cooperative-sticky rebalance, `kcat`, schema registry, Kafka UI, Kafka Connect, ksqlDB, durability, SASL/PLAIN, read-committed, and Streams EOS), and tears down. Exit `0` requires all 21 checks to pass with no skips; readiness errors, service startup failures and skips fail the gate. Logs and separate PASS/FAIL/SKIP results are retained in the printed evidence directory (`ECOSYSTEM_LOG_DIR` overrides it). The CI workflow is blocking. Auxiliary services and Java CLI containers share the selected broker’s network namespace so advertised localhost endpoints are reachable from both host clients and container clients. The SIGKILL check restarts that broker with its data intact; SASL starts an isolated container of the selected implementation on 9097. The Streams EOS script uses librdkafka, not a JVM Streams application.
 
 ### Per-language client compatibility
 

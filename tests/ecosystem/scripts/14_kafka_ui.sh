@@ -27,11 +27,11 @@ trap cleanup EXIT
 # Produce a topic via kcat so there's at least one topic to see.
 if command -v kcat >/dev/null 2>&1; then
     TOPIC="compat-14-ui-$$"
-    echo "x" | kcat -b host.docker.internal:9092 -t "$TOPIC" -P \
+    echo "x" | kcat -b localhost:9092 -t "$TOPIC" -P \
         -X message.timeout.ms=5000 2>/dev/null || true
 fi
 
-docker compose -f "$COMPOSE_FILE" up -d kafka-ui >/dev/null 2>&1
+docker compose -f "$COMPOSE_FILE" up -d kafka-ui
 echo "kafka-ui starting..."
 
 # Wait for /actuator/health (kafka-ui uses Spring Boot)
@@ -44,9 +44,9 @@ for i in $(seq 1 60); do
 done
 
 if ! curl -sf http://localhost:8082/actuator/health >/dev/null 2>&1; then
-    echo "SKIP: kafka-ui health endpoint never came up"
+    echo "FAIL: kafka-ui health endpoint never came up"
     docker logs kawasan-kafka-ui 2>&1 | tail -10
-    exit 0
+    exit 1
 fi
 
 # Allow it a few more seconds to discover the cluster
@@ -61,7 +61,7 @@ if ! echo "$CLUSTERS" | grep -q 'kawasan'; then
 fi
 
 # List topics for our cluster — uses Metadata
-TOPICS=$(curl -sf 'http://localhost:8082/api/clusters/kawasan/topics' 2>&1 || true)
+TOPICS=$(curl -sf 'http://localhost:8082/api/clusters/kawasan/topics')
 echo "topics response (first 200 chars): $(echo "$TOPICS" | head -c 200)"
 
 # Even an empty topic list is a success — what matters is that the

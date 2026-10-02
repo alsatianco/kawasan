@@ -12,13 +12,10 @@
 
 services:
   kafka-ui:
-    image: provectuslabs/kafka-ui:latest
+    image: "${KAFKA_UI_IMAGE:-provectuslabs/kafka-ui:latest}"
     container_name: kawasan-kafka-ui
-    ports:
-      - "8082:8080"
+    network_mode: "container:${HARNESS_BROKER_CONTAINER:-kawasan-harness-candidate}"
     environment:
       KAFKA_CLUSTERS_0_NAME: kawasan
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: host.docker.internal:9092
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: localhost:9092
       LOGGING_LEVEL_COM_PROVECTUS: INFO
-    extra_hosts:
-      - "host.docker.internal:host-gateway"

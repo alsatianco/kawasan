@@ -23,7 +23,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-docker compose -f "$COMPOSE_FILE" up -d kafka-connect >/dev/null 2>&1
+docker compose -f "$COMPOSE_FILE" up -d kafka-connect
 echo "Kafka Connect starting..."
 
 # Wait up to 120s for Connect's REST API (Connect is slow to boot)
@@ -36,9 +36,9 @@ for i in $(seq 1 120); do
 done
 
 if ! curl -sf http://localhost:8083/ >/dev/null 2>&1; then
-    echo "SKIP: Kafka Connect REST never came up (likely consumer-group leader-election gap; topics auto-created OK)"
+    echo "FAIL: Kafka Connect REST never came up"
     docker logs kawasan-kafka-connect 2>&1 | tail -5
-    exit 0
+    exit 1
 fi
 
 # Connect's REST root returns {"version":"...","commit":"...","kafka_cluster_id":"..."}
@@ -58,8 +58,8 @@ done
 echo "connectors: $CONNECTORS"
 
 if [ -z "$CONNECTORS" ]; then
-    echo "SKIP: Kafka Connect /connectors didn't respond after retries (likely transient)"
-    exit 0
+    echo "FAIL: Kafka Connect /connectors didn't respond after retries"
+    exit 1
 fi
 
 if [ "$CONNECTORS" != "[]" ]; then

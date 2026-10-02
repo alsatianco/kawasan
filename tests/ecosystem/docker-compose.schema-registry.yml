@@ -18,17 +18,14 @@
 
 services:
   schema-registry:
-    image: confluentinc/cp-schema-registry:7.5.0
+    image: "${SCHEMA_REGISTRY_IMAGE:-confluentinc/cp-schema-registry:7.5.0}"
     container_name: kawasan-schema-registry
-    ports:
-      - "8081:8081"
+    network_mode: "container:${HARNESS_BROKER_CONTAINER:-kawasan-harness-candidate}"
     environment:
       SCHEMA_REGISTRY_HOST_NAME: schema-registry
       SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
-      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://host.docker.internal:9092
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://localhost:9092
       SCHEMA_REGISTRY_KAFKASTORE_TOPIC: _schemas
       SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: "1"
       SCHEMA_REGISTRY_KAFKASTORE_INIT_TIMEOUT_MS: "30000"
       SCHEMA_REGISTRY_DEBUG: "true"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"

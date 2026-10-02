@@ -23,14 +23,12 @@ for i in 1 2 3 4 5; do
     echo "txn-msg-$i" | kcat -b "$BROKERS" -t "$TOPIC" -P \
         -X transactional.id="$TXN_ID" \
         -X transaction.timeout.ms=10000 \
-        -X message.timeout.ms=5000 \
-        -X delivery.timeout.ms=10000 \
-        2>&1 | head -2 || true
+        -X message.timeout.ms=5000
 done
 
 sleep 1
 
-got=$(kcat -b "$BROKERS" -t "$TOPIC" -C -e -q 2>/dev/null | wc -l | tr -d ' ')
+got=$(kcat -b "$BROKERS" -t "$TOPIC" -C -e -q -X isolation.level=read_committed 2>/dev/null | wc -l | tr -d ' ')
 echo "kcat -C read $got messages after txn produce"
 
 if [ "$got" -lt 5 ]; then

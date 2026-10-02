@@ -6,12 +6,11 @@
 
 services:
   ksqldb-server:
-    image: confluentinc/ksqldb-server:0.29.0
+    image: "${KSQLDB_IMAGE:-confluentinc/ksqldb-server:0.29.0}"
     container_name: kawasan-ksqldb
-    ports:
-      - "8088:8088"
+    network_mode: "container:${HARNESS_BROKER_CONTAINER:-kawasan-harness-candidate}"
     environment:
-      KSQL_BOOTSTRAP_SERVERS: host.docker.internal:9092
+      KSQL_BOOTSTRAP_SERVERS: localhost:9092
       KSQL_LISTENERS: http://0.0.0.0:8088
       KSQL_KSQL_SERVICE_ID: kawasan-ksql
       KSQL_KSQL_LOGGING_PROCESSING_TOPIC_AUTO_CREATE: "true"
@@ -20,5 +19,3 @@ services:
       KSQL_KSQL_LOGGING_PROCESSING_TOPIC_REPLICATION_FACTOR: "1"
       # Without a Schema Registry we use plain JSON not Avro.
       KSQL_KSQL_SCHEMA_REGISTRY_URL: ""
-    extra_hosts:
-      - "host.docker.internal:host-gateway"

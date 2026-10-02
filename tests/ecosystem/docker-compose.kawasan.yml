@@ -21,12 +21,18 @@ services:
     hostname: kawasan
     ports:
       - "9092:9092"
+      # Auxiliary services share this broker's network namespace so Metadata
+      # localhost endpoints work for host clients and container clients alike.
+      - "8081:8081"
+      - "8082:8080"
+      - "8083:8083"
+      - "8088:8088"
       - "9094:9094"      # /metrics, /readiness, /liveness
     environment:
       # The image entrypoint reads KAWASAN_* env vars (now that 0A.14 unifies
       # the JSON/properties config formats, either format works).
       KAWASAN_BROKER_ID: "0"
-      KAWASAN_HOST: "localhost"
+      KAWASAN_ADVERTISED_HOST: "localhost"
       KAWASAN_PORT: "9092"
       KAWASAN_LOG_DIR: "/var/lib/kawasan/data"
       KAWASAN_LOG_LEVEL: "info"

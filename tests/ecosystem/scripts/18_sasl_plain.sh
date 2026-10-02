@@ -1,146 +1,91 @@
 #!/usr/bin/env bash
-# 18_sasl_plain.sh: SASL/PLAIN authentication.
-#
-# Phase EX-8: exercises the SASL/PLAIN code path end-to-end:
-#   1. Start broker with file-backed credentials (one user/password)
-#   2. Connect with correct credentials → produce + consume succeed
-#   3. Connect with wrong password → authentication fails
-#   4. Connect with unknown user → authentication fails
-#
-# This is the missing acceptance test for Phase 4.2a.
+# Isolated SASL/PLAIN acceptance/rejection against the selected implementation.
 set -euo pipefail
 TARGET="${1:-kawasan}"
-
-LOG_DIR="/tmp/kawasan-sasl-test-$$"
-CONFIG_FILE="$(mktemp /tmp/kawasan-sasl-config-XXXX.json)"
-CREDS_FILE="$(mktemp /tmp/kawasan-sasl-creds-XXXX.txt)"
-TOPIC="compat-18-sasl-$$"
-
+DIR="$(mktemp -d /tmp/kawasan-sasl-XXXXXX)"
+NAME="kawasan-harness-sasl-$$"
 cleanup() {
-    pkill -9 -f "kawasan-broker.*$CONFIG_FILE" 2>/dev/null || true
-    rm -rf "$LOG_DIR" "$CONFIG_FILE" "$CREDS_FILE"
+    result=$?
+    docker logs "$NAME" > "${ECOSYSTEM_EVIDENCE_DIR:-/tmp}/$NAME.log" 2>&1 || true
+    if [[ "$result" != 0 ]]; then tail -30 "${ECOSYSTEM_EVIDENCE_DIR:-/tmp}/$NAME.log"; fi
+    docker rm -f "$NAME" >/dev/null 2>&1 || true
+    rm -rf "$DIR"
 }
 trap cleanup EXIT
-
-# Credentials file: alice can authenticate; eve cannot.
-cat > "$CREDS_FILE" <<EOF
-alice:wonderland-42
-bob:second-user
-EOF
-
-cat > "$CONFIG_FILE" <<EOF
-{
-  "broker.id": 0,
-  "host": "localhost",
-  "advertised.host": "localhost",
-  "port": 9097,
-  "log.dirs": "$LOG_DIR",
-  "auto.create.topics.enable": true,
-  "default.replication.factor": 1,
-  "monitoring.host": "0.0.0.0",
-  "monitoring.port": 9098,
-  "security.protocol": "PLAINTEXT",
-  "sasl.plain.credentials.file": "$CREDS_FILE"
-}
-EOF
-
-./build/tools/kawasan-broker --config "$CONFIG_FILE" > /tmp/k-sasl-$$.log 2>&1 &
-B=$!
-for i in $(seq 1 30); do
-    if grep -q "Broker TCP listener active" /tmp/k-sasl-$$.log 2>/dev/null; then break; fi
-    sleep 0.5
-done
-
-echo "Broker started with file-backed credentials"
-
-# Test 1: correct credentials
+chmod 755 "$DIR"
+if [[ "$TARGET" == kafka ]]; then
+    echo 'KafkaServer { org.apache.kafka.common.security.plain.PlainLoginModule required username="alice" password="wonderland-42" user_alice="wonderland-42"; };' > "$DIR/jaas.conf"
+    chmod 644 "$DIR/jaas.conf"
+    docker run -d --name "$NAME" -p 9097:9097 -v "$DIR:/sasl:ro" \
+        -e KAFKA_OPTS=-Djava.security.auth.login.config=/sasl/jaas.conf \
+        -e KAFKA_NODE_ID=1 -e KAFKA_PROCESS_ROLES=broker,controller \
+        -e KAFKA_LISTENERS=SASL_PLAINTEXT://0.0.0.0:9097,CONTROLLER://0.0.0.0:9093 \
+        -e KAFKA_ADVERTISED_LISTENERS=SASL_PLAINTEXT://localhost:9097 \
+        -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+        -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=SASL_PLAINTEXT:SASL_PLAINTEXT,CONTROLLER:PLAINTEXT \
+        -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+        -e KAFKA_SASL_ENABLED_MECHANISMS=PLAIN \
+        -e KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL=PLAIN \
+        -e KAFKA_INTER_BROKER_LISTENER_NAME=SASL_PLAINTEXT \
+        -e 'KAFKA_LISTENER_NAME_SASL_PLAINTEXT_PLAIN_SASL_JAAS_CONFIG=org.apache.kafka.common.security.plain.PlainLoginModule required username="alice" password="wonderland-42" user_alice="wonderland-42";' \
+        -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+        apache/kafka:4.2.0
+else
+    printf 'alice:wonderland-42\n' > "$DIR/credentials"
+    cat > "$DIR/broker.properties" <<'CONFIG'
+host=0.0.0.0
+advertised.host=localhost
+port=9097
+raft.port=9093
+log.dirs=/tmp/kawasan-sasl-data
+monitoring.enabled=false
+sasl.plain.credentials.file=/sasl/credentials
+CONFIG
+    chmod 644 "$DIR"/*
+    IMAGE=$(docker inspect -f '{{.Image}}' "${HARNESS_BROKER_CONTAINER:-kawasan-harness-candidate}")
+    docker run -d --name "$NAME" -p 9097:9097 -v "$DIR:/sasl:ro" \
+        "$IMAGE" kawasan-broker --config /sasl/broker.properties
+fi
 python3 - <<'PY'
-from kafka import KafkaProducer, KafkaConsumer
-import sys
-p = KafkaProducer(
-    bootstrap_servers='localhost:9097',
-    security_protocol='SASL_PLAINTEXT',
-    sasl_mechanism='PLAIN',
-    sasl_plain_username='alice',
-    sasl_plain_password='wonderland-42',
-    api_version=(2, 6, 0),
-)
+import time
+from confluent_kafka import Producer, Consumer, TopicPartition, KafkaError
+
+def producer(user, password):
+    return Producer({'bootstrap.servers':'localhost:9097', 'security.protocol':'SASL_PLAINTEXT',
+                     'sasl.mechanism':'PLAIN', 'sasl.username':user, 'sasl.password':password,
+                     'message.timeout.ms':10000, 'socket.timeout.ms':5000, 'log_level':0})
+p = producer('alice', 'wonderland-42')
+deadline = time.monotonic() + 90
+while True:
+    try:
+        p.list_topics(timeout=3); break
+    except Exception:
+        if time.monotonic() >= deadline: raise
+        time.sleep(1)
+errors = []
 for i in range(5):
-    p.send('compat-18-sasl-topic', value=f'sasl-msg-{i}'.encode()).get(timeout=10)
-p.close()
-print("PASS test-1: alice/wonderland-42 produced 5 messages")
-
-c = KafkaConsumer(
-    'compat-18-sasl-topic',
-    bootstrap_servers='localhost:9097',
-    security_protocol='SASL_PLAINTEXT',
-    sasl_mechanism='PLAIN',
-    sasl_plain_username='alice',
-    sasl_plain_password='wonderland-42',
-    api_version=(2, 6, 0),
-    auto_offset_reset='earliest',
-    consumer_timeout_ms=5000,
-    group_id=None,
-)
-msgs = list(c)
+    p.produce('compat-sasl', value=f'sasl-{i}', partition=0,
+              on_delivery=lambda err, msg: errors.append(err))
+assert p.flush(20) == 0 and len(errors) == 5 and not any(errors), errors
+c = Consumer({'bootstrap.servers':'localhost:9097', 'group.id':'sasl-check',
+              'security.protocol':'SASL_PLAINTEXT', 'sasl.mechanism':'PLAIN',
+              'sasl.username':'alice', 'sasl.password':'wonderland-42', 'enable.auto.commit':False})
+c.assign([TopicPartition('compat-sasl',0,0)])
+got = []; deadline = time.monotonic() + 20
+while len(got) < 5 and time.monotonic() < deadline:
+    m = c.poll(1)
+    if m is not None and not m.error(): got.append(m.value())
 c.close()
-if len(msgs) != 5:
-    print(f"FAIL test-1: expected 5 messages, got {len(msgs)}", file=sys.stderr)
-    sys.exit(1)
-print(f"PASS test-1: alice consumed {len(msgs)} messages")
+assert got == [f'sasl-{i}'.encode() for i in range(5)], got
+for user, password in [('alice','wrong'), ('eve','anything')]:
+    auth_errors = []
+    bad = Producer({'bootstrap.servers':'localhost:9097', 'security.protocol':'SASL_PLAINTEXT',
+                    'sasl.mechanism':'PLAIN', 'sasl.username':user, 'sasl.password':password,
+                    'message.timeout.ms':5000, 'error_cb':auth_errors.append})
+    delivered = []
+    bad.produce('compat-sasl', value='forbidden', on_delivery=lambda err,m: delivered.append(err))
+    bad.flush(10)
+    assert delivered and all(delivered), delivered
+    assert any(e.code() == KafkaError._AUTHENTICATION for e in auth_errors), auth_errors
+print('PASS: authenticated produce/consume; wrong password and unknown user rejected by SASL')
 PY
-
-# Test 2: wrong password → should fail authentication.
-# In dev mode (no credentials configured) Kawasan accepts anything; but
-# with credentials configured, mismatches must be rejected.
-python3 - <<'PY'
-from kafka import KafkaProducer
-from kafka.errors import KafkaError
-import sys
-try:
-    p = KafkaProducer(
-        bootstrap_servers='localhost:9097',
-        security_protocol='SASL_PLAINTEXT',
-        sasl_mechanism='PLAIN',
-        sasl_plain_username='alice',
-        sasl_plain_password='wrong-password',
-        api_version=(2, 6, 0),
-        request_timeout_ms=5000,
-        api_version_auto_timeout_ms=5000,
-    )
-    fut = p.send('compat-18-sasl-topic', value=b'should-not-arrive')
-    fut.get(timeout=5)
-    print("FAIL test-2: wrong password was accepted", file=sys.stderr)
-    sys.exit(1)
-except Exception as e:
-    # Expected: NodeNotReadyError / NoBrokersAvailable / KafkaTimeoutError
-    # The specific exception varies by kafka-python version; what matters
-    # is that no successful produce happened.
-    print(f"PASS test-2: wrong password rejected ({type(e).__name__})")
-PY
-
-# Test 3: unknown user → should fail.
-python3 - <<'PY'
-from kafka import KafkaProducer
-import sys
-try:
-    p = KafkaProducer(
-        bootstrap_servers='localhost:9097',
-        security_protocol='SASL_PLAINTEXT',
-        sasl_mechanism='PLAIN',
-        sasl_plain_username='eve',
-        sasl_plain_password='anything',
-        api_version=(2, 6, 0),
-        request_timeout_ms=5000,
-        api_version_auto_timeout_ms=5000,
-    )
-    fut = p.send('compat-18-sasl-topic', value=b'should-not-arrive')
-    fut.get(timeout=5)
-    print("FAIL test-3: unknown user was accepted", file=sys.stderr)
-    sys.exit(1)
-except Exception as e:
-    print(f"PASS test-3: unknown user rejected ({type(e).__name__})")
-PY
-
-echo ""
-echo "PASS: SASL/PLAIN authentication round-trip (auth + reject-wrong-pw + reject-unknown-user)"

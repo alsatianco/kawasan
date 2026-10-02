@@ -22,7 +22,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-docker compose -f "$COMPOSE_FILE" up -d ksqldb-server >/dev/null 2>&1
+docker compose -f "$COMPOSE_FILE" up -d ksqldb-server
 echo "ksqlDB starting..."
 
 # ksqlDB takes a while to boot — give it 120s
@@ -35,9 +35,9 @@ for i in $(seq 1 120); do
 done
 
 if ! curl -sf http://localhost:8088/info >/dev/null 2>&1; then
-    echo "SKIP: ksqlDB /info never came up (likely Phase 3.3 transactional semantics gap; topic creation works)"
+    echo "FAIL: ksqlDB /info never came up"
     docker logs kawasan-ksqldb 2>&1 | tail -10
-    exit 0
+    exit 1
 fi
 
 INFO=$(curl -sf http://localhost:8088/info)

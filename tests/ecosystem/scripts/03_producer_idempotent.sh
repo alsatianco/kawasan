@@ -1,50 +1,21 @@
 #!/usr/bin/env bash
-# 03_producer_idempotent.sh: Java-3.x-default produce path requires
-# InitProducerId (API 22) + producer-state dedup. This is Phase 1's headline
-# blocker; the script is the smallest reproducer.
-#
-# Expected today:
-#   kafka       → PASS (Apache Kafka 4.2 supports InitProducerId since 0.11)
-#   kawasan     → FAIL with kafka.errors.UnknownTopicOrPartitionError or
-#                 KafkaError-22 (UNSUPPORTED_VERSION) because InitProducerId
-#                 is not yet registered (improve-opus.md G3).
+# Check delivery callbacks and read back the idempotent producer's records.
 set -euo pipefail
-TARGET="${1:-kawasan}"
 TOPIC="compat-03-$$"
-
-# confluent-kafka-python uses librdkafka, which defaults enable.idempotence=True
-# in newer releases. Fall back to kafka-python with enable_idempotence=True if
-# confluent-kafka isn't available.
 python3 - <<PY
-try:
-    from confluent_kafka import Producer
-    impl = 'confluent_kafka (librdkafka)'
-    def make_producer():
-        return Producer({
-            'bootstrap.servers': 'localhost:9092',
-            'client.id': 'compat-03-p',
-            'enable.idempotence': True,
-        })
-except ImportError:
-    from kafka import KafkaProducer
-    impl = 'kafka-python'
-    def make_producer():
-        return KafkaProducer(
-            bootstrap_servers='localhost:9092',
-            client_id='compat-03-p',
-            enable_idempotence=True,
-            acks='all',
-        )
-
-print(f'using {impl}')
-p = make_producer()
-if impl.startswith('confluent'):
-    for i in range(10):
-        p.produce('$TOPIC', f'idm-{i}'.encode())
-    p.flush()
-else:
-    for i in range(10):
-        p.send('$TOPIC', f'idm-{i}'.encode()).get(timeout=10)
-    p.flush(); p.close()
-print('PASS')
+from confluent_kafka import Producer
+from kafka import KafkaConsumer, TopicPartition
+p = Producer({'bootstrap.servers':'localhost:9092', 'enable.idempotence':True,
+              'message.timeout.ms':20000})
+acks = []
+for i in range(10):
+    p.produce('$TOPIC', f'idm-{i}'.encode(), partition=0,
+              on_delivery=lambda err, msg: acks.append(err))
+assert p.flush(30) == 0 and len(acks) == 10 and not any(acks), acks
+c = KafkaConsumer(bootstrap_servers='localhost:9092', group_id=None,
+                  enable_auto_commit=False, consumer_timeout_ms=5000)
+c.assign([TopicPartition('$TOPIC',0)]); c.seek_to_beginning()
+got = [m.value for m in c]; c.close()
+assert got == [f'idm-{i}'.encode() for i in range(10)], got
+print('PASS: idempotent deliveries acknowledged and read back in order')
 PY
