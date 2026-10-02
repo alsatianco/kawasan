@@ -6,6 +6,8 @@
 //      protocol name, so the echo is what lets Connect advance to SyncGroup.
 //   2. A rebalance that overruns its deadline (stalled leader) must be
 //      force-recovered so a multi-worker group can't hang forever.
+#include "kawasan/broker/group_coordinator.h"
+
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -14,7 +16,6 @@
 #include <string>
 #include <thread>
 
-#include "kawasan/broker/group_coordinator.h"
 #include "kawasan/broker/offset_manager.h"
 #include "kawasan/protocol/describe_groups_request.h"
 #include "kawasan/protocol/heartbeat_request.h"
@@ -33,8 +34,8 @@ class GroupCoordinatorTest : public ::testing::Test {
 protected:
     void SetUp() override {
         const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
-        db_path_ = (fs::temp_directory_path() /
-                    ("kawasan-gc-test-" + std::to_string(stamp))).string();
+        db_path_ =
+            (fs::temp_directory_path() / ("kawasan-gc-test-" + std::to_string(stamp))).string();
         fs::create_directories(db_path_);
         offset_mgr_ = std::make_shared<OffsetManager>(db_path_);
         coordinator_ = std::make_unique<GroupCoordinator>(offset_mgr_);
@@ -49,8 +50,7 @@ protected:
 
     // Build a JoinGroup request that admits immediately (non-empty
     // protocol_type + protocols => legacy admit-on-first-join path).
-    protocol::JoinGroupRequest makeJoin(const std::string& group,
-                                        const std::string& member_id,
+    protocol::JoinGroupRequest makeJoin(const std::string& group, const std::string& member_id,
                                         const std::string& proto_type,
                                         const std::string& proto_name,
                                         int32_t rebalance_ms = 60000) {
@@ -81,8 +81,8 @@ protected:
 // Fix 1a: JoinGroup result carries protocol_type + protocol_name so the
 // broker can echo them in the v7+ response.
 TEST_F(GroupCoordinatorTest, JoinGroupEchoesProtocolType) {
-    auto result = coordinator_->handleJoinGroup(
-        makeJoin("connect-cluster", "", "connect", "sessioned"));
+    auto result =
+        coordinator_->handleJoinGroup(makeJoin("connect-cluster", "", "connect", "sessioned"));
 
     EXPECT_EQ(result.error, ErrorCode::NONE);
     EXPECT_EQ(result.protocol_type, "connect");
@@ -93,8 +93,8 @@ TEST_F(GroupCoordinatorTest, JoinGroupEchoesProtocolType) {
 
 // Fix 1b: SyncGroup result carries protocol_type + protocol_name (v5+).
 TEST_F(GroupCoordinatorTest, SyncGroupEchoesProtocolFields) {
-    auto join = coordinator_->handleJoinGroup(
-        makeJoin("connect-cluster", "", "connect", "sessioned"));
+    auto join =
+        coordinator_->handleJoinGroup(makeJoin("connect-cluster", "", "connect", "sessioned"));
     ASSERT_EQ(join.error, ErrorCode::NONE);
 
     protocol::SyncGroupRequest sync;
@@ -145,8 +145,8 @@ TEST_F(GroupCoordinatorTest, RebalanceTimeoutEvictsStalledLeader) {
 
     // The surviving follower re-joins and is elected the new leader at a
     // bumped generation — proving recovery completed, not just eviction.
-    auto rejoin = coordinator_->handleJoinGroup(
-        makeJoin("g-stall", follower, "connect", "sessioned", 1000));
+    auto rejoin =
+        coordinator_->handleJoinGroup(makeJoin("g-stall", follower, "connect", "sessioned", 1000));
     EXPECT_EQ(rejoin.error, ErrorCode::NONE);
     EXPECT_EQ(rejoin.leader_id, follower);
     EXPECT_GT(rejoin.generation_id, j1.generation_id);
@@ -167,3 +167,34 @@ TEST_F(GroupCoordinatorTest, RebalanceWithinDeadlineNotDisturbed) {
 }
 
 }  // namespace
+
+TEST_F(GroupCoordinatorTest, JoiningDuringSyncRejectsAnIncompleteAssignment) {
+    const auto first =
+        coordinator_->handleJoinGroup(makeJoin("join-race", "", "consumer", "range"));
+    const auto second =
+        coordinator_->handleJoinGroup(makeJoin("join-race", "", "consumer", "range"));
+    protocol::SyncGroupRequest sync;
+    sync.setGroupId("join-race");
+    sync.setMemberId(first.member_id);
+    sync.setGenerationId(first.generation_id);
+    sync.setAssignments({{first.member_id, {0xAA}}});
+    EXPECT_EQ(coordinator_->handleSyncGroup(sync).error, ErrorCode::ILLEGAL_GENERATION);
+
+    const auto rejoin =
+        coordinator_->handleJoinGroup(makeJoin("join-race", first.member_id, "consumer", "range"));
+    EXPECT_GT(rejoin.generation_id, first.generation_id);
+    ASSERT_EQ(rejoin.members.size(), 2);
+    sync.setGenerationId(rejoin.generation_id);
+    sync.setAssignments({{first.member_id, {0xAA}}, {second.member_id, {0xBB}}});
+    EXPECT_EQ(coordinator_->handleSyncGroup(sync).error, ErrorCode::NONE);
+
+    // A same-subscription rejoin must preserve the stable generation.
+    const auto existing =
+        coordinator_->handleJoinGroup(makeJoin("join-race", second.member_id, "consumer", "range"));
+    EXPECT_EQ(existing.generation_id, rejoin.generation_id);
+    sync.setMemberId(second.member_id);
+    sync.setAssignments({});
+    const auto follower = coordinator_->handleSyncGroup(sync);
+    EXPECT_EQ(follower.error, ErrorCode::NONE);
+    EXPECT_EQ(follower.assignment, (std::vector<uint8_t>{0xBB}));
+}

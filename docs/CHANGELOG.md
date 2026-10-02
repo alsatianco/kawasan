@@ -57,6 +57,8 @@ Single-node production-hardening (durability, security, quotas), durable single-
 
 ### Fixed
 
+- Consumer groups reject a leader assignment that omits members admitted while SyncGroup was pending, then rejoin with a fresh generation. Same-subscription rejoins preserve stable generations; stale assignments are cleared when membership changes. Two consumers bootstrapped at different brokers now share one group and disjoint partitions.
+
 - Broker destruction keeps its Asio context alive until Raft transports and peer sockets are destroyed, preventing a crash on clean cluster shutdown.
 
 - Raft elections serialize timer and term changes, reject obsolete vote replies, and collect heartbeats independently per peer. A frozen peer no longer stretches healthy-peer heartbeat timing or queues repeated AppendEntries. ISR maintenance waits for current metadata after a broker resumes.

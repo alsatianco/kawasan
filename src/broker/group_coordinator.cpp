@@ -132,6 +132,9 @@ GroupCoordinator::JoinGroupResult GroupCoordinator::handleJoinGroup(
         }
     }
 
+    const auto existing = group.members.find(member_id);
+    const bool membership_changed =
+        existing == group.members.end() || existing->second.metadata != metadata;
     MemberState& member = group.members[member_id];
     member.member_id = member_id;
     // 0A.10: preserve any previously-seen client identity if this is a known
@@ -185,9 +188,11 @@ GroupCoordinator::JoinGroupResult GroupCoordinator::handleJoinGroup(
     //     members to rejoin (their heartbeat at the old generation gets
     //     ILLEGAL_GENERATION or REBALANCE_IN_PROGRESS), so the leader
     //     can compute a fresh assignment that includes the new member.
-    if (group.kind == GroupStateKind::Stable) {
+    if (group.kind == GroupStateKind::Stable && membership_changed) {
         group.kind = GroupStateKind::CompletingRebalance;
         group.generation_id++;
+        for (auto& [id, state] : group.members)
+            state.assignment.clear();
         // Phase EX-1: count per-group rebalances.
         group.rebalances_total.fetch_add(1, std::memory_order_relaxed);
         // EX-12: stamp the rebalance deadline on entry to CompletingRebalance.
@@ -250,6 +255,27 @@ GroupCoordinator::SyncGroupResult GroupCoordinator::handleSyncGroup(
     if (member_it == group->members.end()) {
         result.error = ErrorCode::UNKNOWN_MEMBER_ID;
         return result;
+    }
+
+    // A member may have joined after the leader's JoinGroup response, so
+    // its assignment was computed from an obsolete membership snapshot.
+    if (!request.assignments().empty() && group->kind == GroupStateKind::CompletingRebalance) {
+        const bool complete =
+            std::all_of(group->members.begin(), group->members.end(), [&](const auto& member) {
+                return std::any_of(
+                    request.assignments().begin(), request.assignments().end(),
+                    [&](const auto& assignment) { return assignment.member_id == member.first; });
+            });
+        if (!complete) {
+            ++group->generation_id;
+            group->rebalances_total.fetch_add(1, std::memory_order_relaxed);
+            group->rebalance_started_at = std::chrono::steady_clock::now();
+            for (auto& [id, state] : group->members)
+                state.assignment.clear();
+            persistGroupState(request.groupId(), *group);
+            result.error = ErrorCode::ILLEGAL_GENERATION;
+            return result;
+        }
     }
 
     // Store assignments from the leader

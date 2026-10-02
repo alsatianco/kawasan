@@ -294,6 +294,8 @@ expiry_timestamp = commit_timestamp + retention_ms
 
 The relevant `OffsetManager` API includes `commitOffset` / `commitOffsetBatch`, `fetchOffset` / `fetchOffsetWithMetadata`, `saveGroupMetadata` / `loadGroupMetadata`, `deleteGroup`, `listGroups`, and `deleteExpiredOffsets`.
 
+SyncGroup accepts a rebalance assignment only when it covers every current member. If membership changed after the leader joined, it advances the generation and forces a new assignment. Stable rejoins with unchanged subscription metadata preserve the generation.
+
 ## Coordinator routing
 
 FindCoordinator hashes group IDs to `__consumer_offsets` and transactional IDs to `__transaction_state` with `coordinatorPartitionFor`, using each topic's actual partition count. Its owner is the partition leader in committed metadata, resolved to a Kafka endpoint through `peerEndpoint`. All brokers return the same owner; v4 resolves each requested key separately. Missing, offline, or stale metadata returns `COORDINATOR_NOT_AVAILABLE`. Single-node lookups retain the local endpoint.
