@@ -1,24 +1,25 @@
 #pragma once
 
 #include <atomic>
+#include <boost/asio.hpp>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <future>
-#include <thread>
-#include <memory>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
-
-#include <boost/asio.hpp>
 
 #include "kawasan/common/types.h"
 #include "kawasan/raft/raft_protocol.h"
 
 // Forward declarations
-namespace rocksdb { class DB; }
+namespace rocksdb {
+class DB;
+}
 namespace kawasan::raft {
 class RaftTransport;
 }
@@ -52,9 +53,8 @@ public:
     ///                  single-node restarts but not Raft-safe for multi-node.
     ///                  When provided, current_term, voted_for, and log
     ///                  entries are persisted to a RocksDB instance there.
-    RaftNode(BrokerId id, const std::vector<PeerInfo>& peers,
-             boost::asio::io_context& io_context, int raft_port = 9093,
-             std::string data_dir = "");
+    RaftNode(BrokerId id, const std::vector<PeerInfo>& peers, boost::asio::io_context& io_context,
+             int raft_port = 9093, std::string data_dir = "");
     ~RaftNode();
 
     // Non-copyable/movable
@@ -161,6 +161,7 @@ private:
     void heartbeatThread();
     void startElection();
     void sendHeartbeats();
+    // State transitions and election timers require log_mutex_.
     void becomeFollower(int64_t term);
     void becomeCandidate();
     void becomeLeader();
@@ -189,7 +190,15 @@ private:
     std::vector<LogEntry> log_;
     mutable std::mutex log_mutex_;
 
+    // Accessed only under log_mutex_.
     std::chrono::steady_clock::time_point last_heartbeat_;
+    struct PendingHeartbeat {
+        int64_t term;
+        int64_t last_index;
+        std::future<AppendEntriesResponse> response;
+    };
+    // Owned by the heartbeat thread: one bounded RPC per peer, no backlog.
+    std::map<BrokerId, PendingHeartbeat> pending_heartbeats_;
     // M8-E1 (guarded by log_mutex_): last valid AppendEntries from a leader, and
     // the leader_commit of the first successful one since start (-1 = none).
     std::chrono::steady_clock::time_point last_leader_contact_{};

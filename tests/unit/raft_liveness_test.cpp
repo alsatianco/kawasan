@@ -5,8 +5,8 @@
 // Runs three real RaftNodes in-process over loopback.
 #include <gtest/gtest.h>
 
-#include <boost/asio.hpp>
 #include <atomic>
+#include <boost/asio.hpp>
 #include <chrono>
 #include <memory>
 #include <thread>
@@ -105,7 +105,7 @@ struct Cluster {
 TEST(RaftLivenessTest, NonLeaderReportsNoAges) {
     boost::asio::io_context io;
     RaftNode node(1, {PeerInfo{2, "127.0.0.1", 1}}, io, 0, "");
-    EXPECT_TRUE(node.peerAckAgesMs().empty());  // not started, not leader
+    EXPECT_TRUE(node.peerAckAgesMs().empty());    // not started, not leader
     EXPECT_FALSE(node.hasCurrentMetadata(1000));  // never heard from a leader
 }
 
@@ -454,6 +454,16 @@ TEST(RaftLivenessTest, FrozenFirstPeerDoesNotBlockElection) {
         std::this_thread::sleep_for(20ms);
     }
     EXPECT_TRUE(elected);
+    // A frozen first peer must not stretch the heartbeat cadence until the
+    // remaining follower repeatedly times out and deposes the live leader.
+    const int leader = nodes[0]->isLeader() ? 0 : 1;
+    const auto term = nodes[leader]->currentTerm();
+    const auto stable_until = std::chrono::steady_clock::now() + 4s;
+    while (std::chrono::steady_clock::now() < stable_until) {
+        EXPECT_EQ(nodes[leader]->currentTerm(), term);
+        EXPECT_TRUE(nodes[leader]->isLeader());
+        std::this_thread::sleep_for(100ms);
+    }
     for (auto& n : nodes) {
         n->stop();
     }
@@ -463,4 +473,46 @@ TEST(RaftLivenessTest, FrozenFirstPeerDoesNotBlockElection) {
     hole.close();
     hole_io.stop();
     hole_thread.join();
+}
+
+// A vote reply can be overtaken by a newer leader's AppendEntries. The
+// election thread must compare against the CURRENT term, under the state lock.
+TEST(RaftLivenessTest, DelayedVoteReplyCannotRollBackANewerTerm) {
+    NodeIo node_io;
+    NodeIo peer_io;
+    RaftTransport peer(peer_io.io, 1);
+    const int peer_port = freePort();
+    peer.start(peer_port);
+    std::atomic<int64_t> requested_term{0};
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    peer.setRequestVoteHandler([&](const RequestVoteRequest& request) {
+        requested_term.store(request.term);
+        released.wait_for(2s);
+        RequestVoteResponse response;
+        response.term = request.term + 1;
+        response.vote_granted = false;
+        return response;
+    });
+    RaftNode node(0, {PeerInfo{1, "127.0.0.1", peer_port}}, node_io.io, freePort(), "");
+    node.setCommitCallback([](const LogEntry&) {});
+    node.start();
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (requested_term.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(1ms);
+    }
+    EXPECT_GT(requested_term.load(), 0);
+    const auto newer_term = requested_term.load() + 10;
+    AppendEntriesRequest heartbeat;
+    heartbeat.term = newer_term;
+    heartbeat.leader_id = 1;
+    node.handleAppendEntries(heartbeat);
+    release.set_value();
+    const auto observe_until = std::chrono::steady_clock::now() + 100ms;
+    while (std::chrono::steady_clock::now() < observe_until) {
+        EXPECT_GE(node.currentTerm(), newer_term);
+        std::this_thread::sleep_for(1ms);
+    }
+    node.stop();
+    peer.stop();
 }

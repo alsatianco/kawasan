@@ -201,10 +201,24 @@ def run():
         partition_meta(everyone, topic, p)), 60, f"broker {leader} to rejoin the ISR")
     log(f"broker {leader} is back in the ISR of partition {p}")
 
-    res = admin.elect_leaders(ElectionType.PREFERRED, [TopicPartition(topic, p)]).result(30)
-    for tp, err in (res or {}).items():
-        if err is not None and "ELECTION_NOT_NEEDED" not in str(err):
-            fail(f"preferred election failed: {err}")
+    def elect_preferred():
+        md = AdminClient({"bootstrap.servers": bootstrap(everyone)}).list_topics(
+            topic=topic, timeout=5)
+        current = md.topics[topic].partitions[p]
+        if leader not in current.isrs or md.controller_id < 0:
+            return False
+        controller_admin = AdminClient({"bootstrap.servers": addr(md.controller_id)})
+        res = controller_admin.elect_leaders(
+            ElectionType.PREFERRED, [TopicPartition(topic, p)]).result(5)
+        for tp, err in (res or {}).items():
+            if err is not None and "ELECTION_NOT_NEEDED" not in str(err):
+                if any(code in str(err) for code in (
+                        "NOT_CONTROLLER", "PREFERRED_LEADER_NOT_AVAILABLE")):
+                    return False
+                fail(f"preferred election failed: {err}")
+        return True
+
+    wait_until(elect_preferred, 30, "preferred election after controller ISR convergence")
     wait_until(lambda: (lambda m: m and m.leader == leader)(partition_meta(everyone, topic, p)),
                30, f"broker {leader} to lead partition {p} again")
     log(f"broker {leader} leads partition {p} again; reading it back")

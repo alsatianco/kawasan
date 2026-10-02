@@ -296,6 +296,8 @@ The relevant `OffsetManager` API includes `commitOffset` / `commitOffsetBatch`, 
 
 ## Raft consensus
 
+Election timers and term/state transitions are guarded by the Raft log mutex. Election results are accepted only for the active candidate term. The heartbeat thread retains at most one outstanding AppendEntries RPC per peer and harvests ready replies without waiting on other peers; successful replies acknowledge only the entries sent in that RPC.
+
 Raft replicates cluster metadata across brokers without ZooKeeper. `MetadataController` proposes metadata commands to the Raft log; once an entry commits, every node applies it through `RaftNode::applyCommittedEntries`. In single-node mode the broker is the only voter, so commits are immediate.
 
 The metadata command set (`MetadataCommandType`, `include/kawasan/broker/metadata_types.h`):

@@ -53,6 +53,8 @@ Single-node production-hardening (durability, security, quotas), durable single-
 
 ### Fixed
 
+- Raft elections serialize timer and term changes, reject obsolete vote replies, and collect heartbeats independently per peer. A frozen peer no longer stretches healthy-peer heartbeat timing or queues repeated AppendEntries. ISR maintenance waits for current metadata after a broker resumes.
+
 - **Raft could fail to elect a leader, or lose it repeatedly, while one peer was frozen.** Four bugs, each found with the M8 SIGSTOP nemesis:
   - Elections and heartbeats waited on peer responses in list order under one shared 100 ms budget. A frozen peer early in the list used up the budget and hid a live peer's granted vote or ack, so two live nodes out of three never elected a leader.
   - Outgoing RPCs shared one client pool, so a backlog to a frozen peer starved RPCs to the others. Each peer now has its own RPC thread.

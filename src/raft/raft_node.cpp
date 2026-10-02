@@ -1,5 +1,8 @@
 #include "kawasan/raft/raft_node.h"
-#include "kawasan/common/rocksdb_compat.h"
+
+#include <rocksdb/db.h>
+#include <rocksdb/options.h>
+#include <rocksdb/write_batch.h>
 
 #include <algorithm>
 #include <cstring>
@@ -7,11 +10,8 @@
 #include <random>
 #include <utility>
 
-#include <rocksdb/db.h>
-#include <rocksdb/options.h>
-#include <rocksdb/write_batch.h>
-
 #include "kawasan/common/logger.h"
+#include "kawasan/common/rocksdb_compat.h"
 #include "kawasan/raft/raft_protocol.h"
 #include "kawasan/raft/raft_transport.h"
 
@@ -25,8 +25,8 @@ namespace {
 // Big-endian index encoding gives correct sorted iteration in RocksDB so
 // loadPersistedState() can replay entries in order.
 constexpr const char* kKeyCurrentTerm = "meta:current_term";
-constexpr const char* kKeyVotedFor    = "meta:voted_for";
-constexpr const char* kLogKeyPrefix   = "log:";
+constexpr const char* kKeyVotedFor = "meta:voted_for";
+constexpr const char* kLogKeyPrefix = "log:";
 
 std::string encodeLogKey(int64_t index) {
     std::string out = kLogKeyPrefix;
@@ -38,7 +38,8 @@ std::string encodeLogKey(int64_t index) {
 }
 
 int64_t decodeLogKey(const std::string& key) {
-    if (key.size() != std::strlen(kLogKeyPrefix) + 8) return -1;
+    if (key.size() != std::strlen(kLogKeyPrefix) + 8)
+        return -1;
     const char* p = key.data() + std::strlen(kLogKeyPrefix);
     uint64_t v = 0;
     for (int i = 0; i < 8; ++i) {
@@ -50,39 +51,36 @@ int64_t decodeLogKey(const std::string& key) {
 }  // namespace
 
 RaftNode::RaftNode(BrokerId id, const std::vector<PeerInfo>& peers,
-                   boost::asio::io_context& io_context, int raft_port,
-                   std::string data_dir)
-    : id_(id), peers_(peers), io_context_(io_context), raft_port_(raft_port),
+                   boost::asio::io_context& io_context, int raft_port, std::string data_dir)
+    : id_(id),
+      peers_(peers),
+      io_context_(io_context),
+      raft_port_(raft_port),
       data_dir_(std::move(data_dir)) {
     resetElectionTimeout();
-    
+
     // Initialize transport
     transport_ = std::make_unique<RaftTransport>(io_context_, id_);
-    
+
     // Register handlers for incoming RPCs
     transport_->setRequestVoteHandler(
-        [this](const raft::RequestVoteRequest& req) {
-            return this->handleRequestVote(req);
-        });
-    
+        [this](const raft::RequestVoteRequest& req) { return this->handleRequestVote(req); });
+
     transport_->setAppendEntriesHandler(
-        [this](const raft::AppendEntriesRequest& req) {
-            return this->handleAppendEntries(req);
-        });
+        [this](const raft::AppendEntriesRequest& req) { return this->handleAppendEntries(req); });
 
     // Phase 5.2: InstallSnapshot dispatch.
-    transport_->setInstallSnapshotHandler(
-        [this](const raft::InstallSnapshotRequest& req) {
-            return this->handleInstallSnapshot(req);
-        });
+    transport_->setInstallSnapshotHandler([this](const raft::InstallSnapshotRequest& req) {
+        return this->handleInstallSnapshot(req);
+    });
 
     // Configure peers in transport
     for (const auto& peer : peers_) {
         transport_->add_peer(peer.id, peer.host, peer.port);
     }
-    
-    Logger::info("Initialized Raft node with ID {} (port {}), {} peer(s)", 
-                 id_, raft_port_, peers_.size());
+
+    Logger::info("Initialized Raft node with ID {} (port {}), {} peer(s)", id_, raft_port_,
+                 peers_.size());
 }
 
 RaftNode::~RaftNode() {
@@ -113,13 +111,14 @@ void RaftNode::start() {
     // with NOT_CONTROLLER.
     if (peers_.empty()) {
         Logger::info("Single-node mode: becoming leader immediately");
+        std::lock_guard<std::mutex> lock(log_mutex_);
         becomeLeader();
     }
 
     election_thread_ = std::thread(&RaftNode::electionThread, this);
     heartbeat_thread_ = std::thread(&RaftNode::heartbeatThread, this);
-    Logger::info("Started Raft node {} on port {} (term={}, log_size={})", id_,
-                 raft_port_, current_term_.load(), log_.size());
+    Logger::info("Started Raft node {} on port {} (term={}, log_size={})", id_, raft_port_,
+                 current_term_.load(), log_.size());
 }
 
 void RaftNode::stop() {
@@ -165,17 +164,15 @@ void RaftNode::stop() {
 }
 
 std::future<int64_t> RaftNode::appendCommand(const std::vector<uint8_t>& command,
-                                              const std::string& command_type) {
+                                             const std::string& command_type) {
     std::promise<int64_t> promise;
     auto future = promise.get_future();
 
+    std::lock_guard<std::mutex> lock(log_mutex_);
     if (!isLeader()) {
-        promise.set_exception(
-            std::make_exception_ptr(std::runtime_error("Not the leader")));
+        promise.set_exception(std::make_exception_ptr(std::runtime_error("Not the leader")));
         return future;
     }
-
-    std::lock_guard<std::mutex> lock(log_mutex_);
 
     LogEntry entry;
     entry.term = current_term_;
@@ -230,9 +227,9 @@ RequestVoteResponse RaftNode::handleRequestVote(const RequestVoteRequest& reques
     int64_t last_log_index = log_.empty() ? 0 : log_.back().index;
     int64_t last_log_term = log_.empty() ? 0 : log_.back().term;
 
-    bool log_up_to_date = (request.last_log_term > last_log_term) ||
-                          (request.last_log_term == last_log_term &&
-                           request.last_log_index >= last_log_index);
+    bool log_up_to_date =
+        (request.last_log_term > last_log_term) ||
+        (request.last_log_term == last_log_term && request.last_log_index >= last_log_index);
 
     if (can_vote && log_up_to_date) {
         voted_for_ = request.candidate_id;
@@ -268,6 +265,9 @@ AppendEntriesResponse RaftNode::handleAppendEntries(const AppendEntriesRequest& 
         return response;
     }
 
+    if (state_ == NodeState::CANDIDATE)
+        becomeFollower(request.term);
+
     // Reset election timeout on valid heartbeat
     resetElectionTimeout();
     leader_id_ = request.leader_id;
@@ -279,11 +279,6 @@ AppendEntriesResponse RaftNode::handleAppendEntries(const AppendEntriesRequest& 
             first_leader_commit_ = -1;
         }
         last_leader_contact_ = now;
-    }
-
-    // If we're a candidate, revert to follower
-    if (state_ == NodeState::CANDIDATE) {
-        becomeFollower(request.term);
     }
 
     // Check log consistency
@@ -301,8 +296,7 @@ AppendEntriesResponse RaftNode::handleAppendEntries(const AppendEntriesRequest& 
         const auto& entry = request.entries[i];
 
         // If existing entry conflicts, delete it and all following
-        if (log_.size() > log_insert_pos &&
-            log_[log_insert_pos].term != entry.term) {
+        if (log_.size() > log_insert_pos && log_[log_insert_pos].term != entry.term) {
             // 0A.7: also truncate the persisted log so follower restart sees
             // the same history we now consider authoritative.
             const int64_t truncate_from = log_[log_insert_pos].index;
@@ -321,8 +315,7 @@ AppendEntriesResponse RaftNode::handleAppendEntries(const AppendEntriesRequest& 
 
     // Update commit index
     if (request.leader_commit > commit_index_) {
-        int64_t new_commit =
-            std::min(request.leader_commit, log_.empty() ? 0L : log_.back().index);
+        int64_t new_commit = std::min(request.leader_commit, log_.empty() ? 0L : log_.back().index);
         commit_index_ = new_commit;
         applyCommittedEntries();
     }
@@ -338,7 +331,8 @@ AppendEntriesResponse RaftNode::handleAppendEntries(const AppendEntriesRequest& 
 }
 
 bool RaftNode::shouldSnapshot() const {
-    if (state_.load() != NodeState::LEADER) return false;
+    if (state_.load() != NodeState::LEADER)
+        return false;
     std::lock_guard<std::mutex> lock(log_mutex_);
     return static_cast<int64_t>(log_.size()) > snapshot_threshold_;
 }
@@ -350,21 +344,22 @@ std::vector<uint8_t> RaftNode::generateSnapshot() {
     // accepting the snapshot can log what it received.
     const int64_t last_applied = last_applied_.load();
     const int64_t current_term = current_term_.load();
-    std::string snap = "{\"version\":1,\"last_applied\":" +
-                       std::to_string(last_applied) +
+    std::string snap = "{\"version\":1,\"last_applied\":" + std::to_string(last_applied) +
                        ",\"term\":" + std::to_string(current_term) + "}";
     return std::vector<uint8_t>(snap.begin(), snap.end());
 }
 
 void RaftNode::sendSnapshotIfNeeded() {
-    if (!shouldSnapshot()) return;
+    if (!shouldSnapshot())
+        return;
 
     // Capture log state under lock.
     int64_t last_included_index = 0;
     int64_t last_included_term = 0;
     {
         std::lock_guard<std::mutex> lock(log_mutex_);
-        if (log_.empty()) return;
+        if (log_.empty())
+            return;
         last_included_index = log_.back().index;
         last_included_term = log_.back().term;
     }
@@ -379,8 +374,8 @@ void RaftNode::sendSnapshotIfNeeded() {
     req.data = snapshot_data;
     req.done = true;
 
-    Logger::info("Leader {} initiating snapshot (last_included_index={}, term={}, bytes={})",
-                 id_, last_included_index, last_included_term, snapshot_data.size());
+    Logger::info("Leader {} initiating snapshot (last_included_index={}, term={}, bytes={})", id_,
+                 last_included_index, last_included_term, snapshot_data.size());
 
     // Ship to all peers. Don't block on the response — failures will be
     // retried on the next snapshot cycle.
@@ -398,16 +393,15 @@ void RaftNode::sendSnapshotIfNeeded() {
     // optimistically (single-broker case has no peers to wait for).
     {
         std::lock_guard<std::mutex> lock(log_mutex_);
-        auto new_end = std::remove_if(
-            log_.begin(), log_.end(),
-            [&](const LogEntry& e) { return e.index <= last_included_index; });
+        auto new_end = std::remove_if(log_.begin(), log_.end(), [&](const LogEntry& e) {
+            return e.index <= last_included_index;
+        });
         log_.erase(new_end, log_.end());
     }
     Logger::info("Leader {} truncated log past index {}", id_, last_included_index);
 }
 
-InstallSnapshotResponse RaftNode::handleInstallSnapshot(
-    const InstallSnapshotRequest& request) {
+InstallSnapshotResponse RaftNode::handleInstallSnapshot(const InstallSnapshotRequest& request) {
     // Phase 5.2: handle InstallSnapshot RPC. Steps per Raft §7:
     //   1. Reply immediately if term < currentTerm
     //   2. Create new snapshot file if first chunk (offset = 0)
@@ -415,23 +409,17 @@ InstallSnapshotResponse RaftNode::handleInstallSnapshot(
     //   4. If done=false, return; wait for more chunks
     //   5. Save snapshot, discard older log entries, reset state machine
     InstallSnapshotResponse response;
-    response.term = current_term_.load();
-
-    if (request.term < current_term_.load()) {
-        // Stale leader.
-        return response;
+    {
+        std::lock_guard<std::mutex> lock(log_mutex_);
+        response.term = current_term_;
+        if (request.term < current_term_)
+            return response;
+        if (request.term > current_term_)
+            becomeFollower(request.term);
+        response.term = current_term_;
+        leader_id_ = request.leader_id;
+        resetElectionTimeout();
     }
-
-    // Higher term seen — convert to follower and adopt the new term.
-    if (request.term > current_term_.load()) {
-        current_term_ = request.term;
-        voted_for_ = 0;
-        becomeFollower(request.term);
-        persistTerm();
-        persistVotedFor();
-    }
-    leader_id_ = request.leader_id;
-    resetElectionTimeout();
 
     // Accumulate chunks. Reset on offset=0 to start a new snapshot.
     std::lock_guard<std::mutex> snap_lock(snapshot_mutex_);
@@ -443,11 +431,11 @@ InstallSnapshotResponse RaftNode::handleInstallSnapshot(
     // Append chunk at offset (we expect contiguous chunks in practice).
     if (request.offset > 0 &&
         request.offset != static_cast<int64_t>(incoming_snapshot_->data.size())) {
-        Logger::warn("InstallSnapshot: unexpected offset {} (have {} bytes)",
-                     request.offset, incoming_snapshot_->data.size());
+        Logger::warn("InstallSnapshot: unexpected offset {} (have {} bytes)", request.offset,
+                     incoming_snapshot_->data.size());
     }
-    incoming_snapshot_->data.insert(incoming_snapshot_->data.end(),
-                                    request.data.begin(), request.data.end());
+    incoming_snapshot_->data.insert(incoming_snapshot_->data.end(), request.data.begin(),
+                                    request.data.end());
 
     if (!request.done) {
         response.term = current_term_.load();
@@ -456,17 +444,15 @@ InstallSnapshotResponse RaftNode::handleInstallSnapshot(
 
     // Final chunk — install the snapshot.
     Logger::info("InstallSnapshot complete: last_included_index={} term={} bytes={}",
-                 incoming_snapshot_->last_included_index,
-                 incoming_snapshot_->last_included_term,
+                 incoming_snapshot_->last_included_index, incoming_snapshot_->last_included_term,
                  incoming_snapshot_->data.size());
 
     // Truncate log entries up to and including last_included_index.
     {
         std::lock_guard<std::mutex> log_lock(log_mutex_);
-        auto new_end = std::remove_if(
-            log_.begin(), log_.end(), [&](const LogEntry& e) {
-                return e.index <= incoming_snapshot_->last_included_index;
-            });
+        auto new_end = std::remove_if(log_.begin(), log_.end(), [&](const LogEntry& e) {
+            return e.index <= incoming_snapshot_->last_included_index;
+        });
         log_.erase(new_end, log_.end());
 
         // Advance the snapshot floor and the commit/applied counters together,
@@ -476,9 +462,12 @@ InstallSnapshotResponse RaftNode::handleInstallSnapshot(
         // worker "everything up to here is already captured by the snapshot —
         // do not invoke the callback for it".
         const int64_t lii = incoming_snapshot_->last_included_index;
-        if (apply_floor_.load() < lii) apply_floor_.store(lii);
-        if (commit_index_.load() < lii) commit_index_.store(lii);
-        if (last_applied_.load() < lii) last_applied_.store(lii);
+        if (apply_floor_.load() < lii)
+            apply_floor_.store(lii);
+        if (commit_index_.load() < lii)
+            commit_index_.store(lii);
+        if (last_applied_.load() < lii)
+            last_applied_.store(lii);
     }
 
     // Snapshot bytes themselves are opaque to Raft; a real implementation
@@ -492,39 +481,22 @@ InstallSnapshotResponse RaftNode::handleInstallSnapshot(
 }
 
 void RaftNode::electionThread() {
-    // Phase 5.2: CV-driven wake. We wait up to `election_timeout_` on the
-    // election_cv_; the wait returns early when a heartbeat arrives or
-    // stop() is called (both signal the CV). Worst case the CV times out
-    // and we re-check, which is exactly when we'd want to start an
-    // election anyway. The old 10 ms busy-poll wasted ~100 wakes/second
-    // per broker even in a healthy cluster.
     while (running_) {
-        std::unique_lock<std::mutex> lock(election_cv_mutex_);
-        // Compute how long to wait based on the most recent heartbeat;
-        // re-evaluated each iteration so an updated heartbeat correctly
-        // extends the wait.
-        auto wait_for = election_timeout_;
-        // A leader receives no heartbeats, so last_heartbeat_ goes stale and
-        // the elapsed-based wait below would be 0 forever — a busy spin that
-        // pinned a full core on every idle single-node broker.
-        if (state_ != NodeState::LEADER) {
-            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - last_heartbeat_);
-            if (elapsed < election_timeout_) {
-                wait_for = election_timeout_ - elapsed;
-            } else {
-                wait_for = std::chrono::milliseconds(0);
+        std::chrono::milliseconds wait_for;
+        {
+            std::lock_guard<std::mutex> lock(log_mutex_);
+            wait_for = election_timeout_;
+            if (state_ != NodeState::LEADER) {
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - last_heartbeat_);
+                wait_for = std::max(election_timeout_ - elapsed, std::chrono::milliseconds::zero());
             }
         }
-        // Predicate-based wait: re-check `running_` after wake.
+        std::unique_lock<std::mutex> lock(election_cv_mutex_);
         election_cv_.wait_for(lock, wait_for, [this] { return !running_; });
         lock.unlock();
-
-        if (!running_) break;
-
-        if (state_ != NodeState::LEADER && hasElectionTimedOut()) {
-            startElection();
-        }
+        if (running_)
+            startElection();  // rechecks the timer under log_mutex_
     }
 }
 
@@ -545,218 +517,150 @@ void RaftNode::heartbeatThread() {
             if (ticks % 1000 == 0) {
                 sendSnapshotIfNeeded();
             }
+        } else {
+            pending_heartbeats_.clear();
         }
     }
+    pending_heartbeats_.clear();
 }
 
 void RaftNode::startElection() {
-    becomeCandidate();
-
-    const int64_t election_term = current_term_.load();
-    Logger::info("Starting election for term {}", election_term);
-
-    int votes_received = 1;  // Vote for self
-    const int votes_needed = static_cast<int>((peers_.size() + 1) / 2 + 1);
-
-    // If we're the only node, become leader immediately
-    if (peers_.empty()) {
-        becomeLeader();
-        return;
-    }
-
-    // Prepare RequestVote request
-    raft::RequestVoteRequest vote_request;
-    vote_request.term = election_term;
-    vote_request.candidate_id = id_;
-    
+    RequestVoteRequest request;
     {
-        // Read our log position under the lock, then RELEASE it before sending
-        // RequestVotes and waiting for responses below. Holding log_mutex_ across
-        // the election window is a deadlock: every peer's handleRequestVote /
-        // handleAppendEntries also takes log_mutex_, so while this candidate waits
-        // (~100ms) no peer could grant it a vote, and symmetrically. With all
-        // nodes doing this concurrently the cluster spins electing forever and
-        // never converges on a leader.
         std::lock_guard<std::mutex> lock(log_mutex_);
-        vote_request.last_log_index = log_.empty() ? 0 : log_.back().index;
-        vote_request.last_log_term = log_.empty() ? 0 : log_.back().term;
+        if (!running_ || state_ == NodeState::LEADER || !hasElectionTimedOut())
+            return;
+        becomeCandidate();
+        request.term = current_term_;
+        request.candidate_id = id_;
+        request.last_log_index = log_.empty() ? 0 : log_.back().index;
+        request.last_log_term = log_.empty() ? 0 : log_.back().term;
+        if (peers_.empty()) {
+            becomeLeader();
+            return;
+        }
     }
-
-    // Send RequestVote RPCs to all peers
-    std::vector<std::future<raft::RequestVoteResponse>> responses;
+    Logger::info("Starting election for term {}", request.term);
+    int votes = 1;
+    const int needed = static_cast<int>((peers_.size() + 1) / 2 + 1);
+    std::vector<std::future<RequestVoteResponse>> responses;
     for (const auto& peer : peers_) {
-        try {
-            Logger::debug("Sending RequestVote to peer {} for term {}", 
-                         peer.id, election_term);
-            responses.push_back(transport_->sendRequestVote(peer.id, vote_request));
-        } catch (const std::exception& e) {
-            Logger::warn("Failed to send RequestVote to peer {}: {}", 
-                        peer.id, e.what());
-        }
+        responses.push_back(transport_->sendRequestVote(peer.id, request));
     }
-    
-    // Wait for responses with timeout (must unlock before waiting)
-    // Note: In production, this should be async to avoid blocking election thread
-    const auto timeout = std::chrono::milliseconds(100);
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
     for (auto& future : responses) {
-        // Past the deadline, still take every vote that has already arrived: a
-        // slow or frozen peer earlier in the list must not hide a live peer's
-        // granted vote (that stalled elections forever).
-        using Duration = std::chrono::steady_clock::duration;
-        const auto remaining =
-            std::max<Duration>(deadline - std::chrono::steady_clock::now(), Duration::zero());
-        if (future.wait_for(remaining) == std::future_status::ready) {
-            try {
-                auto response = future.get();
-                
-                // If we see a higher term, step down
-                if (response.term > election_term) {
-                    Logger::info("Saw higher term {} during election, stepping down", 
-                                response.term);
-                    becomeFollower(response.term);
-                    return;
-                }
-                
-                // Count vote if granted and term matches
-                if (response.vote_granted && response.term == election_term) {
-                    votes_received++;
-                    Logger::debug("Received vote for term {}, total votes: {}/{}", 
-                                 election_term, votes_received, votes_needed);
-                }
-            } catch (const std::exception& e) {
-                Logger::warn("Error getting vote response: {}", e.what());
+        const auto remaining = std::max(deadline - std::chrono::steady_clock::now(),
+                                        std::chrono::steady_clock::duration::zero());
+        if (future.wait_for(remaining) != std::future_status::ready)
+            continue;
+        try {
+            const auto response = future.get();
+            std::lock_guard<std::mutex> lock(log_mutex_);
+            if (response.term > current_term_) {
+                becomeFollower(response.term);
+                return;
             }
+            if (current_term_ != request.term || state_ != NodeState::CANDIDATE)
+                return;
+            if (response.vote_granted && response.term == request.term)
+                ++votes;
+        } catch (const std::exception& e) {
+            Logger::debug("RequestVote failed: {}", e.what());
         }
     }
-    
-    // Check if we won the election
-    if (votes_received >= votes_needed && state_ == NodeState::CANDIDATE) {
-        Logger::info("Won election for term {} with {} votes", 
-                    election_term, votes_received);
+    std::lock_guard<std::mutex> lock(log_mutex_);
+    if (running_ && current_term_ == request.term && state_ == NodeState::CANDIDATE &&
+        votes >= needed) {
         becomeLeader();
-    } else {
-        Logger::debug("Lost election for term {}, got {} votes (needed {})", 
-                     election_term, votes_received, votes_needed);
     }
 }
 
 void RaftNode::sendHeartbeats() {
-    if (state_ != NodeState::LEADER) {
-        return;
+    // Harvest all ready replies without waiting for an unresponsive peer.
+    for (auto it = pending_heartbeats_.begin(); it != pending_heartbeats_.end();) {
+        if (it->second.response.wait_for(std::chrono::milliseconds(0)) !=
+            std::future_status::ready) {
+            ++it;
+            continue;
+        }
+        try {
+            const auto response = it->second.response.get();
+            std::lock_guard<std::mutex> lock(log_mutex_);
+            if (response.term > current_term_) {
+                becomeFollower(response.term);
+            } else if (state_ == NodeState::LEADER && current_term_ == it->second.term) {
+                for (auto& peer : peers_) {
+                    if (peer.id != it->first)
+                        continue;
+                    peer.last_ack = std::chrono::steady_clock::now();
+                    if (response.success) {
+                        // Credit only the entries in this RPC, not a follower's
+                        // potentially divergent extra tail.
+                        peer.match_index = it->second.last_index;
+                        peer.next_index = peer.match_index + 1;
+                        updateCommitIndex();
+                    } else {
+                        const auto next = std::max<int64_t>(1, response.last_log_index + 1);
+                        peer.next_index = next < peer.next_index
+                                              ? next
+                                              : std::max<int64_t>(1, peer.next_index - 1);
+                    }
+                    break;
+                }
+            }
+        } catch (const std::exception& e) {
+            Logger::debug("AppendEntries to peer {} failed: {}", it->first, e.what());
+        }
+        it = pending_heartbeats_.erase(it);
     }
-    
-    // Phase 1: build per-peer AppendEntries requests while holding log_mutex_
-    // (read log state), then RELEASE the lock before doing any network I/O.
-    // Holding log_mutex_ across the RPC waits starved appendCommand and made
-    // replication flaky (entries past the first often never committed).
-    struct PendingSend {
-        BrokerId peer_id;
-        raft::AppendEntriesRequest request;
+    struct Send {
+        BrokerId peer;
+        AppendEntriesRequest request;
     };
-    std::vector<PendingSend> sends;
-    int64_t current_term = 0;
+    std::vector<Send> sends;
     {
         std::lock_guard<std::mutex> lock(log_mutex_);
-        if (state_ != NodeState::LEADER) {
+        if (state_ != NodeState::LEADER)
             return;
-        }
-        current_term = current_term_.load();
-        const int64_t log_size = static_cast<int64_t>(log_.size());
-        for (auto& peer : peers_) {
-            raft::AppendEntriesRequest request;
-            request.term = current_term;
+        for (const auto& peer : peers_) {
+            if (pending_heartbeats_.count(peer.id))
+                continue;
+            AppendEntriesRequest request;
+            request.term = current_term_;
             request.leader_id = id_;
             request.prev_log_index = peer.next_index - 1;
-            request.prev_log_term =
-                (request.prev_log_index > 0 && request.prev_log_index <= log_size)
-                    ? log_[static_cast<size_t>(request.prev_log_index - 1)].term
-                    : 0;
+            request.prev_log_term = request.prev_log_index > 0
+                                        ? log_[static_cast<size_t>(request.prev_log_index - 1)].term
+                                        : 0;
             request.leader_commit = commit_index_;
-            if (peer.next_index > 0 && peer.next_index <= log_size) {
-                for (size_t i = static_cast<size_t>(peer.next_index - 1); i < log_.size();
-                     ++i) {
-                    request.entries.push_back(log_[i]);
-                }
+            for (size_t i = static_cast<size_t>(peer.next_index - 1); i < log_.size(); ++i) {
+                request.entries.push_back(log_[i]);
             }
             sends.push_back({peer.id, std::move(request)});
         }
     }
-
-    // Phase 2: send all RPCs (no lock held).
-    std::vector<std::pair<BrokerId, std::future<raft::AppendEntriesResponse>>> futures;
-    for (auto& send : sends) {
+    for (const auto& send : sends) {
         try {
-            futures.emplace_back(send.peer_id,
-                                 transport_->sendAppendEntries(send.peer_id, send.request));
+            const auto last =
+                send.request.prev_log_index + static_cast<int64_t>(send.request.entries.size());
+            pending_heartbeats_.emplace(send.peer, PendingHeartbeat{send.request.term, last,
+                                                                    transport_->sendAppendEntries(
+                                                                        send.peer, send.request)});
         } catch (const std::exception& e) {
-            Logger::warn("Failed to send AppendEntries to peer {}: {}", send.peer_id,
-                         e.what());
-        }
-    }
-
-    // Phase 3: collect responses (no lock held) within a bounded window, then
-    // apply each under a freshly-acquired lock.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
-    for (auto& [peer_id, fut] : futures) {
-        // Past the deadline, still process every response that has already
-        // arrived (see startElection): a frozen peer first in the list must not
-        // hide live followers' acks.
-        using Duration = std::chrono::steady_clock::duration;
-        const auto remaining =
-            std::max<Duration>(deadline - std::chrono::steady_clock::now(), Duration::zero());
-        if (fut.wait_for(remaining) != std::future_status::ready) continue;
-
-        raft::AppendEntriesResponse response;
-        try {
-            response = fut.get();
-        } catch (const std::exception& e) {
-            Logger::warn("Error processing AppendEntries response from peer {}: {}", peer_id,
-                         e.what());
-            continue;
-        }
-
-        std::lock_guard<std::mutex> lock(log_mutex_);
-        // Ignore stale responses if we are no longer the leader for this term.
-        if (state_ != NodeState::LEADER || current_term_.load() != current_term) {
-            return;
-        }
-        if (response.term > current_term) {
-            Logger::info("Peer {} has higher term {}, stepping down", peer_id, response.term);
-            becomeFollower(response.term);
-            return;
-        }
-        for (auto& peer : peers_) {
-            if (peer.id != peer_id) continue;
-            peer.last_ack = std::chrono::steady_clock::now();
-            if (response.success) {
-                peer.match_index = response.last_log_index;
-                peer.next_index = response.last_log_index + 1;
-                Logger::trace("AppendEntries to peer {} succeeded, match_index={}",
-                              peer.id, peer.match_index);
-                updateCommitIndex();  // we hold log_mutex_, per its precondition
-            } else {
-                // Use the follower's last_log_index as a hint to jump to the
-                // divergence point (O(1) instead of decrement-by-one).
-                const int64_t hint = response.last_log_index;
-                const int64_t new_next = std::max<int64_t>(1, hint + 1);
-                if (new_next < peer.next_index) {
-                    peer.next_index = new_next;
-                } else if (peer.next_index > 1) {
-                    peer.next_index--;
-                }
-            }
-            break;
+            Logger::debug("AppendEntries dispatch failed: {}", e.what());
         }
     }
 }
 
 void RaftNode::becomeFollower(int64_t term) {
+    if (term < current_term_)
+        return;
+    const bool new_term = term > current_term_;
     current_term_ = term;
     state_ = NodeState::FOLLOWER;
     first_leader_commit_ = -1;  // M8-E1: catch up with the new leadership first
-    voted_for_ = -1;
+    if (new_term)
+        voted_for_ = -1;
     leader_id_ = -1;
     // 0A.7: persist BOTH fields together — Raft safety requires that on
     // restart we never re-grant a vote in a stale term.
@@ -779,7 +683,6 @@ void RaftNode::becomeCandidate() {
 
 void RaftNode::becomeLeader() {
     {
-        std::lock_guard<std::mutex> lock(log_mutex_);
         // Initialize peer state before any heartbeat can observe LEADER.
         const auto now = std::chrono::steady_clock::now();
         for (auto& peer : peers_) {
@@ -886,8 +789,7 @@ void RaftNode::applyThread() {
             // holding apply_mutex_, so an untimed wait could miss a wakeup. The
             // 100ms cap guarantees the worker re-checks and drains regardless.
             apply_cv_.wait_for(wl, std::chrono::milliseconds(100), [this] {
-                return !apply_running_.load() ||
-                       last_applied_.load() < commit_index_.load();
+                return !apply_running_.load() || last_applied_.load() < commit_index_.load();
             });
         }
 
@@ -906,7 +808,8 @@ void RaftNode::applyThread() {
                     last_applied_.store(from);
                 }
                 const int64_t to = commit_index_.load();
-                if (from >= to) break;  // fully drained
+                if (from >= to)
+                    break;  // fully drained
                 idx = from + 1;
                 const int64_t log_size = static_cast<int64_t>(log_.size());
                 if (idx > log_size) {
@@ -982,8 +885,7 @@ void RaftNode::openPersistence() {
     std::unique_ptr<rocksdb::DB> db_raw;
     auto status = openRocksDb(opts, data_dir_, db_raw);
     if (!status.ok()) {
-        Logger::error("Failed to open Raft persistence at {}: {}", data_dir_,
-                      status.ToString());
+        Logger::error("Failed to open Raft persistence at {}: {}", data_dir_, status.ToString());
         return;
     }
     persist_db_ = std::move(db_raw);
@@ -1011,15 +913,15 @@ void RaftNode::loadPersistedState() {
 
     // Replay log in index order.
     std::lock_guard<std::mutex> lock(log_mutex_);
-    std::unique_ptr<rocksdb::Iterator> it(
-        persist_db_->NewIterator(rocksdb::ReadOptions()));
+    std::unique_ptr<rocksdb::Iterator> it(persist_db_->NewIterator(rocksdb::ReadOptions()));
     for (it->Seek(kLogKeyPrefix); it->Valid(); it->Next()) {
         const std::string key = it->key().ToString();
         if (key.compare(0, std::strlen(kLogKeyPrefix), kLogKeyPrefix) != 0) {
             break;  // iterated past log namespace
         }
         const int64_t idx = decodeLogKey(key);
-        if (idx < 0) continue;
+        if (idx < 0)
+            continue;
         const std::string raw = it->value().ToString();
         std::vector<uint8_t> bytes(raw.begin(), raw.end());
         try {
@@ -1027,18 +929,18 @@ void RaftNode::loadPersistedState() {
             LogEntry entry = LogEntryCodec::decodeFrom(bb);
             log_.push_back(std::move(entry));
         } catch (const std::exception& ex) {
-            Logger::error("Failed to decode persisted log entry at idx={}: {}", idx,
-                          ex.what());
+            Logger::error("Failed to decode persisted log entry at idx={}: {}", idx, ex.what());
         }
     }
     if (!log_.empty()) {
-        Logger::info("Restored {} Raft log entries (last index={}, last term={})",
-                     log_.size(), log_.back().index, log_.back().term);
+        Logger::info("Restored {} Raft log entries (last index={}, last term={})", log_.size(),
+                     log_.back().index, log_.back().term);
     }
 }
 
 void RaftNode::persistTerm() {
-    if (!persist_db_) return;
+    if (!persist_db_)
+        return;
     int64_t v = current_term_.load();
     rocksdb::WriteOptions wo;
     wo.sync = true;
@@ -1047,7 +949,8 @@ void RaftNode::persistTerm() {
 }
 
 void RaftNode::persistVotedFor() {
-    if (!persist_db_) return;
+    if (!persist_db_)
+        return;
     BrokerId v = voted_for_.load();
     rocksdb::WriteOptions wo;
     wo.sync = true;
@@ -1056,25 +959,26 @@ void RaftNode::persistVotedFor() {
 }
 
 void RaftNode::persistLogEntry(const LogEntry& entry) {
-    if (!persist_db_) return;
+    if (!persist_db_)
+        return;
     ByteBuffer bb;
     LogEntryCodec::encodeInto(bb, entry);
     auto encoded = bb.release();
     rocksdb::WriteOptions wo;
     wo.sync = true;
-    persist_db_->Put(
-        wo, encodeLogKey(entry.index),
-        rocksdb::Slice(reinterpret_cast<const char*>(encoded.data()), encoded.size()));
+    persist_db_->Put(wo, encodeLogKey(entry.index),
+                     rocksdb::Slice(reinterpret_cast<const char*>(encoded.data()), encoded.size()));
 }
 
 void RaftNode::truncateLogFrom(int64_t index) {
-    if (!persist_db_) return;
+    if (!persist_db_)
+        return;
     rocksdb::WriteBatch batch;
-    std::unique_ptr<rocksdb::Iterator> it(
-        persist_db_->NewIterator(rocksdb::ReadOptions()));
+    std::unique_ptr<rocksdb::Iterator> it(persist_db_->NewIterator(rocksdb::ReadOptions()));
     for (it->Seek(encodeLogKey(index)); it->Valid(); it->Next()) {
         const std::string key = it->key().ToString();
-        if (key.compare(0, std::strlen(kLogKeyPrefix), kLogKeyPrefix) != 0) break;
+        if (key.compare(0, std::strlen(kLogKeyPrefix), kLogKeyPrefix) != 0)
+            break;
         batch.Delete(key);
     }
     rocksdb::WriteOptions wo;
@@ -1095,16 +999,16 @@ void RaftNode::updateCommitIndex() {
 
     // Find the highest index that's been replicated to a majority
     const int64_t log_size = static_cast<int64_t>(log_.size());
-    
+
     for (int64_t n = log_size; n > commit_index_; --n) {
         // Count how many peers have replicated up to index n
-        int replicas = 1; // Count self
+        int replicas = 1;  // Count self
         for (const auto& peer : peers_) {
             if (peer.match_index >= n) {
                 replicas++;
             }
         }
-        
+
         // If majority have replicated, and the entry is from current term, commit it
         const int majority = static_cast<int>((peers_.size() + 1) / 2 + 1);
         if (replicas >= majority) {

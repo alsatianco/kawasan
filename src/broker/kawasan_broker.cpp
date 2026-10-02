@@ -3710,7 +3710,7 @@ void KawasanBroker::reconcileReplicas() {
 }
 
 void KawasanBroker::maintainLeaderIsr() {
-    if (!metadata_controller_ || !replica_manager_) {
+    if (!metadata_controller_ || !replica_manager_ || !dataPlaneCurrent()) {
         return;
     }
     // Wall-clock millis, matching the timestamp ReplicaManager records on each
