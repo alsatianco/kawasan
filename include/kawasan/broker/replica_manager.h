@@ -106,9 +106,12 @@ public:
     /// On a partition this broker leads, a shrink may advance the high watermark.
     void updateISR(const TopicPartition& tp, const std::vector<BrokerId>& isr);
 
-    /// @brief Gets the log for a partition
-    /// @param tp The topic-partition
-    /// @return Shared pointer to the log, or nullptr if not found
+    /// @brief Include prospective ISR members in the acknowledgement requirement
+    /// before submitting an expansion, until Raft confirms the proposal.
+    bool beginIsrUpdate(const TopicPartition& tp, const std::vector<BrokerId>& proposed,
+                        int32_t leader_epoch);
+
+    /// @brief Gets the log for a partition, or nullptr if not managed.
     std::shared_ptr<storage::Log> getLog(const TopicPartition& tp) const;
 
     /// @brief Gets all managed topic-partitions
@@ -221,10 +224,14 @@ private:
         bool epoch_check_pending = false;
         Offset leadership_read_floor = 0;
         bool watermark_ready = false;
+        std::optional<std::vector<BrokerId>> pending_isr;
 
         // Leader-side tracking of follower states (only used when this broker is leader)
         std::map<BrokerId, FollowerState> follower_states;
     };
+
+    static std::vector<BrokerId> effectiveIsrLocked(ReplicaInfo& info,
+                                                    const std::vector<BrokerId>& authoritative);
 
     /// @brief Computes the ISR-derived high watermark for a replica (caller holds
     /// mutex_). HW = min(leader LEO, min in-sync follower fetch offset). Followers

@@ -544,4 +544,30 @@ TEST_F(ISRManagementTest, PromotionDoesNotExpandIsrAtStaleCheckpointWatermark) {
     EXPECT_EQ(*update, (std::vector<BrokerId>{0, 1, 2}));
 }
 
+TEST_F(ISRManagementTest, PendingIsrExpansionHoldsAcksAcrossStaleReconciliation) {
+    TopicPartition tp{"isr-expansion-barrier", 0};
+    auto log = createTestLog(tp.topic, tp.partition);
+    appendN(log, 10);
+    ASSERT_TRUE(replica_manager_->reconcileReplica(tp, log, 0, {0, 1}, 0));
+    replica_manager_->updateFollowerFetchOffset(tp, 1, 10);
+    replica_manager_->updateFollowerFetchOffset(tp, 2, 10);
+    ASSERT_TRUE(replica_manager_->beginIsrUpdate(tp, {0, 1, 2}, 0));
+    appendN(log, 1);
+    replica_manager_->updateFollowerFetchOffset(tp, 1, 11);
+    EXPECT_EQ(replica_manager_->isrCommittedOffset(tp).value_or(-1), 10);
+    replica_manager_->reconcileReplica(tp, log, 0, {0, 1}, 0);
+    EXPECT_EQ(replica_manager_->isrCommittedOffset(tp).value_or(-1), 10);
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    EXPECT_EQ(replica_manager_->computeIsrUpdate(tp, 1000, now).value_or(std::vector<BrokerId>{}),
+              (std::vector<BrokerId>{0, 1, 2}));
+    replica_manager_->updateFollowerFetchOffset(tp, 2, 11);
+    EXPECT_EQ(replica_manager_->isrCommittedOffset(tp).value_or(-1), 11);
+    replica_manager_->reconcileReplica(tp, log, 0, {0, 1, 2}, 0);
+    EXPECT_FALSE(replica_manager_->computeIsrUpdate(tp, 1000, now).has_value());
+    replica_manager_->reconcileReplica(tp, log, 0, {0, 1}, 1);
+    EXPECT_EQ(replica_manager_->getISR(tp), (std::vector<BrokerId>{0, 1}));
+}
+
 }  // namespace kawasan::broker

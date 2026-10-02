@@ -2205,6 +2205,7 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
         size_t partition_index;
         TopicPartition tp;
         Offset required_offset;  // committed once the ISR has everything before this
+        int32_t leader_epoch;
     };
     std::vector<protocol::ProduceTopicResponse> topic_responses;
     std::vector<PendingAck> pending_acks;
@@ -2316,6 +2317,18 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                     replica_manager_->addReplica(tp, log_ptr);
                 }
 
+                if (!cluster_brokers_.empty()) {
+                    const auto current = currentPartitionMetadata(tp);
+                    if (!current || current->leader != broker_id_ ||
+                        current->leader_epoch != partition_it->leader_epoch) {
+                        partition_response.error_code = ErrorCode::NOT_LEADER_FOR_PARTITION;
+                        topic_response.partitions.push_back(partition_response);
+                        has_error = true;
+                        continue;
+                    }
+                    replica_manager_->updateISR(tp, current->isr);
+                }
+
                 // M4: partition replication state. On a single-node partition the
                 // ISR is {self} (size 1), so both the NOT_ENOUGH_REPLICAS gate and
                 // the HW-decoupling below are no-ops and behavior is byte-identical.
@@ -2355,6 +2368,12 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                                      topic_data.topic, partition_data.partition, batch.producerId(),
                                      batch.producerEpoch(), batch.baseSequence(),
                                      chk.duplicate_offset);
+                        if (acks == -1 && isr_size > 1 && chk.duplicate_offset >= 0) {
+                            pending_acks.push_back(PendingAck{topic_responses.size(),
+                                topic_response.partitions.size(), tp,
+                                chk.duplicate_offset + static_cast<Offset>(batch.records().size()),
+                                partition_it->leader_epoch});
+                        }
                         topic_response.partitions.push_back(partition_response);
                         continue;
                     }
@@ -2428,7 +2447,8 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                     pending_acks.push_back(PendingAck{topic_responses.size(),
                                                       topic_response.partitions.size(), tp,
                                                       base_offset +
-                                                          static_cast<Offset>(record_count)});
+                                                          static_cast<Offset>(record_count),
+                                                      partition_it->leader_epoch});
                 }
             } catch (const StorageException& ex) {
                 Logger::error("Storage error while appending to {}-{}: {}", topic_data.topic,
@@ -2483,11 +2503,25 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
     // this broker lost leadership, and with REQUEST_TIMED_OUT at expiry rather
     // than being falsely acked. Returns true once nothing is pending.
     auto resolve = [this](ProduceState& st, bool expired) -> bool {
-        auto unresolved = std::remove_if(
-            st.pending.begin(), st.pending.end(), [&](const PendingAck& ack) {
+        auto unresolved =
+            std::remove_if(st.pending.begin(), st.pending.end(), [&](const PendingAck& ack) {
                 auto& pr = st.topics[ack.topic_index].partitions[ack.partition_index];
+                auto partition_write_lock = lockPartitionWrites(ack.tp);
+                if (!cluster_brokers_.empty()) {
+                    const auto current = currentPartitionMetadata(ack.tp);
+                    if (!dataPlaneCurrent() || !current || current->leader != broker_id_ ||
+                        current->leader_epoch != ack.leader_epoch) {
+                        pr.error_code = ErrorCode::NOT_LEADER_FOR_PARTITION;
+                        st.has_error = true;
+                        return true;
+                    }
+                    replica_manager_->updateISR(ack.tp, current->isr);
+                }
                 if (!replica_manager_->isLeader(ack.tp)) {
                     pr.error_code = ErrorCode::NOT_LEADER_FOR_PARTITION;
+                } else if (static_cast<int32_t>(replica_manager_->getISR(ack.tp).size()) <
+                           min_insync_replicas_) {
+                    pr.error_code = ErrorCode::NOT_ENOUGH_REPLICAS_AFTER_APPEND;
                 } else if (replica_manager_->isrCommittedOffset(ack.tp).value_or(0) >=
                            ack.required_offset) {
                     return true;
@@ -2822,6 +2856,18 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
                     // Create a non-owning shared_ptr wrapper
                     std::shared_ptr<storage::Log> log_ptr(log, [](storage::Log*) {});
                     replica_manager_->addReplica(tp, log_ptr);
+                }
+
+                auto partition_write_lock = lockPartitionWrites(tp);
+                if (!cluster_brokers_.empty()) {
+                    const auto current = currentPartitionMetadata(tp);
+                    if (!current || current->leader != broker_id_ ||
+                        current->leader_epoch != partition_it->leader_epoch) {
+                        partition_response.error_code = ErrorCode::NOT_LEADER_FOR_PARTITION;
+                        finalize_partition(0);
+                        continue;
+                    }
+                    replica_manager_->updateISR(tp, current->isr);
                 }
 
                 // M4: leader-side follower bookkeeping. The follower's fetch
@@ -3852,6 +3898,10 @@ void KawasanBroker::reconcileReplicas() {
             }
             const TopicPartition tp{tm.name, pm.partition};
             auto partition_write_lock = lockPartitionWrites(tp);
+            const auto current = currentPartitionMetadata(tp);
+            if (!current || current->leader != pm.leader ||
+                current->leader_epoch != pm.leader_epoch || current->isr != pm.isr)
+                continue;  // Do not apply a metadata snapshot taken before this lock.
             auto* log = log_manager_->getOrCreateLog(tm.name, pm.partition);
             if (!log) {
                 continue;
@@ -3895,11 +3945,17 @@ void KawasanBroker::maintainLeaderIsr() {
             if (pm.leader != broker_id_ || pm.replicas.size() <= 1) {
                 continue;
             }
-            auto proposed = replica_manager_->computeIsrUpdate({tm.name, pm.partition},
-                                                               replica_lag_time_max_ms_, now);
+            const TopicPartition tp{tm.name, pm.partition};
+            auto partition_write_lock = lockPartitionWrites(tp);
+            if (!isPartitionLeadership(tp, broker_id_, pm.leader_epoch))
+                continue;
+            auto proposed = replica_manager_->computeIsrUpdate(tp, replica_lag_time_max_ms_, now);
             if (!proposed) {
                 continue;  // ISR already correct
             }
+            if (!replica_manager_->beginIsrUpdate(tp, *proposed, pm.leader_epoch))
+                continue;
+            partition_write_lock.unlock();  // Never hold a data lock across a controller RPC.
             Logger::info("ISR change proposed for {}-{}: {} members -> {} members", tm.name,
                          pm.partition, pm.isr.size(), proposed->size());
 
@@ -3918,6 +3974,20 @@ void KawasanBroker::maintainLeaderIsr() {
             }
         }
     }
+}
+
+std::optional<PartitionMetadata> KawasanBroker::currentPartitionMetadata(
+    const TopicPartition& tp) const {
+    if (!metadata_controller_)
+        return std::nullopt;
+    const auto topics = metadata_controller_->describeTopics({tp.topic});
+    if (topics.empty() || topics.front().error_code != ErrorCode::NONE)
+        return std::nullopt;
+    for (const auto& pm : topics.front().partitions) {
+        if (pm.partition == tp.partition)
+            return pm;
+    }
+    return std::nullopt;
 }
 
 bool KawasanBroker::isPartitionLeadership(const TopicPartition& tp, BrokerId leader,
@@ -3987,8 +4057,8 @@ void KawasanBroker::maintainPartitionLeaders() {
     for (const auto& change : changes) {
         if (change.new_leader) {
             if (*change.new_leader < 0) {
-                Logger::warn("Controller: {}-{} is offline (no live in-sync replica)",
-                             change.topic, change.partition);
+                Logger::warn("Controller: {}-{} is offline (no live in-sync replica)", change.topic,
+                             change.partition);
             } else if (change.unclean) {
                 Logger::error("Controller: UNCLEAN election of broker {} for {}-{} — records "
                               "acknowledged by the lost in-sync replicas may be gone",

@@ -201,10 +201,14 @@ asio::ip::tcp::socket connect(asio::io_context& io, int32_t port) {
 // Sends an acks=all Produce (v3) of one record WITHOUT reading the response, so
 // the caller can do other work on other connections while it is outstanding.
 void sendAcksAllProduce(asio::ip::tcp::socket& socket, const std::string& topic,
-                        const std::string& value, int32_t timeout_ms, int32_t corr) {
+                        const std::string& value, int32_t timeout_ms, int32_t corr,
+                        int64_t producer_id = -1, int32_t sequence = -1) {
     kawasan::storage::RecordBatch batch;
     batch.setMagic(2);
     batch.setFirstTimestamp(0);
+    batch.setProducerId(producer_id);
+    batch.setProducerEpoch(producer_id >= 0 ? 0 : -1);
+    batch.setBaseSequence(sequence);
     kawasan::Record record;
     record.timestamp = 0;
     record.value = std::vector<uint8_t>(value.begin(), value.end());
@@ -350,13 +354,14 @@ namespace {
 // not fetched yet, so an acks=all produce must wait for replication.
 struct ParkedProduceFixture {
     std::string log_dir = makeLogDir();
-    kawasan::broker::KawasanBroker broker{makeConfig(log_dir, /*min_insync=*/1)};
+    kawasan::broker::KawasanBroker broker;
     asio::io_context io;
     std::unique_ptr<asio::ip::tcp::socket> admin;
     const std::string topic;
     const kawasan::TopicPartition tp;
 
-    explicit ParkedProduceFixture(std::string name) : topic(std::move(name)), tp{topic, 0} {
+    explicit ParkedProduceFixture(std::string name, int min_insync = 1)
+        : broker(makeConfig(log_dir, min_insync)), topic(std::move(name)), tp{topic, 0} {
         ensureLogger();
         broker.start();
         admin = std::make_unique<asio::ip::tcp::socket>(connect(io, broker.port()));
@@ -443,4 +448,27 @@ TEST(ReplicaFetchTest, AcksAllParkedCompletesWhenIsrShrinks) {
     EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(2));
     EXPECT_EQ(f.broker.replicaManager()->getHighWatermark(f.tp).value_or(-1), 2);
     producer.close();
+}
+
+TEST(ReplicaFetchTest, ParkedProduceFailsWhenIsrShrinksBelowMinimumAfterAppend) {
+    ParkedProduceFixture f("min-isr-after-append", 2);
+    auto producer = connect(f.io, f.broker.port());
+    sendAcksAllProduce(producer, f.topic, "unreplicated", 5000, 50);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    f.broker.replicaManager()->updateISR(f.tp, {kBrokerId});
+    EXPECT_EQ(readProduceError(producer), kawasan::ErrorCode::NOT_ENOUGH_REPLICAS_AFTER_APPEND);
+}
+
+TEST(ReplicaFetchTest, IdempotentRetryWaitsForReplicationBeforeAcknowledgement) {
+    ParkedProduceFixture f("duplicate-replication");
+    auto producer = connect(f.io, f.broker.port());
+    sendAcksAllProduce(producer, f.topic, "retry", 500, 60, 71, 0);
+    EXPECT_EQ(readProduceError(producer), kawasan::ErrorCode::REQUEST_TIMED_OUT);
+    sendAcksAllProduce(producer, f.topic, "retry", 5000, 61, 71, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(producer.available(), 0u);
+    auto follower = connect(f.io, f.broker.port());
+    EXPECT_EQ(fetchAs(follower, f.topic, kFollowerId, 2, 62).error, kawasan::ErrorCode::NONE);
+    EXPECT_EQ(readProduceError(producer), kawasan::ErrorCode::NONE);
+    EXPECT_EQ(f.broker.replicaManager()->getLog(f.tp)->logEndOffset(), 2);
 }

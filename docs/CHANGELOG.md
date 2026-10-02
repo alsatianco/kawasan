@@ -12,6 +12,8 @@ Single-node durability, security and quotas; durable single-node transactions (M
 
 ### Fixed
 
+- Hold acknowledgements on prospective ISR members before submitting expansion, retaining the barrier across stale metadata polls and ambiguous controller RPCs. Data handlers refresh the committed ISR under the partition lock; deferred acknowledgements recheck metadata ownership/epoch and minISR, including idempotent retries. Shrinking below minISR after append returns `NOT_ENOUGH_REPLICAS_AFTER_APPEND` instead of success.
+
 - Defer consumer Fetch and ListOffsets while a new leader confirms its inherited log tail with the current ISR, preventing stale follower/checkpoint high watermarks from appearing as regressing committed offsets. Replica Fetch remains available to complete recovery; the M9 observer now fails immediately on an I3 regression.
 
 - Check the exact acknowledged offsets and payloads of fully visible transactions even when their commit result is ambiguous; all-or-nothing visibility alone cannot validate their data.

@@ -207,12 +207,49 @@ void ReplicaManager::updateISR(const TopicPartition& tp, const std::vector<Broke
         return;
     }
 
-    it->second.isr = isr;
+    it->second.isr = effectiveIsrLocked(it->second, isr);
     spdlog::debug("Updated ISR for {}-{}, new ISR size={}", tp.topic, tp.partition, isr.size());
     if (it->second.leader == local_broker_id_) {
         // An ISR shrink can commit records the dropped replica was holding back.
         maybeAdvanceHighWatermarkLocked(it->second);
     }
+}
+
+std::vector<BrokerId> ReplicaManager::effectiveIsrLocked(
+    ReplicaInfo& info, const std::vector<BrokerId>& authoritative) {
+    if (!info.pending_isr)
+        return authoritative;
+    std::set<BrokerId> members(authoritative.begin(), authoritative.end());
+    if (info.pending_isr) {
+        const std::set<BrokerId> pending(info.pending_isr->begin(), info.pending_isr->end());
+        if (members == pending) {
+            info.pending_isr.reset();
+            return authoritative;
+        } else
+            members.insert(pending.begin(), pending.end());
+    }
+    return {members.begin(), members.end()};
+}
+
+bool ReplicaManager::beginIsrUpdate(const TopicPartition& tp, const std::vector<BrokerId>& proposed,
+                                    int32_t leader_epoch) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = replicas_.find(tp);
+    if (it == replicas_.end() || it->second.leader != local_broker_id_ ||
+        it->second.leader_epoch != leader_epoch)
+        return false;
+    auto& info = it->second;
+    if (info.pending_isr)
+        return proposed == *info.pending_isr;
+    std::set<BrokerId> effective(info.isr.begin(), info.isr.end());
+    const bool expanding = std::any_of(proposed.begin(), proposed.end(),
+                                       [&](BrokerId id) { return !effective.count(id); });
+    if (expanding) {
+        info.pending_isr = proposed;
+        effective.insert(proposed.begin(), proposed.end());
+        info.isr.assign(effective.begin(), effective.end());
+    }
+    return true;  // Shrinks wait for committed metadata; never pre-shrink locally.
 }
 
 std::shared_ptr<storage::Log> ReplicaManager::getLog(const TopicPartition& tp) const {
@@ -590,6 +627,7 @@ bool ReplicaManager::reconcileReplica(const TopicPartition& tp, std::shared_ptr<
     if (was_leader != is_leader || (is_leader && leader_epoch != info.leader_epoch)) {
         // Follower progress was reported against an earlier leadership.
         info.follower_states.clear();
+        info.pending_isr.reset();
         info.leadership_read_floor = info.log->logEndOffset();
         info.watermark_ready = false;
     }
@@ -600,7 +638,7 @@ bool ReplicaManager::reconcileReplica(const TopicPartition& tp, std::shared_ptr<
         info.log->assignLeaderEpochStart(leader_epoch, info.log->logEndOffset());
     }
     info.leader = leader;
-    info.isr = isr;
+    info.isr = effectiveIsrLocked(info, isr);
     info.leader_epoch = leader_epoch;
     if (changed && is_leader) {
         // An ISR shrink can commit records the dropped replica was holding back.
@@ -627,6 +665,8 @@ std::optional<std::vector<BrokerId>> ReplicaManager::computeIsrUpdate(const Topi
         return std::nullopt;  // not managed, or we do not lead this partition
     }
     const auto& info = it->second;
+    if (info.pending_isr)
+        return info.pending_isr; // An ambiguous RPC retries the same expansion safely.
     const Offset hw =
         info.log ? std::max(info.log->highWatermark(), info.leadership_read_floor) : 0;
 
