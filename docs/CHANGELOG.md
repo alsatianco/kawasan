@@ -10,6 +10,10 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 Single-node durability, security and quotas; durable single-node transactions (M1–M3); and multi-broker replication, automatic clean leader failover, fencing, epoch-based divergence recovery, and coordinator routing (M4–M8). Single-node remains the primary supported mode. Multi-broker remains experimental pending randomized-fault validation and durable coordinator failover.
 
+### Fixed
+
+- OffsetFetch reads durable group offsets even without JoinGroup membership, including after restart. M9 transaction checks exposed that manual consumers could commit offsets successfully yet read the unset sentinel.
+
 ### Added
 
 - M9 subprocess SIGKILL regression proves exact acknowledged record recovery, idempotent producer sequence replay/deduplication, and durable transactional producer epochs without graceful shutdown.

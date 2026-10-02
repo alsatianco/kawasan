@@ -516,14 +516,12 @@ GroupCoordinator::handleOffsetCommit(const protocol::OffsetCommitRequest& reques
     return topics;
 }
 
-std::vector<protocol::OffsetFetchResponse::Topic>
-GroupCoordinator::handleOffsetFetch(const protocol::OffsetFetchRequest& request,
-                                    ErrorCode& overall_error) const {
+std::vector<protocol::OffsetFetchResponse::Topic> GroupCoordinator::handleOffsetFetch(
+    const protocol::OffsetFetchRequest& request, ErrorCode& overall_error) const {
     std::vector<protocol::OffsetFetchResponse::Topic> topics;
     overall_error = ErrorCode::NONE;
 
     std::lock_guard<std::mutex> lock(mutex_);
-    const GroupState* group = findGroup(request.groupId());
 
     for (const auto& topic_request : request.topics()) {
         protocol::OffsetFetchResponse::Topic topic_response;
@@ -540,27 +538,14 @@ GroupCoordinator::handleOffsetFetch(const protocol::OffsetFetchRequest& request,
             partition_response.metadata = "";
             partition_response.error = ErrorCode::NONE;
 
-            if (group) {
-                // Fetch offset from OffsetManager (persistent storage)
-                auto offset_metadata = offset_manager_->fetchOffsetWithMetadata(
-                    request.groupId(),
-                    topic_request.topic,
-                    partition_request.partition
-                );
-
-                if (offset_metadata.has_value()) {
-                    partition_response.offset = offset_metadata->offset;
-                    partition_response.metadata = offset_metadata->metadata;
-                    Logger::info("OffsetFetch: group='{}' topic='{}' partition={} -> offset={} (FOUND in persistent storage)",
-                                 request.groupId(), topic_request.topic, partition_request.partition,
-                                 partition_response.offset);
-                } else {
-                    Logger::info("OffsetFetch: group='{}' topic='{}' partition={} -> offset=-1 (NOT FOUND, returning Kafka unset sentinel)",
-                                 request.groupId(), topic_request.topic, partition_request.partition);
-                }
-            } else {
-                Logger::info("OffsetFetch: group='{}' NOT FOUND, topic='{}' partition={} -> returning offset=-1",
-                             request.groupId(), topic_request.topic, partition_request.partition);
+            // Manual/transactional consumers need no JoinGroup membership.
+            // OffsetManager is the durable source of truth, including after
+            // restart when no in-memory group has been reconstructed.
+            auto offset_metadata = offset_manager_->fetchOffsetWithMetadata(
+                request.groupId(), topic_request.topic, partition_request.partition);
+            if (offset_metadata.has_value()) {
+                partition_response.offset = offset_metadata->offset;
+                partition_response.metadata = offset_metadata->metadata;
             }
 
             topic_response.partitions.push_back(std::move(partition_response));
@@ -572,8 +557,7 @@ GroupCoordinator::handleOffsetFetch(const protocol::OffsetFetchRequest& request,
     return topics;
 }
 
-GroupCoordinator::GroupState* GroupCoordinator::findGroup(
-    const std::string& group_id) {
+GroupCoordinator::GroupState* GroupCoordinator::findGroup(const std::string& group_id) {
     auto it = groups_.find(group_id);
     if (it == groups_.end()) {
         return nullptr;

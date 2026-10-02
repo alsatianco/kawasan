@@ -198,3 +198,25 @@ TEST_F(GroupCoordinatorTest, JoiningDuringSyncRejectsAnIncompleteAssignment) {
     EXPECT_EQ(follower.error, ErrorCode::NONE);
     EXPECT_EQ(follower.assignment, (std::vector<uint8_t>{0xBB}));
 }
+
+// M9 I4 finding: transactional/manual consumers can commit offsets without
+// JoinGroup. Durable offsets must remain fetchable without an in-memory group.
+TEST_F(GroupCoordinatorTest, FetchesDurableOffsetsWithoutGroupMembershipAfterRestart) {
+    offset_mgr_->commitOffset("manual-txn-group", "input", 0, 7, "txn-checkpoint");
+    coordinator_.reset();
+    offset_mgr_.reset();
+    offset_mgr_ = std::make_shared<OffsetManager>(db_path_);
+    coordinator_ = std::make_unique<GroupCoordinator>(offset_mgr_);
+
+    protocol::OffsetFetchRequest request;
+    request.setGroupId("manual-txn-group");
+    request.setTopics({{"input", {{0}, {1}}}});
+    ErrorCode error = ErrorCode::NONE;
+    auto result = coordinator_->handleOffsetFetch(request, error);
+    ASSERT_EQ(error, ErrorCode::NONE);
+    ASSERT_EQ(result.size(), 1u);
+    ASSERT_EQ(result[0].partitions.size(), 2u);
+    EXPECT_EQ(result[0].partitions[0].offset, 7);
+    EXPECT_EQ(result[0].partitions[0].metadata, "txn-checkpoint");
+    EXPECT_EQ(result[0].partitions[1].offset, -1);
+}

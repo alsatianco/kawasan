@@ -6,6 +6,8 @@ The single-node broker is the primary supported mode. Multi-broker replication i
 
 This document explains how the system is structured and how the pieces fit together. For installing, configuring, and operating a broker see [./OPERATIONS.md](./OPERATIONS.md) and [./CONFIGURATION.md](./CONFIGURATION.md); for the full set of supported protocol APIs see [./api_coverage_matrix.md](./api_coverage_matrix.md).
 
+Manual assignment and transactional offset commits do not require an in-memory joined group. OffsetFetch reads the persistent OffsetManager directly; a genuinely uncommitted partition returns -1, including after restart.
+
 ## Contents
 
 - [System overview](#system-overview)
