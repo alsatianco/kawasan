@@ -271,7 +271,15 @@ AppendEntriesResponse RaftNode::handleAppendEntries(const AppendEntriesRequest& 
     // Reset election timeout on valid heartbeat
     resetElectionTimeout();
     leader_id_ = request.leader_id;
-    last_leader_contact_ = std::chrono::steady_clock::now();
+    {
+        // M8-E1: after a gap in leader contact (frozen, partitioned) our applied
+        // metadata may be stale; count as current again only once caught up.
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_leader_contact_ > kCatchUpAfterContactGap) {
+            first_leader_commit_ = -1;
+        }
+        last_leader_contact_ = now;
+    }
 
     // If we're a candidate, revert to follower
     if (state_ == NodeState::CANDIDATE) {
@@ -593,11 +601,12 @@ void RaftNode::startElection() {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     
     for (auto& future : responses) {
-        const auto remaining = deadline - std::chrono::steady_clock::now();
-        if (remaining <= std::chrono::milliseconds(0)) {
-            break;
-        }
-        
+        // Past the deadline, still take every vote that has already arrived: a
+        // slow or frozen peer earlier in the list must not hide a live peer's
+        // granted vote (that stalled elections forever).
+        using Duration = std::chrono::steady_clock::duration;
+        const auto remaining =
+            std::max<Duration>(deadline - std::chrono::steady_clock::now(), Duration::zero());
         if (future.wait_for(remaining) == std::future_status::ready) {
             try {
                 auto response = future.get();
@@ -691,8 +700,12 @@ void RaftNode::sendHeartbeats() {
     // apply each under a freshly-acquired lock.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
     for (auto& [peer_id, fut] : futures) {
-        const auto remaining = deadline - std::chrono::steady_clock::now();
-        if (remaining <= std::chrono::milliseconds(0)) break;
+        // Past the deadline, still process every response that has already
+        // arrived (see startElection): a frozen peer first in the list must not
+        // hide live followers' acks.
+        using Duration = std::chrono::steady_clock::duration;
+        const auto remaining =
+            std::max<Duration>(deadline - std::chrono::steady_clock::now(), Duration::zero());
         if (fut.wait_for(remaining) != std::future_status::ready) continue;
 
         raft::AppendEntriesResponse response;
@@ -742,6 +755,7 @@ void RaftNode::sendHeartbeats() {
 void RaftNode::becomeFollower(int64_t term) {
     current_term_ = term;
     state_ = NodeState::FOLLOWER;
+    first_leader_commit_ = -1;  // M8-E1: catch up with the new leadership first
     voted_for_ = -1;
     leader_id_ = -1;
     // 0A.7: persist BOTH fields together — Raft safety requires that on

@@ -69,6 +69,9 @@ struct Cluster {
             }
             ios.push_back(std::make_unique<NodeIo>());
             nodes.push_back(std::make_unique<RaftNode>(id, peers, ios.back()->io, ports[id], ""));
+            // A real broker always has its metadata state machine attached;
+            // without one nothing is applied and no follower is ever current.
+            nodes.back()->setCommitCallback([](const LogEntry&) {});
         }
         for (auto& node : nodes) {
             node->start();
@@ -290,6 +293,173 @@ TEST(RaftLivenessTest, UnresponsivePeerNeitherHangsRpcsNorBlocksServing) {
     b_io.stop();
     a_thread.join();
     b_thread.join();
+    hole.close();
+    hole_io.stop();
+    hole_thread.join();
+}
+
+// Regression (M8 divergence nemesis): RPCs queued to a frozen peer must not
+// starve RPCs to live peers. With a shared client pool, a heartbeat backlog to
+// the frozen peer occupied every thread and elections never converged.
+TEST(RaftLivenessTest, FrozenPeerBacklogDoesNotDelayOtherPeers) {
+    boost::asio::io_context hole_io;
+    boost::asio::ip::tcp::acceptor hole(
+        hole_io, boost::asio::ip::tcp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 0));
+    boost::asio::ip::tcp::socket held(hole_io);
+    std::thread hole_thread([&] {
+        boost::system::error_code ec;
+        hole.accept(held, ec);
+    });
+
+    NodeIo live_io;
+    const int live_port = freePort();
+    RaftTransport live(live_io.io, 2);
+    live.setRequestVoteHandler([](const RequestVoteRequest& req) {
+        RequestVoteResponse resp;
+        resp.term = req.term;
+        resp.vote_granted = true;
+        return resp;
+    });
+    live.start(live_port);
+
+    NodeIo a_io;
+    RaftTransport a(a_io.io, 1);
+    a.start(freePort());
+    a.add_peer(9, "127.0.0.1", hole.local_endpoint().port());
+    a.add_peer(2, "127.0.0.1", live_port);
+
+    RequestVoteRequest req;
+    req.term = 3;
+    req.candidate_id = 1;
+    std::vector<std::future<RequestVoteResponse>> backlog;
+    for (int i = 0; i < 20; ++i) {
+        backlog.push_back(a.sendRequestVote(9, req));
+    }
+    const auto start = std::chrono::steady_clock::now();
+    auto vote = a.sendRequestVote(2, req);
+    ASSERT_EQ(vote.wait_for(500ms), std::future_status::ready);
+    EXPECT_TRUE(vote.get().vote_granted);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, 500ms);
+
+    a.stop();
+    live.stop();
+    hole.close();
+    hole_io.stop();
+    hole_thread.join();
+}
+
+// Regression (M8 divergence nemesis): a follower that was cut off (frozen,
+// partitioned) must re-catch-up before it counts as current again. Merely
+// hearing from the leader is not enough: its applied metadata may still name
+// it the leader of partitions that have since failed over.
+TEST(RaftLivenessTest, FollowerMustCatchUpAgainAfterAContactGap) {
+    boost::asio::io_context io;
+    RaftNode node(1, {PeerInfo{2, "127.0.0.1", 1}}, io, 0, "");
+    std::atomic<bool> release_second{false};
+    std::atomic<int64_t> applied{0};
+    node.setCommitCallback([&](const LogEntry& entry) {
+        while (entry.index == 2 && !release_second.load()) {
+            std::this_thread::sleep_for(5ms);
+        }
+        applied.store(entry.index);
+    });
+    node.start();
+
+    // High terms: the started node campaigns on its own (its only peer is
+    // unreachable) and keeps raising its term.
+    auto entry = [](int64_t index, int64_t term) {
+        LogEntry e;
+        e.term = term;
+        e.index = index;
+        e.command_type = "metadata";
+        return e;
+    };
+    AppendEntriesRequest first;
+    first.term = 1000;
+    first.leader_id = 2;
+    first.prev_log_index = 0;
+    first.prev_log_term = 0;
+    first.entries = {entry(1, 1000)};
+    first.leader_commit = 1;
+    ASSERT_TRUE(node.handleAppendEntries(first).success);
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (applied.load() < 1 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(5ms);
+    }
+    EXPECT_TRUE(node.hasCurrentMetadata(5000));
+
+    std::this_thread::sleep_for(1200ms);  // cut off from the leader
+    AppendEntriesRequest second;
+    second.term = 2000;
+    second.leader_id = 2;
+    second.prev_log_index = 1;
+    second.prev_log_term = 1000;
+    second.entries = {entry(2, 2000)};
+    second.leader_commit = 2;
+    ASSERT_TRUE(node.handleAppendEntries(second).success);
+    // Contact is fresh (well within the lease), but entry 2 is not applied yet.
+    EXPECT_FALSE(node.hasCurrentMetadata(5000));
+    release_second.store(true);
+    while (applied.load() < 2 && std::chrono::steady_clock::now() < deadline + 2s) {
+        std::this_thread::sleep_for(5ms);
+    }
+    AppendEntriesRequest heartbeat = second;  // keep it a follower for the check
+    heartbeat.prev_log_index = 2;
+    heartbeat.prev_log_term = 2000;
+    heartbeat.entries.clear();
+    ASSERT_TRUE(node.handleAppendEntries(heartbeat).success);
+    EXPECT_TRUE(node.hasCurrentMetadata(5000));
+    node.stop();
+}
+
+// Regression (M8 divergence nemesis): with a frozen peer FIRST in the peer
+// list, its pending vote/heartbeat future consumed the whole response window
+// and the loop gave up before looking at the live peer's (already granted)
+// vote — two live nodes out of three never elected a leader.
+TEST(RaftLivenessTest, FrozenFirstPeerDoesNotBlockElection) {
+    boost::asio::io_context hole_io;
+    boost::asio::ip::tcp::acceptor hole(
+        hole_io, boost::asio::ip::tcp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 0));
+    std::vector<std::unique_ptr<boost::asio::ip::tcp::socket>> held;
+    std::atomic<bool> accepting{true};
+    std::thread hole_thread([&] {
+        while (accepting.load()) {
+            auto sock = std::make_unique<boost::asio::ip::tcp::socket>(hole_io);
+            boost::system::error_code ec;
+            hole.accept(*sock, ec);
+            if (ec) {
+                break;
+            }
+            held.push_back(std::move(sock));  // never read, never answer
+        }
+    });
+    const int hole_port = hole.local_endpoint().port();
+
+    std::vector<int> ports{freePort(), freePort()};  // brokers 1 and 2
+    std::vector<std::unique_ptr<NodeIo>> ios;
+    std::vector<std::unique_ptr<RaftNode>> nodes;
+    for (int i = 0; i < 2; ++i) {
+        const int id = i + 1;
+        std::vector<PeerInfo> peers{PeerInfo{0, "127.0.0.1", hole_port}};  // frozen, first
+        peers.push_back(PeerInfo{3 - id, "127.0.0.1", ports[(3 - id) - 1]});
+        ios.push_back(std::make_unique<NodeIo>());
+        nodes.push_back(std::make_unique<RaftNode>(id, peers, ios.back()->io, ports[i], ""));
+        nodes.back()->setCommitCallback([](const LogEntry&) {});
+        nodes.back()->start();
+    }
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    bool elected = false;
+    while (!elected && std::chrono::steady_clock::now() < deadline) {
+        elected = nodes[0]->isLeader() || nodes[1]->isLeader();
+        std::this_thread::sleep_for(20ms);
+    }
+    EXPECT_TRUE(elected);
+    for (auto& n : nodes) {
+        n->stop();
+    }
+    nodes.clear();
+    ios.clear();
+    accepting.store(false);
     hole.close();
     hole_io.stop();
     hole_thread.join();

@@ -22,24 +22,28 @@ RaftTransport::RaftTransport(boost::asio::io_context& io_context, int local_peer
     : io_context_(io_context)
     , local_peer_id_(local_peer_id)
     , running_(false)
-    , listen_port_(0)
-    , client_guard_(boost::asio::make_work_guard(client_io_)) {
-    for (int i = 0; i < kClientThreads; ++i) {
-        client_threads_.emplace_back([this] { client_io_.run(); });
-    }
+    , listen_port_(0) {
     spdlog::info("RaftTransport created for peer {}", local_peer_id_);
 }
 
 RaftTransport::~RaftTransport() {
     stop();
-    client_guard_.reset();
-    client_io_.stop();
-    for (auto& t : client_threads_) {
-        if (t.joinable()) {
-            t.join();
+    std::map<int, std::unique_ptr<PeerWorker>> workers;
+    {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        workers.swap(peer_workers_);
+    }
+    for (auto& [id, worker] : workers) {
+        worker->guard.reset();
+        worker->io.stop();
+        if (worker->thread.joinable()) {
+            worker->thread.join();
         }
     }
 }
+
+RaftTransport::PeerWorker::PeerWorker()
+    : guard(boost::asio::make_work_guard(io)), thread([this] { io.run(); }) {}
 
 void RaftTransport::start(int port) {
     std::lock_guard<std::mutex> lock(peers_mutex_);
@@ -140,6 +144,9 @@ void RaftTransport::add_peer(int peer_id, const std::string& host, int port) {
     peer.retry_count = 0;
     
     peers_[peer_id] = peer;
+    if (!peer_workers_.count(peer_id)) {
+        peer_workers_[peer_id] = std::make_unique<PeerWorker>();
+    }
     spdlog::info("Added peer {} at {}:{}", peer_id, host, port);
 }
 
@@ -203,7 +210,7 @@ std::vector<uint8_t> RaftTransport::roundTrip(int peer_id, const std::vector<uin
                                      std::to_string(peer_id) + " expired before sending");
         }
         try {
-            auto socket = get_connection(peer_id);
+            auto socket = get_connection(peer_id, deadline);
             transferWithDeadline(*socket, true, message.data(), message.size(), deadline);
             uint8_t length_buf[4];
             transferWithDeadline(*socket, false, length_buf, 4, deadline);
@@ -245,10 +252,24 @@ std::future<Response> RaftTransport::sendRpc(int peer_id, std::vector<uint8_t> r
     auto promise = std::make_shared<std::promise<Response>>();
     auto future = promise->get_future();
     const auto enqueued = Clock::now();
-    // Client RPCs never run on the io_context that serves incoming RPCs: two
+    // Client RPCs never run on the io_context that serves incoming RPCs (two
     // nodes calling each other at once would otherwise both block in a read
-    // with no thread left to answer the other.
-    boost::asio::post(client_io_, [this, peer_id, request = std::move(request), timeout,
+    // with no thread left to answer the other), and each peer has its own
+    // thread, so a frozen peer only delays RPCs to itself.
+    boost::asio::io_context* worker_io = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        auto it = peer_workers_.find(peer_id);
+        if (it != peer_workers_.end()) {
+            worker_io = &it->second->io;
+        }
+    }
+    if (worker_io == nullptr) {
+        promise->set_exception(std::make_exception_ptr(
+            std::invalid_argument("Unknown peer ID: " + std::to_string(peer_id))));
+        return future;
+    }
+    boost::asio::post(*worker_io, [this, peer_id, request = std::move(request), timeout,
                                    rpc_name, decode, promise, enqueued]() {
         try {
             promise->set_value(decode(roundTrip(peer_id, request, timeout, enqueued, rpc_name)));
@@ -349,94 +370,61 @@ void RaftTransport::registerSession(std::shared_ptr<Session> session) {
     active_sessions_.push_back(session);
 }
 
-std::shared_ptr<tcp::socket> RaftTransport::get_connection(int peer_id) {
+std::shared_ptr<tcp::socket> RaftTransport::get_connection(
+    int peer_id, std::chrono::steady_clock::time_point deadline) {
+    std::string host;
+    int port = 0;
+    {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        auto it = peers_.find(peer_id);
+        if (it == peers_.end()) {
+            throw std::invalid_argument("Unknown peer ID: " + std::to_string(peer_id));
+        }
+        PeerInfo& peer = it->second;
+        if (peer.socket && peer.socket->is_open() && peer.connected) {
+            return peer.socket;
+        }
+        if (peer.retry_count > 0 &&
+            std::chrono::steady_clock::now() <
+                peer.last_retry + calculate_backoff(peer.retry_count)) {
+            throw std::runtime_error("Backing off before reconnecting to peer " +
+                                     std::to_string(peer_id));
+        }
+        host = peer.host;
+        port = peer.port;
+    }
+
+    // Connect WITHOUT holding peers_mutex_ (every RPC to every peer needs it)
+    // and never past the RPC deadline.
+    auto socket = std::make_shared<tcp::socket>(io_context_);
+    try {
+        connectWithDeadline(*socket, host, port, deadline);
+    } catch (const std::exception& e) {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        auto it = peers_.find(peer_id);
+        if (it != peers_.end()) {
+            it->second.retry_count++;
+            it->second.last_retry = std::chrono::steady_clock::now();
+            it->second.connected = false;
+        }
+        spdlog::debug("Failed to connect to peer {} at {}:{}: {}", peer_id, host, port, e.what());
+        throw std::runtime_error("Failed to connect to peer " + std::to_string(peer_id));
+    }
+
     std::lock_guard<std::mutex> lock(peers_mutex_);
-    
     auto it = peers_.find(peer_id);
     if (it == peers_.end()) {
         throw std::invalid_argument("Unknown peer ID: " + std::to_string(peer_id));
     }
-    
-    PeerInfo& peer = it->second;
-    
-    // Check if existing connection is valid
-    if (peer.socket && peer.socket->is_open() && peer.connected) {
-        return peer.socket;
-    }
-    
-    // Need to connect
-    if (!connect_to_peer(peer_id, peer)) {
-        throw std::runtime_error("Failed to connect to peer " + std::to_string(peer_id));
-    }
-    
-    return peer.socket;
-}
-
-bool RaftTransport::connect_to_peer(int peer_id, PeerInfo& peer) {
-    // Check if we need backoff
-    if (peer.retry_count > 0) {
-        auto now = std::chrono::steady_clock::now();
-        auto backoff = calculate_backoff(peer.retry_count);
-        auto next_retry = peer.last_retry + backoff;
-        
-        if (now < next_retry) {
-            auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                next_retry - now).count();
-            spdlog::debug("Backing off {} ms before retry to peer {}", wait_ms, peer_id);
-            return false;
-        }
-    }
-    
-    try {
-        // Close existing socket if any
-        if (peer.socket) {
-            boost::system::error_code ec;
-            peer.socket->close(ec);
-        }
-        
-        // Create new socket
-        peer.socket = std::make_shared<tcp::socket>(io_context_);
-        
-        // Resolve endpoint
-        tcp::resolver resolver(io_context_);
-        auto endpoints = resolver.resolve(peer.host, std::to_string(peer.port));
-        
-        // Connect synchronously (could be made async in future)
+    if (it->second.socket) {
         boost::system::error_code ec;
-        boost::asio::connect(*peer.socket, endpoints, ec);
-        
-        if (ec) {
-            spdlog::warn("Failed to connect to peer {} at {}:{}: {}",
-                peer_id, peer.host, peer.port, ec.message());
-            
-            peer.retry_count++;
-            peer.last_retry = std::chrono::steady_clock::now();
-            peer.connected = false;
-            return false;
-        }
-        
-        // Client RPCs drive this socket with poll()-bounded non-blocking IO.
-        peer.socket->non_blocking(true, ec);
-        if (ec) {
-            spdlog::warn("Failed to make socket to peer {} non-blocking: {}", peer_id,
-                         ec.message());
-            peer.connected = false;
-            return false;
-        }
-
-        // Success
-        peer.connected = true;
-        peer.retry_count = 0;
-        spdlog::info("Connected to peer {} at {}:{}", peer_id, peer.host, peer.port);
-        return true;
-        
-    } catch (const std::exception& e) {
-        spdlog::error("Exception connecting to peer {}: {}", peer_id, e.what());
-        peer.retry_count++;
-        peer.last_retry = std::chrono::steady_clock::now();
-        peer.connected = false;
-        return false;
+        it->second.socket->close(ec);
     }
+    it->second.socket = socket;
+    it->second.connected = true;
+    it->second.retry_count = 0;
+    spdlog::info("Connected to peer {} at {}:{}", peer_id, host, port);
+    return socket;
 }
 
 std::chrono::milliseconds RaftTransport::calculate_backoff(int retry_count) {

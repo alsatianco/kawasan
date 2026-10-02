@@ -139,8 +139,9 @@ public:
     /// @brief M8-E1: whether this node's applied state machine is provably
     /// current, so it may serve data-plane requests from it. A leader needs a
     /// quorum (incl. itself) of peers that acked within `lease_ms`; a follower
-    /// must have applied up to the commit index a leader reported after this
-    /// process started, and have heard from a leader within `lease_ms`. A
+    /// must have applied up to the commit index a leader reported when contact
+    /// was (re)established — at start, after stepping down, or after a gap of
+    /// over 1 s — and have heard from a leader within `lease_ms`. A
     /// candidate is never current. Single-node (no peers) is always current
     /// once leader.
     bool hasCurrentMetadata(int64_t lease_ms) const;
@@ -193,6 +194,7 @@ private:
     // the leader_commit of the first successful one since start (-1 = none).
     std::chrono::steady_clock::time_point last_leader_contact_{};
     int64_t first_leader_commit_ = -1;
+    static constexpr std::chrono::milliseconds kCatchUpAfterContactGap{1000};
     std::chrono::milliseconds election_timeout_{150};
     std::chrono::milliseconds heartbeat_interval_{50};
 

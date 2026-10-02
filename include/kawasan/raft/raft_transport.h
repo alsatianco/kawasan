@@ -211,11 +211,10 @@ private:
     // Accept new incoming connections
     void do_accept();
     
-    // Get or create connection to peer
-    std::shared_ptr<boost::asio::ip::tcp::socket> get_connection(int peer_id);
-    
-    // Connect to a peer with retry logic
-    bool connect_to_peer(int peer_id, PeerInfo& peer);
+    // Get or create (bounded by `deadline`, outside peers_mutex_) the
+    // connection to a peer; honors the reconnect backoff.
+    std::shared_ptr<boost::asio::ip::tcp::socket> get_connection(
+        int peer_id, std::chrono::steady_clock::time_point deadline);
     
     // Calculate backoff delay based on retry count
     std::chrono::milliseconds calculate_backoff(int retry_count);
@@ -250,8 +249,8 @@ private:
     // existing field pair stable (see setInstallSnapshotHandler note).
     std::unique_ptr<InstallSnapshotHandler> install_snapshot_handler_;
 
-    // Client side: outgoing RPCs run on this private pool (never on the shared
-    // io_context that serves incoming RPCs), each bounded by a deadline.
+    // Client side: outgoing RPCs run on per-peer worker threads (never on the
+    // shared io_context that serves incoming RPCs), each bounded by a deadline.
     std::vector<uint8_t> roundTrip(int peer_id, const std::vector<uint8_t>& request,
                                    std::chrono::milliseconds timeout,
                                    std::chrono::steady_clock::time_point enqueued,
@@ -260,13 +259,17 @@ private:
     std::future<Response> sendRpc(int peer_id, std::vector<uint8_t> request,
                                   std::chrono::milliseconds timeout, const char* rpc_name,
                                   Decode decode);
-    boost::asio::io_context client_io_;
-    std::optional<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>>
-        client_guard_;
-    std::vector<std::thread> client_threads_;
+    // One thread per peer runs that peer's outgoing RPCs in order.
+    struct PeerWorker {
+        PeerWorker();
+        boost::asio::io_context io;
+        std::optional<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>>
+            guard;
+        std::thread thread;
+    };
+    std::map<int, std::unique_ptr<PeerWorker>> peer_workers_;  // guarded by peers_mutex_
 
     // Configuration
-    static constexpr int kClientThreads = 4;
     static constexpr std::chrono::milliseconds kRpcTimeout{1000};
     static constexpr std::chrono::milliseconds kSnapshotRpcTimeout{10000};
     static constexpr int kMaxRetries = 3;
