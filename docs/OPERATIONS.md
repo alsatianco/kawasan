@@ -775,6 +775,10 @@ cd tests/ecosystem
 
 `scripts/tests/consistency_checker.py` keeps a new JSONL ledger, flushing and fsyncing every acknowledgement and observation. The checker compares acknowledged keys and values at their exact partition offsets (I1), rejects gaps or regressing scan offsets in a fresh nontransactional log (I2), and rejects regressing committed ListOffsets samples (I3). Transaction checks allow control/aborted-record gaps and require all-or-nothing visibility with matching staged group offsets (I4). Ambiguous unacknowledged writes may remain in the log.
 
+The local cluster harness supports `kill9 <id>`, `pause <id>`, `resume <id>`, and `restart <id>`. Signals verify that each PID still belongs to the configured broker. `KEEP_DATA=1` retains logs/data on `down`; frozen brokers are resumed before shutdown. `N=1` starts a true single-node broker without `raft.peers`. `KAFKA_BASE`, `RAFT_BASE`, and `MON_BASE` override the default 9092/9093/9094 port bases (broker IDs add 100).
+
+The M9 nemesis allows one unavailable broker at a time, checks surviving ISR members for every partition and a surviving Raft majority, and requires a full ISR after healing. Its seeded schedule covers follower, partition-leader and controller victims with both SIGKILL and SIGSTOP before randomizing further faults.
+
 Saved evidence can be checked without a broker:
 
 ```bash

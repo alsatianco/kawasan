@@ -20,3 +20,6 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_test(NAME ConsistencyCheckerTest
     COMMAND ${Python3_EXECUTABLE} -m unittest discover
             -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_consistency_checker.py)
+add_test(NAME NemesisTest
+    COMMAND ${Python3_EXECUTABLE} -m unittest discover
+            -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_nemesis.py)
