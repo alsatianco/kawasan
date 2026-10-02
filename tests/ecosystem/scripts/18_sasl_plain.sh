@@ -33,6 +33,7 @@ if [[ "$TARGET" == kafka ]]; then
 else
     printf 'alice:wonderland-42\n' > "$DIR/credentials"
     cat > "$DIR/broker.properties" <<'CONFIG'
+broker.id=0
 host=0.0.0.0
 advertised.host=localhost
 port=9097
