@@ -3,9 +3,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
-from consistency_checker import Ledger, Violation, verify_records, verify_watermarks, verify_transactions
+from consistency_checker import Ledger, Violation, verify_records, verify_watermarks, verify_transactions, observe_offsets
 
 
 def record(offset, key=None, partition=0):
@@ -39,6 +39,10 @@ class CheckerTest(unittest.TestCase):
             with self.subTest(offsets=offsets), self.assertRaisesRegex(Violation, 'I2'):
                 verify_records([], [record(i) for i in offsets], {0: 2})
 
+    def test_duplicate_write_at_distinct_offsets_is_rejected(self):
+        with self.assertRaisesRegex(Violation, 'I2'):
+            verify_records([ack(0, 'same')], [record(0, 'same'), record(1, 'same')], {0: 2})
+
     def test_ack_collision_is_not_hidden_by_dictionary(self):
         with self.assertRaisesRegex(Violation, 'I2'):
             verify_records([ack(0), ack(0, 'other')], [record(0)], {0: 1})
@@ -51,6 +55,29 @@ class CheckerTest(unittest.TestCase):
     def test_missing_observations_cannot_pass(self):
         with self.assertRaisesRegex(Violation, 'I3'):
             verify_watermarks([], [0])
+
+    def test_invalid_client_offset_is_unavailable_not_a_watermark(self):
+        # Keep the core CTest suite independent of the optional Kafka package.
+        from types import SimpleNamespace
+        import sys
+        fake_kafka = SimpleNamespace(IsolationLevel=SimpleNamespace(READ_COMMITTED=1),
+                                     TopicPartition=lambda t, p: SimpleNamespace(
+                                         topic=t, partition=p), KafkaException=RuntimeError)
+        # Use a hashable partition object in the fake Admin response.
+        class Partition:
+            partition = 0
+        admin = Mock()
+        future = Mock()
+        future.result.return_value = SimpleNamespace(offset=-1001)
+        admin.list_offsets.return_value = {Partition(): future}
+        ledger = Mock()
+        with patch.dict(sys.modules, {'confluent_kafka': fake_kafka,
+                         'confluent_kafka.admin': SimpleNamespace(
+                             OffsetSpec=SimpleNamespace(latest=lambda: -1))}):
+            self.assertEqual(observe_offsets(admin, 't', [], ledger), {})
+        event = ledger.append.call_args.args[0]
+        self.assertEqual(event['type'], 'unavailable')
+        self.assertEqual(event['offset'], -1001)
 
     def test_each_partition_is_checked_independently(self):
         events = [dict(type='watermark', partition=p, offset=o)

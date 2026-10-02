@@ -78,7 +78,7 @@ It performs the following:
 
 ### Docker
 
-The repository ships a multi-stage Ubuntu 24.04 `Dockerfile` (Boost 1.83, Clang 18). It builds only tools, with four compiler jobs by default; use `--build-arg BUILD_JOBS=2` on smaller Docker hosts. The image exposes the Kafka port `9092` and the Raft port `9093`, runs `kawasan-broker --config /etc/kawasan/server.properties`, and includes a `nc -z localhost 9092` health check.
+The repository ships a multi-stage Ubuntu 24.04 `Dockerfile` (Boost 1.83, Clang 18). It builds only tools and excludes development/test artifacts from the context, with four compiler jobs by default; use `--build-arg BUILD_JOBS=2` on smaller Docker hosts. The image exposes the Kafka port `9092` and the Raft port `9093`, runs `kawasan-broker --config /etc/kawasan/server.properties`, and includes a `nc -z localhost 9092` health check.
 
 ```bash
 docker build -t kawasan:latest .
@@ -806,6 +806,34 @@ The evidence directory must contain `ledger.jsonl` and `scan.json`. The independ
 | Go (Sarama) | `sarama_test.go` | Placeholder |
 
 Each client test exercises connect → topic create → produce (100+) → consume/verify → offset commit → consumer-group behavior.
+
+### M9 consistency and chaos evidence
+
+The checker owns a fresh local cluster, uses `acks=all` (RF=3, minISR=2), and fsyncs each successful delivery to `ledger.jsonl`. It records ambiguous failed writes separately. After healing it scans with `read_committed` and checks exact acknowledged offsets/values (I1), unique write keys and ordered contiguous offsets (I2), monotonic committed ListOffsets observations (I3), and transaction visibility plus staged group offsets in transaction mode (I4). Client errors and invalid-offset sentinels are saved as unavailable samples; every partition requires successful observations before and after faults.
+
+```bash
+python3 -m pip install -r tests/ecosystem/requirements.txt
+# Independent fixtures and a real socket/fork/SIGKILL regression
+ctest --test-dir build -R 'ConsistencyCheckerTest|NemesisTest|ChaosKillTest' --output-on-failure
+# Full three-broker schedule: leader, follower, controller; SIGKILL and pause
+python3 scripts/tests/consistency_checker.py --duration 1800 --seed 45 \
+  --artifacts /tmp/kawasan-chaos-45
+# RF=1 durability and transaction checks (coordinator failover remains M10)
+python3 scripts/tests/consistency_checker.py --single-node --duration 60 \
+  --artifacts /tmp/kawasan-chaos-single
+python3 scripts/tests/consistency_checker.py --single-node --transactions --duration 60 \
+  --artifacts /tmp/kawasan-chaos-txn
+# Recheck saved evidence without starting brokers
+python3 scripts/tests/consistency_checker.py --verify-only /tmp/kawasan-chaos-45
+# Build a disposable mutated broker and require a live I1 rejection
+python3 scripts/tests/check_seeded_hw_bug.py --artifacts /tmp/kawasan-chaos-hw-proof
+```
+
+Use a new artifact directory for every run. Evidence includes the seed, commit and binary/checker hashes, ordered scan, summary, fault/heal events, broker logs and RocksDB data on success and failure. The HW proof copies build inputs into its artifact directory and leaves the master worktree intact; compiler/startup failures do not count as detection. Default broker ports are 9092/9192/9292; `--port-base` allocates a separate block, with Raft and monitoring at +1/+2. `--broker-bin` selects a candidate binary. Keep the machine awake for timing-sensitive local runs.
+
+The nemesis permits one fault at a time only when the remaining live ISR meets minISR and the remaining brokers retain a Raft majority. It resumes/restarts the victim and waits for readiness plus the full ISR before choosing another fault. Incomplete role/action coverage, failed healing, missing samples and undrained delivery callbacks fail the run.
+
+`.github/workflows/chaos-nightly.yml` runs the 30-minute cluster workload, both single-node modes, native regressions and the live HW proof. It archives evidence for 14 days, including on failure. Its optional dispatch seed reproduces victim/hold choices; client and election timing can still differ. **Seven consecutive scheduled green nightlies remain the failover acceptance gate.** Local runs and repeated dispatches do not establish that history, and clustering stays experimental until the gate is met.
 
 ### Unit and integration tests
 

@@ -1,0 +1,76 @@
+name: chaos-nightly
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: 'Optional integer seed to replay a fault schedule'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  chaos:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build clang libboost-all-dev \
+            librocksdb-dev libspdlog-dev nlohmann-json3-dev libgtest-dev \
+            libssl-dev zlib1g-dev libsnappy-dev liblz4-dev libzstd-dev
+          python3 -m pip install -r tests/ecosystem/requirements.txt
+      - name: Choose reproducible seed
+        env:
+          REQUESTED_SEED: ${{ inputs.seed }}
+        run: |
+          seed="${REQUESTED_SEED:-$(date -u +%s)}"
+          [[ "$seed" =~ ^[0-9]+$ ]] || { echo 'Seed must be a nonnegative integer'; exit 1; }
+          echo "CHAOS_SEED=$seed" >> "$GITHUB_ENV"
+          mkdir -p chaos-evidence
+      - name: Build and run regression tests
+        run: |
+          cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DKAWASAN_BUILD_EXAMPLES=OFF
+          cmake --build build -j2
+          ctest --test-dir build --output-on-failure --timeout 600
+      - name: Single-node SIGKILL durability
+        run: |
+          python3 scripts/tests/consistency_checker.py --single-node --duration 60 \
+            --seed "$CHAOS_SEED" --artifacts chaos-evidence/single-node
+      - name: Transaction visibility and staged offsets across SIGKILL
+        run: |
+          python3 scripts/tests/consistency_checker.py --single-node --transactions \
+            --duration 60 --seed "$CHAOS_SEED" --artifacts chaos-evidence/transactions
+      - name: Thirty-minute three-broker nemesis
+        run: |
+          python3 scripts/tests/consistency_checker.py --duration 1800 \
+            --seed "$CHAOS_SEED" --artifacts chaos-evidence/cluster
+      - name: Prove live checker rejects a seeded high-watermark bug
+        run: |
+          python3 scripts/tests/check_seeded_hw_bug.py \
+            --jobs 2 --artifacts chaos-evidence/seeded-hw
+      - name: Archive ledgers, scans, summaries and broker data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          include-hidden-files: true
+          path: |
+            chaos-evidence/
+            !chaos-evidence/seeded-hw/build/**
+            !chaos-evidence/seeded-hw/source/**
+            build/Testing/Temporary/

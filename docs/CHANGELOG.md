@@ -20,6 +20,8 @@ Single-node durability, security and quotas; durable single-node transactions (M
 
 ### Added
 
+- M9 live consistency driver with durable acknowledgements, independent I1–I4 checks, min-ISR-preserving pause/SIGKILL schedules, retained evidence and a disposable broker HW mutation proof. The new chaos nightly runs a 30-minute cluster workload plus single-node durability and transaction/crash modes. Seven scheduled green nightlies remain the acceptance gate.
+
 - M9 subprocess SIGKILL regression proves exact acknowledged record recovery, idempotent producer sequence replay/deduplication, and durable transactional producer epochs without graceful shutdown.
 
 - M9 seeded nemesis planner preserves min ISR and Raft quorum, requires healing between faults, and covers leader/follower/controller kills and pauses. The process harness adds validated SIGKILL, safe restarts, configurable port bases, retained failure data, and true single-node mode.

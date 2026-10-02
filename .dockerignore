@@ -6,3 +6,13 @@ AI-TEMP
 __pycache__
 *.pyc
 .DS_Store
+
+# Runtime image builds only tools; omit development and verification artifacts.
+.github
+docs
+tests
+bench
+examples
+scripts
+README.md
+CLAUDE.md
