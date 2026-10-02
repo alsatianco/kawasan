@@ -58,6 +58,12 @@ public:
     /// @return The high watermark offset, or nullopt if partition not found
     std::optional<Offset> getHighWatermark(const TopicPartition& tp) const;
 
+    /// @brief A consumer-visible HW only after the current leadership's ISR
+    /// confirms the inherited log tail. Until then a stale follower/checkpoint
+    /// HW must not be exposed as a successful committed-offset observation.
+    std::optional<Offset> readableHighWatermark(const TopicPartition& tp,
+                                                int32_t leader_epoch) const;
+
     /// @brief Updates the high watermark for a partition
     /// @param tp The topic-partition
     /// @param hw The new high watermark
@@ -213,6 +219,8 @@ private:
         // via OffsetForLeaderEpoch (set on becoming a follower, on a leader or
         // epoch change, and on an out-of-range / gap fetch).
         bool epoch_check_pending = false;
+        Offset leadership_read_floor = 0;
+        bool watermark_ready = false;
 
         // Leader-side tracking of follower states (only used when this broker is leader)
         std::map<BrokerId, FollowerState> follower_states;

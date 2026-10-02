@@ -109,6 +109,13 @@ def verify_records(events, records, end_offsets, transactional=False):
     return {'acknowledged': len(acked), 'scanned': len(records)}
 
 
+def check_watermark(previous, partition, offset):
+    if offset < 0 or offset < previous.get(partition, 0):
+        raise Violation(f'I3: committed offset regressed on {partition}: '
+                        f'{previous.get(partition)} -> {offset}')
+    previous[partition] = offset
+
+
 def verify_watermarks(events, partitions):
     """I3 successful committed ListOffsets observations may never regress."""
     previous = {}
@@ -117,10 +124,7 @@ def verify_watermarks(events, partitions):
         if event['type'] != 'watermark':
             continue
         partition, offset = event['partition'], event['offset']
-        if offset < 0 or offset < previous.get(partition, 0):
-            raise Violation(f'I3: committed offset regressed on {partition}: '
-                            f'{previous.get(partition)} -> {offset}')
-        previous[partition] = offset
+        check_watermark(previous, partition, offset)
         counts[partition] += 1
     for partition in partitions:
         if counts[partition] < 2:
@@ -344,12 +348,14 @@ def run_writes(cluster, topic, duration, ledger, seed, no_faults=False):
     stop = threading.Event()
     errors = []
     admin = AdminClient(cluster.client_config)
+    previous_offsets = {}
     # A separate observer keeps sampling while producer callbacks fsync and
     # while the nemesis waits for ISR healing; transient RPC errors stay in evidence.
     def observer():
         try:
             while not stop.is_set():
-                observe_offsets(admin, topic, partitions, ledger)
+                for partition, offset in observe_offsets(admin, topic, partitions, ledger).items():
+                    check_watermark(previous_offsets, partition, offset)
                 stop.wait(.5)
         except BaseException as exc:
             errors.append(exc)
@@ -385,7 +391,7 @@ def run_writes(cluster, topic, duration, ledger, seed, no_faults=False):
                              on_delivery=callback(key, partition))
     if producer.flush(30) or any(successes[p] < 10 for p in partitions):
         raise RuntimeError('baseline acks=all writes failed before nemesis')
-    observe_offsets(admin, topic, partitions, ledger)
+    previous_offsets.update(observe_offsets(admin, topic, partitions, ledger))
     sampler.start()
     if nemesis: nemesis.start()
     deadline = time.monotonic() + duration

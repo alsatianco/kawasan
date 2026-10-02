@@ -2811,6 +2811,13 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
 
                 // Register replica with ReplicaManager if not already registered
                 TopicPartition tp{lookup_name, partition.partition};
+                if (!cluster_brokers_.empty() &&
+                    (!replica_manager_->isLeader(tp) ||
+                     replica_manager_->getLeaderEpoch(tp) != partition_it->leader_epoch)) {
+                    partition_response.error_code = ErrorCode::NOT_LEADER_FOR_PARTITION;
+                    finalize_partition(0);
+                    continue;
+                }
                 if (!replica_manager_->isLeader(tp)) {
                     // Create a non-owning shared_ptr wrapper
                     std::shared_ptr<storage::Log> log_ptr(log, [](storage::Log*) {});
@@ -2834,6 +2841,15 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
 
                 // Get high watermark from ReplicaManager (falls back to log's HW if not found)
                 auto hw_opt = replica_manager_->getHighWatermark(tp);
+                if (!cluster_brokers_.empty() && !is_follower) {
+                    hw_opt =
+                        replica_manager_->readableHighWatermark(tp, partition_it->leader_epoch);
+                    if (!hw_opt) {
+                        partition_response.error_code = ErrorCode::NOT_LEADER_FOR_PARTITION;
+                        finalize_partition(0);
+                        continue;
+                    }
+                }
                 const Offset high_watermark = hw_opt.value_or(log->highWatermark());
                 partition_response.high_watermark = high_watermark;
 
@@ -3191,6 +3207,8 @@ RequestDispatcher::HandlerResult KawasanBroker::handleListOffsets(
             partition_response.offset = -1;
             partition_response.leader_epoch = -1;
 
+            int32_t selected_leader_epoch = -1;
+
             // Offsets come from the partition leader's log (a follower's HW and
             // log end lag). Only enforced where metadata knows the partition.
             if (!topic_metadata.empty() && topic_metadata.front().error_code == ErrorCode::NONE) {
@@ -3199,6 +3217,7 @@ RequestDispatcher::HandlerResult KawasanBroker::handleListOffsets(
                     return m.partition == partition.partition;
                 });
                 if (pm != parts.end()) {
+                    selected_leader_epoch = pm->leader_epoch;
                     ErrorCode gate = ErrorCode::NONE;
                     if (pm->leader != broker_id_ || !metadata_current) {
                         gate = ErrorCode::NOT_LEADER_FOR_PARTITION;
@@ -3222,13 +3241,24 @@ RequestDispatcher::HandlerResult KawasanBroker::handleListOffsets(
                 continue;
             }
 
+            Offset committed_offset = log->highWatermark();
+            if (!cluster_brokers_.empty()) {
+                const auto ready_hw = replica_manager_->readableHighWatermark(
+                    {topic.topic, partition.partition}, selected_leader_epoch);
+                if (!ready_hw) {
+                    partition_response.error_code = ErrorCode::NOT_LEADER_FOR_PARTITION;
+                    topic_response.partitions.push_back(partition_response);
+                    continue;
+                }
+                committed_offset = *ready_hw;
+            }
             try {
                 // Handle special timestamp values per Kafka protocol:
                 // -1 = LATEST (end of log, high watermark)
                 // -2 = EARLIEST (start of log)
                 if (partition.timestamp == -1) {
                     // Latest offset (high watermark / end of log)
-                    partition_response.offset = log->highWatermark();
+                    partition_response.offset = committed_offset;
                     partition_response.timestamp = partition.timestamp;
                 } else if (partition.timestamp == -2) {
                     // Earliest offset (log start offset)

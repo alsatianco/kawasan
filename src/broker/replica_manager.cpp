@@ -31,7 +31,8 @@ void ReplicaManager::addReplica(const TopicPartition& tp, std::shared_ptr<storag
 
     ReplicaInfo info;
     info.log = log;
-    info.leader = local_broker_id_;           // In single-node mode, we're always the leader
+    info.leader = local_broker_id_;  // In single-node mode, we're always the leader
+    info.watermark_ready = true;
     info.isr = {local_broker_id_};            // ISR contains only this broker
     info.fetch_offset = log->logEndOffset();  // Start fetching from current end offset
 
@@ -88,6 +89,16 @@ std::optional<Offset> ReplicaManager::getHighWatermark(const TopicPartition& tp)
     return it->second.log->highWatermark();
 }
 
+std::optional<Offset> ReplicaManager::readableHighWatermark(const TopicPartition& tp,
+                                                            int32_t leader_epoch) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = replicas_.find(tp);
+    if (it == replicas_.end() || it->second.leader != local_broker_id_ ||
+        it->second.leader_epoch != leader_epoch || !it->second.watermark_ready)
+        return std::nullopt;
+    return it->second.log->highWatermark();
+}
+
 void ReplicaManager::updateHighWatermark(const TopicPartition& tp, Offset hw) {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -136,6 +147,8 @@ Offset ReplicaManager::maybeAdvanceHighWatermarkLocked(ReplicaInfo& info) {
     }
     const Offset new_hw = computeHighWatermarkLocked(info);
     const Offset current_hw = info.log->highWatermark();
+    if (info.leader == local_broker_id_ && new_hw >= info.leadership_read_floor)
+        info.watermark_ready = true;
     if (new_hw > current_hw) {
         info.log->setHighWatermark(new_hw);
         return new_hw;
@@ -537,6 +550,7 @@ bool ReplicaManager::reconcileReplica(const TopicPartition& tp, std::shared_ptr<
         info.leader = leader;
         info.isr = isr;
         info.leader_epoch = leader_epoch;
+        info.leadership_read_floor = info.log->logEndOffset();
         // A follower starts fetching from its current log-end; a leader's
         // fetch_offset is unused.
         info.fetch_offset = (leader != local_broker_id_) ? info.log->logEndOffset() : 0;
@@ -576,6 +590,8 @@ bool ReplicaManager::reconcileReplica(const TopicPartition& tp, std::shared_ptr<
     if (was_leader != is_leader || (is_leader && leader_epoch != info.leader_epoch)) {
         // Follower progress was reported against an earlier leadership.
         info.follower_states.clear();
+        info.leadership_read_floor = info.log->logEndOffset();
+        info.watermark_ready = false;
     }
     if (is_leader && info.log) {
         // M8-F3: becoming leader (or re-elected at a higher epoch): the new
@@ -611,7 +627,8 @@ std::optional<std::vector<BrokerId>> ReplicaManager::computeIsrUpdate(const Topi
         return std::nullopt;  // not managed, or we do not lead this partition
     }
     const auto& info = it->second;
-    const Offset hw = info.log ? info.log->highWatermark() : 0;
+    const Offset hw =
+        info.log ? std::max(info.log->highWatermark(), info.leadership_read_floor) : 0;
 
     std::set<BrokerId> current(info.isr.begin(), info.isr.end());
     std::set<BrokerId> proposed;

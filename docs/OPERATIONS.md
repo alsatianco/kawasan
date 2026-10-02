@@ -790,7 +790,7 @@ Each client test exercises connect → topic create → produce (100+) → consu
 
 ### M9 consistency and chaos evidence
 
-The checker owns a fresh local cluster, uses `acks=all` (RF=3, minISR=2), and fsyncs each successful delivery to `ledger.jsonl`. It records ambiguous failed writes separately. After healing it scans with `read_committed` and checks exact acknowledged offsets/values (I1), unique write keys and ordered contiguous offsets (I2), monotonic committed ListOffsets observations (I3), and transaction visibility plus staged group offsets in transaction mode (I4). A fully visible transaction with an ambiguous commit result must still match its acknowledged offsets and payloads. Client errors and invalid-offset sentinels are saved as unavailable samples; every partition requires successful observations before and after faults.
+The checker owns a fresh local cluster, uses `acks=all` (RF=3, minISR=2), and fsyncs each successful delivery to `ledger.jsonl`. It records ambiguous failed writes separately. After healing it scans with `read_committed` and checks exact acknowledged offsets/values (I1), unique write keys and ordered contiguous offsets (I2), monotonic committed ListOffsets observations (I3), and transaction visibility plus staged group offsets in transaction mode (I4). A fully visible transaction with an ambiguous commit result must still match its acknowledged offsets and payloads. The concurrent observer fails immediately on I3 regressions, healing the current fault before shutdown. Client errors and invalid-offset sentinels are saved as unavailable samples; every partition requires successful observations before and after faults.
 
 ```bash
 python3 -m pip install -r tests/ecosystem/requirements.txt

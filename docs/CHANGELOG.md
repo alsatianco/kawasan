@@ -12,6 +12,8 @@ Single-node durability, security and quotas; durable single-node transactions (M
 
 ### Fixed
 
+- Defer consumer Fetch and ListOffsets while a new leader confirms its inherited log tail with the current ISR, preventing stale follower/checkpoint high watermarks from appearing as regressing committed offsets. Replica Fetch remains available to complete recovery; the M9 observer now fails immediately on an I3 regression.
+
 - Check the exact acknowledged offsets and payloads of fully visible transactions even when their commit result is ambiguous; all-or-nothing visibility alone cannot validate their data.
 
 - Pin the executable in every chaos evidence directory so rebuilding the worktree cannot change the candidate between restarts. Record the nemesis hash alongside the binary and checker hashes.

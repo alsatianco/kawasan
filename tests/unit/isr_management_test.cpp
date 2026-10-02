@@ -496,4 +496,52 @@ TEST_F(ISRManagementTest, NewLeaderReplicaRecordsEpochStart) {
     EXPECT_EQ(log->epochEndOffset(2), (std::pair<int32_t, Offset>{2, 3}));
 }
 
+TEST_F(ISRManagementTest, PromotedWatermarkWaitsForIsrToConfirmInheritedTail) {
+    TopicPartition tp{"promoted-watermark", 0};
+    auto log = createTestLog(tp.topic, tp.partition);
+    appendN(log, 10);
+    log->setHighWatermark(9);  // Last follower response/checkpoint lags the old leader's ack.
+    ASSERT_TRUE(replica_manager_->reconcileReplica(tp, log, 1, {0, 1, 2}, 0));
+    ASSERT_TRUE(replica_manager_->reconcileReplica(tp, log, 0, {0, 1, 2}, 1));
+    EXPECT_FALSE(replica_manager_->readableHighWatermark(tp, 1).has_value());
+    replica_manager_->updateFollowerFetchOffset(tp, 2, 9);
+    replica_manager_->maybeAdvanceHighWatermark(tp);
+    replica_manager_->updateISR(tp, {0, 2});  // The dead old leader leaves ISR.
+    EXPECT_FALSE(replica_manager_->readableHighWatermark(tp, 1).has_value());
+    replica_manager_->updateFollowerFetchOffset(tp, 2, 10);
+    replica_manager_->maybeAdvanceHighWatermark(tp);
+    EXPECT_EQ(replica_manager_->readableHighWatermark(tp, 1).value_or(-1), 10);
+    EXPECT_FALSE(replica_manager_->readableHighWatermark(tp, 0).has_value());
+    // A new leadership must confirm its inherited prefix again.
+    ASSERT_TRUE(replica_manager_->reconcileReplica(tp, log, 0, {0, 2}, 2));
+    EXPECT_FALSE(replica_manager_->readableHighWatermark(tp, 2).has_value());
+}
+
+TEST_F(ISRManagementTest, EmptyAndSoleReplicaLeadersHaveReadableWatermarks) {
+    TopicPartition tp{"empty-watermark", 0};
+    auto log = createTestLog(tp.topic, tp.partition);
+    ASSERT_TRUE(replica_manager_->reconcileReplica(tp, log, 0, {0, 1}, 0));
+    EXPECT_EQ(replica_manager_->readableHighWatermark(tp, 0).value_or(-1), 0);
+    appendN(log, 3);
+    ASSERT_TRUE(replica_manager_->reconcileReplica(tp, log, 0, {0}, 1));
+    EXPECT_EQ(replica_manager_->readableHighWatermark(tp, 1).value_or(-1), 3);
+}
+
+TEST_F(ISRManagementTest, PromotionDoesNotExpandIsrAtStaleCheckpointWatermark) {
+    TopicPartition tp{"promotion-isr-floor", 0};
+    auto log = createTestLog(tp.topic, tp.partition);
+    appendN(log, 10);
+    log->setHighWatermark(9);
+    ASSERT_TRUE(replica_manager_->reconcileReplica(tp, log, 0, {0, 1}, 1));
+    replica_manager_->updateFollowerFetchOffset(tp, 2, 9);
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    EXPECT_FALSE(replica_manager_->computeIsrUpdate(tp, 1000, now).has_value());
+    replica_manager_->updateFollowerFetchOffset(tp, 2, 10);
+    const auto update = replica_manager_->computeIsrUpdate(tp, 1000, now);
+    ASSERT_TRUE(update.has_value());
+    EXPECT_EQ(*update, (std::vector<BrokerId>{0, 1, 2}));
+}
+
 }  // namespace kawasan::broker
