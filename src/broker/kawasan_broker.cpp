@@ -3310,35 +3310,65 @@ Buffer KawasanBroker::buildListOffsetsError(const RequestDispatcher::RequestCont
     return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
+protocol::FindCoordinatorResponse::Coordinator KawasanBroker::resolveCoordinator(
+    const std::string& key, protocol::CoordinatorType type) const {
+    protocol::FindCoordinatorResponse::Coordinator result;
+    result.key = key;
+    if (type != protocol::CoordinatorType::GROUP &&
+        type != protocol::CoordinatorType::TRANSACTION) {
+        result.error_code = ErrorCode::INVALID_REQUEST;
+    } else if (cluster_brokers_.empty()) {
+        result.node_id = broker_id_;
+        result.host = advertised_host_;
+        result.port = port_;
+        return result;
+    } else {
+        result.error_code = ErrorCode::COORDINATOR_NOT_AVAILABLE;
+        if (dataPlaneCurrent() && metadata_controller_) {
+            const char* topic = type == protocol::CoordinatorType::GROUP ? "__consumer_offsets"
+                                                                         : "__transaction_state";
+            const auto topics = metadata_controller_->describeTopics({topic});
+            if (!topics.empty() && topics.front().error_code == ErrorCode::NONE &&
+                !topics.front().partitions.empty()) {
+                const auto& partitions = topics.front().partitions;
+                const int32_t partition =
+                    coordinatorPartitionFor(key, static_cast<int32_t>(partitions.size()));
+                for (const auto& pm : partitions) {
+                    if (pm.partition != partition || pm.leader < 0)
+                        continue;
+                    if (const auto endpoint = peerEndpoint(pm.leader)) {
+                        result.node_id = pm.leader;
+                        result.host = endpoint->first;
+                        result.port = endpoint->second;
+                        result.error_code = ErrorCode::NONE;
+                        return result;
+                    }
+                }
+            }
+        }
+    }
+    result.error_message = KawasanException::toString(result.error_code);
+    return result;
+}
+
 RequestDispatcher::HandlerResult KawasanBroker::handleFindCoordinator(
     RequestDispatcher::RequestContext& context) {
     protocol::FindCoordinatorRequest request;
     request.decode(context.payload, context.header.apiVersion());
-
-    Logger::info("FindCoordinator request for {} key(s) (first: {})", request.keys().size(),
-                 request.key());
-
-    // In a single-broker setup, this broker is always the coordinator.
     protocol::FindCoordinatorResponse response;
     response.setThrottleTimeMs(0);
-    response.setErrorCode(ErrorCode::NONE);
-    response.setNodeId(broker_id_);
-    response.setHost(advertised_host_);
-    response.setPort(port_);
-
-    // Phase 1.6: v4 returns one Coordinator entry per requested key.
     if (context.header.apiVersion() >= 4) {
         for (const auto& key : request.keys()) {
-            protocol::FindCoordinatorResponse::Coordinator c;
-            c.key = key;
-            c.node_id = broker_id_;
-            c.host = advertised_host_;
-            c.port = port_;
-            c.error_code = ErrorCode::NONE;
-            response.addCoordinator(std::move(c));
+            response.addCoordinator(resolveCoordinator(key, request.keyType()));
         }
+    } else {
+        const auto coordinator = resolveCoordinator(request.key(), request.keyType());
+        response.setErrorCode(coordinator.error_code);
+        response.setErrorMessage(coordinator.error_message);
+        response.setNodeId(coordinator.node_id);
+        response.setHost(coordinator.host);
+        response.setPort(coordinator.port);
     }
-
     const int16_t version =
         std::clamp<int16_t>(context.header.apiVersion(), 0, kFindCoordinatorMaxVersion);
     RequestDispatcher::HandlerResult result;

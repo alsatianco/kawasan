@@ -12,6 +12,8 @@ Single-node production-hardening (durability, security, quotas), durable single-
 
 ### Added
 
+- FindCoordinator routes group and transaction keys to the leader of their hashed internal-topic partition (M8-G1), including per-key v4 responses. Missing or offline owners return COORDINATOR_NOT_AVAILABLE; single-node routing stays local.
+
 - **Followers reconcile divergent logs with a new leader (KIP-101, M8-E3).** When a broker becomes a follower, its leader or epoch changes, or a fetch is out of range or leaves a gap, it first asks the leader where its own latest epoch ends (OffsetForLeaderEpoch). It then truncates its log there before fetching. Without epoch history on either side it falls back to its high watermark. Replica fetches now use Fetch v9 and carry the follower's `current_leader_epoch`, so a stale leader or follower is fenced instead of served. Fixes found along the way:
   - A new leader records its epoch start before its first write, not on the next fetcher cycle.
   - A fetch task that spans a leadership change is re-checked against committed metadata before its data is ingested. Without this, a just-elected leader could append its predecessor's divergent records.

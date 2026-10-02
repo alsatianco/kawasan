@@ -30,6 +30,7 @@
 #include "kawasan/common/config.h"
 #include "kawasan/common/types.h"
 #include "kawasan/protocol/api_versions.h"
+#include "kawasan/protocol/find_coordinator_request.h"
 #include "kawasan/raft/raft_node.h"
 #include "kawasan/storage/log_manager.h"
 
@@ -236,6 +237,9 @@ private:
     RequestDispatcher::HandlerResult handleListOffsets(RequestDispatcher::RequestContext& context);
     Buffer buildListOffsetsError(const RequestDispatcher::RequestContext& context, ErrorCode code,
                                  int16_t response_version) const;
+    protocol::FindCoordinatorResponse::Coordinator resolveCoordinator(
+        const std::string& key, protocol::CoordinatorType type) const;
+
     RequestDispatcher::HandlerResult handleFindCoordinator(
         RequestDispatcher::RequestContext& context);
     Buffer buildFindCoordinatorError(const RequestDispatcher::RequestContext& context,

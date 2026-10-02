@@ -126,3 +126,8 @@ add_test(NAME ConnectTest COMMAND connect_test)
 add_executable(connect_source_test connect_source_test.cpp)
 target_link_libraries(connect_source_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME ConnectSourceTest COMMAND connect_source_test)
+
+# M8-G: coordinator discovery and ownership over real cluster sockets.
+add_executable(find_coordinator_routing_test find_coordinator_routing_test.cpp)
+target_link_libraries(find_coordinator_routing_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME FindCoordinatorRoutingTest COMMAND find_coordinator_routing_test)
