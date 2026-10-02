@@ -14,3 +14,9 @@ add_subdirectory(benchmark)
 if(KAWASAN_BUILD_FUZZ)
     add_subdirectory(fuzz)
 endif()
+
+# M9 checker fixtures are dependency-free and must reject corrupt histories.
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME ConsistencyCheckerTest
+    COMMAND ${Python3_EXECUTABLE} -m unittest discover
+            -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_consistency_checker.py)

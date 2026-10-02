@@ -12,6 +12,8 @@ Single-node durability, security and quotas; durable single-node transactions (M
 
 ### Added
 
+- M9 durable JSONL acknowledgement ledger and independent I1–I4 consistency checks, including offline evidence replay and corruption fixtures registered with CTest.
+
 - Ecosystem verification now distinguishes failures and skips, retains per-check evidence, runs durability/SASL against the selected Docker broker, verifies real producer deliveries, and uses Kafka-valid compaction settings. Pinned Python clients and shared container networking keep both oracle and candidate legs reproducible.
 
 - Docker builds use Ubuntu 24.04 and bounded compiler parallelism, omit local artifacts, and ship a container config with persistent storage and environment substitution. Linux builds normalize distro zstd targets and avoid glibc endian-macro collisions and transitive-header assumptions.
