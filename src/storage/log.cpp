@@ -239,7 +239,8 @@ Log::ReplicaAppendResult Log::appendReplicatedBatch(const RecordBatch& batch) {
     // has (e.g. after a reconnect). Skip it — re-appending would double-key and
     // over-count the segment's next-offset.
     if (wire_base < leo) {
-        return ReplicaAppendResult::kDuplicate;
+        const Offset wire_end = wire_base + static_cast<Offset>(batch.records().size());
+        return wire_end > leo ? ReplicaAppendResult::kOverlap : ReplicaAppendResult::kDuplicate;
     }
     // A hole: the follower is missing offsets in [leo, wire_base). It must NOT
     // append here — the segment would relabel the batch to `leo` and silently

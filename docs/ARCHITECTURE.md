@@ -322,9 +322,15 @@ The Raft leader records when each peer last answered an AppendEntries, whether o
 
 This closes two windows. A restarted broker would otherwise act on its pre-crash metadata file, and a cut-off broker on its last view. Because the lease is shorter than the controller's liveness timeout, an isolated broker stops serving before the controller fails its partitions over. `/ready` reports the same condition. Single-node is always current.
 
-**Request epoch fencing (M8-E2).** Fetch (v9+) and ListOffsets (v4+) partitions carry the client's `current_leader_epoch`. `checkLeaderEpoch` (`leader_election_policy.h`) compares it with the partition's epoch from the metadata store, after the leader and currency gates. An older epoch gets `FENCED_LEADER_EPOCH`, a newer one `UNKNOWN_LEADER_EPOCH`, and `-1` skips the check. Replica fetches pass the same gate, though the follower's `PeerClient` still speaks Fetch v4 and so sends no epoch (that is M8-E3). ListOffsets still returns `leader_epoch = -1`.
+**Request epoch fencing (M8-E2).** Fetch (v9+) and ListOffsets (v4+) partitions carry the client's `current_leader_epoch`. `checkLeaderEpoch` (`leader_election_policy.h`) compares it with the partition's epoch from the metadata store, after the leader and currency gates. An older epoch gets `FENCED_LEADER_EPOCH`, a newer one `UNKNOWN_LEADER_EPOCH`, and `-1` skips the check. Replica fetches pass the same gate. The follower's `PeerClient` uses Fetch v9 and sends its epoch (M8-E3). ListOffsets still returns `leader_epoch = -1`.
 
 **OffsetForLeaderEpoch (M8-F4).** Only the partition leader answers, and only with current metadata and a matching `current_leader_epoch`. It answers from `Log::epochEndOffset`, which applies KIP-101 semantics over the leader-epoch cache. A log with no epoch history answers as before: the current epoch and the log end. `PeerClient::offsetForLeaderEpoch` (v3, `replica_id` = follower) is the follower-side client.
+
+**Follower reconciliation (M8-E3).** `ReplicaInfo::epoch_check_pending` is set when a broker becomes a follower, when a follower's leader or epoch changes, and on an out-of-range or gap fetch. Before fetching, the follower asks the leader `OffsetForLeaderEpoch(latest cached epoch)`. It truncates to `followerTruncationOffset` (`follower_truncation.h`), which takes the leader's end for that epoch, capped by the follower's own end for an older epoch. Without epoch history on either side it uses the follower's high watermark. Replica fetches use Fetch v9 with `current_leader_epoch`.
+- Within a cycle, a leader that fails to answer is skipped, because every request to a frozen peer waits out its deadline.
+- Before ingesting, fetched data is re-checked against the committed metadata (`KawasanBroker::isPartitionLeadership`), since a cycle can outlive a leadership change.
+- A batch that straddles the log end (`kOverlap`) replaces the follower's tail.
+- In a cluster, the produce path records the leader's epoch start before its first write.
 
 A `RaftNode` is always in one of three states — `FOLLOWER`, `CANDIDATE`, or `LEADER`:
 
@@ -353,7 +359,7 @@ There are six message types (`enum class RaftMessageType : uint8_t`):
 
 Log entries (`struct LogEntry`) carry a term, index, command type, and serialized command bytes. For the exact per-field byte layout and encode/decode of each message, see `include/kawasan/raft/raft_protocol.h` (and the `encode`/`decode` functions in `src/raft/raft_protocol.cpp`) — that header is the authoritative wire spec rather than reproducing every field table here. In a multi-node group a newly elected leader first appends a `noop` entry of its own term (Raft §5.4.2), so entries committed by the previous leader reach every state machine without waiting for the next command. `MetadataController` ignores `noop` entries.
 
-Outgoing RPCs run on a private 4-thread client pool inside `RaftTransport`, never on the io_context that serves incoming RPCs. Each one is bounded by a deadline: 1 s, or 10 s for InstallSnapshot. Sockets are non-blocking and waits use `poll()`. An RPC still queued past its deadline fails without being sent, and a socket that timed out is never reused. Before this, the broker's single Raft io thread did blocking reads with no timeout. One frozen peer wedged it for good, and two nodes calling each other at once (for example two election candidates) deadlocked permanently.
+Outgoing RPCs run on a dedicated thread per peer inside `RaftTransport`, never on the io_context that serves incoming RPCs. Connects are bounded and done outside the transport lock. Each one is bounded by a deadline: 1 s, or 10 s for InstallSnapshot. Sockets are non-blocking and waits use `poll()`. An RPC still queued past its deadline fails without being sent, and a socket that timed out is never reused. Before this, the broker's single Raft io thread did blocking reads with no timeout. One frozen peer wedged it for good, and two nodes calling each other at once (for example two election candidates) deadlocked permanently.
 
 ### Known limitation: Raft TLS is not enforced
 

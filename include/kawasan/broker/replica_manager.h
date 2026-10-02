@@ -209,6 +209,10 @@ private:
         std::vector<BrokerId> isr;  // In-Sync Replicas
         Offset fetch_offset = 0;    // Last fetched offset (for follower replicas)
         int32_t leader_epoch = 0;   // KIP-101: bumped on each leadership change
+        // M8-E3: before fetching from this leader, reconcile the log tail with it
+        // via OffsetForLeaderEpoch (set on becoming a follower, on a leader or
+        // epoch change, and on an out-of-range / gap fetch).
+        bool epoch_check_pending = false;
 
         // Leader-side tracking of follower states (only used when this broker is leader)
         std::map<BrokerId, FollowerState> follower_states;
@@ -233,13 +237,26 @@ private:
         BrokerId leader;
         Offset fetch_offset;
         std::shared_ptr<storage::Log> log;
+        int32_t leader_epoch = -1;
+        bool epoch_check = false;
     };
+
+    /// @brief M8-E3: truncate the follower's tail to where it diverges from the
+    /// leader (KIP-101 via OffsetForLeaderEpoch, HW fallback without epoch
+    /// history). Returns false if the leader could not answer (retry later);
+    /// `reachable` is cleared if it could not be reached at all.
+    bool reconcileWithLeader(const FetchTask& task, PeerClient& client, bool& reachable);
+
+    /// @brief Marks/clears the epoch check for `task`'s partition — clearing only
+    /// if the leader and epoch still match what was checked.
+    void setEpochCheckPending(const FetchTask& task, bool pending);
 
     /// @brief M5: replicate one follower partition from its leader (network I/O,
     /// runs outside mutex_). Appends fetched batches offset-preserved, adopts the
     /// leader's high watermark, and writes the advanced fetch offset back into
     /// replicas_ under the lock.
-    void fetchPartitionFromLeader(const FetchTask& task);
+    /// Returns false if the leader could not be reached (skip it this cycle).
+    bool fetchPartitionFromLeader(const FetchTask& task);
 
     /// @brief M5: get (creating if needed) the cached PeerClient for a leader.
     /// Called only from the fetcher thread, so peer_clients_ needs no lock.

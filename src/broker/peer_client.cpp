@@ -19,13 +19,13 @@
 namespace kawasan::broker {
 
 namespace {
-// Fetch v4: leader returns raw RecordBatch bytes (appendable as-is) and the
-// request/response headers stay non-flexible (< v12), so the default header
-// codecs apply.
-constexpr int16_t kFetchVersion = 4;
+// Fetch v9: leader returns raw RecordBatch bytes (appendable as-is), the
+// request carries current_leader_epoch (M8-E3), and the request/response
+// headers stay non-flexible (< v12), so the default header codecs apply.
+constexpr int16_t kFetchVersion = 9;
 // Followers do not long-poll, so a fetch answers at once; AlterPartition waits
 // for a Raft commit on the controller.
-constexpr std::chrono::milliseconds kFetchTimeout{5000};
+constexpr std::chrono::milliseconds kFetchTimeout{2000};
 constexpr std::chrono::milliseconds kAlterPartitionTimeout{10000};
 constexpr int32_t kMaxResponseBytes = 64 * 1024 * 1024;
 }  // namespace
@@ -37,16 +37,12 @@ PeerClient::~PeerClient() {
     disconnect();
 }
 
-void PeerClient::ensureConnected() {
+void PeerClient::ensureConnected(std::chrono::steady_clock::time_point deadline) {
     if (connected_ && socket_.is_open()) {
         return;
     }
-    boost::system::error_code ec;
-    socket_.close(ec);
-    boost::asio::ip::tcp::resolver resolver(io_context_);
-    const auto endpoints = resolver.resolve(host_, std::to_string(port_));
-    boost::asio::connect(socket_, endpoints);
-    socket_.non_blocking(true);  // all I/O goes through transferWithDeadline
+    // Bounded, and leaves the socket non-blocking for transferWithDeadline.
+    connectWithDeadline(socket_, host_, port_, deadline);
     connected_ = true;
 }
 
@@ -55,7 +51,7 @@ std::vector<uint8_t> PeerClient::exchange(const Buffer& payload,
     // Bounded: this runs on the replica-fetcher thread, which also drives the
     // controller's failover sweep — a frozen peer must not block it forever.
     const auto deadline = std::chrono::steady_clock::now() + timeout;
-    ensureConnected();
+    ensureConnected(deadline);
     std::vector<uint8_t> frame(sizeof(int32_t) + payload.size());
     const int32_t net_size = htonl(static_cast<int32_t>(payload.size()));
     std::memcpy(frame.data(), &net_size, sizeof(net_size));
@@ -85,10 +81,9 @@ void PeerClient::disconnect() {
 
 std::optional<PeerClient::FetchResult> PeerClient::fetch(const std::string& topic,
                                                          PartitionId partition,
-                                                         Offset fetch_offset) {
+                                                         Offset fetch_offset,
+                                                         int32_t current_leader_epoch) {
     try {
-        ensureConnected();
-
         const int32_t corr = ++correlation_id_;
         Buffer payload;
         protocol::RequestHeader header(protocol::ApiKey::FETCH, kFetchVersion, corr,
@@ -103,6 +98,7 @@ std::optional<PeerClient::FetchResult> PeerClient::fetch(const std::string& topi
         protocol::FetchPartition fp;
         fp.partition = partition;
         fp.fetch_offset = fetch_offset;
+        fp.current_leader_epoch = current_leader_epoch;
         fp.partition_max_bytes = 8 * 1024 * 1024;
         protocol::FetchTopic ft;
         ft.topic = topic;
@@ -120,7 +116,7 @@ std::optional<PeerClient::FetchResult> PeerClient::fetch(const std::string& topi
         FetchResult result;
         // We requested exactly one topic/partition; tolerate an empty response.
         if (fetch_response.topics().empty() || fetch_response.topics().front().partitions.empty()) {
-            result.error = ErrorCode::NONE;
+            result.error = fetch_response.errorCode();  // v7+ top-level error (e.g. session)
             return result;
         }
         const auto& pr = fetch_response.topics().front().partitions.front();
@@ -141,8 +137,6 @@ std::optional<ErrorCode> PeerClient::alterPartition(const std::string& topic, Pa
                                                     const std::vector<BrokerId>& new_isr,
                                                     int32_t partition_epoch) {
     try {
-        ensureConnected();
-
         const int32_t corr = ++correlation_id_;
         Buffer payload;
         // AlterPartition (API 56) is flexible from v0 — RequestHeader::encode

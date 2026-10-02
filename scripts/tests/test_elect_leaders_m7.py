@@ -22,9 +22,12 @@ try:
     from confluent_kafka.admin import AdminClient, NewTopic
     from confluent_kafka import TopicPartition
     try:
-        from confluent_kafka.admin import ElectionType
+        from confluent_kafka import ElectionType  # 2.x exports it at top level
     except ImportError:
-        ElectionType = None
+        try:
+            from confluent_kafka.admin import ElectionType
+        except ImportError:
+            ElectionType = None
 except ImportError:
     print("SKIP: confluent-kafka not installed", file=sys.stderr)
     sys.exit(0)

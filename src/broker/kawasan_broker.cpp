@@ -2359,6 +2359,13 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                 // when followers fetch). Single-node (ISR==1) advances HW=LEO in
                 // the append, byte-identical to before.
                 const bool advance_hw = isr_size <= 1;
+                if (!cluster_brokers_.empty()) {
+                    // M8-F3: our epoch must start before our first write in it,
+                    // or a follower asking where the previous epoch ended would
+                    // be told too late (the fetcher records it only on its next
+                    // cycle). No-op once recorded.
+                    log->assignLeaderEpochStart(partition_it->leader_epoch, log->logEndOffset());
+                }
                 const Offset base_offset = log->appendBatch(std::move(batch), advance_hw);
 
                 // Phase 2.1: record successful append for dedup.
@@ -3742,6 +3749,23 @@ void KawasanBroker::maintainLeaderIsr() {
             }
         }
     }
+}
+
+bool KawasanBroker::isPartitionLeadership(const TopicPartition& tp, BrokerId leader,
+                                          int32_t leader_epoch) const {
+    if (!metadata_controller_) {
+        return true;
+    }
+    const auto topics = metadata_controller_->describeTopics({tp.topic});
+    if (topics.empty() || topics.front().error_code != ErrorCode::NONE) {
+        return false;
+    }
+    for (const auto& pm : topics.front().partitions) {
+        if (pm.partition == tp.partition) {
+            return pm.leader == leader && pm.leader_epoch == leader_epoch;
+        }
+    }
+    return false;
 }
 
 bool KawasanBroker::dataPlaneCurrent() const {

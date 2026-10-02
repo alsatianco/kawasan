@@ -41,6 +41,11 @@ add_executable(offset_for_leader_epoch_codec_test offset_for_leader_epoch_codec_
 target_link_libraries(offset_for_leader_epoch_codec_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME OffsetForLeaderEpochCodecTest COMMAND offset_for_leader_epoch_codec_test)
 
+# M8-E3: follower truncation point (KIP-101 / HW fallback)
+add_executable(follower_truncation_test follower_truncation_test.cpp)
+target_link_libraries(follower_truncation_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME FollowerTruncationTest COMMAND follower_truncation_test)
+
 add_executable(metadata_leader_election_test metadata_leader_election_test.cpp)
 target_link_libraries(metadata_leader_election_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME MetadataLeaderElectionTest COMMAND metadata_leader_election_test)

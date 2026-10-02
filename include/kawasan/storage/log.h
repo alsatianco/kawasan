@@ -86,9 +86,12 @@ public:
     /// @brief M5: result of a follower-side replicated append.
     enum class ReplicaAppendResult {
         kAppended,   ///< batch written at its leader-assigned base offset
-        kDuplicate,  ///< wire base offset < local LEO — already have it, skipped
+        kDuplicate,  ///< the whole batch lies below local LEO — already have it
         kGap,        ///< wire base offset > local LEO — follower diverged; caller
-                     ///< must stop and re-fetch (truncate handled by later M7)
+                     ///< must stop and reconcile with the leader
+        kOverlap,    ///< batch starts below local LEO but extends past it: our
+                     ///< tail from its base differs (e.g. a truncation cut into a
+                     ///< batch); caller truncates to the base and appends again
     };
 
     /// @brief M5: append a batch replicated from the partition leader, PRESERVING

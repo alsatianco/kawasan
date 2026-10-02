@@ -220,3 +220,23 @@ TEST_F(LeaderEpochCacheTest, ReplicatedBatchesRecordEpochStarts) {
     // Replicated batches keep the leader's stamp byte-for-byte.
     EXPECT_EQ(stamps(log), (std::vector<int32_t>{1, 1, 3, -1}));
 }
+
+// Regression (M8 divergence nemesis): after truncating into the middle of a
+// batch, the leader's next batch overlaps our log end. It must not be skipped
+// as a duplicate forever: the follower drops its overlapping tail and takes the
+// leader's batch.
+TEST_F(LeaderEpochCacheTest, ReplicatedBatchStraddlingLogEndReportsOverlap) {
+    kawasan::storage::Log log("t", 0, dir_);
+    auto at = [](kawasan::storage::RecordBatch b, kawasan::Offset base) {
+        b.setBaseOffset(base);
+        return b;
+    };
+    ASSERT_EQ(log.appendReplicatedBatch(at(batchOf(5, 1), 0)),
+              kawasan::storage::Log::ReplicaAppendResult::kAppended);
+    log.appendReplicatedBatch(at(batchOf(1, 1), 5));  // our divergent offset 5
+    EXPECT_EQ(log.appendReplicatedBatch(at(batchOf(3, 1), 0)),
+              kawasan::storage::Log::ReplicaAppendResult::kDuplicate);  // wholly below LEO 6
+    EXPECT_EQ(log.appendReplicatedBatch(at(batchOf(4, 2), 4)),
+              kawasan::storage::Log::ReplicaAppendResult::kOverlap);  // covers 4..7, LEO is 6
+    EXPECT_EQ(log.logEndOffset(), 6);  // nothing changed yet
+}

@@ -22,10 +22,10 @@ namespace kawasan::broker {
 /// bounded by a deadline, so a frozen peer cannot stall the thread.
 ///
 /// Modeled on the producer client's framed request/response (4-byte big-endian
-/// length prefix + Kafka request/response headers). Fetch v4 is used on purpose:
-/// at v4+ the leader returns raw RecordBatch bytes (appendable as-is), and the
-/// header stays non-flexible (< v12), so the default response-header decode
-/// applies.
+/// length prefix + Kafka request/response headers). Fetch v9: the leader returns
+/// raw RecordBatch bytes (appendable as-is), the request carries the follower's
+/// current_leader_epoch (KIP-320 fencing), and the headers stay non-flexible
+/// (< v12), so the default response-header decode applies.
 class PeerClient {
 public:
     PeerClient(std::string host, int32_t port, BrokerId self_broker_id);
@@ -46,8 +46,11 @@ public:
     /// `fetch_offset`. Returns nullopt on a connection/protocol error (the caller
     /// should back off and retry); a partition-level Kafka error is reported via
     /// FetchResult::error.
+    /// `current_leader_epoch` (M8-E3) is this follower's view of the leader's
+    /// epoch; a leader on a different epoch answers FENCED_LEADER_EPOCH /
+    /// UNKNOWN_LEADER_EPOCH instead of serving data. -1 skips the check.
     std::optional<FetchResult> fetch(const std::string& topic, PartitionId partition,
-                                     Offset fetch_offset);
+                                     Offset fetch_offset, int32_t current_leader_epoch = -1);
 
     /// @brief M6: propose an ISR change for one partition to the controller
     /// (AlterPartition, API 56 — a flexible-from-v0 API). Returns the committed
@@ -77,7 +80,7 @@ public:
     int32_t port() const { return port_; }
 
 private:
-    void ensureConnected();
+    void ensureConnected(std::chrono::steady_clock::time_point deadline);
     void disconnect();
     /// Sends one framed request and returns the framed response body, all within
     /// `timeout`. Throws on any error (callers disconnect).

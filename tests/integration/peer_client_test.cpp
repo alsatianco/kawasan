@@ -92,7 +92,7 @@ TEST(PeerClientDeadlineTest, UnresponsivePeerFailsInsteadOfHanging) {
     PeerClient client("127.0.0.1", hole.local_endpoint().port(), /*self=*/2);
     const auto start = std::chrono::steady_clock::now();
     EXPECT_FALSE(client.fetch(kTopic, 0, 0).has_value());
-    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(8));
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(5));
     hole.close();
     accepter.join();
 }
@@ -146,4 +146,20 @@ TEST_F(PeerClientTest, OffsetForLeaderEpochAnswersFromEpochHistory) {
     EXPECT_EQ(newer.end_offset, -1);
     EXPECT_EQ(ask(0, 0).error, ErrorCode::FENCED_LEADER_EPOCH);
     EXPECT_EQ(ask(2, 0).error, ErrorCode::UNKNOWN_LEADER_EPOCH);
+}
+
+// M8-E3: replica fetches carry the follower's view of the leader epoch (Fetch
+// v9+); a follower still on an old epoch is fenced rather than silently served.
+TEST_F(PeerClientTest, ReplicaFetchIsFencedOnAStaleEpoch) {
+    ASSERT_EQ(broker_->metadataController()->updatePartitionLeader(kTopic, 0, kBrokerId).error_code,
+              ErrorCode::NONE);  // epoch -> 1
+    PeerClient client("127.0.0.1", broker_->port(), /*self=*/2);
+    auto stale = client.fetch(kTopic, 0, 0, /*current_leader_epoch=*/0);
+    ASSERT_TRUE(stale.has_value());
+    EXPECT_EQ(stale->error, ErrorCode::FENCED_LEADER_EPOCH);
+    auto current = client.fetch(kTopic, 0, 0, /*current_leader_epoch=*/1);
+    ASSERT_TRUE(current.has_value());
+    EXPECT_EQ(current->error, ErrorCode::NONE);
+    EXPECT_EQ(current->high_watermark, 3);
+    EXPECT_FALSE(current->record_batches.empty());
 }

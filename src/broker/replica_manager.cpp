@@ -1,5 +1,7 @@
 #include "kawasan/broker/replica_manager.h"
 
+#include "kawasan/broker/follower_truncation.h"
+
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -279,15 +281,25 @@ void ReplicaManager::fetcherThreadLoop() {
                 for (auto& [tp, info] : replicas_) {
                     // leader < 0: offline partition, nothing to fetch from.
                     if (info.leader != local_broker_id_ && info.leader >= 0 && info.log) {
-                        tasks.push_back({tp, info.leader, info.fetch_offset, info.log});
+                        tasks.push_back({tp, info.leader, info.fetch_offset, info.log,
+                                         info.leader_epoch, info.epoch_check_pending});
                     }
                 }
             }
+            // A leader that failed to answer is skipped for the rest of the
+            // cycle: every request to a frozen peer waits out its deadline, and
+            // this thread also runs the controller's failover sweep.
+            std::set<BrokerId> unreachable;
             for (const auto& task : tasks) {
                 if (!running_) {
                     break;
                 }
-                fetchPartitionFromLeader(task);
+                if (unreachable.count(task.leader)) {
+                    continue;
+                }
+                if (!fetchPartitionFromLeader(task)) {
+                    unreachable.insert(task.leader);
+                }
             }
         } catch (const std::exception& e) {
             spdlog::error("Error in follower fetch thread: {}", e.what());
@@ -318,62 +330,63 @@ PeerClient* ReplicaManager::peerClientFor(BrokerId leader, const std::string& ho
     return raw;
 }
 
-void ReplicaManager::fetchPartitionFromLeader(const FetchTask& task) {
+bool ReplicaManager::fetchPartitionFromLeader(const FetchTask& task) {
     if (!broker_) {
-        return;
+        return true;
     }
     // Resolve the leader's Kafka listener address from cluster metadata.
     auto endpoint = broker_->peerEndpoint(task.leader);
     if (!endpoint) {
         spdlog::trace("No endpoint for leader {} of {}-{}; skipping", task.leader, task.tp.topic,
                       task.tp.partition);
-        return;
+        return true;
     }
 
     PeerClient* client = peerClientFor(task.leader, endpoint->first, endpoint->second);
-    auto result = client->fetch(task.tp.topic, task.tp.partition, task.fetch_offset);
+    Offset fetch_offset = task.fetch_offset;
+    if (task.epoch_check) {
+        bool reachable = true;
+        if (!reconcileWithLeader(task, *client, reachable)) {
+            return reachable;  // the leader could not answer yet; retry next cycle
+        }
+        fetch_offset = task.log->logEndOffset();
+    }
+    auto result =
+        client->fetch(task.tp.topic, task.tp.partition, fetch_offset, task.leader_epoch);
     if (!result) {
         // Connection/protocol error: drop the cached client so next cycle
         // reconnects; the loop sleep provides the backoff.
         peer_clients_.erase(task.leader);
-        return;
+        return false;
     }
     if (result->error == ErrorCode::OFFSET_OUT_OF_RANGE) {
-        // M7: the leader rejected our fetch offset. If we hold an un-committed
-        // tail (high watermark < log-end), it may have diverged from the (new)
-        // leader — reconcile by truncating the tail down to our high watermark
-        // and re-syncing. This never discards acknowledged data: everything up
-        // to the HW was committed by the ISR. If there is no un-committed tail
-        // (HW == LEO) we are instead behind the leader's log start (records were
-        // retention-deleted) — a full resync, out of scope until later.
-        const Offset leo = task.log->logEndOffset();
-        const Offset hw = task.log->highWatermark();
-        if (hw < leo) {
-            spdlog::warn(
-                "Follower {}-{}: leader rejected fetch at {}; truncating divergent tail to HW {}",
-                task.tp.topic, task.tp.partition, task.fetch_offset, hw);
-            task.log->truncateSuffix(hw);
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto it = replicas_.find(task.tp);
-            if (it != replicas_.end()) {
-                it->second.fetch_offset = task.log->logEndOffset();
-            }
-        } else {
-            spdlog::warn("Follower {}-{}: out of range at {} with no un-committed tail "
-                         "(leader log-start ahead — needs full resync)",
-                         task.tp.topic, task.tp.partition, task.fetch_offset);
-        }
-        return;
+        // Our log end is beyond the leader's: our tail diverged. Reconcile via
+        // the epoch check next cycle. (If instead we are behind the leader's
+        // log start — retention deleted what we need — the check finds nothing
+        // to cut and a full resync is still out of scope.)
+        spdlog::warn("Follower {}-{}: leader rejected fetch at {}; reconciling the log tail",
+                     task.tp.topic, task.tp.partition, fetch_offset);
+        setEpochCheckPending(task, true);
+        return true;
     }
     if (result->error != ErrorCode::NONE) {
-        // Leadership may have moved; the next reconcile fixes our view.
+        // NOT_LEADER / FENCED_LEADER_EPOCH / UNKNOWN_LEADER_EPOCH: one of us has
+        // stale leadership; the next reconcile cycle fixes our view.
         spdlog::debug("Fetch from leader {} for {}-{} returned error {}", task.leader,
                       task.tp.topic, task.tp.partition, static_cast<int16_t>(result->error));
-        return;
+        return true;
+    }
+
+    // The task was snapshotted at the start of a cycle that may have spanned a
+    // leadership change (e.g. waiting out a frozen peer). Never ingest data from
+    // a leader the committed metadata no longer names: if we have since become
+    // the leader ourselves, it would corrupt our log.
+    if (!broker_->isPartitionLeadership(task.tp, task.leader, task.leader_epoch)) {
+        return true;
     }
 
     // Ingest the leader's raw batches, offset-preserved. Stop on a gap (the
-    // follower diverged; leader-epoch truncation is M7).
+    // follower diverged; reconcile with the leader first).
     if (!result->record_batches.empty()) {
         Buffer buf(result->record_batches);
         while (buf.remaining() >= 12) {
@@ -385,9 +398,16 @@ void ReplicaManager::fetchPartitionFromLeader(const FetchTask& task) {
                              task.tp.partition, e.what());
                 break;
             }
-            const auto r = task.log->appendReplicatedBatch(batch);
+            auto r = task.log->appendReplicatedBatch(batch);
+            if (r == storage::Log::ReplicaAppendResult::kOverlap) {
+                // Our tail from this batch's base differs from the leader's: the
+                // leader is authoritative, so take its whole batch.
+                task.log->truncateSuffix(batch.baseOffset());
+                r = task.log->appendReplicatedBatch(batch);
+            }
             if (r == storage::Log::ReplicaAppendResult::kGap) {
-                break;  // need truncation before continuing (M7)
+                setEpochCheckPending(task, true);  // diverged; reconcile first
+                break;
             }
             // kDuplicate: already had it; kAppended: continue.
         }
@@ -405,6 +425,73 @@ void ReplicaManager::fetchPartitionFromLeader(const FetchTask& task) {
         if (it != replicas_.end()) {
             it->second.fetch_offset = new_leo;
         }
+    }
+    return true;
+}
+
+bool ReplicaManager::reconcileWithLeader(const FetchTask& task, PeerClient& client,
+                                         bool& reachable) {
+    const auto latest = task.log->latestLeaderEpoch();
+    std::optional<EpochAnswer> leader_answer;
+    EpochAnswer own;
+    if (latest) {
+        auto r = client.offsetForLeaderEpoch(task.tp.topic, task.tp.partition, task.leader_epoch,
+                                             *latest);
+        if (!r) {
+            peer_clients_.erase(task.leader);
+            reachable = false;
+            return false;
+        }
+        if (r->error != ErrorCode::NONE) {
+            spdlog::debug("OffsetForLeaderEpoch from leader {} for {}-{} returned error {}",
+                          task.leader, task.tp.topic, task.tp.partition,
+                          static_cast<int16_t>(r->error));
+            return false;
+        }
+        leader_answer = EpochAnswer{r->leader_epoch, r->end_offset};
+        if (leader_answer->defined()) {
+            const auto [epoch, end] = task.log->epochEndOffset(leader_answer->epoch);
+            own = EpochAnswer{epoch, end};
+        }
+    }
+    if (!broker_->isPartitionLeadership(task.tp, task.leader, task.leader_epoch)) {
+        return false;  // leadership moved since the snapshot; re-check next cycle
+    }
+    const Offset leo = task.log->logEndOffset();
+    const Offset hw = task.log->highWatermark();
+    const Offset target = followerTruncationOffset(latest, leader_answer, own, leo, hw);
+    if (target < leo) {
+        if (target < hw) {
+            spdlog::error("Follower {}-{}: truncating below the high watermark ({} < {}) to "
+                          "match leader {} — records it acknowledged are gone (unclean "
+                          "election?)",
+                          task.tp.topic, task.tp.partition, target, hw, task.leader);
+        } else {
+            spdlog::warn("Follower {}-{}: truncating divergent tail {}..{} to match leader {} "
+                         "(epoch {})",
+                         task.tp.topic, task.tp.partition, target, leo, task.leader,
+                         task.leader_epoch);
+        }
+        task.log->truncateSuffix(target);
+    }
+    setEpochCheckPending(task, false);
+    return true;
+}
+
+void ReplicaManager::setEpochCheckPending(const FetchTask& task, bool pending) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = replicas_.find(task.tp);
+    if (it == replicas_.end()) {
+        return;
+    }
+    if (pending) {
+        it->second.epoch_check_pending = true;
+        return;
+    }
+    // A leadership change since the snapshot needs its own check.
+    if (it->second.leader == task.leader && it->second.leader_epoch == task.leader_epoch) {
+        it->second.epoch_check_pending = false;
+        it->second.fetch_offset = task.log->logEndOffset();
     }
 }
 
@@ -448,6 +535,8 @@ bool ReplicaManager::reconcileReplica(const TopicPartition& tp, std::shared_ptr<
         // A follower starts fetching from its current log-end; a leader's
         // fetch_offset is unused.
         info.fetch_offset = (leader != local_broker_id_) ? info.log->logEndOffset() : 0;
+        // M8-E3: its tail may be from an older leadership — check first.
+        info.epoch_check_pending = leader != local_broker_id_;
         auto& stored = replicas_[tp] = std::move(info);
         if (leader == local_broker_id_) {
             // M8-F3: our epoch starts at our log end.
@@ -474,6 +563,10 @@ bool ReplicaManager::reconcileReplica(const TopicPartition& tp, std::shared_ptr<
         // Demoted (M8-D): resume replication from our own log end, not the
         // unused offset from our leader days.
         info.fetch_offset = info.log->logEndOffset();
+    }
+    if (!is_leader && (was_leader || info.leader != leader || info.leader_epoch != leader_epoch)) {
+        // M8-E3: a new leadership — our tail may diverge from the new leader's.
+        info.epoch_check_pending = true;
     }
     if (was_leader != is_leader || (is_leader && leader_epoch != info.leader_epoch)) {
         // Follower progress was reported against an earlier leadership.

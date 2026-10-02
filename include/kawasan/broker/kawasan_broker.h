@@ -122,6 +122,11 @@ public:
     /// NOT_LEADER_FOR_PARTITION instead of acting on stale leadership.
     bool dataPlaneCurrent() const;
 
+    /// @brief Whether the committed metadata names `leader` at `leader_epoch` as
+    /// the leader of `tp` (the replica fetcher re-checks before ingesting).
+    bool isPartitionLeadership(const TopicPartition& tp, BrokerId leader,
+                               int32_t leader_epoch) const;
+
     /// @brief M8-E1: sets the /ready probe from dataPlaneCurrent(). Called by
     /// the replica-fetcher thread (multi-broker only).
     void refreshReadiness();
