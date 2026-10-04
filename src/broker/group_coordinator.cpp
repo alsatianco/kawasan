@@ -342,6 +342,51 @@ GroupCoordinator::SyncGroupResult GroupCoordinator::handleSyncGroup(
     return result;
 }
 
+ErrorCode GroupCoordinator::validateTxnOffsetCommit(
+    const std::string& group_id, int32_t generation_id, const std::string& member_id,
+    const std::optional<std::string>& group_instance_id) const {
+    if (group_id.empty()) {
+        return ErrorCode::INVALID_GROUP_ID;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const GroupState* group = findGroup(group_id);
+    if (group && group->kind == GroupStateKind::Dead) {
+        return ErrorCode::COORDINATOR_NOT_AVAILABLE;
+    }
+    // Kafka accepts manual assignment on empty groups and legacy transactional
+    // commits without membership metadata, even when a classic group is active.
+    if (generation_id < 0 && (!group || group->kind == GroupStateKind::Empty)) {
+        return ErrorCode::NONE;
+    }
+    if (generation_id < 0 && member_id.empty() && !group_instance_id) {
+        return ErrorCode::NONE;
+    }
+    if (!group) {
+        return ErrorCode::UNKNOWN_MEMBER_ID;
+    }
+    // Static identity fencing precedes generation validation. A replaced static
+    // member must not be mistaken for a consumer that merely needs to rejoin.
+    if (group_instance_id) {
+        const auto instance = std::find_if(
+            group->members.begin(), group->members.end(),
+            [&](const auto& entry) { return entry.second.group_instance_id == group_instance_id; });
+        if (instance == group->members.end()) {
+            return ErrorCode::UNKNOWN_MEMBER_ID;
+        }
+        if (instance->first != member_id) {
+            return ErrorCode::FENCED_INSTANCE_ID;
+        }
+    }
+    if (group->members.find(member_id) == group->members.end()) {
+        return ErrorCode::UNKNOWN_MEMBER_ID;
+    }
+    if (generation_id != group->generation_id) {
+        return ErrorCode::ILLEGAL_GENERATION;
+    }
+    // A current member can commit transactional offsets during a rebalance.
+    return ErrorCode::NONE;
+}
+
 ErrorCode GroupCoordinator::handleHeartbeat(const protocol::HeartbeatRequest& request) {
     std::lock_guard<std::mutex> lock(mutex_);
     GroupState* group = findGroup(request.groupId());
@@ -484,6 +529,7 @@ std::vector<protocol::OffsetCommitResponse::Topic> GroupCoordinator::handleOffse
                 data.partition = partition_request.partition;
                 data.offset = partition_request.offset;
                 data.metadata = partition_request.metadata;
+                data.committed_leader_epoch = partition_request.committed_leader_epoch;
                 batch_offsets.push_back(std::move(data));
 
                 partition_response.error = ErrorCode::NONE;
@@ -550,6 +596,7 @@ std::vector<protocol::OffsetFetchResponse::Topic> GroupCoordinator::handleOffset
             if (offset_metadata.has_value()) {
                 partition_response.offset = offset_metadata->offset;
                 partition_response.metadata = offset_metadata->metadata;
+                partition_response.committed_leader_epoch = offset_metadata->committed_leader_epoch;
             }
 
             topic_response.partitions.push_back(std::move(partition_response));

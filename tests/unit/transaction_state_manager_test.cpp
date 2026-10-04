@@ -10,6 +10,7 @@
 #include <string>
 
 #include "kawasan/broker/transaction_coordinator.h"
+#include "kawasan/common/buffer.h"
 
 namespace kawasan::broker {
 namespace {
@@ -28,8 +29,8 @@ Snapshot makeSnapshot() {
     s.state_start_time_ms = 1234567890123LL;
     s.partitions = {{"orders", 3, 100}, {"orders", 5, 250}, {"__consumer_offsets", 12, -1}};
     s.pending_offsets = {
-        {"grp-A", "input", 0, 500, "meta"},
-        {"grp-A", "input", 1, 900, ""},
+        {"grp-A", "input", 0, 500, "meta", 17},
+        {"grp-A", "input", 1, 900, "", 19},
     };
     return s;
 }
@@ -59,7 +60,36 @@ TEST(TxnStateSerialization, RoundTripsEveryField) {
         EXPECT_EQ(decoded.pending_offsets[i].partition, original.pending_offsets[i].partition);
         EXPECT_EQ(decoded.pending_offsets[i].offset, original.pending_offsets[i].offset);
         EXPECT_EQ(decoded.pending_offsets[i].metadata, original.pending_offsets[i].metadata);
+        EXPECT_EQ(decoded.pending_offsets[i].committed_leader_epoch,
+                  original.pending_offsets[i].committed_leader_epoch);
     }
+}
+
+TEST(TxnStateSerialization, ReadsLegacySnapshotWithoutLeaderEpoch) {
+    Buffer legacy;
+    auto field = [&](const std::string& value) {
+        legacy.writeInt32(static_cast<int32_t>(value.size()));
+        legacy.writeBytes(reinterpret_cast<const uint8_t*>(value.data()), value.size());
+    };
+    legacy.writeInt8(1);
+    field("legacy-txn");
+    legacy.writeInt64(100);
+    legacy.writeInt16(2);
+    legacy.writeInt32(60000);
+    legacy.writeInt8(static_cast<int8_t>(State::PrepareCommit));
+    legacy.writeInt64(123);
+    legacy.writeInt32(0);
+    legacy.writeInt32(1);
+    field("legacy-group");
+    field("input");
+    legacy.writeInt32(4);
+    legacy.writeInt64(15);
+    field("checkpoint");
+    const auto decoded = TSM::deserialize({legacy.data(), legacy.data() + legacy.size()});
+    ASSERT_EQ(decoded.pending_offsets.size(), 1u);
+    EXPECT_EQ(decoded.pending_offsets[0].offset, 15);
+    EXPECT_EQ(decoded.pending_offsets[0].metadata, "checkpoint");
+    EXPECT_EQ(decoded.pending_offsets[0].committed_leader_epoch, -1);
 }
 
 TEST(TxnStateSerialization, EmptySnapshotRoundTrips) {

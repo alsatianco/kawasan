@@ -723,12 +723,11 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
         // Phase 4.2a: SASL PLAIN handshake + authenticate.
         {protocol::ApiKey::SASL_HANDSHAKE, 0, 1},
         {protocol::ApiKey::SASL_AUTHENTICATE, 0, 2},
-        // Phase 3.3 scaffolding: transactional APIs (v0 only — covers
-        // kafka-python + librdkafka negotiation; full semantics deferred).
-        {protocol::ApiKey::ADD_PARTITIONS_TO_TXN, 0, 0},
-        {protocol::ApiKey::ADD_OFFSETS_TO_TXN, 0, 0},
-        {protocol::ApiKey::END_TXN, 0, 0},
-        {protocol::ApiKey::TXN_OFFSET_COMMIT, 0, 0},
+        // CM-4: flexible v3 transactions with classic group generation fencing.
+        {protocol::ApiKey::ADD_PARTITIONS_TO_TXN, 0, 3},
+        {protocol::ApiKey::ADD_OFFSETS_TO_TXN, 0, 3},
+        {protocol::ApiKey::END_TXN, 0, 3},
+        {protocol::ApiKey::TXN_OFFSET_COMMIT, 0, 3},
     };
     if (compatibility_profile == "3.x") {
         const std::map<protocol::ApiKey, int16_t> caps{
@@ -1301,6 +1300,7 @@ void KawasanBroker::finishTxnCompletion(
             d.partition = po.partition;
             d.offset = po.offset;
             d.metadata = po.metadata;
+            d.committed_leader_epoch = po.committed_leader_epoch;
             by_group[po.group_id].push_back(std::move(d));
         }
         for (auto& [group_id, data] : by_group) {
@@ -1933,15 +1933,12 @@ void KawasanBroker::registerProtocolHandlers() {
     reg_admin(protocol::ApiKey::SASL_HANDSHAKE, 0, 1, &KawasanBroker::handleSaslHandshake);
     reg_admin(protocol::ApiKey::SASL_AUTHENTICATE, 0, 2, &KawasanBroker::handleSaslAuthenticate);
 
-    // Phase 3.3 scaffolding: transactional APIs. Advertised v0 only —
-    // sufficient for kafka-python and librdkafka to negotiate; higher
-    // versions just add tagged_fields which our v0 encoders don't emit
-    // but our flex-header path handles correctly.
-    reg_admin(protocol::ApiKey::ADD_PARTITIONS_TO_TXN, 0, 0,
+    // CM-4: shared advertised/dispatcher ranges include flexible v3 bodies.
+    reg_admin(protocol::ApiKey::ADD_PARTITIONS_TO_TXN, 0, 3,
               &KawasanBroker::handleAddPartitionsToTxn);
-    reg_admin(protocol::ApiKey::ADD_OFFSETS_TO_TXN, 0, 0, &KawasanBroker::handleAddOffsetsToTxn);
-    reg_admin(protocol::ApiKey::END_TXN, 0, 0, &KawasanBroker::handleEndTxn);
-    reg_admin(protocol::ApiKey::TXN_OFFSET_COMMIT, 0, 0, &KawasanBroker::handleTxnOffsetCommit);
+    reg_admin(protocol::ApiKey::ADD_OFFSETS_TO_TXN, 0, 3, &KawasanBroker::handleAddOffsetsToTxn);
+    reg_admin(protocol::ApiKey::END_TXN, 0, 3, &KawasanBroker::handleEndTxn);
+    reg_admin(protocol::ApiKey::TXN_OFFSET_COMMIT, 0, 3, &KawasanBroker::handleTxnOffsetCommit);
 }
 
 Buffer KawasanBroker::encodeResponse(const RequestDispatcher::RequestContext& context,
@@ -5819,10 +5816,14 @@ Buffer KawasanBroker::handleTxnOffsetCommit(RequestDispatcher::RequestContext& c
                  req.transactionalId(), req.groupId(), req.producerId(), req.producerEpoch(),
                  req.topics().size());
     // M2: fence a stale-epoch (zombie) producer before staging any offsets.
-    const ErrorCode txn_error =
+    ErrorCode txn_error =
         !isCoordinatorFor(req.transactionalId(), protocol::CoordinatorType::TRANSACTION)
             ? ErrorCode::NOT_COORDINATOR
             : validateTxnProducer(req.transactionalId(), req.producerId(), req.producerEpoch());
+    if (txn_error == ErrorCode::NONE) {
+        txn_error = group_coordinator_->validateTxnOffsetCommit(
+            req.groupId(), req.generationId(), req.memberId(), req.groupInstanceId());
+    }
     if (txn_error != ErrorCode::NONE) {
         protocol::TxnOffsetCommitResponse resp;
         resp.setThrottleTimeMs(0);
@@ -5855,31 +5856,11 @@ Buffer KawasanBroker::handleTxnOffsetCommit(RequestDispatcher::RequestContext& c
                 po.partition = p.partition;
                 po.offset = p.offset;
                 po.metadata = p.metadata;
+                po.committed_leader_epoch = p.committed_leader_epoch;
                 staged.push_back(std::move(po));
             }
         }
         transaction_coordinator_->stagePendingOffsets(req.transactionalId(), std::move(staged));
-    } else if (offset_manager_ && !req.groupId().empty()) {
-        // Fallback: if no transactional context is provided, treat
-        // this like a plain OffsetCommit. This preserves the old
-        // scaffolding behavior for clients that send TxnOffsetCommit
-        // without a real txn.
-        std::vector<OffsetManager::OffsetCommitData> data;
-        for (const auto& t : req.topics()) {
-            for (const auto& p : t.partitions) {
-                OffsetManager::OffsetCommitData d;
-                d.topic = t.topic;
-                d.partition = p.partition;
-                d.offset = p.offset;
-                d.metadata = p.metadata;
-                data.push_back(std::move(d));
-            }
-        }
-        try {
-            offset_manager_->commitOffsetBatch(req.groupId(), data);
-        } catch (const std::exception& ex) {
-            Logger::warn("TxnOffsetCommit batch commit failed: {}", ex.what());
-        }
     }
     protocol::TxnOffsetCommitResponse resp;
     resp.setThrottleTimeMs(0);

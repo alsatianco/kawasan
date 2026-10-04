@@ -1,4 +1,2 @@
 # profile<TAB>case<TAB>error substring<TAB>milestone<TAB>reason
 # Rows are added only after a fully green Kafka oracle and a recorded candidate failure.
-java-4.2.0	eos-offsets	UnsupportedVersionException: Broker doesn't support group metadata commit API on version 0	CM-4	TxnOffsetCommit v3 with generation validation is required
-java-3.9.1	eos-offsets	UnsupportedVersionException: Broker doesn't support group metadata commit API on version 0	CM-4	TxnOffsetCommit v3 with generation validation is required

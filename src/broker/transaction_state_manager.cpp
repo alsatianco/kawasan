@@ -1,11 +1,10 @@
 #include "kawasan/broker/transaction_state_manager.h"
 
-#include "kawasan/broker/coordinator_routing.h"
-
 #include <algorithm>
 #include <stdexcept>
 #include <unordered_map>
 
+#include "kawasan/broker/coordinator_routing.h"
 #include "kawasan/common/buffer.h"
 #include "kawasan/common/logger.h"
 #include "kawasan/common/types.h"
@@ -17,7 +16,7 @@ namespace kawasan::broker {
 
 namespace {
 
-constexpr int8_t kSnapshotVersion = 1;
+constexpr int8_t kSnapshotVersion = 2;
 
 // Length-prefixed (INT32) byte field — UTF-8-agnostic, so PendingOffset
 // metadata (arbitrary bytes) round-trips safely, unlike JSON.
@@ -47,7 +46,13 @@ TransactionStateManager::TransactionStateManager(storage::LogManager* log_manage
 std::vector<uint8_t> TransactionStateManager::serialize(
     const TransactionCoordinator::TxnSnapshot& s) {
     Buffer buf;
-    buf.writeInt8(kSnapshotVersion);
+    // Preserve v1 bytes for snapshots without leader-epoch metadata.
+    const int8_t version =
+        std::any_of(s.pending_offsets.begin(), s.pending_offsets.end(),
+                    [](const auto& offset) { return offset.committed_leader_epoch != -1; })
+            ? kSnapshotVersion
+            : 1;
+    buf.writeInt8(version);
     putBytes(buf, s.transactional_id);
     buf.writeInt64(s.producer_id);
     buf.writeInt16(s.producer_epoch);
@@ -69,6 +74,8 @@ std::vector<uint8_t> TransactionStateManager::serialize(
         buf.writeInt32(po.partition);
         buf.writeInt64(po.offset);
         putBytes(buf, po.metadata);
+        if (version >= 2)
+            buf.writeInt32(po.committed_leader_epoch);
     }
     return std::vector<uint8_t>(buf.data(), buf.data() + buf.size());
 }
@@ -78,7 +85,7 @@ TransactionCoordinator::TxnSnapshot TransactionStateManager::deserialize(
     Buffer buf(bytes);
     TransactionCoordinator::TxnSnapshot s;
     const int8_t version = buf.readInt8();
-    if (version != kSnapshotVersion) {
+    if (version != 1 && version != kSnapshotVersion) {
         throw std::runtime_error("txn-state: unknown snapshot version " + std::to_string(version));
     }
     s.transactional_id = getBytes(buf);
@@ -111,6 +118,7 @@ TransactionCoordinator::TxnSnapshot TransactionStateManager::deserialize(
         po.partition = buf.readInt32();
         po.offset = buf.readInt64();
         po.metadata = getBytes(buf);
+        po.committed_leader_epoch = version >= 2 ? buf.readInt32() : -1;
         s.pending_offsets.push_back(std::move(po));
     }
     return s;

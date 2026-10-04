@@ -66,6 +66,11 @@ bool isFlexibleRequestHeader(ApiKey api_key, int16_t api_version) {
             return api_version >= 5;
         case ApiKey::DELETE_TOPICS:
             return api_version >= 4;
+        case ApiKey::ADD_PARTITIONS_TO_TXN:
+        case ApiKey::ADD_OFFSETS_TO_TXN:
+        case ApiKey::END_TXN:
+        case ApiKey::TXN_OFFSET_COMMIT:
+            return api_version >= 3;
         case ApiKey::INIT_PRODUCER_ID:
             // Phase 1.18: v2+ flexible
             return api_version >= 2;
@@ -154,7 +159,7 @@ void RequestHeader::encode(Buffer& buffer) const {
     buffer.writeInt16(static_cast<int16_t>(api_key_));
     buffer.writeInt16(api_version_);
     buffer.writeInt32(correlation_id_);
-    
+
     if (isFlexibleRequestHeader(api_key_, api_version_)) {
         // Request Header v2: regular STRING for client_id + tagged_fields.
         // See decode() for the corresponding spec note.
@@ -176,7 +181,7 @@ void RequestHeader::decode(Buffer& buffer) {
     api_key_ = static_cast<ApiKey>(buffer.readInt16());
     api_version_ = buffer.readInt16();
     correlation_id_ = buffer.readInt32();
-    
+
     // Now we know the api_key and api_version, so we can determine the header format.
     //
     // Per the Kafka wire spec, Request Header v2 ("flexible" header) uses a
@@ -198,12 +203,11 @@ void RequestHeader::decode(Buffer& buffer) {
     }
 }
 
-
 size_t RequestHeader::size() const {
     size_t base_size = sizeof(int16_t) +  // api_key
                        sizeof(int16_t) +  // api_version
                        sizeof(int32_t);   // correlation_id
-    
+
     if (isFlexibleRequestHeader(api_key_, api_version_)) {
         // Flexible version: compact string + tagged fields
         // This is an approximation; actual size depends on varint encoding
@@ -212,7 +216,7 @@ size_t RequestHeader::size() const {
         // Legacy version: regular string
         base_size += sizeof(int16_t) + client_id_.size();
     }
-    
+
     return base_size;
 }
 
@@ -270,6 +274,11 @@ bool RequestHeader::isFlexibleResponseHeader() const {
         case ApiKey::SASL_HANDSHAKE:
             // Response header for SASL_HANDSHAKE remains v0 (no tagged fields)
             return false;
+        case ApiKey::ADD_PARTITIONS_TO_TXN:
+        case ApiKey::ADD_OFFSETS_TO_TXN:
+        case ApiKey::END_TXN:
+        case ApiKey::TXN_OFFSET_COMMIT:
+            return api_version_ >= 3;
         case ApiKey::INIT_PRODUCER_ID:
             return api_version_ >= 2;
         case ApiKey::OFFSET_FOR_LEADER_EPOCH:

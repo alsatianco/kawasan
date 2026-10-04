@@ -17,6 +17,7 @@
 #include <thread>
 
 #include "kawasan/broker/offset_manager.h"
+#include "kawasan/common/rocksdb_compat.h"
 #include "kawasan/protocol/describe_groups_request.h"
 #include "kawasan/protocol/heartbeat_request.h"
 #include "kawasan/protocol/join_group_request.h"
@@ -219,4 +220,117 @@ TEST_F(GroupCoordinatorTest, FetchesDurableOffsetsWithoutGroupMembershipAfterRes
     EXPECT_EQ(result[0].partitions[0].offset, 7);
     EXPECT_EQ(result[0].partitions[0].metadata, "txn-checkpoint");
     EXPECT_EQ(result[0].partitions[1].offset, -1);
+}
+
+TEST_F(GroupCoordinatorTest, TransactionalOffsetsFenceGenerationAndStaticIdentity) {
+    auto request = makeJoin("txn-group", "", "consumer", "range");
+    request.setGroupInstanceId("instance");
+    const auto joined = coordinator_->handleJoinGroup(request);
+    ASSERT_EQ(joined.error, ErrorCode::NONE);
+    auto validate = [&](int32_t generation, const std::string& member,
+                        std::optional<std::string> instance = std::nullopt) {
+        return coordinator_->validateTxnOffsetCommit("txn-group", generation, member, instance);
+    };
+    EXPECT_EQ(validate(joined.generation_id, joined.member_id, "instance"), ErrorCode::NONE);
+    EXPECT_EQ(validate(joined.generation_id, joined.member_id), ErrorCode::NONE);
+    EXPECT_EQ(validate(joined.generation_id + 1, joined.member_id, "instance"),
+              ErrorCode::ILLEGAL_GENERATION);
+    EXPECT_EQ(validate(joined.generation_id, "unknown"), ErrorCode::UNKNOWN_MEMBER_ID);
+    EXPECT_EQ(validate(joined.generation_id, joined.member_id, "missing-instance"),
+              ErrorCode::UNKNOWN_MEMBER_ID);
+    EXPECT_EQ(validate(joined.generation_id, "stale-member", "instance"),
+              ErrorCode::FENCED_INSTANCE_ID);
+    EXPECT_EQ(validate(joined.generation_id + 1, "stale-member", "instance"),
+              ErrorCode::FENCED_INSTANCE_ID);
+    EXPECT_EQ(validate(-1, ""), ErrorCode::NONE);  // legacy transactional references
+    EXPECT_EQ(validate(-1, joined.member_id), ErrorCode::ILLEGAL_GENERATION);
+    EXPECT_EQ(coordinator_->validateTxnOffsetCommit("", -1, "", std::nullopt),
+              ErrorCode::INVALID_GROUP_ID);
+    EXPECT_EQ(coordinator_->validateTxnOffsetCommit("missing", 1, "unknown", std::nullopt),
+              ErrorCode::UNKNOWN_MEMBER_ID);
+}
+
+TEST_F(GroupCoordinatorTest, TransactionalOffsetsAcceptCurrentGenerationDuringRebalance) {
+    const auto first =
+        coordinator_->handleJoinGroup(makeJoin("txn-rebalance", "", "consumer", "range"));
+    ASSERT_EQ(first.error, ErrorCode::NONE);
+    protocol::SyncGroupRequest sync;
+    sync.setGroupId("txn-rebalance");
+    sync.setGenerationId(first.generation_id);
+    sync.setMemberId(first.member_id);
+    sync.setAssignments({{first.member_id, {1}}});
+    ASSERT_EQ(coordinator_->handleSyncGroup(sync).error, ErrorCode::NONE);
+    const auto next =
+        coordinator_->handleJoinGroup(makeJoin("txn-rebalance", "", "consumer", "range"));
+    ASSERT_EQ(next.error, ErrorCode::NONE);
+    ASSERT_GT(next.generation_id, first.generation_id);
+    EXPECT_EQ(coordinator_->validateTxnOffsetCommit("txn-rebalance", next.generation_id,
+                                                    next.member_id, std::nullopt),
+              ErrorCode::NONE);
+    EXPECT_EQ(coordinator_->validateTxnOffsetCommit("txn-rebalance", first.generation_id,
+                                                    first.member_id, std::nullopt),
+              ErrorCode::ILLEGAL_GENERATION);
+    EXPECT_EQ(coordinator_->handleLeaveGroup("txn-rebalance", first.member_id), ErrorCode::NONE);
+    EXPECT_EQ(coordinator_->handleLeaveGroup("txn-rebalance", next.member_id), ErrorCode::NONE);
+    // Kafka's empty-group path accepts generationless manual commits.
+    EXPECT_EQ(coordinator_->validateTxnOffsetCommit("txn-rebalance", -1, "manual-member",
+                                                    "manual-instance"),
+              ErrorCode::NONE);
+}
+
+TEST_F(GroupCoordinatorTest, OffsetLeaderEpochSurvivesCacheRestart) {
+    offset_mgr_->commitOffsetBatch("epoch-group", {{"input", 0, 42, "checkpoint", 17}});
+    coordinator_.reset();
+    offset_mgr_.reset();
+    offset_mgr_ = std::make_shared<OffsetManager>(db_path_);
+    coordinator_ = std::make_unique<GroupCoordinator>(offset_mgr_);
+    const auto stored = offset_mgr_->fetchOffsetWithMetadata("epoch-group", "input", 0);
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(stored->offset, 42);
+    EXPECT_EQ(stored->metadata, "checkpoint");
+    EXPECT_EQ(stored->committed_leader_epoch, 17);
+    protocol::OffsetFetchRequest request;
+    request.setGroupId("epoch-group");
+    request.setTopics({{"input", {{0}}}});
+    ErrorCode error;
+    const auto fetched = coordinator_->handleOffsetFetch(request, error);
+    EXPECT_EQ(error, ErrorCode::NONE);
+    ASSERT_EQ(fetched.size(), 1u);
+    EXPECT_EQ(fetched[0].partitions[0].committed_leader_epoch, 17);
+}
+
+TEST_F(GroupCoordinatorTest, ReadsLegacyOffsetStorageAndRejectsTruncatedEpoch) {
+    coordinator_.reset();
+    offset_mgr_.reset();
+    std::unique_ptr<rocksdb::DB> db;
+    rocksdb::Options options;
+    ASSERT_TRUE(kawasan::openRocksDb(options, db_path_, db).ok());
+    kawasan::Buffer legacy;
+    legacy.writeInt8(1);
+    legacy.writeInt64(51);
+    legacy.writeInt64(1000);
+    legacy.writeInt64(2000);
+    legacy.writeInt32(3);
+    legacy.writeBytes(reinterpret_cast<const uint8_t*>("old"), 3);
+    const std::string binary(reinterpret_cast<const char*>(legacy.data()), legacy.size());
+    ASSERT_TRUE(db->Put(rocksdb::WriteOptions{}, "offset:legacy:input:0", binary).ok());
+    ASSERT_TRUE(
+        db->Put(
+              rocksdb::WriteOptions{}, "offset:legacy:input:1",
+              R"({"offset":52,"metadata":"json","commit_timestamp":1000,"expiry_timestamp":2000})")
+            .ok());
+    std::string truncated = binary;
+    truncated[0] = 2;
+    truncated.append(3, '\0');
+    ASSERT_TRUE(db->Put(rocksdb::WriteOptions{}, "offset:legacy:input:2", truncated).ok());
+    db.reset();
+    offset_mgr_ = std::make_shared<OffsetManager>(db_path_);
+    for (int32_t partition : {0, 1}) {
+        const auto stored = offset_mgr_->fetchOffsetWithMetadata("legacy", "input", partition);
+        ASSERT_TRUE(stored.has_value());
+        EXPECT_EQ(stored->offset, 51 + partition);
+        EXPECT_EQ(stored->metadata, partition == 0 ? "old" : "json");
+        EXPECT_EQ(stored->committed_leader_epoch, -1);
+    }
+    EXPECT_FALSE(offset_mgr_->fetchOffsetWithMetadata("legacy", "input", 2));
 }

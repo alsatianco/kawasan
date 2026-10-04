@@ -6,8 +6,8 @@ import re
 import sys
 
 CAPS = {
-    "4.x": {0: 11, 1: 13, 2: 8, 9: 9, 21: 2, 36: 2},
-    "3.x": {0: 9, 1: 12, 2: 7, 9: 8, 21: 0, 36: 1},
+    "4.x": {0: 11, 1: 13, 2: 8, 9: 9, 21: 2, 36: 2, 24: 3, 25: 3, 26: 3, 28: 3},
+    "3.x": {0: 9, 1: 12, 2: 7, 9: 8, 21: 0, 36: 1, 24: 3, 25: 3, 26: 3, 28: 3},
 }
 
 
@@ -28,7 +28,7 @@ def verify(observed, profile, compatibility):
             errors.append(f"API {api} requests exceeded profile maximum {caps[api]}")
     required = {0, 1}
     if profile.startswith("java-"):
-        required |= {2, 9}
+        required |= {2, 9, 24, 25, 26, 28}
     for api in sorted(required):
         if not observed.get(api):
             errors.append(f"missing request evidence for API {api}")

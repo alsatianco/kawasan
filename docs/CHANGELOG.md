@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgrade and operational procedures see [./OPERATIONS.md](./OPERATIONS.md); for the full protocol surface see [./api_coverage_matrix.md](./api_coverage_matrix.md).
 
+## 2026-10-05
+
+- Support transactional API v3 with classic group generation and static-instance
+  fencing before offset staging. Accept current members during rebalance and
+  retain legacy transaction commits without membership metadata. Preserve
+  committed leader epoch through pending offsets, transaction snapshots,
+  offset-cache persistence and OffsetFetch. Existing single-node v1/JSON offset
+  records and v1 transaction snapshots remain readable; writes without epoch
+  metadata retain their v1 format. Multi-broker coordinator recovery remains M10.
+
 ## 2026-10-04
 
 - Decode and encode TxnOffsetCommit's v2 committed leader epoch and v3

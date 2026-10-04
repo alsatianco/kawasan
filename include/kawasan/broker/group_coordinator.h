@@ -40,9 +40,9 @@ namespace kawasan::broker {
 /// Offsets are now persisted to disk via OffsetManager.
 class GroupCoordinator {
 public:
-    explicit GroupCoordinator(std::shared_ptr<OffsetManager> offset_manager,
-                             storage::LogManager* log_manager = nullptr,
-                             std::shared_ptr<monitoring::MetricsCollector> metrics_collector = nullptr);
+    explicit GroupCoordinator(
+        std::shared_ptr<OffsetManager> offset_manager, storage::LogManager* log_manager = nullptr,
+        std::shared_ptr<monitoring::MetricsCollector> metrics_collector = nullptr);
     ~GroupCoordinator();
 
     GroupCoordinator(const GroupCoordinator&) = delete;
@@ -78,6 +78,9 @@ public:
                                     const std::string& client_host = "");
     SyncGroupResult handleSyncGroup(const protocol::SyncGroupRequest& request);
     ErrorCode handleHeartbeat(const protocol::HeartbeatRequest& request);
+    ErrorCode validateTxnOffsetCommit(const std::string& group_id, int32_t generation_id,
+                                      const std::string& member_id,
+                                      const std::optional<std::string>& group_instance_id) const;
     ErrorCode handleLeaveGroup(const std::string& group_id, const std::string& member_id);
 
     std::vector<protocol::OffsetCommitResponse::Topic> handleOffsetCommit(
@@ -194,11 +197,16 @@ private:
 
     static const char* stateKindName(GroupStateKind k) {
         switch (k) {
-            case GroupStateKind::Empty: return "Empty";
-            case GroupStateKind::PreparingRebalance: return "PreparingRebalance";
-            case GroupStateKind::CompletingRebalance: return "CompletingRebalance";
-            case GroupStateKind::Stable: return "Stable";
-            case GroupStateKind::Dead: return "Dead";
+            case GroupStateKind::Empty:
+                return "Empty";
+            case GroupStateKind::PreparingRebalance:
+                return "PreparingRebalance";
+            case GroupStateKind::CompletingRebalance:
+                return "CompletingRebalance";
+            case GroupStateKind::Stable:
+                return "Stable";
+            case GroupStateKind::Dead:
+                return "Dead";
         }
         return "Unknown";
     }
@@ -227,10 +235,13 @@ private:
 
         GroupState() = default;
         GroupState(const GroupState& other)
-            : generation_id(other.generation_id), kind(other.kind),
+            : generation_id(other.generation_id),
+              kind(other.kind),
               protocol_type(other.protocol_type),
-              protocol_name(other.protocol_name), leader_id(other.leader_id),
-              members(other.members), last_activity(other.last_activity),
+              protocol_name(other.protocol_name),
+              leader_id(other.leader_id),
+              members(other.members),
+              last_activity(other.last_activity),
               rebalance_timeout_ms(other.rebalance_timeout_ms),
               rebalance_started_at(other.rebalance_started_at),
               rebalances_total(other.rebalances_total.load()) {}
@@ -264,16 +275,17 @@ private:
     /// @brief Checks and removes timed-out members from groups.
     void checkMemberTimeouts();
 
-    static std::vector<uint8_t> selectMetadata(
-        const protocol::JoinGroupRequest& request, const std::string& protocol_name);
+    static std::vector<uint8_t> selectMetadata(const protocol::JoinGroupRequest& request,
+                                               const std::string& protocol_name);
 
     std::shared_ptr<OffsetManager> offset_manager_;
     storage::LogManager* log_manager_;  ///< For accessing log end offsets (optional)
-    std::shared_ptr<monitoring::MetricsCollector> metrics_collector_;  ///< For recording metrics (optional)
+    std::shared_ptr<monitoring::MetricsCollector>
+        metrics_collector_;  ///< For recording metrics (optional)
     mutable std::mutex mutex_;
     std::unordered_map<std::string, GroupState> groups_;
     std::atomic<int64_t> member_sequence_{0};
-    
+
     // Group expiration
     int64_t group_retention_ms_;  ///< Group retention period (default: 7 days)
     int64_t member_timeout_ms_;   ///< Member timeout period (default: 30 seconds)

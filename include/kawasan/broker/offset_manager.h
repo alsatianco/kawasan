@@ -1,13 +1,13 @@
 #pragma once
 
+#include <rocksdb/db.h>
+
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
-
-#include <rocksdb/db.h>
 
 namespace kawasan::broker {
 
@@ -29,7 +29,7 @@ public:
     /// @param db_path Path to RocksDB database directory
     /// @throws std::runtime_error if RocksDB cannot be opened
     explicit OffsetManager(const std::string& db_path);
-    
+
     /// @brief Destructor - closes RocksDB connections
     ~OffsetManager();
 
@@ -41,10 +41,11 @@ public:
 
     /// @brief Metadata associated with a committed offset
     struct OffsetMetadata {
-        int64_t offset;              ///< Committed offset value
-        std::string metadata;        ///< Consumer-provided metadata
-        int64_t commit_timestamp;    ///< When offset was committed (ms since epoch)
-        int64_t expiry_timestamp;    ///< When offset should expire (ms since epoch)
+        int64_t offset;            ///< Committed offset value
+        std::string metadata;      ///< Consumer-provided metadata
+        int64_t commit_timestamp;  ///< When offset was committed (ms since epoch)
+        int64_t expiry_timestamp;  ///< When offset should expire (ms since epoch)
+        int32_t committed_leader_epoch = -1;
     };
 
     /// @brief Data for a single offset commit
@@ -53,6 +54,7 @@ public:
         int32_t partition;
         int64_t offset;
         std::string metadata;
+        int32_t committed_leader_epoch = -1;
     };
 
     /// @brief Key for identifying an offset
@@ -62,8 +64,7 @@ public:
         int32_t partition;
 
         bool operator==(const OffsetKey& other) const {
-            return group_id == other.group_id && 
-                   topic == other.topic && 
+            return group_id == other.group_id && topic == other.topic &&
                    partition == other.partition;
         }
     };
@@ -79,40 +80,32 @@ public:
     /// @param offset Offset value to commit
     /// @param metadata Optional consumer metadata
     /// @throws std::runtime_error on RocksDB write failure
-    void commitOffset(
-        const std::string& group_id,
-        const std::string& topic,
-        int32_t partition,
-        int64_t offset,
-        const std::string& metadata = "");
+    void commitOffset(const std::string& group_id, const std::string& topic, int32_t partition,
+                      int64_t offset, const std::string& metadata = "");
 
     /// @brief Fetches a committed offset (simple version).
     /// @param group_id Consumer group ID
     /// @param topic Topic name
     /// @param partition Partition number
     /// @return Committed offset value, or std::nullopt if not found
-    std::optional<int64_t> fetchOffset(
-        const std::string& group_id,
-        const std::string& topic,
-        int32_t partition) const;
+    std::optional<int64_t> fetchOffset(const std::string& group_id, const std::string& topic,
+                                       int32_t partition) const;
 
     /// @brief Fetches a committed offset with full metadata.
     /// @param group_id Consumer group ID
     /// @param topic Topic name
     /// @param partition Partition number
     /// @return Offset metadata, or std::nullopt if not found
-    std::optional<OffsetMetadata> fetchOffsetWithMetadata(
-        const std::string& group_id,
-        const std::string& topic,
-        int32_t partition) const;
+    std::optional<OffsetMetadata> fetchOffsetWithMetadata(const std::string& group_id,
+                                                          const std::string& topic,
+                                                          int32_t partition) const;
 
     /// @brief Commits multiple offsets atomically using RocksDB WriteBatch.
     /// @param group_id Consumer group ID
     /// @param offsets Vector of offset commit data
     /// @throws std::runtime_error on RocksDB write failure
-    void commitOffsetBatch(
-        const std::string& group_id,
-        const std::vector<OffsetCommitData>& offsets);
+    void commitOffsetBatch(const std::string& group_id,
+                           const std::vector<OffsetCommitData>& offsets);
 
     //
     // Group Management
@@ -129,12 +122,12 @@ public:
 
     /// @brief Complete group metadata
     struct GroupMetadata {
-        std::string state;           ///< Group state: "Stable", "Dead", "Empty", etc.
-        std::string protocol_type;   ///< Protocol type (e.g., "consumer")
-        std::string protocol;        ///< Selected protocol name
+        std::string state;          ///< Group state: "Stable", "Dead", "Empty", etc.
+        std::string protocol_type;  ///< Protocol type (e.g., "consumer")
+        std::string protocol;       ///< Selected protocol name
         std::vector<MemberMetadata> members;
-        int32_t generation;          ///< Current generation ID
-        int64_t last_update_timestamp; ///< Last update time (ms since epoch)
+        int32_t generation;             ///< Current generation ID
+        int64_t last_update_timestamp;  ///< Last update time (ms since epoch)
     };
 
     /// @brief Persists group metadata to RocksDB.
@@ -155,9 +148,7 @@ public:
 
     /// @brief Phase 4.1f: deletes a single (group, topic, partition) offset.
     /// @return true if a stored offset was deleted, false if it didn't exist.
-    bool deleteOffset(const std::string& group_id,
-                      const std::string& topic,
-                      int32_t partition);
+    bool deleteOffset(const std::string& group_id, const std::string& topic, int32_t partition);
 
     /// @brief Lists all consumer groups that have committed offsets.
     /// @return Vector of group IDs
@@ -194,10 +185,8 @@ public:
 
 private:
     /// @brief Constructs a RocksDB key for an offset.
-    static std::string makeOffsetKey(
-        const std::string& group_id,
-        const std::string& topic,
-        int32_t partition);
+    static std::string makeOffsetKey(const std::string& group_id, const std::string& topic,
+                                     int32_t partition);
 
     /// @brief Constructs a RocksDB key prefix for a group's offsets.
     static std::string makeGroupOffsetPrefix(const std::string& group_id);

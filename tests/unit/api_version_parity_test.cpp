@@ -15,6 +15,7 @@
 #include "kawasan/protocol/list_offsets_request.h"
 #include "kawasan/protocol/offset_fetch_request.h"
 #include "kawasan/protocol/produce_request.h"
+#include "kawasan/protocol/request_header.h"
 #include "kawasan/protocol/sasl_request.h"
 #include "kawasan/protocol/txn_request.h"
 
@@ -412,4 +413,31 @@ TEST(ApiVersionParityTest, TxnOffsetCommitReuseResetsGroupMetadataAndTopics) {
     EXPECT_TRUE(request.memberId().empty());
     EXPECT_FALSE(request.groupInstanceId());
     EXPECT_EQ(request.topics().size(), 1u);
+}
+
+TEST(ApiVersionParityTest, TransactionalHeadersMatchKafkaGeneratedCodecs) {
+    using namespace kawasan::protocol;
+    for (const auto api : {ApiKey::ADD_PARTITIONS_TO_TXN, ApiKey::ADD_OFFSETS_TO_TXN,
+                           ApiKey::END_TXN, ApiKey::TXN_OFFSET_COMMIT}) {
+        for (const int16_t version : {2, 3}) {
+            SCOPED_TRACE(static_cast<int16_t>(api));
+            SCOPED_TRACE(version);
+            const std::string prefix = "txn-header-" + std::to_string(static_cast<int16_t>(api)) +
+                                       "-v" + std::to_string(version);
+            const auto bytes = golden(prefix + "-request");
+            kawasan::Buffer input(bytes);
+            RequestHeader header;
+            header.decode(input);
+            EXPECT_EQ(input.remaining(), 0u);
+            EXPECT_EQ(header.clientId(), "cm4");
+            EXPECT_EQ(header.isFlexibleResponseHeader(), version == 3);
+            kawasan::Buffer encoded;
+            RequestHeader(api, version, 42, "cm4").encode(encoded);
+            EXPECT_EQ(std::vector<uint8_t>(encoded.data(), encoded.data() + encoded.size()), bytes);
+            kawasan::Buffer response;
+            ResponseHeader(42, header.isFlexibleResponseHeader()).encode(response);
+            EXPECT_EQ(std::vector<uint8_t>(response.data(), response.data() + response.size()),
+                      golden(prefix + "-response"));
+        }
+    }
 }

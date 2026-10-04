@@ -278,7 +278,17 @@ In short: offsets are always synchronous and messages are synchronous by default
 
 ## Consumer offset storage
 
-Manual assignment and transactional offset commits do not require an in-memory joined group. OffsetFetch reads the persistent OffsetManager directly; a genuinely uncommitted partition returns -1, including after restart.
+Legacy transactional commits without group membership and manual assignment do
+not require an in-memory joined group. TxnOffsetCommit v3 validates generation,
+member and optional static instance against the classic group before staging
+pending offsets. OffsetFetch reads the persistent OffsetManager directly; a
+genuinely uncommitted partition returns -1, including after restart.
+
+Pending offsets carry committed leader epoch. Transaction snapshots use binary
+v2 when that field is present and read v1 with epoch -1. Offset cache records use
+binary v2 with a trailing INT32 epoch, while v1 and legacy JSON remain readable.
+Writes without epoch metadata retain v1 bytes. This local format compatibility
+does not implement the clustered migration in [ADR 0001](adr/0001-replicated-coordinator-state.md).
 
 
 `OffsetManager` (`include/kawasan/broker/offset_manager.h`, `src/broker/offset_manager.cpp`) persists committed offsets and consumer-group state to RocksDB, so groups survive broker restarts. It uses a dedicated RocksDB database opened with `OptimizeForPointLookup` (64 MB block cache); `GroupCoordinator` calls into it on commit/fetch and on group state changes.

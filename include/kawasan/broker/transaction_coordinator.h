@@ -63,6 +63,7 @@ public:
         int32_t partition = 0;
         int64_t offset = 0;
         std::string metadata;
+        int32_t committed_leader_epoch = -1;
     };
 
     /// @brief M1: a partition participating in a transaction, plus the

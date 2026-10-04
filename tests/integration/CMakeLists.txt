@@ -143,3 +143,8 @@ add_executable(client_api_parity_test client_api_parity_test.cpp)
 target_link_libraries(client_api_parity_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME ClientApiParityTest COMMAND client_api_parity_test)
 set_tests_properties(ClientApiParityTest PROPERTIES TIMEOUT 90)
+
+# CM-4: real group metadata fencing before transactional offsets are staged.
+add_executable(txn_offset_fencing_test txn_offset_fencing_test.cpp)
+target_link_libraries(txn_offset_fencing_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME TxnOffsetFencingTest COMMAND txn_offset_fencing_test)

@@ -1,13 +1,13 @@
 #include "kawasan/broker/offset_manager.h"
-#include "kawasan/common/rocksdb_compat.h"
 
-#include <cstring>
-
-#include <nlohmann/json.hpp>
 #include <rocksdb/options.h>
 #include <rocksdb/write_batch.h>
 
+#include <cstring>
+#include <nlohmann/json.hpp>
+
 #include "kawasan/common/logger.h"
+#include "kawasan/common/rocksdb_compat.h"
 
 using json = nlohmann::json;
 
@@ -24,33 +24,32 @@ constexpr const char* kGroupPrefix = "group:";
 
 }  // namespace
 
-OffsetManager::OffsetManager(const std::string& db_path)
-    : retention_ms_(kDefaultRetentionMs) {
+OffsetManager::OffsetManager(const std::string& db_path) : retention_ms_(kDefaultRetentionMs) {
     rocksdb::Options options;
     options.create_if_missing = true;
     options.error_if_exists = false;
-    
+
     // Optimize for point lookups (offset fetches are typically by key)
     options.OptimizeForPointLookup(64);  // 64 MB block cache
-    
+
     // Configure write buffer
     options.max_write_buffer_number = 2;
     options.write_buffer_size = 16 * 1024 * 1024;  // 16 MB
-    
+
     // Disable compression for now (Snappy may not be available on all systems)
     options.compression = rocksdb::kNoCompression;
-    
+
     std::unique_ptr<rocksdb::DB> db_raw;
     rocksdb::Status status = openRocksDb(options, db_path, db_raw);
-    
+
     if (!status.ok()) {
-        throw std::runtime_error("Failed to open offset RocksDB at " + db_path + 
-                                ": " + status.ToString());
+        throw std::runtime_error("Failed to open offset RocksDB at " + db_path + ": " +
+                                 status.ToString());
     }
-    
+
     db_ = std::move(db_raw);
-    Logger::info("OffsetManager initialized with db_path={}, retention={}ms", 
-                 db_path, retention_ms_);
+    Logger::info("OffsetManager initialized with db_path={}, retention={}ms", db_path,
+                 retention_ms_);
 }
 
 OffsetManager::~OffsetManager() {
@@ -60,47 +59,41 @@ OffsetManager::~OffsetManager() {
     }
 }
 
-void OffsetManager::commitOffset(
-    const std::string& group_id,
-    const std::string& topic,
-    int32_t partition,
-    int64_t offset,
-    const std::string& metadata) {
-    
+void OffsetManager::commitOffset(const std::string& group_id, const std::string& topic,
+                                 int32_t partition, int64_t offset, const std::string& metadata) {
     const std::string key = makeOffsetKey(group_id, topic, partition);
-    
+
     // Build metadata with timestamps
     OffsetMetadata offset_meta;
     offset_meta.offset = offset;
     offset_meta.metadata = metadata;
     offset_meta.commit_timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
     offset_meta.expiry_timestamp = offset_meta.commit_timestamp + retention_ms_;
-    
+
     const std::string value = serializeOffsetMetadata(offset_meta);
-    
+
     // Write to RocksDB with sync=true for durability
     rocksdb::WriteOptions write_opts;
     write_opts.sync = true;
     write_opts.disableWAL = false;
-    
+
     rocksdb::Status status = db_->Put(write_opts, key, value);
-    
+
     if (!status.ok()) {
-        throw std::runtime_error("Failed to commit offset for group=" + group_id + 
-                                " topic=" + topic + " partition=" + std::to_string(partition) +
-                                ": " + status.ToString());
+        throw std::runtime_error("Failed to commit offset for group=" + group_id +
+                                 " topic=" + topic + " partition=" + std::to_string(partition) +
+                                 ": " + status.ToString());
     }
-    
-    Logger::debug("Committed offset: group={}, topic={}, partition={}, offset={}",
-                  group_id, topic, partition, offset);
+
+    Logger::debug("Committed offset: group={}, topic={}, partition={}, offset={}", group_id, topic,
+                  partition, offset);
 }
 
-std::optional<int64_t> OffsetManager::fetchOffset(
-    const std::string& group_id,
-    const std::string& topic,
-    int32_t partition) const {
-    
+std::optional<int64_t> OffsetManager::fetchOffset(const std::string& group_id,
+                                                  const std::string& topic,
+                                                  int32_t partition) const {
     auto metadata = fetchOffsetWithMetadata(group_id, topic, partition);
     if (metadata.has_value()) {
         return metadata->offset;
@@ -109,123 +102,118 @@ std::optional<int64_t> OffsetManager::fetchOffset(
 }
 
 std::optional<OffsetManager::OffsetMetadata> OffsetManager::fetchOffsetWithMetadata(
-    const std::string& group_id,
-    const std::string& topic,
-    int32_t partition) const {
-    
+    const std::string& group_id, const std::string& topic, int32_t partition) const {
     const std::string key = makeOffsetKey(group_id, topic, partition);
-    
+
     rocksdb::ReadOptions read_opts;
     read_opts.verify_checksums = true;
-    
+
     std::string value;
     rocksdb::Status status = db_->Get(read_opts, key, &value);
-    
+
     if (status.IsNotFound()) {
-        Logger::debug("Offset not found: group={}, topic={}, partition={}",
-                     group_id, topic, partition);
+        Logger::debug("Offset not found: group={}, topic={}, partition={}", group_id, topic,
+                      partition);
         return std::nullopt;
     }
-    
+
     if (!status.ok()) {
-        Logger::error("Failed to fetch offset for group={} topic={} partition={}: {}",
-                     group_id, topic, partition, status.ToString());
+        Logger::error("Failed to fetch offset for group={} topic={} partition={}: {}", group_id,
+                      topic, partition, status.ToString());
         return std::nullopt;
     }
-    
+
     auto metadata = deserializeOffsetMetadata(value);
     if (metadata.has_value()) {
-        Logger::debug("Fetched offset: group={}, topic={}, partition={}, offset={}",
-                     group_id, topic, partition, metadata->offset);
+        Logger::debug("Fetched offset: group={}, topic={}, partition={}, offset={}", group_id,
+                      topic, partition, metadata->offset);
     }
-    
+
     return metadata;
 }
 
-void OffsetManager::commitOffsetBatch(
-    const std::string& group_id,
-    const std::vector<OffsetCommitData>& offsets) {
-    
+void OffsetManager::commitOffsetBatch(const std::string& group_id,
+                                      const std::vector<OffsetCommitData>& offsets) {
     if (offsets.empty()) {
         return;
     }
-    
+
     rocksdb::WriteBatch batch;
-    
+
     const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+
     for (const auto& offset_data : offsets) {
         const std::string key = makeOffsetKey(group_id, offset_data.topic, offset_data.partition);
-        
+
         OffsetMetadata offset_meta;
         offset_meta.offset = offset_data.offset;
         offset_meta.metadata = offset_data.metadata;
+        offset_meta.committed_leader_epoch = offset_data.committed_leader_epoch;
         offset_meta.commit_timestamp = now;
         offset_meta.expiry_timestamp = now + retention_ms_;
-        
+
         const std::string value = serializeOffsetMetadata(offset_meta);
         batch.Put(key, value);
     }
-    
+
     rocksdb::WriteOptions write_opts;
     write_opts.sync = true;
     write_opts.disableWAL = false;
-    
+
     rocksdb::Status status = db_->Write(write_opts, &batch);
-    
+
     if (!status.ok()) {
-        throw std::runtime_error("Failed to commit offset batch for group=" + group_id +
-                                ": " + status.ToString());
+        throw std::runtime_error("Failed to commit offset batch for group=" + group_id + ": " +
+                                 status.ToString());
     }
-    
+
     Logger::info("Committed offset batch: group={}, count={}", group_id, offsets.size());
 }
 
 void OffsetManager::deleteGroup(const std::string& group_id) {
     // Delete all offsets for this group
     const std::string prefix = makeGroupOffsetPrefix(group_id);
-    
+
     rocksdb::ReadOptions read_opts;
     std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(read_opts));
-    
+
     rocksdb::WriteBatch batch;
     size_t count = 0;
-    
+
     for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
         batch.Delete(it->key());
         ++count;
     }
-    
+
     if (!it->status().ok()) {
-        throw std::runtime_error("Failed to iterate offsets for group=" + group_id +
-                                ": " + it->status().ToString());
+        throw std::runtime_error("Failed to iterate offsets for group=" + group_id + ": " +
+                                 it->status().ToString());
     }
-    
+
     // Also delete group metadata key (for future use)
     const std::string group_meta_key = makeGroupMetadataKey(group_id);
     batch.Delete(group_meta_key);
-    
+
     if (count == 0) {
         Logger::info("No offsets found for group={}", group_id);
         return;
     }
-    
+
     rocksdb::WriteOptions write_opts;
     write_opts.sync = true;
-    
+
     rocksdb::Status status = db_->Write(write_opts, &batch);
-    
+
     if (!status.ok()) {
-        throw std::runtime_error("Failed to delete group=" + group_id +
-                                ": " + status.ToString());
+        throw std::runtime_error("Failed to delete group=" + group_id + ": " + status.ToString());
     }
-    
+
     Logger::info("Deleted group: group={}, offsets_deleted={}", group_id, count);
 }
 
-bool OffsetManager::deleteOffset(const std::string& group_id,
-                                 const std::string& topic,
+bool OffsetManager::deleteOffset(const std::string& group_id, const std::string& topic,
                                  int32_t partition) {
     const std::string key = makeOffsetKey(group_id, topic, partition);
     // Probe first so we can report whether anything was deleted.
@@ -235,17 +223,15 @@ bool OffsetManager::deleteOffset(const std::string& group_id,
         return false;
     }
     if (!get_status.ok()) {
-        throw std::runtime_error("Failed to probe offset for delete: " +
-                                 get_status.ToString());
+        throw std::runtime_error("Failed to probe offset for delete: " + get_status.ToString());
     }
 
     rocksdb::WriteOptions write_opts;
     write_opts.sync = true;
     auto del_status = db_->Delete(write_opts, key);
     if (!del_status.ok()) {
-        throw std::runtime_error("Failed to delete offset for " + group_id +
-                                 "/" + topic + "-" + std::to_string(partition) +
-                                 ": " + del_status.ToString());
+        throw std::runtime_error("Failed to delete offset for " + group_id + "/" + topic + "-" +
+                                 std::to_string(partition) + ": " + del_status.ToString());
     }
     Logger::info("OffsetDelete: removed offset for {}/{}-{}", group_id, topic, partition);
     return true;
@@ -254,10 +240,10 @@ bool OffsetManager::deleteOffset(const std::string& group_id,
 std::vector<std::string> OffsetManager::listGroups() const {
     std::vector<std::string> groups;
     std::string last_group;
-    
+
     rocksdb::ReadOptions read_opts;
     std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(read_opts));
-    
+
     for (it->Seek(kOffsetPrefix); it->Valid() && it->key().starts_with(kOffsetPrefix); it->Next()) {
         auto offset_key = parseOffsetKey(it->key().ToString());
         if (offset_key.has_value() && offset_key->group_id != last_group) {
@@ -265,40 +251,38 @@ std::vector<std::string> OffsetManager::listGroups() const {
             last_group = offset_key->group_id;
         }
     }
-    
+
     Logger::debug("Listed {} groups", groups.size());
     return groups;
 }
 
 std::vector<OffsetManager::OffsetKey> OffsetManager::listOffsetsForGroup(
     const std::string& group_id) const {
-    
     std::vector<OffsetKey> offset_keys;
     const std::string prefix = makeGroupOffsetPrefix(group_id);
-    
+
     rocksdb::ReadOptions read_opts;
     std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(read_opts));
-    
+
     for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
         auto offset_key = parseOffsetKey(it->key().ToString());
         if (offset_key.has_value()) {
             offset_keys.push_back(*offset_key);
         }
     }
-    
+
     Logger::debug("Listed {} offsets for group={}", offset_keys.size(), group_id);
     return offset_keys;
 }
 
 std::map<std::pair<std::string, int32_t>, int64_t> OffsetManager::fetchAllOffsets(
     const std::string& group_id) const {
-    
     std::map<std::pair<std::string, int32_t>, int64_t> result;
     const std::string prefix = makeGroupOffsetPrefix(group_id);
-    
+
     rocksdb::ReadOptions read_opts;
     std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(read_opts));
-    
+
     for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
         auto offset_key = parseOffsetKey(it->key().ToString());
         if (offset_key.has_value()) {
@@ -308,7 +292,7 @@ std::map<std::pair<std::string, int32_t>, int64_t> OffsetManager::fetchAllOffset
             }
         }
     }
-    
+
     Logger::debug("Fetched {} offsets for group={}", result.size(), group_id);
     return result;
 }
@@ -316,10 +300,10 @@ std::map<std::pair<std::string, int32_t>, int64_t> OffsetManager::fetchAllOffset
 size_t OffsetManager::deleteExpiredOffsets(int64_t now_millis) {
     rocksdb::ReadOptions read_opts;
     std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(read_opts));
-    
+
     rocksdb::WriteBatch batch;
     size_t count = 0;
-    
+
     for (it->Seek(kOffsetPrefix); it->Valid() && it->key().starts_with(kOffsetPrefix); it->Next()) {
         auto metadata = deserializeOffsetMetadata(it->value().ToString());
         if (metadata.has_value() && metadata->expiry_timestamp < now_millis) {
@@ -327,26 +311,26 @@ size_t OffsetManager::deleteExpiredOffsets(int64_t now_millis) {
             ++count;
         }
     }
-    
+
     if (!it->status().ok()) {
         Logger::error("Failed to iterate for expired offsets: {}", it->status().ToString());
         return 0;
     }
-    
+
     if (count == 0) {
         return 0;
     }
-    
+
     rocksdb::WriteOptions write_opts;
     write_opts.sync = true;
-    
+
     rocksdb::Status status = db_->Write(write_opts, &batch);
-    
+
     if (!status.ok()) {
         Logger::error("Failed to delete expired offsets: {}", status.ToString());
         return 0;
     }
-    
+
     Logger::info("Deleted {} expired offsets", count);
     return count;
 }
@@ -381,7 +365,8 @@ void OffsetManager::saveGroupMetadata(const std::string& group_id, const GroupMe
         }
         if (i < data.size()) {
             uint32_t n = static_cast<uint32_t>(data[i]) << 16;
-            if (i + 1 < data.size()) n |= static_cast<uint32_t>(data[i + 1]) << 8;
+            if (i + 1 < data.size())
+                n |= static_cast<uint32_t>(data[i + 1]) << 8;
             out.push_back(kTable[(n >> 18) & 0x3F]);
             out.push_back(kTable[(n >> 12) & 0x3F]);
             out.push_back(i + 1 < data.size() ? kTable[(n >> 6) & 0x3F] : '=');
@@ -418,54 +403,53 @@ void OffsetManager::saveGroupMetadata(const std::string& group_id, const GroupMe
         members_array.push_back(member_obj);
     }
     j["members"] = members_array;
-    
+
     const std::string value = j.dump();
-    
+
     // Write to RocksDB asynchronously for better performance
     // WAL provides durability, sync on every write is too expensive
     rocksdb::WriteOptions write_opts;
-    write_opts.sync = false;  // Async writes for better throughput
+    write_opts.sync = false;        // Async writes for better throughput
     write_opts.disableWAL = false;  // Keep WAL enabled for durability
-    
+
     rocksdb::Status status = db_->Put(write_opts, key, value);
-    
+
     if (!status.ok()) {
-        throw std::runtime_error("Failed to save group metadata for group=" + group_id +
-                                ": " + status.ToString());
+        throw std::runtime_error("Failed to save group metadata for group=" + group_id + ": " +
+                                 status.ToString());
     }
-    
-    Logger::debug("Saved group metadata: group={}, state={}, generation={}, members={}",
-                  group_id, metadata.state, metadata.generation, metadata.members.size());
+
+    Logger::debug("Saved group metadata: group={}, state={}, generation={}, members={}", group_id,
+                  metadata.state, metadata.generation, metadata.members.size());
 }
 
 std::optional<OffsetManager::GroupMetadata> OffsetManager::loadGroupMetadata(
     const std::string& group_id) const {
-    
     const std::string key = makeGroupMetadataKey(group_id);
-    
+
     std::string value;
     rocksdb::Status status = db_->Get(rocksdb::ReadOptions(), key, &value);
-    
+
     if (status.IsNotFound()) {
         return std::nullopt;
     }
-    
+
     if (!status.ok()) {
-        Logger::error("Failed to load group metadata for group={}: {}", 
-                     group_id, status.ToString());
+        Logger::error("Failed to load group metadata for group={}: {}", group_id,
+                      status.ToString());
         return std::nullopt;
     }
-    
+
     try {
         json j = json::parse(value);
-        
+
         GroupMetadata metadata;
         metadata.state = j.value("state", "Empty");
         metadata.protocol_type = j.value("protocol_type", "");
         metadata.protocol = j.value("protocol", "");
         metadata.generation = j.value("generation", 0);
         metadata.last_update_timestamp = j.value("last_update_timestamp", 0LL);
-        
+
         // Phase EX-7 fix: base64-decode binary fields. Accept both
         // the new `metadata_b64`/`assignment_b64` keys (Java client
         // assignment payloads are non-UTF-8) and the legacy raw-string
@@ -476,17 +460,22 @@ std::optional<OffsetManager::GroupMetadata> OffsetManager::loadGroupMetadata(
             static bool inited = false;
             if (!inited) {
                 std::memset(inv, -1, sizeof(inv));
-                const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-                for (int i = 0; i < 64; ++i) inv[static_cast<uint8_t>(tbl[i])] = i;
+                const char* tbl =
+                    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                for (int i = 0; i < 64; ++i)
+                    inv[static_cast<uint8_t>(tbl[i])] = i;
                 inited = true;
             }
             std::vector<uint8_t> out;
             out.reserve(s.size() * 3 / 4);
-            uint32_t buf = 0; int bits = 0;
+            uint32_t buf = 0;
+            int bits = 0;
             for (char c : s) {
-                if (c == '=') break;
+                if (c == '=')
+                    break;
                 int v = inv[static_cast<uint8_t>(c)];
-                if (v < 0) continue;
+                if (v < 0)
+                    continue;
                 buf = (buf << 6) | v;
                 bits += 6;
                 if (bits >= 8) {
@@ -511,26 +500,27 @@ std::optional<OffsetManager::GroupMetadata> OffsetManager::loadGroupMetadata(
                     // ASCII; broken for Java clients). Read as-is for
                     // backward compatibility with pre-fix persistence.
                     std::string metadata_str = member_obj["metadata"];
-                    member.metadata = std::vector<uint8_t>(metadata_str.begin(), metadata_str.end());
+                    member.metadata =
+                        std::vector<uint8_t>(metadata_str.begin(), metadata_str.end());
                 }
                 if (member_obj.contains("assignment_b64")) {
                     member.assignment = b64decode(member_obj["assignment_b64"].get<std::string>());
                 } else if (member_obj.contains("assignment")) {
                     std::string assignment_str = member_obj["assignment"];
-                    member.assignment = std::vector<uint8_t>(assignment_str.begin(), assignment_str.end());
+                    member.assignment =
+                        std::vector<uint8_t>(assignment_str.begin(), assignment_str.end());
                 }
 
                 metadata.members.push_back(std::move(member));
             }
         }
-        
+
         Logger::debug("Loaded group metadata: group={}, state={}, generation={}, members={}",
-                     group_id, metadata.state, metadata.generation, metadata.members.size());
-        
+                      group_id, metadata.state, metadata.generation, metadata.members.size());
+
         return metadata;
     } catch (const std::exception& e) {
-        Logger::error("Failed to parse group metadata for group={}: {}", 
-                     group_id, e.what());
+        Logger::error("Failed to parse group metadata for group={}: {}", group_id, e.what());
         return std::nullopt;
     }
 }
@@ -539,10 +529,8 @@ std::optional<OffsetManager::GroupMetadata> OffsetManager::loadGroupMetadata(
 // Private Helper Methods
 //
 
-std::string OffsetManager::makeOffsetKey(
-    const std::string& group_id,
-    const std::string& topic,
-    int32_t partition) {
+std::string OffsetManager::makeOffsetKey(const std::string& group_id, const std::string& topic,
+                                         int32_t partition) {
     return std::string(kOffsetPrefix) + group_id + ":" + topic + ":" + std::to_string(partition);
 }
 
@@ -559,31 +547,31 @@ std::optional<OffsetManager::OffsetKey> OffsetManager::parseOffsetKey(const std:
     if (!key.starts_with(kOffsetPrefix)) {
         return std::nullopt;
     }
-    
+
     const std::string suffix = key.substr(std::strlen(kOffsetPrefix));
-    
+
     // Find the first colon (separates group_id from topic)
     size_t first_colon = suffix.find(':');
     if (first_colon == std::string::npos) {
         return std::nullopt;
     }
-    
+
     // Find the last colon (separates topic from partition)
     size_t last_colon = suffix.rfind(':');
     if (last_colon == std::string::npos || last_colon == first_colon) {
         return std::nullopt;
     }
-    
+
     OffsetKey result;
     result.group_id = suffix.substr(0, first_colon);
     result.topic = suffix.substr(first_colon + 1, last_colon - first_colon - 1);
-    
+
     try {
         result.partition = std::stoi(suffix.substr(last_colon + 1));
     } catch (...) {
         return std::nullopt;
     }
-    
+
     return result;
 }
 
@@ -596,9 +584,12 @@ std::optional<OffsetManager::OffsetKey> OffsetManager::parseOffsetKey(const std:
 //   bytes 25-28 : metadata length (big-endian uint32)
 //   bytes 29-N  : metadata bytes
 // Total: 29 bytes + metadata.size() (vs. ~200 bytes for JSON with no metadata).
+// Binary v2 adds a trailing big-endian INT32 leader epoch; unset epochs keep
+// v1 bytes. Both versions remain readable.
 // Backward compatibility: if first byte is '{', fall back to the old JSON path.
 namespace {
 constexpr uint8_t kOffsetBinaryV1Magic = 0x01;
+constexpr uint8_t kOffsetBinaryV2Magic = 0x02;
 
 void appendInt64BE(std::string& out, int64_t value) {
     auto u = static_cast<uint64_t>(value);
@@ -632,13 +623,16 @@ uint32_t readUInt32BE(const char* p) {
 
 std::string OffsetManager::serializeOffsetMetadata(const OffsetMetadata& metadata) {
     std::string out;
-    out.reserve(29 + metadata.metadata.size());
-    out.push_back(static_cast<char>(kOffsetBinaryV1Magic));
+    const bool has_epoch = metadata.committed_leader_epoch != -1;
+    out.reserve((has_epoch ? 33 : 29) + metadata.metadata.size());
+    out.push_back(static_cast<char>(has_epoch ? kOffsetBinaryV2Magic : kOffsetBinaryV1Magic));
     appendInt64BE(out, metadata.offset);
     appendInt64BE(out, metadata.commit_timestamp);
     appendInt64BE(out, metadata.expiry_timestamp);
     appendUInt32BE(out, static_cast<uint32_t>(metadata.metadata.size()));
     out.append(metadata.metadata);
+    if (has_epoch)
+        appendUInt32BE(out, static_cast<uint32_t>(metadata.committed_leader_epoch));
     return out;
 }
 
@@ -648,8 +642,9 @@ std::optional<OffsetManager::OffsetMetadata> OffsetManager::deserializeOffsetMet
         return std::nullopt;
     }
 
-    // Binary v1 path.
-    if (static_cast<uint8_t>(data[0]) == kOffsetBinaryV1Magic) {
+    // Binary v2 appends committed leader epoch to the v1 payload.
+    const uint8_t version = static_cast<uint8_t>(data[0]);
+    if (version == kOffsetBinaryV1Magic || version == kOffsetBinaryV2Magic) {
         if (data.size() < 29) {
             Logger::error("Binary offset record too short: {} bytes", data.size());
             return std::nullopt;
@@ -659,11 +654,15 @@ std::optional<OffsetManager::OffsetMetadata> OffsetManager::deserializeOffsetMet
         m.commit_timestamp = readInt64BE(data.data() + 9);
         m.expiry_timestamp = readInt64BE(data.data() + 17);
         const uint32_t meta_len = readUInt32BE(data.data() + 25);
-        if (data.size() < static_cast<size_t>(29) + meta_len) {
+        const size_t payload_end = static_cast<size_t>(29) + meta_len;
+        if (data.size() < payload_end + (version == kOffsetBinaryV2Magic ? 4 : 0)) {
             Logger::error("Binary offset record metadata length mismatch");
             return std::nullopt;
         }
         m.metadata.assign(data.data() + 29, meta_len);
+        if (version == kOffsetBinaryV2Magic)
+            m.committed_leader_epoch =
+                static_cast<int32_t>(readUInt32BE(data.data() + payload_end));
         return m;
     }
 

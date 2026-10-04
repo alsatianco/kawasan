@@ -97,11 +97,25 @@ persistence or cluster authorization guarantee.
 Transactional mutation APIs require a producer initialized with InitProducerId.
 An unmapped ID or unknown/empty transaction returns INVALID_PRODUCER_ID_MAPPING;
 an unequal epoch returns INVALID_PRODUCER_EPOCH. Socket regressions cover all
-four APIs and confirm rejected requests preserve the valid transaction. Version
-caps remain at v0 until CM-4's wire and group-generation validation are complete.
+four APIs and confirm rejected requests preserve the valid transaction.
+AddPartitionsToTxn, AddOffsetsToTxn, EndTxn and TxnOffsetCommit support v0–v3.
 
 Kafka-generated transactional fixtures cover AddPartitionsToTxn, AddOffsetsToTxn,
 EndTxn and TxnOffsetCommit v3. TxnOffsetCommit v2 inserts committed leader epoch
 before metadata; v3 adds generation, member and nullable instance ID before topics.
-Codec reuse resets those group fields and replaces topics. These wire repairs are
-independent of the v3 advertisement gate, which requires real group validation.
+Codec reuse resets those group fields and replaces topics. Transactional offset
+commits validate classic group generation and member identity. Static instance
+fencing precedes generation checks; current members can commit during rebalance.
+Legacy commits without membership metadata remain supported. Socket regressions
+prove rejected requests do not stage offsets, commit publishes the checkpoint,
+and abort leaves it unchanged. Committed leader epoch survives transaction
+snapshots and offset-cache restart; legacy records read with epoch -1.
+
+Multi-broker transaction completion and coordinator replay remain experimental
+M10 work. OffsetFetch fetch-all/require-stable semantic checks are the next
+CM-4 follow-up; version advertisement alone does not establish cluster EOS.
+
+Kafka-generated header fixtures cover each transactional API at v2/v3, including
+flexible request and response tagged fields. Java verification requires actual
+v3 requests on API 24/25/26/28. The JVM leg has a 300-second execution limit;
+interrupted or incomplete result files fail the matrix gate.

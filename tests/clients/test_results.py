@@ -32,12 +32,26 @@ class NegotiatedVersionsTest(unittest.TestCase):
     def test_java_requires_actual_modern_requests(self):
         from negotiated import observed_versions, verify
         evidence = "\n".join(f"Client peer request api_key={key} version={version} correlation_id=8"
-                             for key, version in [(0, 11), (1, 13), (2, 8), (9, 9)])
+                             for key, version in [(0, 11), (1, 13), (2, 8), (9, 9), (24, 3), (25, 3), (26, 3), (28, 3)])
         actual = observed_versions(evidence)
         self.assertEqual(verify(actual, "java-4.2.0", "4.x"), [])
         self.assertTrue(verify({}, "java-4.2.0", "4.x"))
         actual[1] = {12}
         self.assertTrue(verify(actual, "java-4.2.0", "4.x"))
+
+    def test_java_requires_modern_transactional_requests(self):
+        from negotiated import verify
+        actual = {0: {11}, 1: {13}, 2: {8}, 9: {9},
+                  24: {3}, 25: {3}, 26: {3}, 28: {3}}
+        self.assertEqual(verify(actual, "java-4.2.0", "4.x"), [])
+        for api in (24, 25, 26, 28):
+            with self.subTest(api=api):
+                missing = dict(actual)
+                missing.pop(api)
+                self.assertTrue(verify(missing, "java-4.2.0", "4.x"))
+                downgraded = dict(actual)
+                downgraded[api] = {0}
+                self.assertTrue(verify(downgraded, "java-4.2.0", "4.x"))
 
     def test_legacy_profile_rejects_requests_above_caps(self):
         from negotiated import verify

@@ -127,6 +127,17 @@ public class WireFixtures {
         var commitResultPartition = new TxnOffsetCommitResponseData.TxnOffsetCommitResponsePartition().setPartitionIndex(0).setErrorCode((short)22);
         var commitResultTopic = new TxnOffsetCommitResponseData.TxnOffsetCommitResponseTopic().setName("t").setPartitions(List.of(commitResultPartition));
         add("txn-offset-commit-response-v3",new TxnOffsetCommitResponseData().setTopics(List.of(commitResultTopic)),(short)3);
+        for (ApiKeys api : List.of(ApiKeys.ADD_PARTITIONS_TO_TXN, ApiKeys.ADD_OFFSETS_TO_TXN,
+                                   ApiKeys.END_TXN, ApiKeys.TXN_OFFSET_COMMIT)) {
+            for (short version : new short[]{2, 3}) {
+                String prefix = "txn-header-" + api.id + "-v" + version;
+                add(prefix + "-request", new RequestHeaderData().setRequestApiKey(api.id)
+                    .setRequestApiVersion(version).setCorrelationId(42).setClientId("cm4"),
+                    api.requestHeaderVersion(version));
+                add(prefix + "-response", new ResponseHeaderData().setCorrelationId(42),
+                    api.responseHeaderVersion(version));
+            }
+        }
         System.out.println(new ObjectMapper().writerWithDefaultPrettyPrinter().writeValueAsString(fixtures));
     }
 }
