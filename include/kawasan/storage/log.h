@@ -58,6 +58,8 @@ public:
     Log(Log&&) noexcept;
     Log& operator=(Log&&) noexcept;
 
+    void updateConfig(const LogConfig& config);
+
     /// @brief Appends records to the log
     /// @param records The records to append
     /// @param force_sync If true, fsync this append regardless of the log's

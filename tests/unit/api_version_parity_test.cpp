@@ -8,6 +8,7 @@
 #include "kawasan/common/buffer.h"
 #include "kawasan/protocol/admin_misc_requests.h"
 #include "kawasan/protocol/delete_topics_request.h"
+#include "kawasan/protocol/describe_configs_request.h"
 #include "kawasan/protocol/describe_groups_request.h"
 #include "kawasan/protocol/fetch_request.h"
 #include "kawasan/protocol/list_offsets_request.h"
@@ -271,5 +272,21 @@ TEST(ApiVersionParityTest, TruncatedOffsetFetchDoesNotAllocateDeclaredGroupsOrTo
         // This probes retained allocation, independent of the exception text.
         EXPECT_LE(request.groups().capacity(), malformed.size());
         EXPECT_LE(request.topics().capacity(), malformed.size());
+    }
+}
+
+TEST(ApiVersionParityTest, DescribeConfigsUsesKafkaDefaultAndDynamicTopicSources) {
+    for (int16_t version : {1, 4}) {
+        const auto bytes = golden("describe-configs-response-v" + std::to_string(version));
+        kawasan::Buffer input(bytes);
+        kawasan::protocol::DescribeConfigsResponse response;
+        response.decode(input, version);
+        ASSERT_EQ(response.results().size(), 1u);
+        ASSERT_EQ(response.results()[0].configs.size(), 2u);
+        EXPECT_TRUE(response.results()[0].configs[0].is_default);
+        EXPECT_FALSE(response.results()[0].configs[1].is_default);
+        kawasan::Buffer encoded;
+        response.encode(encoded, version);
+        EXPECT_EQ(std::vector<uint8_t>(encoded.data(), encoded.data() + encoded.size()), bytes);
     }
 }

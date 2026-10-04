@@ -197,3 +197,64 @@ TEST(TopicIdentityTest, RejectsMalformedAndDuplicatePersistedIdentities) {
     corrupt["topics"][1]["topic_id"] = corrupt["topics"][0]["topic_id"];
     check_bad(corrupt);
 }
+
+TEST(TopicIdentityTest, ConfigCommandsFenceRecreationAndPreserveIncrementalDeltas) {
+    Workspace w;
+    MetadataStore store(w.path.string(), "cluster", testBroker(0), nullptr);
+    store.load();
+    auto spec = topic("t");
+    spec.topic_id = newTopicId();
+    ASSERT_EQ(store.applyCreate(spec).error_code, ErrorCode::NONE);
+    MetadataCommand command;
+    command.type = MetadataCommandType::ALTER_CONFIGS;
+    command.topic_name = "t";
+    command.expected_topic_id = spec.topic_id;
+    command.config_changes = {{"retention.ms", "300000", 0}};
+    ASSERT_EQ(store.applyConfigs(command).error_code, ErrorCode::NONE);
+    command.config_changes = {{"segment.bytes", "4096", 0}};
+    ASSERT_EQ(store.applyConfigs(command).error_code, ErrorCode::NONE);
+    store.load();
+    EXPECT_EQ(store.topicConfigs("t")->at("retention.ms"), "300000");
+    EXPECT_EQ(store.topicConfigs("t")->at("segment.bytes"), "4096");
+    ASSERT_EQ(store.applyDelete("t").error_code, ErrorCode::NONE);
+    spec.topic_id = newTopicId();
+    ASSERT_EQ(store.applyCreate(spec).error_code, ErrorCode::NONE);
+    EXPECT_EQ(store.applyConfigs(command).error_code, ErrorCode::UNKNOWN_TOPIC_OR_PARTITION);
+    EXPECT_TRUE(store.topicConfigs("t")->empty());
+}
+
+TEST(TopicIdentityTest, ConfigValidationIsAtomicAndListOperationsAreDurable) {
+    Workspace w;
+    MetadataStore store(w.path.string(), "cluster", testBroker(0), nullptr);
+    store.load();
+    auto spec = topic("t");
+    spec.topic_id = newTopicId();
+    ASSERT_EQ(store.applyCreate(spec).error_code, ErrorCode::NONE);
+    MetadataCommand command;
+    command.type = MetadataCommandType::ALTER_CONFIGS;
+    command.topic_name = "t";
+    command.expected_topic_id = spec.topic_id;
+    for (const std::string value : {"", "1junk", "-2", "9223372036854775808"}) {
+        command.config_changes = {{"retention.ms", "300000", 0}, {"retention.bytes", value, 0}};
+        EXPECT_EQ(store.applyConfigs(command).error_code, ErrorCode::INVALID_CONFIG);
+        EXPECT_TRUE(store.topicConfigs("t")->empty());
+    }
+    command.config_changes = {{"cleanup.policy", "compact", 2}};
+    ASSERT_EQ(store.applyConfigs(command, true).error_code, ErrorCode::NONE);
+    EXPECT_TRUE(store.topicConfigs("t")->empty());
+    ASSERT_EQ(store.applyConfigs(command).error_code, ErrorCode::NONE);
+    EXPECT_EQ(store.topicConfigs("t")->at("cleanup.policy"), "delete,compact");
+    ASSERT_EQ(store.applyConfigs(command).error_code, ErrorCode::NONE);
+    EXPECT_EQ(store.topicConfigs("t")->at("cleanup.policy"), "delete,compact");
+    command.config_changes = {{"cleanup.policy", "delete", 3}};
+    ASSERT_EQ(store.applyConfigs(command).error_code, ErrorCode::NONE);
+    EXPECT_EQ(store.topicConfigs("t")->at("cleanup.policy"), "compact");
+    command.config_changes = {{"cleanup.policy", "compact", 3}};
+    EXPECT_EQ(store.applyConfigs(command).error_code, ErrorCode::INVALID_CONFIG);
+    command.replace_configs = true;
+    command.config_changes = {{"retention.ms", "100000", 0}};
+    ASSERT_EQ(store.applyConfigs(command).error_code, ErrorCode::NONE);
+    store.load();
+    EXPECT_EQ(store.topicConfigs("t")->size(), 1u);
+    EXPECT_EQ(store.topicConfigs("t")->at("retention.ms"), "100000");
+}

@@ -20,15 +20,17 @@ namespace kawasan::storage {
 /// @brief Manages all logs (topic-partitions) for a broker
 class LogManager {
 public:
-    explicit LogManager(const std::string& base_log_dir,
-                        LogConfig default_config = LogConfig());
+    explicit LogManager(const std::string& base_log_dir, LogConfig default_config = LogConfig());
     ~LogManager();
 
-    /// @brief 0A.4: register a per-topic LogConfig that overrides the default.
-    /// Logs newly created under this topic inherit the registered config.
-    /// Existing in-memory Log objects are NOT mutated here; alter-config support
-    /// arrives later (Phase 4).
+    /// @brief Updates both current and future logs under their locks.
     void setTopicConfig(const std::string& topic, const LogConfig& config);
+
+    void configureTopic(const std::string& topic,
+                        const std::map<std::string, std::string>& overrides) {
+        setTopicConfig(topic, LogConfig::fromMap(overrides, default_config_));
+    }
+    LogConfig defaultConfig() const { return default_config_; }
 
     /// @brief 0A.4: returns the effective config for a topic (override or default).
     LogConfig getTopicConfig(const std::string& topic) const;
@@ -101,8 +103,8 @@ public:
 
     /// @brief Phase EX-1 (§6.3): Prometheus metrics snapshot for LogCleaner.
     struct CleanerMetrics {
-        bool running;                  // gauge (0 or 1)
-        int64_t compactions_total;     // counter: compaction passes that dropped >0 batches
+        bool running;                       // gauge (0 or 1)
+        int64_t compactions_total;          // counter: compaction passes that dropped >0 batches
         int64_t dedupe_buffer_utilization;  // gauge: average OffsetMap size across last pass
         // Per-(topic, partition) dirty ratio. Range [0, 1].
         struct PartitionRatio {

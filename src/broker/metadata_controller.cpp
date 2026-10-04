@@ -80,6 +80,24 @@ TopicOperationResult MetadataController::createTopic(const TopicSpecification& s
     return replicateAndAwait(command);
 }
 
+TopicOperationResult MetadataController::alterTopicConfigs(
+    const std::string& name, const std::vector<TopicConfigChange>& changes, bool replace,
+    bool validate_only) {
+    if (raft_node_ && !raft_node_->isLeader()) {
+        return TopicOperationResult::failure(ErrorCode::NOT_CONTROLLER, "Not the controller");
+    }
+    MetadataCommand command;
+    command.type = MetadataCommandType::ALTER_CONFIGS;
+    command.topic_name = name;
+    command.replace_configs = replace;
+    command.config_changes = changes;
+    auto validated = store_.applyConfigs(command, true);
+    if (validate_only || validated.error_code != ErrorCode::NONE)
+        return validated;
+    command.expected_topic_id = validated.topic_metadata.topic_id;
+    return replicateAndAwait(command);
+}
+
 TopicOperationResult MetadataController::deleteTopic(const std::string& topic_name) {
     MetadataCommand command;
     command.type = MetadataCommandType::DELETE_TOPIC;
@@ -185,6 +203,8 @@ TopicOperationResult MetadataController::applyCommand(const MetadataCommand& com
     switch (command.type) {
         case MetadataCommandType::CREATE_TOPIC:
             return store_.applyCreate(command.topic_spec);
+        case MetadataCommandType::ALTER_CONFIGS:
+            return store_.applyConfigs(command);
         case MetadataCommandType::DELETE_TOPIC:
             return store_.applyDelete(command.topic_name);
         case MetadataCommandType::UPDATE_ISR:
@@ -212,6 +232,18 @@ std::vector<uint8_t> MetadataController::serializeCommand(const MetadataCommand&
         json["topic"]["replication_factor"] = command.topic_spec.replication_factor;
         json["topic"]["assignments"] = command.topic_spec.assignments;
         json["topic"]["configs"] = command.topic_spec.configs;
+    } else if (command.type == MetadataCommandType::ALTER_CONFIGS) {
+        json["type"] = "alter_configs";
+        json["topic_name"] = command.topic_name;
+        json["expected_topic_id"] = command.expected_topic_id;
+        json["replace"] = command.replace_configs;
+        json["changes"] = nlohmann::json::array();
+        for (const auto& change : command.config_changes) {
+            nlohmann::json value =
+                change.value ? nlohmann::json(*change.value) : nlohmann::json(nullptr);
+            json["changes"].push_back(
+                {{"name", change.name}, {"value", value}, {"operation", change.operation}});
+        }
     } else if (command.type == MetadataCommandType::DELETE_TOPIC) {
         json["type"] = "delete";
         json["topic_name"] = command.topic_name;
@@ -267,6 +299,32 @@ MetadataCommand MetadataController::deserializeCommand(const std::vector<uint8_t
         command.topic_spec.assignments =
             topic.value("assignments", std::vector<std::vector<BrokerId>>{});
         command.topic_spec.configs = topic.value("configs", std::map<std::string, std::string>{});
+    } else if (type == "alter_configs") {
+        command.type = MetadataCommandType::ALTER_CONFIGS;
+        command.topic_name = json.at("topic_name").get<std::string>();
+        const auto& id = json.at("expected_topic_id");
+        if (!id.is_array() || id.size() != 16)
+            throw std::runtime_error("Invalid config topic ID");
+        for (size_t i = 0; i < 16; ++i) {
+            if (!id[i].is_number_integer() || id[i].get<int64_t>() < 0 ||
+                id[i].get<int64_t>() > 255)
+                throw std::runtime_error("Invalid config topic ID byte");
+            command.expected_topic_id[i] = id[i].get<uint8_t>();
+        }
+        if (command.expected_topic_id == std::array<uint8_t, 16>{})
+            throw std::runtime_error("Zero config topic ID");
+        command.replace_configs = json.at("replace").get<bool>();
+        for (const auto& change : json.at("changes")) {
+            TopicConfigChange decoded;
+            decoded.name = change.at("name").get<std::string>();
+            if (!change.at("value").is_null())
+                decoded.value = change.at("value").get<std::string>();
+            auto operation = change.at("operation").get<int>();
+            if (operation < 0 || operation > 3)
+                throw std::runtime_error("Invalid config operation");
+            decoded.operation = static_cast<int8_t>(operation);
+            command.config_changes.push_back(std::move(decoded));
+        }
     } else if (type == "delete") {
         command.type = MetadataCommandType::DELETE_TOPIC;
         command.topic_name = json.at("topic_name").get<std::string>();

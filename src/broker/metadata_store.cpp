@@ -4,12 +4,14 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <random>
+#include <set>
 #include <sstream>
 #include <utility>
 
@@ -294,9 +296,7 @@ void MetadataStore::load() {
     // to delete-only retention.
     if (log_manager_) {
         for (const auto& [name, state] : topics_) {
-            if (!state.configs.empty()) {
-                log_manager_->setTopicConfig(name, storage::LogConfig::fromMap(state.configs));
-            }
+            log_manager_->configureTopic(name, state.configs);
         }
     }
 
@@ -322,7 +322,7 @@ TopicOperationResult MetadataStore::applyCreate(const TopicSpecification& spec) 
     // 0A.4: register the per-topic LogConfig (cleanup.policy, retention, etc.)
     // BEFORE creating the partition logs so the per-topic config takes effect.
     if (log_manager_) {
-        log_manager_->setTopicConfig(spec.name, storage::LogConfig::fromMap(spec.configs));
+        log_manager_->configureTopic(spec.name, spec.configs);
         for (const auto& partition : state.metadata.partitions) {
             log_manager_->getOrCreateLog(spec.name, partition.partition);
         }
@@ -335,6 +335,122 @@ TopicOperationResult MetadataStore::applyCreate(const TopicSpecification& spec) 
     result.error_code = ErrorCode::NONE;
     result.topic_metadata = state.metadata;
     result.has_metadata = true;
+    return result;
+}
+
+std::optional<std::map<std::string, std::string>> MetadataStore::topicConfigs(
+    const std::string& name) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = topics_.find(name);
+    if (it == topics_.end())
+        return std::nullopt;
+    return it->second.configs;
+}
+
+TopicOperationResult MetadataStore::applyConfigs(const MetadataCommand& command,
+                                                 bool validate_only) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = topics_.find(command.topic_name);
+    if (it == topics_.end() || (command.expected_topic_id != std::array<uint8_t, 16>{} &&
+                                command.expected_topic_id != it->second.metadata.topic_id)) {
+        return TopicOperationResult::failure(ErrorCode::UNKNOWN_TOPIC_OR_PARTITION,
+                                             "Topic does not exist or was recreated");
+    }
+    auto configs =
+        command.replace_configs ? std::map<std::string, std::string>{} : it->second.configs;
+    std::set<std::string> changed;
+    auto invalid = [](const std::string& message) {
+        return TopicOperationResult::failure(ErrorCode::INVALID_CONFIG, message);
+    };
+    auto policy_parts = [](const std::string& value) {
+        std::vector<std::string> result;
+        std::stringstream stream(value);
+        std::string token;
+        while (std::getline(stream, token, ','))
+            result.push_back(token);
+        return result;
+    };
+    for (const auto& change : command.config_changes) {
+        if (!changed.insert(change.name).second)
+            return invalid("Duplicate config: " + change.name);
+        if (change.name != "cleanup.policy" && change.name != "retention.ms" &&
+            change.name != "retention.bytes" && change.name != "segment.bytes" &&
+            change.name != "segment.ms")
+            return invalid("Unsupported config: " + change.name);
+        if (change.operation == 1) {
+            if (change.value)
+                return invalid("DELETE requires a null value");
+            configs.erase(change.name);
+        } else if (change.operation == 0) {
+            if (!change.value)
+                return invalid("SET requires a value");
+            configs[change.name] = *change.value;
+        } else if (change.operation == 2 || change.operation == 3) {
+            if (change.name != "cleanup.policy" || !change.value)
+                return invalid("List operation requires cleanup.policy and a value");
+            std::string current;
+            auto existing = configs.find(change.name);
+            if (existing != configs.end())
+                current = existing->second;
+            else {
+                auto base = log_manager_ ? log_manager_->defaultConfig() : storage::LogConfig{};
+                if (base.cleanup_policy_delete)
+                    current = "delete";
+                if (base.cleanup_policy_compact)
+                    current += current.empty() ? "compact" : ",compact";
+            }
+            auto parts = policy_parts(current);
+            for (const auto& value : policy_parts(*change.value)) {
+                if (value != "delete" && value != "compact")
+                    return invalid("Invalid cleanup.policy");
+                if (change.operation == 2) {
+                    if (std::find(parts.begin(), parts.end(), value) == parts.end())
+                        parts.push_back(value);
+                } else
+                    parts.erase(std::remove(parts.begin(), parts.end(), value), parts.end());
+            }
+            std::string joined;
+            for (const auto& part : parts) {
+                if (!joined.empty())
+                    joined += ',';
+                joined += part;
+            }
+            configs[change.name] = joined;
+        } else
+            return invalid("Unknown config operation");
+    }
+    for (const auto& [name, value] : configs) {
+        if (name == "cleanup.policy") {
+            if (value.empty() || value.back() == ',')
+                return invalid("Invalid cleanup.policy");
+            for (const auto& token : policy_parts(value)) {
+                if (token != "delete" && token != "compact")
+                    return invalid("Invalid cleanup.policy");
+            }
+        } else if (name == "retention.ms" || name == "retention.bytes" || name == "segment.ms" ||
+                   name == "segment.bytes") {
+            int64_t parsed = 0;
+            auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), parsed);
+            const auto minimum = name == "segment.bytes" ? 1 : -1;
+            if (error != std::errc{} || end != value.data() + value.size() || parsed < minimum)
+                return invalid("Invalid value for " + name);
+        }
+    }
+    TopicOperationResult result;
+    result.topic_metadata = it->second.metadata;
+    result.has_metadata = true;
+    if (!validate_only) {
+        auto previous = it->second.configs;
+        it->second.configs = std::move(configs);
+        try {
+            persistLocked();
+        } catch (...) {
+            it->second.configs = std::move(previous);
+            throw;
+        }
+        if (log_manager_)
+            log_manager_->configureTopic(command.topic_name, it->second.configs);
+    }
     return result;
 }
 

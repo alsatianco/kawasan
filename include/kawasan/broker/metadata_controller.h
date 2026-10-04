@@ -31,6 +31,13 @@ public:
     TopicOperationResult createTopic(const TopicSpecification& spec);
     TopicOperationResult deleteTopic(const std::string& topic_name);
 
+    TopicOperationResult alterTopicConfigs(const std::string& name,
+                                           const std::vector<TopicConfigChange>& changes,
+                                           bool replace, bool validate_only);
+    std::optional<std::map<std::string, std::string>> topicConfigs(const std::string& name) const {
+        return store_.topicConfigs(name);
+    }
+
     /// @brief Updates the ISR for a partition (replicated via Raft).
     /// @param topic Topic name
     /// @param partition Partition ID

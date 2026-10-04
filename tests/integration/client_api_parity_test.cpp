@@ -3,9 +3,11 @@
 #include <array>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <map>
 #include <memory>
+#include <nlohmann/json.hpp>
 #include <thread>
 
 #include "kawasan/broker/kawasan_broker.h"
@@ -13,8 +15,10 @@
 #include "kawasan/common/logger.h"
 #include "kawasan/common/socket_deadline.h"
 #include "kawasan/protocol/admin_misc_requests.h"
+#include "kawasan/protocol/alter_configs_request.h"
 #include "kawasan/protocol/create_topics_request.h"
 #include "kawasan/protocol/fetch_request.h"
+#include "kawasan/protocol/incremental_alter_configs_request.h"
 #include "kawasan/protocol/list_offsets_request.h"
 #include "kawasan/protocol/offset_fetch_request.h"
 #include "kawasan/protocol/produce_request.h"
@@ -361,4 +365,132 @@ TEST_F(ClientApiParityTest, ModernSaslAndDeleteRecordsUseFlexibleBodies) {
     body.skipTaggedFields();
     body.skipTaggedFields();
     EXPECT_EQ(body.remaining(), 0u);
+}
+
+TEST_F(ClientApiParityTest, TopicConfigReadbackSurvivesRestartAndOverrideRemoval) {
+    config_.setLong("log.retention.ms", 200000);
+    config_.setString("log.durability", "async");
+    start();
+    create("config-topic");
+    EXPECT_EQ(broker_->logManager()->getTopicConfig("config-topic").flush_mode,
+              storage::FlushMode::kAsync);
+    IncrementalAlterConfigsRequest altered;
+    altered.addResource({ConfigResourceType::TOPIC,
+                         "config-topic",
+                         {{"retention.ms", IncrementalAlterConfigsRequest::Op::SET, "300000"}}});
+    auto changed = call(ApiKey::INCREMENTAL_ALTER_CONFIGS, 1, altered);
+    IncrementalAlterConfigsResponse result;
+    result.decode(changed, 1);
+    ASSERT_EQ(result.results().size(), 1u);
+    ASSERT_EQ(result.results()[0].error_code, ErrorCode::NONE);
+    auto describe = [&] {
+        DescribeConfigsRequest request;
+        request.addResource({ConfigResourceType::TOPIC, "config-topic"});
+        auto body = call(ApiKey::DESCRIBE_CONFIGS, 4, request);
+        DescribeConfigsResponse response;
+        response.decode(body, 4);
+        EXPECT_EQ(response.results()[0].error_code, ErrorCode::NONE);
+        std::map<std::string, ConfigEntry> entries;
+        for (const auto& entry : response.results()[0].configs)
+            entries[entry.name] = entry;
+        return entries;
+    };
+    EXPECT_EQ(describe().at("retention.ms").value, "300000");
+    EXPECT_FALSE(describe().at("retention.ms").is_default);
+    std::ifstream metadata(dir_ / "meta/topics.json");
+    const auto json = nlohmann::json::parse(metadata);
+    for (const auto& topic : json.at("topics")) {
+        if (topic.at("name") == "config-topic") {
+            EXPECT_EQ(topic.at("configs").value("retention.ms", ""), "300000");
+        }
+    }
+    broker_.reset();
+    start();
+    EXPECT_EQ(describe().at("retention.ms").value, "300000");
+    IncrementalAlterConfigsRequest removed;
+    removed.addResource(
+        {ConfigResourceType::TOPIC,
+         "config-topic",
+         {{"retention.ms", IncrementalAlterConfigsRequest::Op::DELETE, std::nullopt}}});
+    auto deleted = call(ApiKey::INCREMENTAL_ALTER_CONFIGS, 1, removed);
+    result.decode(deleted, 1);
+    ASSERT_EQ(result.results()[0].error_code, ErrorCode::NONE);
+    EXPECT_EQ(describe().at("retention.ms").value, "200000");
+    EXPECT_EQ(broker_->logManager()->getTopicConfig("config-topic").retention_ms, 200000);
+    EXPECT_EQ(broker_->logManager()->getTopicConfig("config-topic").flush_mode,
+              storage::FlushMode::kAsync);
+}
+
+TEST_F(ClientApiParityTest, InvalidAndUnknownTopicConfigRequestsFail) {
+    start();
+    create("config-validation");
+    AlterConfigsRequest invalid;
+    invalid.setValidateOnly(true);
+    invalid.addResource(
+        {ConfigResourceType::TOPIC, "config-validation", {{"retention.ms", "invalid"}}});
+    auto body = call(ApiKey::ALTER_CONFIGS, 2, invalid);
+    AlterConfigsResponse response;
+    response.decode(body, 2);
+    ASSERT_EQ(response.results().size(), 1u);
+    EXPECT_EQ(response.results()[0].error_code, ErrorCode::INVALID_CONFIG);
+    AlterConfigsRequest unknown;
+    unknown.addResource(
+        {ConfigResourceType::TOPIC, "missing-config-topic", {{"retention.ms", "300000"}}});
+    auto missing = call(ApiKey::ALTER_CONFIGS, 2, unknown);
+    response.decode(missing, 2);
+    EXPECT_EQ(response.results()[0].error_code, ErrorCode::UNKNOWN_TOPIC_OR_PARTITION);
+    DescribeConfigsRequest describe;
+    describe.addResource({ConfigResourceType::TOPIC, "missing-config-topic"});
+    auto absent = call(ApiKey::DESCRIBE_CONFIGS, 4, describe);
+    DescribeConfigsResponse described;
+    described.decode(absent, 4);
+    EXPECT_EQ(described.results()[0].error_code, ErrorCode::UNKNOWN_TOPIC_OR_PARTITION);
+}
+
+TEST_F(ClientApiParityTest, LiveTopicPoliciesUpdateAlreadyOpenLogs) {
+    start();
+    create("live-policy");
+    produce("live-policy");
+    auto* log = broker_->logManager()->getLog("live-policy", 0);
+    ASSERT_NE(log, nullptr);
+    IncrementalAlterConfigsRequest altered;
+    altered.addResource({ConfigResourceType::TOPIC,
+                         "live-policy",
+                         {{"segment.bytes", IncrementalAlterConfigsRequest::Op::SET, "1"},
+                          {"retention.bytes", IncrementalAlterConfigsRequest::Op::SET, "0"}}});
+    auto body = call(ApiKey::INCREMENTAL_ALTER_CONFIGS, 1, altered);
+    IncrementalAlterConfigsResponse response;
+    response.decode(body, 1);
+    ASSERT_EQ(response.results()[0].error_code, ErrorCode::NONE);
+    Record record;
+    record.timestamp = 1;
+    record.value = std::vector<uint8_t>{'v'};
+    log->append({record});
+    log->cleanup();
+    EXPECT_EQ(log->logStartOffset(), 1);  // rolled segment removed, active segment retained
+    EXPECT_EQ(log->logEndOffset(), 2);
+}
+
+TEST_F(ClientApiParityTest, ZeroTimeRetentionRemovesRolledSegments) {
+    start();
+    create("zero-retention");
+    produce("zero-retention");
+    IncrementalAlterConfigsRequest altered;
+    altered.addResource({ConfigResourceType::TOPIC,
+                         "zero-retention",
+                         {{"segment.bytes", IncrementalAlterConfigsRequest::Op::SET, "1"},
+                          {"retention.ms", IncrementalAlterConfigsRequest::Op::SET, "0"}}});
+    auto body = call(ApiKey::INCREMENTAL_ALTER_CONFIGS, 1, altered);
+    IncrementalAlterConfigsResponse response;
+    response.decode(body, 1);
+    ASSERT_EQ(response.results()[0].error_code, ErrorCode::NONE);
+    auto* log = broker_->logManager()->getLog("zero-retention", 0);
+    Record record;
+    record.timestamp = 1;
+    record.value = std::vector<uint8_t>{'v'};
+    log->append({record});
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    log->cleanup();
+    EXPECT_EQ(log->logStartOffset(), 1);
+    EXPECT_EQ(log->logEndOffset(), 2);
 }

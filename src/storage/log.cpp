@@ -90,6 +90,11 @@ LogConfig LogConfig::fromMap(const std::map<std::string, std::string>& configs,
     return result;
 }
 
+void Log::updateConfig(const LogConfig& config) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    config_ = config;
+}
+
 LogConfig LogConfig::fromMap(const std::map<std::string, std::string>& configs) {
     return fromMap(configs, LogConfig{});
 }
@@ -349,7 +354,8 @@ void Log::flush() {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& segment : segments_) {
         segment->flush();
-    }    if (checkpoint_dirty_ && !closed_) {
+    }
+    if (checkpoint_dirty_ && !closed_) {
         persistCheckpointLocked();
     }
 }
@@ -513,7 +519,7 @@ void Log::cleanup() {
 
     if (config_.cleanup_policy_delete && segments_.size() > 1) {
         // Time-based retention
-        if (config_.retention_ms > 0) {
+        if (config_.retention_ms >= 0) {
             const auto retention_time = std::chrono::milliseconds(config_.retention_ms);
             std::vector<size_t> to_delete;
             for (size_t i = 0; i + 1 < segments_.size(); ++i) {

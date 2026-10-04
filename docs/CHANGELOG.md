@@ -8,6 +8,12 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-04
 
+- Replicate and persist topic config replacements and incremental operations
+  through Raft, fence changes with topic UUIDs, and update already-open logs.
+  Validate supported runtime keys, preserve broker defaults and durability mode,
+  return effective DescribeConfigs values with correct Kafka config sources,
+  and honor zero time retention while protecting active segments.
+
 - Bound OffsetFetch array counts before allocating group/topic storage. A
   truncated-request regression proves thousands of declared entries cannot
   reserve memory from a few bytes; classic and grouped versions are covered.

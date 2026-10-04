@@ -83,6 +83,10 @@ public class WireFixtures {
         var listResult = new ListOffsetsResponseData.ListOffsetsPartitionResponse().setPartitionIndex(0).setTimestamp(-1).setOffset(42).setLeaderEpoch(3);
         var listResultTopic = new ListOffsetsResponseData.ListOffsetsTopicResponse().setName("t").setPartitions(List.of(listResult));
         add("list-offsets-response-v8",new ListOffsetsResponseData().setTopics(List.of(listResultTopic)),(short)8);
+        var defaultConfig = new DescribeConfigsResponseData.DescribeConfigsResourceResult().setName("retention.ms").setValue("604800000").setConfigSource((byte)5).setDocumentation(null);
+        var topicConfig = new DescribeConfigsResponseData.DescribeConfigsResourceResult().setName("segment.bytes").setValue("4096").setConfigSource((byte)1).setDocumentation(null);
+        var configResult = new DescribeConfigsResponseData.DescribeConfigsResult().setErrorMessage(null).setResourceType((byte)2).setResourceName("t").setConfigs(List.of(defaultConfig, topicConfig));
+        for (short v : new short[]{1,4}) add("describe-configs-response-v"+v,new DescribeConfigsResponseData().setResults(List.of(configResult)),v);
         System.out.println(new ObjectMapper().writerWithDefaultPrettyPrinter().writeValueAsString(fixtures));
     }
 }

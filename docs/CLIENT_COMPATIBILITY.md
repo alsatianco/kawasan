@@ -79,3 +79,10 @@ above-cap error replies, UUID record fetching and long-poll wakeup, ListOffsets
 EARLIEST_LOCAL (-4), and classic OffsetFetch v9. The matrix retains broker debug
 request logs so actual negotiated versions can be inspected alongside case
 results. See [the profile settings](CONFIGURATION.md#protocol-compatibility).
+
+Topic config round trips use replicated, persisted overrides. DescribeConfigs
+reports Kafka source IDs (dynamic topic 1, static broker 4, default 5). Kafka-generated
+v1/v4 response fixtures cover source encoding; socket tests cover validation,
+restart, override removal and changes to already-open logs. The three-broker check
+is `scripts/tests/test_topic_configs_cm3.py`, retaining controller-failover evidence
+under its fresh `BASE` directory.

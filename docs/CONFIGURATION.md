@@ -327,3 +327,21 @@ Validation only checks the keys above; it does not warn about inert keys or abou
 ```
 
 See [./OPERATIONS.md](./OPERATIONS.md) for tuning and deployment, [./ARCHITECTURE.md](./ARCHITECTURE.md) for subsystem design, and [./FAQ.md](./FAQ.md) for common issues.
+
+### Topic config changes
+
+`AlterConfigs` replaces a topic's explicit overrides; `IncrementalAlterConfigs`
+updates only the requested keys. The supported runtime keys are `cleanup.policy`,
+`retention.ms`, `retention.bytes`, `segment.bytes` and `segment.ms`. Unknown keys,
+invalid numbers, duplicate keys and invalid list operations return `INVALID_CONFIG`.
+`validate_only` checks the request without changing metadata or logs. Missing topics
+return `UNKNOWN_TOPIC_OR_PARTITION`; cluster mutations require the active controller.
+
+Successful changes commit through Raft and persist in topic metadata. Every broker
+applies the committed policies to current and future partition logs. Removing an
+override restores that broker's configured default and preserves its durability
+mode. Time retention of zero removes expired rolled segments; the active segment
+remains protected. DescribeConfigs returns effective values and Kafka config sources
+(dynamic topic, static broker, or default), and honors requested key filters.
+Broker-resource alteration remains a read-only no-op; dynamic broker configuration
+is outside this supported topic surface.

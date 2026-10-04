@@ -68,9 +68,9 @@
 namespace kawasan::broker {
 
 namespace {
-constexpr int16_t kMetadataMaxVersion = 12;  // Phase 1.2
-constexpr int16_t kProduceMaxVersion = 11;   // CM-3
-constexpr int16_t kFetchMaxVersion = 13;     // CM-3: persisted controller UUIDs
+constexpr int16_t kMetadataMaxVersion = 12;        // Phase 1.2
+constexpr int16_t kProduceMaxVersion = 11;         // CM-3
+constexpr int16_t kFetchMaxVersion = 13;           // CM-3: persisted controller UUIDs
 constexpr int16_t kListOffsetsMaxVersion = 8;      // CM-3: EARLIEST_LOCAL
 constexpr int16_t kFindCoordinatorMaxVersion = 4;  // Phase 1.6
 constexpr int16_t kJoinGroupMaxVersion = 9;        // Phase 1.7
@@ -488,8 +488,7 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
         std::max<int64_t>(1000, config_.get<int64_t>("replica.lag.time.max.ms", 30000));
     broker_liveness_timeout_ms_ =
         std::max<int64_t>(1000, config_.get<int64_t>("broker.liveness.timeout.ms", 9000));
-    unclean_leader_election_enabled_ =
-        config_.get<bool>("unclean.leader.election.enable", false);
+    unclean_leader_election_enabled_ = config_.get<bool>("unclean.leader.election.enable", false);
 
     // Initialize OffsetManager with persistent storage
     const std::string offset_db_path = log_dir_ + "/consumer_offsets";
@@ -2352,8 +2351,8 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                 continue;
             }
 
-            auto partition_write_lock = lockPartitionWrites(
-                {topic_data.topic, partition_data.partition});
+            auto partition_write_lock =
+                lockPartitionWrites({topic_data.topic, partition_data.partition});
             try {
                 storage::RecordBatch batch = storage::RecordBatch::deserializeFromProduceRequest(
                     partition_data.record_batch);
@@ -2433,8 +2432,8 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                                      batch.producerEpoch(), batch.baseSequence(),
                                      chk.duplicate_offset);
                         if (acks == -1 && isr_size > 1 && chk.duplicate_offset >= 0) {
-                            pending_acks.push_back(PendingAck{topic_responses.size(),
-                                topic_response.partitions.size(), tp,
+                            pending_acks.push_back(PendingAck{
+                                topic_responses.size(), topic_response.partitions.size(), tp,
                                 chk.duplicate_offset + static_cast<Offset>(batch.records().size()),
                                 partition_it->leader_epoch});
                         }
@@ -2508,11 +2507,10 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                 // replica has it. With only the leader in the ISR the append
                 // already advanced the HW past it; otherwise it is resolved below.
                 if (acks == -1 && isr_size > 1) {
-                    pending_acks.push_back(PendingAck{topic_responses.size(),
-                                                      topic_response.partitions.size(), tp,
-                                                      base_offset +
-                                                          static_cast<Offset>(record_count),
-                                                      partition_it->leader_epoch});
+                    pending_acks.push_back(
+                        PendingAck{topic_responses.size(), topic_response.partitions.size(), tp,
+                                   base_offset + static_cast<Offset>(record_count),
+                                   partition_it->leader_epoch});
                 }
             } catch (const StorageException& ex) {
                 Logger::error("Storage error while appending to {}-{}: {}", topic_data.topic,
@@ -3197,15 +3195,14 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
         // the connection for that long); long-poll wait time is not throttling.
         int32_t fetch_throttle_ms = 0;
         if (quota_manager_) {
-            fetch_throttle_ms = quota_manager_->recordAndThrottleMs(
-                QuotaManager::Type::kConsumer, ctx.header.clientId(), bytes);
+            fetch_throttle_ms = quota_manager_->recordAndThrottleMs(QuotaManager::Type::kConsumer,
+                                                                    ctx.header.clientId(), bytes);
         }
         out.setThrottleTimeMs(fetch_throttle_ms);
 
         const int16_t version = std::clamp<int16_t>(ctx.header.apiVersion(), 0, kFetchMaxVersion);
         RequestDispatcher::HandlerResult result;
-        result.payload =
-            encodeResponse(ctx, [&](Buffer& buffer) { out.encode(buffer, version); });
+        result.payload = encodeResponse(ctx, [&](Buffer& buffer) { out.encode(buffer, version); });
 
         if (monitoring_manager_ && monitoring_manager_->metricsCollector()) {
             auto end_time = std::chrono::steady_clock::now();
@@ -3575,9 +3572,9 @@ Buffer KawasanBroker::handleJoinGroup(RequestDispatcher::RequestContext& context
     protocol::JoinGroupRequest request;
     request.decode(context.payload, context.header.apiVersion());
     if (!isCoordinatorFor(request.groupId(), protocol::CoordinatorType::GROUP)) {
-        return buildJoinGroupError(context, ErrorCode::NOT_COORDINATOR, context.header.apiVersion());
+        return buildJoinGroupError(context, ErrorCode::NOT_COORDINATOR,
+                                   context.header.apiVersion());
     }
-
 
     // 0A.10: forward the real client identity so DescribeGroups returns
     // something useful instead of "unknown".
@@ -3967,7 +3964,8 @@ std::optional<std::pair<std::string, int32_t>> KawasanBroker::peerEndpoint(
 }
 
 std::unique_lock<std::mutex> KawasanBroker::lockPartitionWrites(const TopicPartition& tp) {
-    if (cluster_brokers_.empty()) return {};
+    if (cluster_brokers_.empty())
+        return {};
     std::mutex* mutex;
     {
         std::lock_guard<std::mutex> map_lock(partition_write_mutex_map_mutex_);
@@ -4397,26 +4395,44 @@ Buffer KawasanBroker::handleDescribeConfigs(RequestDispatcher::RequestContext& c
 
             result.configs = configs;
         } else if (resource.resource_type == protocol::ConfigResourceType::TOPIC) {
-            // Topic configs - return basic defaults
-            std::vector<protocol::ConfigEntry> configs;
-
-            protocol::ConfigEntry retention_config;
-            retention_config.name = "retention.ms";
-            retention_config.value = std::to_string(log_config_.retention_ms);
-            retention_config.read_only = false;
-            retention_config.is_default = true;
-            retention_config.is_sensitive = false;
-            configs.push_back(retention_config);
-
-            protocol::ConfigEntry segment_size_config;
-            segment_size_config.name = "segment.bytes";
-            segment_size_config.value = std::to_string(log_config_.segment_size);
-            segment_size_config.read_only = false;
-            segment_size_config.is_default = true;
-            segment_size_config.is_sensitive = false;
-            configs.push_back(segment_size_config);
-
-            result.configs = configs;
+            const auto overrides = metadata_controller_->topicConfigs(resource.resource_name);
+            if (!overrides) {
+                result.error_code = ErrorCode::UNKNOWN_TOPIC_OR_PARTITION;
+                result.error_message = "Topic does not exist";
+            } else {
+                const auto effective =
+                    storage::LogConfig::fromMap(*overrides, log_manager_->defaultConfig());
+                std::string policy;
+                if (effective.cleanup_policy_delete)
+                    policy = "delete";
+                if (effective.cleanup_policy_compact)
+                    policy += policy.empty() ? "compact" : ",compact";
+                const std::map<std::string, std::string> values = {
+                    {"cleanup.policy", policy},
+                    {"retention.ms", std::to_string(effective.retention_ms)},
+                    {"retention.bytes", std::to_string(effective.retention_bytes)},
+                    {"segment.bytes", std::to_string(effective.segment_size)},
+                    {"segment.ms", std::to_string(effective.segment_ms)}};
+                for (const auto& [name, value] : values) {
+                    if (!resource.config_names.empty() &&
+                        std::find(resource.config_names.begin(), resource.config_names.end(),
+                                  name) == resource.config_names.end())
+                        continue;
+                    protocol::ConfigEntry entry;
+                    entry.name = name;
+                    entry.value = value;
+                    std::string broker_key = name == "segment.bytes" ? "log.segment.bytes"
+                                             : name == "segment.ms"  ? "log.roll.ms"
+                                                                     : "log." + name;
+                    const bool inherited =
+                        config_.has(broker_key) ||
+                        (name == "segment.ms" && config_.has("log.roll.hours")) ||
+                        (name == "retention.ms" && config_.has("log.retention.hours"));
+                    entry.is_default = !overrides->contains(name) && !inherited;
+                    entry.config_source = overrides->contains(name) ? 1 : (inherited ? 4 : 5);
+                    result.configs.push_back(std::move(entry));
+                }
+            }
         }
 
         response.addResult(result);
@@ -4693,19 +4709,15 @@ Buffer KawasanBroker::handleAlterConfigs(RequestDispatcher::RequestContext& cont
         rr.error_code = ErrorCode::NONE;
 
         if (res.resource_type == protocol::ConfigResourceType::TOPIC) {
-            // Phase 4.1a: build the new config map from the request and push it
-            // through LogManager::setTopicConfig. validate_only is honored —
-            // we never persist when set.
-            std::map<std::string, std::string> cfg;
-            for (const auto& e : res.configs) {
-                if (e.value.has_value())
-                    cfg[e.name] = *e.value;
+            std::vector<TopicConfigChange> changes;
+            for (const auto& entry : res.configs) {
+                changes.push_back(
+                    {entry.name, entry.value, static_cast<int8_t>(entry.value ? 0 : 1)});
             }
-            if (!request.validateOnly() && log_manager_) {
-                log_manager_->setTopicConfig(res.resource_name, storage::LogConfig::fromMap(cfg));
-                Logger::info("AlterConfigs: topic '{}' updated with {} configs", res.resource_name,
-                             cfg.size());
-            }
+            const auto changed = metadata_controller_->alterTopicConfigs(
+                res.resource_name, changes, true, request.validateOnly());
+            rr.error_code = changed.error_code;
+            rr.error_message = changed.error_message;
         } else if (res.resource_type == protocol::ConfigResourceType::BROKER) {
             // Broker-resource alteration is accepted but not persisted to the
             // running broker — most broker configs are read-only at runtime.
@@ -4740,8 +4752,6 @@ Buffer KawasanBroker::handleIncrementalAlterConfigs(RequestDispatcher::RequestCo
     protocol::IncrementalAlterConfigsResponse response;
     response.setThrottleTimeMs(0);
 
-    using Op = protocol::IncrementalAlterConfigsRequest::Op;
-
     for (const auto& res : request.resources()) {
         protocol::IncrementalAlterConfigsResponse::ResourceResult rr;
         rr.resource_type = res.resource_type;
@@ -4749,70 +4759,13 @@ Buffer KawasanBroker::handleIncrementalAlterConfigs(RequestDispatcher::RequestCo
         rr.error_code = ErrorCode::NONE;
 
         if (res.resource_type == protocol::ConfigResourceType::TOPIC && log_manager_) {
-            // Phase 4.1b: start from the current effective config, then apply
-            // per-key operations. APPEND/SUBTRACT honor comma-list semantics
-            // (cleanup.policy can be "delete,compact").
-            auto current = log_manager_->getTopicConfig(res.resource_name);
-            std::map<std::string, std::string> cfg;
-            std::string policy;
-            if (current.cleanup_policy_delete && current.cleanup_policy_compact) {
-                policy = "delete,compact";
-            } else if (current.cleanup_policy_compact) {
-                policy = "compact";
-            } else {
-                policy = "delete";
-            }
-            cfg["cleanup.policy"] = policy;
-            cfg["retention.ms"] = std::to_string(current.retention_ms);
-            cfg["retention.bytes"] = std::to_string(current.retention_bytes);
-            cfg["segment.bytes"] = std::to_string(current.segment_size);
-            cfg["segment.ms"] = std::to_string(current.segment_ms);
-
-            for (const auto& c : res.configs) {
-                switch (c.op) {
-                    case Op::SET:
-                        if (c.value.has_value())
-                            cfg[c.name] = *c.value;
-                        else
-                            cfg.erase(c.name);
-                        break;
-                    case Op::DELETE:
-                        cfg.erase(c.name);
-                        break;
-                    case Op::APPEND:
-                    case Op::SUBTRACT: {
-                        auto it = cfg.find(c.name);
-                        std::vector<std::string> parts;
-                        if (it != cfg.end()) {
-                            std::stringstream ss(it->second);
-                            std::string tok;
-                            while (std::getline(ss, tok, ','))
-                                parts.push_back(tok);
-                        }
-                        if (c.value.has_value()) {
-                            if (c.op == Op::APPEND) {
-                                parts.push_back(*c.value);
-                            } else {
-                                parts.erase(std::remove(parts.begin(), parts.end(), *c.value),
-                                            parts.end());
-                            }
-                        }
-                        std::string joined;
-                        for (size_t i = 0; i < parts.size(); ++i) {
-                            if (i > 0)
-                                joined.push_back(',');
-                            joined += parts[i];
-                        }
-                        cfg[c.name] = joined;
-                        break;
-                    }
-                }
-            }
-            if (!request.validateOnly()) {
-                log_manager_->setTopicConfig(res.resource_name, storage::LogConfig::fromMap(cfg));
-                Logger::info("IncrementalAlterConfigs: topic '{}' applied {} ops",
-                             res.resource_name, res.configs.size());
-            }
+            std::vector<TopicConfigChange> changes;
+            for (const auto& entry : res.configs)
+                changes.push_back({entry.name, entry.value, static_cast<int8_t>(entry.op)});
+            const auto changed = metadata_controller_->alterTopicConfigs(
+                res.resource_name, changes, false, request.validateOnly());
+            rr.error_code = changed.error_code;
+            rr.error_message = changed.error_message;
         } else if (res.resource_type == protocol::ConfigResourceType::BROKER) {
             Logger::info("IncrementalAlterConfigs: broker config no-op (read-only)");
         } else {
@@ -4821,7 +4774,6 @@ Buffer KawasanBroker::handleIncrementalAlterConfigs(RequestDispatcher::RequestCo
         }
         response.addResult(std::move(rr));
     }
-
     const int16_t version = std::clamp<int16_t>(context.header.apiVersion(), 0, 1);
     return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }

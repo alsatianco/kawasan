@@ -24,12 +24,15 @@ LogManager::~LogManager() {
 namespace {
 
 bool isEnvironmentalOpenError(const std::string& what) {
-    static const char* const MARKERS[] = {
-        "/LOCK",                  // RocksDB: "While lock file: <dir>/LOCK: ..."
-        "lock hold by current process",
-        "No locks available",     "Too many open files", "Resource temporarily unavailable",
-        "Permission denied",      "No space left",       "Read-only file system",
-        "Operation not permitted"};
+    static const char* const MARKERS[] = {"/LOCK",  // RocksDB: "While lock file: <dir>/LOCK: ..."
+                                          "lock hold by current process",
+                                          "No locks available",
+                                          "Too many open files",
+                                          "Resource temporarily unavailable",
+                                          "Permission denied",
+                                          "No space left",
+                                          "Read-only file system",
+                                          "Operation not permitted"};
     for (const char* marker : MARKERS) {
         if (what.find(marker) != std::string::npos) {
             return true;
@@ -42,7 +45,7 @@ bool isEnvironmentalOpenError(const std::string& what) {
 
 Log* LogManager::getOrCreateLog(const std::string& topic, PartitionId partition) {
     TopicPartition tp{topic, partition};
-    
+
     // Fast path: check if log exists without holding the global lock
     {
         std::shared_lock<std::shared_mutex> read_lock(mutex_);
@@ -51,10 +54,10 @@ Log* LogManager::getOrCreateLog(const std::string& topic, PartitionId partition)
             return it->second.get();
         }
     }
-    
+
     // Slow path: create new log with exclusive lock
     std::unique_lock<std::shared_mutex> write_lock(mutex_);
-    
+
     // Double-check after acquiring write lock (another thread may have created it)
     auto it = logs_.find(tp);
     if (it != logs_.end()) {
@@ -74,12 +77,13 @@ Log* LogManager::getOrCreateLog(const std::string& topic, PartitionId partition)
     try {
         Log* log_ptr = registerLogLocked(
             tp, std::make_unique<Log>(topic, partition, log_dir, effective_config));
-        Logger::info("Created log for topic {} partition {} (cleanup.policy: {}{}{})",
-                     topic, partition,
-                     effective_config.cleanup_policy_delete ? "delete" : "",
-                     (effective_config.cleanup_policy_delete &&
-                      effective_config.cleanup_policy_compact) ? "," : "",
-                     effective_config.cleanup_policy_compact ? "compact" : "");
+        Logger::info(
+            "Created log for topic {} partition {} (cleanup.policy: {}{}{})", topic, partition,
+            effective_config.cleanup_policy_delete ? "delete" : "",
+            (effective_config.cleanup_policy_delete && effective_config.cleanup_policy_compact)
+                ? ","
+                : "",
+            effective_config.cleanup_policy_compact ? "compact" : "");
         return log_ptr;
     } catch (const std::exception& ex) {
         // Never destroy data on open failure. Environmental errors (RocksDB
@@ -114,9 +118,8 @@ Log* LogManager::getOrCreateLog(const std::string& topic, PartitionId partition)
             return log_ptr;
         } catch (const std::exception& ex2) {
             // Surface the original context with the second failure reason.
-            Logger::error(
-                "Failed to recover log for {}-{} at {}: {}", topic, partition, log_dir,
-                ex2.what());
+            Logger::error("Failed to recover log for {}-{} at {}: {}", topic, partition, log_dir,
+                          ex2.what());
             throw;
         }
     }
@@ -302,6 +305,10 @@ std::string LogManager::getLogDir(const std::string& topic, PartitionId partitio
 void LogManager::setTopicConfig(const std::string& topic, const LogConfig& config) {
     std::unique_lock<std::shared_mutex> write_lock(mutex_);
     topic_configs_[topic] = config;
+    for (auto& [tp, log] : logs_) {
+        if (tp.topic == topic)
+            log->updateConfig(config);
+    }
     Logger::info("Registered LogConfig for topic '{}' (compact={}, delete={}, retention.ms={})",
                  topic, config.cleanup_policy_compact, config.cleanup_policy_delete,
                  config.retention_ms);

@@ -34,6 +34,9 @@ public:
     /// @brief Applies a create topic command.
     TopicOperationResult applyCreate(const TopicSpecification& spec);
 
+    TopicOperationResult applyConfigs(const MetadataCommand& command, bool validate_only = false);
+    std::optional<std::map<std::string, std::string>> topicConfigs(const std::string& name) const;
+
     /// @brief Applies a delete topic command.
     TopicOperationResult applyDelete(const std::string& topic_name);
 

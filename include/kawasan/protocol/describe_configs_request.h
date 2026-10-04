@@ -10,12 +10,7 @@
 namespace kawasan::protocol {
 
 /// @brief Resource type for DescribeConfigs request
-enum class ConfigResourceType : int8_t {
-    UNKNOWN = 0,
-    TOPIC = 2,
-    BROKER = 4,
-    BROKER_LOGGER = 8
-};
+enum class ConfigResourceType : int8_t { UNKNOWN = 0, TOPIC = 2, BROKER = 4, BROKER_LOGGER = 8 };
 
 /// @brief Resource specification for DescribeConfigs request
 struct ConfigResource {
@@ -39,12 +34,8 @@ public:
     bool includeDocumentation() const { return include_documentation_; }
 
     // Setters
-    void setResources(const std::vector<ConfigResource>& resources) { 
-        resources_ = resources; 
-    }
-    void addResource(const ConfigResource& resource) { 
-        resources_.push_back(resource); 
-    }
+    void setResources(const std::vector<ConfigResource>& resources) { resources_ = resources; }
+    void addResource(const ConfigResource& resource) { resources_.push_back(resource); }
     void setIncludeSynonyms(bool include) { include_synonyms_ = include; }
     void setIncludeDocumentation(bool include) { include_documentation_ = include; }
 
@@ -68,6 +59,7 @@ struct ConfigEntry {
     bool read_only = false;
     bool is_default = false;
     bool is_sensitive = false;
+    int8_t config_source = -1;
 };
 
 /// @brief Resource result in DescribeConfigs response
@@ -86,18 +78,14 @@ public:
 
     // Getters
     int32_t throttleTimeMs() const { return throttle_time_ms_; }
-    const std::vector<DescribeConfigsResourceResult>& results() const { 
-        return results_; 
-    }
+    const std::vector<DescribeConfigsResourceResult>& results() const { return results_; }
 
     // Setters
     void setThrottleTimeMs(int32_t time) { throttle_time_ms_ = time; }
-    void setResults(const std::vector<DescribeConfigsResourceResult>& results) { 
-        results_ = results; 
+    void setResults(const std::vector<DescribeConfigsResourceResult>& results) {
+        results_ = results;
     }
-    void addResult(const DescribeConfigsResourceResult& result) { 
-        results_.push_back(result); 
-    }
+    void addResult(const DescribeConfigsResourceResult& result) { results_.push_back(result); }
 
     // Serialization
     void encode(Buffer& buffer, int16_t api_version) const;

@@ -25,13 +25,11 @@ std::optional<std::string> readCompactNullableString(kawasan::Buffer& buffer) {
 void writeCompactString(kawasan::Buffer& buffer, const std::string& value) {
     buffer.writeUnsignedVarInt(static_cast<uint32_t>(value.size() + 1));
     if (!value.empty()) {
-        buffer.writeBytes(reinterpret_cast<const uint8_t*>(value.data()),
-                          value.size());
+        buffer.writeBytes(reinterpret_cast<const uint8_t*>(value.data()), value.size());
     }
 }
 
-void writeCompactNullableString(kawasan::Buffer& buffer,
-                                const std::optional<std::string>& value) {
+void writeCompactNullableString(kawasan::Buffer& buffer, const std::optional<std::string>& value) {
     if (value) {
         writeCompactString(buffer, *value);
     } else {
@@ -39,12 +37,10 @@ void writeCompactNullableString(kawasan::Buffer& buffer,
     }
 }
 
-int32_t readCompactArrayLength(kawasan::Buffer& buffer,
-                               const char* field_name) {
+int32_t readCompactArrayLength(kawasan::Buffer& buffer, const char* field_name) {
     const uint32_t length_plus_one = buffer.readUnsignedVarInt();
     if (length_plus_one == 0) {
-        throw kawasan::ProtocolException(
-            std::string(field_name) + " compact array cannot be null");
+        throw kawasan::ProtocolException(std::string(field_name) + " compact array cannot be null");
     }
     return static_cast<int32_t>(length_plus_one - 1);
 }
@@ -145,8 +141,7 @@ void DescribeConfigsRequest::decode(Buffer& buffer, int16_t api_version) {
         if (use_flexible) {
             const uint32_t count_plus_one = buffer.readUnsignedVarInt();
             if (count_plus_one > 0) {
-                const int32_t config_count =
-                    static_cast<int32_t>(count_plus_one - 1);
+                const int32_t config_count = static_cast<int32_t>(count_plus_one - 1);
                 resource.config_names.reserve(config_count);
                 for (int32_t j = 0; j < config_count; ++j) {
                     resource.config_names.push_back(readCompactString(buffer));
@@ -189,8 +184,7 @@ void DescribeConfigsRequest::decode(Buffer& buffer, int16_t api_version) {
 
     for (int32_t i = 0; i < resource_count; ++i) {
         ConfigResource resource;
-        resource.resource_type =
-            static_cast<ConfigResourceType>(buffer.readInt8());
+        resource.resource_type = static_cast<ConfigResourceType>(buffer.readInt8());
         resource.resource_name = read_resource_name();
         read_config_names(resource);
         resources_.push_back(std::move(resource));
@@ -261,7 +255,7 @@ void DescribeConfigsResponse::encode(Buffer& buffer, int16_t api_version) const 
 
     // Throttle time (v0+)
     buffer.writeInt32(throttle_time_ms_);
-    
+
     // Results array
     if (flexible) {
         buffer.writeUnsignedVarInt(static_cast<uint32_t>(results_.size() + 1));
@@ -276,10 +270,9 @@ void DescribeConfigsResponse::encode(Buffer& buffer, int16_t api_version) const 
                                  : std::optional<std::string>(result.error_message);
             writeCompactNullableString(buffer, error_msg);
         } else {
-            buffer.writeNullableString(
-                result.error_message.empty()
-                    ? std::optional<std::string>{}
-                    : std::optional<std::string>(result.error_message));
+            buffer.writeNullableString(result.error_message.empty()
+                                           ? std::optional<std::string>{}
+                                           : std::optional<std::string>(result.error_message));
         }
         buffer.writeInt8(static_cast<int8_t>(result.resource_type));
         if (flexible) {
@@ -287,40 +280,41 @@ void DescribeConfigsResponse::encode(Buffer& buffer, int16_t api_version) const 
         } else {
             buffer.writeString(result.resource_name);
         }
-        
+
         // Config entries
         if (flexible) {
-            buffer.writeUnsignedVarInt(
-                static_cast<uint32_t>(result.configs.size() + 1));
+            buffer.writeUnsignedVarInt(static_cast<uint32_t>(result.configs.size() + 1));
         } else {
             buffer.writeInt32(static_cast<int32_t>(result.configs.size()));
         }
         for (const auto& config : result.configs) {
             if (flexible) {
                 writeCompactString(buffer, config.name);
-                writeCompactNullableString(
-                    buffer,
-                    config.value.empty()
-                        ? std::optional<std::string>{}
-                        : std::optional<std::string>(config.value));
+                writeCompactNullableString(buffer, config.value.empty()
+                                                       ? std::optional<std::string>{}
+                                                       : std::optional<std::string>(config.value));
             } else {
                 buffer.writeString(config.name);
-                buffer.writeNullableString(
-                    config.value.empty()
-                        ? std::optional<std::string>{}
-                        : std::optional<std::string>(config.value));
+                buffer.writeNullableString(config.value.empty()
+                                               ? std::optional<std::string>{}
+                                               : std::optional<std::string>(config.value));
             }
             buffer.writeInt8(config.read_only ? 1 : 0);
-            
+
             if (api_version >= 1) {
-                // Config source (we'll use DEFAULT_CONFIG = 4)
-                buffer.writeInt8(config.is_default ? 4 : 5);
+                // Kafka: default=5, static broker=4, dynamic topic=1.
+                buffer.writeInt8(
+                    config.config_source >= 0
+                        ? config.config_source
+                        : (config.is_default
+                               ? 5
+                               : (result.resource_type == ConfigResourceType::TOPIC ? 1 : 4)));
             } else {
                 buffer.writeInt8(config.is_default ? 1 : 0);
             }
-            
+
             buffer.writeInt8(config.is_sensitive ? 1 : 0);
-            
+
             // Synonyms (v1+) - empty array
             if (api_version >= 1) {
                 if (flexible) {
@@ -329,12 +323,12 @@ void DescribeConfigsResponse::encode(Buffer& buffer, int16_t api_version) const 
                     buffer.writeInt32(0);
                 }
             }
-            
+
             // Config type (v3+) - UNKNOWN = 0
             if (api_version >= 3) {
                 buffer.writeInt8(0);
             }
-            
+
             // Documentation (v3+) - nullable string
             if (api_version >= 3) {
                 if (flexible) {
@@ -365,7 +359,7 @@ void DescribeConfigsResponse::decode(Buffer& buffer, int16_t api_version) {
 
     // Throttle time
     throttle_time_ms_ = buffer.readInt32();
-    
+
     // Results array
     int32_t result_count = 0;
     if (flexible) {
@@ -378,7 +372,7 @@ void DescribeConfigsResponse::decode(Buffer& buffer, int16_t api_version) {
     }
     results_.clear();
     results_.reserve(result_count);
-    
+
     for (int32_t i = 0; i < result_count; ++i) {
         DescribeConfigsResourceResult result;
         result.error_code = static_cast<ErrorCode>(buffer.readInt16());
@@ -390,14 +384,12 @@ void DescribeConfigsResponse::decode(Buffer& buffer, int16_t api_version) {
             result.error_message = error_msg.value_or("");
         }
         result.resource_type = static_cast<ConfigResourceType>(buffer.readInt8());
-        result.resource_name = flexible ? readCompactString(buffer)
-                                        : buffer.readString();
-        
+        result.resource_name = flexible ? readCompactString(buffer) : buffer.readString();
+
         // Config entries
         int32_t config_count = 0;
         if (flexible) {
-            config_count =
-                readCompactArrayLength(buffer, "DescribeConfigs configs");
+            config_count = readCompactArrayLength(buffer, "DescribeConfigs configs");
         } else {
             config_count = buffer.readInt32();
             if (config_count < 0) {
@@ -405,11 +397,10 @@ void DescribeConfigsResponse::decode(Buffer& buffer, int16_t api_version) {
             }
         }
         result.configs.reserve(config_count);
-        
+
         for (int32_t j = 0; j < config_count; ++j) {
             ConfigEntry config;
-            config.name =
-                flexible ? readCompactString(buffer) : buffer.readString();
+            config.name = flexible ? readCompactString(buffer) : buffer.readString();
             if (flexible) {
                 auto value = readCompactNullableString(buffer);
                 config.value = value.value_or("");
@@ -418,47 +409,47 @@ void DescribeConfigsResponse::decode(Buffer& buffer, int16_t api_version) {
                 config.value = value.value_or("");
             }
             config.read_only = buffer.readInt8() != 0;
-            
+
             if (api_version >= 1) {
                 int8_t source = buffer.readInt8();
-                config.is_default = (source == 4);
+                config.config_source = source;
+                config.is_default = (source == 5);
             } else {
                 config.is_default = buffer.readInt8() != 0;
             }
-            
+
             config.is_sensitive = buffer.readInt8() != 0;
-            
+
             // Synonyms (v1+)
             if (api_version >= 1) {
                 if (flexible) {
-                    const uint32_t synonym_count_plus_one =
-                        buffer.readUnsignedVarInt();
+                    const uint32_t synonym_count_plus_one = buffer.readUnsignedVarInt();
                     if (synonym_count_plus_one > 0) {
                         const int32_t synonym_count =
                             static_cast<int32_t>(synonym_count_plus_one - 1);
                         for (int32_t k = 0; k < synonym_count; ++k) {
-                            (void)readCompactString(buffer);      // name
+                            (void)readCompactString(buffer);          // name
                             (void)readCompactNullableString(buffer);  // value
-                            (void)buffer.readInt8();              // source
-                            skipTaggedFields(buffer);             // synonym tags
+                            (void)buffer.readInt8();                  // source
+                            skipTaggedFields(buffer);                 // synonym tags
                         }
                     }
                 } else {
                     int32_t synonym_count = buffer.readInt32();
                     // Skip synonyms for now
                     for (int32_t k = 0; k < synonym_count; ++k) {
-                        buffer.readString();         // name
-                        buffer.readNullableString(); // value
-                        buffer.readInt8();           // source
+                        buffer.readString();          // name
+                        buffer.readNullableString();  // value
+                        buffer.readInt8();            // source
                     }
                 }
             }
-            
+
             // Config type (v3+)
             if (api_version >= 3) {
                 buffer.readInt8();
             }
-            
+
             // Documentation (v3+)
             if (api_version >= 3) {
                 if (flexible) {
@@ -474,10 +465,10 @@ void DescribeConfigsResponse::decode(Buffer& buffer, int16_t api_version) {
             if (flexible) {
                 skipTaggedFields(buffer);  // Config tagged fields
             }
-            
+
             result.configs.push_back(std::move(config));
         }
-        
+
         if (flexible) {
             skipTaggedFields(buffer);  // Result tagged fields
         }
@@ -493,33 +484,32 @@ void DescribeConfigsResponse::decode(Buffer& buffer, int16_t api_version) {
 // DescribeConfigsResponse size
 size_t DescribeConfigsResponse::size(int16_t api_version) const {
     const bool flexible = api_version >= 4;
-    size_t total = 4;  // throttle_time_ms
-    total += flexible ? 1 : 4;        // results array length
-    
+    size_t total = 4;           // throttle_time_ms
+    total += flexible ? 1 : 4;  // results array length
+
     for (const auto& result : results_) {
-        total += 2;  // error_code
-        total += (flexible ? 1 : 2) +
-                 result.error_message.size();  // error_message
-        total += 1;  // resource_type
+        total += 2;                                                 // error_code
+        total += (flexible ? 1 : 2) + result.error_message.size();  // error_message
+        total += 1;                                                 // resource_type
         total += (flexible ? 1 : 2) + result.resource_name.size();
         total += flexible ? 1 : 4;  // configs array length
-        
+
         for (const auto& config : result.configs) {
             total += (flexible ? 1 : 2) + config.name.size();   // name
             total += (flexible ? 1 : 2) + config.value.size();  // value
-            total += 1;  // read_only
-            
+            total += 1;                                         // read_only
+
             if (api_version >= 1) {
-                total += 1;  // config source
+                total += 1;                 // config source
                 total += flexible ? 1 : 4;  // synonyms array (empty)
             } else {
                 total += 1;  // is_default
             }
-            
+
             total += 1;  // is_sensitive
-            
+
             if (api_version >= 3) {
-                total += 1;  // config type
+                total += 1;                   // config type
                 total += (flexible ? 1 : 2);  // documentation (null)
             }
 
@@ -532,7 +522,7 @@ size_t DescribeConfigsResponse::size(int16_t api_version) const {
             total += 1;  // Result tagged fields
         }
     }
-    
+
     if (flexible) {
         total += 1;  // Response tagged fields
     }
