@@ -231,6 +231,9 @@ The history is populated in multi-broker mode only. A broker that becomes a part
 
 Consumer offsets and group metadata are stored in a separate RocksDB database (not under the partition log dirs) — see [Consumer offset storage](#consumer-offset-storage). Streams state stores keep their own RocksDB directories — see [Kawasan Streams](#kawasan-streams).
 
+Replica Fetch never auto-creates topics: a stale follower task after deletion
+receives UNKNOWN_TOPIC_OR_PARTITION. Topic creation remains controller-owned.
+
 ### Topic identities
 
 The controller assigns a topic UUID before committing CREATE_TOPIC. The UUID

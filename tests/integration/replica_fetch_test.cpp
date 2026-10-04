@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "kawasan/broker/kawasan_broker.h"
+#include "kawasan/broker/metadata_controller.h"
 #include "kawasan/broker/replica_manager.h"
 #include "kawasan/client/producer.h"
 #include "kawasan/common/buffer.h"
@@ -471,4 +472,33 @@ TEST(ReplicaFetchTest, IdempotentRetryWaitsForReplicationBeforeAcknowledgement) 
     EXPECT_EQ(fetchAs(follower, f.topic, kFollowerId, 2, 62).error, kawasan::ErrorCode::NONE);
     EXPECT_EQ(readProduceError(producer), kawasan::ErrorCode::NONE);
     EXPECT_EQ(f.broker.replicaManager()->getLog(f.tp)->logEndOffset(), 2);
+}
+
+// A follower with a stale task must not resurrect a topic that was deleted.
+// This also covers a lagging follower asking for a topic absent on the leader.
+TEST(ReplicaFetchTest, FollowerFetchNeverAutoCreatesMissingOrDeletedTopics) {
+    ensureLogger();
+    const auto log_dir = makeLogDir();
+    auto config = makeConfig(log_dir, 1);
+    config.setBool("auto.create.topics.enable", true);
+    kawasan::broker::KawasanBroker broker(config);
+    broker.start();
+    asio::io_context io;
+    auto follower = connect(io, broker.port());
+    const std::string topic = "deleted-replica-fetch";
+    auto missing = fetchAs(follower, topic, kFollowerId, 0, 100);
+    EXPECT_EQ(missing.error, kawasan::ErrorCode::UNKNOWN_TOPIC_OR_PARTITION);
+    EXPECT_EQ(broker.metadataController()->describeTopics({topic}).front().error_code,
+              kawasan::ErrorCode::UNKNOWN_TOPIC_OR_PARTITION);
+    createTopic(follower, "deleted-replica-fetch-existing", 101);
+    const std::string deleted = "deleted-replica-fetch-existing";
+    ASSERT_EQ(broker.metadataController()->deleteTopic(deleted).error_code,
+              kawasan::ErrorCode::NONE);
+    auto stale = fetchAs(follower, deleted, kFollowerId, 0, 102);
+    EXPECT_EQ(stale.error, kawasan::ErrorCode::UNKNOWN_TOPIC_OR_PARTITION);
+    EXPECT_EQ(broker.metadataController()->describeTopics({deleted}).front().error_code,
+              kawasan::ErrorCode::UNKNOWN_TOPIC_OR_PARTITION);
+    follower.close();
+    broker.stop();
+    std::filesystem::remove_all(log_dir);
 }

@@ -8,6 +8,10 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-04
 
+- Prevent stale follower Fetch requests from automatically recreating deleted
+  topics. Replica fetches now return UNKNOWN_TOPIC_OR_PARTITION for absent
+  topics, with a socket regression covering missing and deleted topics.
+
 - Persist controller-assigned topic UUIDs in both metadata and Raft commands,
   add indexed lookup, and migrate missing legacy IDs deterministically.
   Reject malformed or duplicate stored IDs. Upgrade experimental clusters

@@ -2749,7 +2749,7 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
             }
 
             auto [topic_metadata_opt, topic_error] =
-                getTopicMetadata(lookup_name, auto_create_topics_enabled_);
+                getTopicMetadata(lookup_name, !is_follower && auto_create_topics_enabled_);
 
             // Authorization: READ on the topic (no-op when the authorizer is
             // disabled, the default). Deny → each requested partition fails with
