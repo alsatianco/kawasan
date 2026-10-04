@@ -170,6 +170,8 @@ std::string KawasanException::toString(ErrorCode code) {
             return "Group max size reached";
         case ErrorCode::FENCED_INSTANCE_ID:
             return "Fenced instance ID";
+        case ErrorCode::UNSTABLE_OFFSET_COMMIT:
+            return "Unstable offset commit";
         case ErrorCode::UNKNOWN_TOPIC_ID:
             return "Unknown topic ID";
         case ErrorCode::INVALID_UPDATE_VERSION:
@@ -180,4 +182,3 @@ std::string KawasanException::toString(ErrorCode code) {
 }
 
 }  // namespace kawasan
-

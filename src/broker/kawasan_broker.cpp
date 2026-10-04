@@ -3827,7 +3827,29 @@ Buffer KawasanBroker::handleOffsetFetch(RequestDispatcher::RequestContext& conte
 
     auto fetch_owned = [&](const protocol::OffsetFetchRequest& req, ErrorCode& error) {
         if (isCoordinatorFor(req.groupId(), protocol::CoordinatorType::GROUP)) {
-            return group_coordinator_->handleOffsetFetch(req, error);
+            // Capture pending transactions before reading the committed cache.
+            // Resolved transactions clear this list only after applying offsets.
+            std::set<std::pair<std::string, int32_t>> pending;
+            if (req.requireStable()) {
+                for (const auto& txn : transaction_coordinator_->list({}, {})) {
+                    for (const auto& offset : txn.pending_offsets) {
+                        if (offset.group_id == req.groupId())
+                            pending.emplace(offset.topic, offset.partition);
+                    }
+                }
+            }
+            auto topics = group_coordinator_->handleOffsetFetch(req, error);
+            for (auto& topic : topics) {
+                for (auto& partition : topic.partitions) {
+                    if (pending.count({topic.topic, partition.partition})) {
+                        partition.error = ErrorCode::UNSTABLE_OFFSET_COMMIT;
+                        partition.offset = -1;
+                        partition.committed_leader_epoch = -1;
+                        partition.metadata.clear();
+                    }
+                }
+            }
+            return topics;
         }
         error = ErrorCode::NOT_COORDINATOR;
         std::vector<protocol::OffsetFetchResponse::Topic> topics;

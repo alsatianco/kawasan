@@ -211,17 +211,43 @@ protected:
         EXPECT_EQ(response.remaining(), 0u);
         return error;
     }
-    OffsetFetchResponse::Partition fetched(const std::string& group) {
+    OffsetFetchResponse::Partition fetched(const std::string& group, bool require_stable = false) {
         OffsetFetchRequest request;
         OffsetFetchRequest::Group queried;
         queried.group_id = group;
         queried.topics.push_back({"cm4-input", {{0}}});
         request.addGroup(queried);
+        request.setRequireStable(require_stable);
         auto body = typed(ApiKey::OFFSET_FETCH, 9, request);
         OffsetFetchResponse response;
         response.decode(body, 9);
         EXPECT_EQ(response.groups().size(), 1u);
         return response.groups().at(0).topics.at(0).partitions.at(0);
+    }
+    std::vector<OffsetFetchResponse::Topic> fetchedAll(const std::string& group,
+                                                       int16_t version = 9,
+                                                       bool require_stable = false) {
+        OffsetFetchRequest request;
+        request.setRequireStable(require_stable);
+        if (version >= 8) {
+            OffsetFetchRequest::Group queried;
+            queried.group_id = group;
+            queried.fetch_all_topics = true;
+            request.addGroup(queried);
+        } else {
+            request.setGroupId(group);
+            request.setFetchAllTopics(true);
+        }
+        auto body = typed(ApiKey::OFFSET_FETCH, version, request);
+        OffsetFetchResponse response;
+        response.decode(body, version);
+        EXPECT_EQ(body.remaining(), 0u);
+        if (version >= 8) {
+            EXPECT_EQ(response.groups().at(0).error_code, ErrorCode::NONE);
+            return response.groups().at(0).topics;
+        }
+        EXPECT_EQ(response.errorCode(), ErrorCode::NONE);
+        return response.topics();
     }
     std::filesystem::path dir_;
     std::unique_ptr<broker::KawasanBroker> broker_;
@@ -283,4 +309,54 @@ TEST_F(TxnOffsetFencingTest, ModernOffsetCommitKeepsProducerFencing) {
     ASSERT_EQ(stage(request("cm4-epoch-txn", current, "cm4-epoch-group", joined)), ErrorCode::NONE);
     ASSERT_EQ(end("cm4-epoch-txn", current, true), ErrorCode::NONE);
     EXPECT_EQ(fetched("cm4-epoch-group").offset, 7);
+}
+
+TEST_F(TxnOffsetFencingTest, StableOffsetFetchRejectsPendingCommitUntilResolved) {
+    const auto joined = join("cm4-stable-group");
+    const auto identity = init("cm4-stable-txn");
+    ASSERT_EQ(addOffsets("cm4-stable-txn", identity, "cm4-stable-group", 3), ErrorCode::NONE);
+    ASSERT_EQ(stage(request("cm4-stable-txn", identity, "cm4-stable-group", joined)),
+              ErrorCode::NONE);
+    auto pending = fetched("cm4-stable-group", true);
+    EXPECT_EQ(pending.error, ErrorCode::UNSTABLE_OFFSET_COMMIT);
+    EXPECT_EQ(pending.offset, -1);
+    ASSERT_EQ(end("cm4-stable-txn", identity, true, 3), ErrorCode::NONE);
+    EXPECT_EQ(fetched("cm4-stable-group", true).offset, 7);
+    ASSERT_EQ(addOffsets("cm4-stable-txn", identity, "cm4-stable-group", 3), ErrorCode::NONE);
+    ASSERT_EQ(
+        stage(request("cm4-stable-txn", identity, "cm4-stable-group", joined, std::nullopt, 9)),
+        ErrorCode::NONE);
+    EXPECT_EQ(fetched("cm4-stable-group").offset, 7);
+    pending = fetched("cm4-stable-group", true);
+    EXPECT_EQ(pending.error, ErrorCode::UNSTABLE_OFFSET_COMMIT);
+    EXPECT_EQ(pending.offset, -1);
+    EXPECT_EQ(pending.committed_leader_epoch, -1);
+    EXPECT_TRUE(pending.metadata.empty());
+    const auto all = fetchedAll("cm4-stable-group", 9, true);
+    ASSERT_EQ(all.size(), 1u);
+    EXPECT_EQ(all[0].partitions[0].error, ErrorCode::UNSTABLE_OFFSET_COMMIT);
+    ASSERT_EQ(end("cm4-stable-txn", identity, false, 3), ErrorCode::NONE);
+    const auto stable = fetched("cm4-stable-group", true);
+    EXPECT_EQ(stable.error, ErrorCode::NONE);
+    EXPECT_EQ(stable.offset, 7);
+    EXPECT_EQ(stable.committed_leader_epoch, 3);
+}
+
+TEST_F(TxnOffsetFencingTest, FetchAllOffsetsUsesExactGroupWithColonAndPreservesMetadata) {
+    const auto joined = join("cm4:group");
+    const auto identity = init("cm4-all-txn");
+    ASSERT_EQ(addOffsets("cm4-all-txn", identity, "cm4:group", 3), ErrorCode::NONE);
+    ASSERT_EQ(stage(request("cm4-all-txn", identity, "cm4:group", joined)), ErrorCode::NONE);
+    ASSERT_EQ(end("cm4-all-txn", identity, true, 3), ErrorCode::NONE);
+    for (int16_t version : {2, 7, 9}) {
+        SCOPED_TRACE(version);
+        const auto all = fetchedAll("cm4:group", version);
+        ASSERT_EQ(all.size(), 1u);
+        EXPECT_EQ(all[0].topic, "cm4-input");
+        ASSERT_EQ(all[0].partitions.size(), 1u);
+        EXPECT_EQ(all[0].partitions[0].offset, 7);
+        EXPECT_EQ(all[0].partitions[0].metadata, "cm4-checkpoint");
+        if (version >= 5)
+            EXPECT_EQ(all[0].partitions[0].committed_leader_epoch, 3);
+    }
 }

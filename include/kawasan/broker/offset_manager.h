@@ -165,6 +165,10 @@ public:
     std::map<std::pair<std::string, int32_t>, int64_t> fetchAllOffsets(
         const std::string& group_id) const;
 
+    /// @brief Fetches all checkpoints and their metadata from one iterator snapshot.
+    std::map<std::pair<std::string, int32_t>, OffsetMetadata> fetchAllOffsetsWithMetadata(
+        const std::string& group_id) const;
+
     //
     // Cleanup (Future Enhancement)
     //

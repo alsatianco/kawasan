@@ -8,6 +8,13 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-05
 
+- Honor OffsetFetch fetch-all and require-stable semantics. Hide checkpoints
+  behind UNSTABLE_OFFSET_COMMIT while their transactional update is pending.
+  Preserve complete checkpoint metadata in fetch-all. Parse offset keys from
+  the topic/partition end and filter exact group IDs so colon-containing group
+  names cannot read or delete a neighboring group's checkpoints. Delete persisted
+  group membership even when the group has no offsets.
+
 - Support transactional API v3 with classic group generation and static-instance
   fencing before offset staging. Accept current members during rebalance and
   retain legacy transaction commits without membership metadata. Preserve

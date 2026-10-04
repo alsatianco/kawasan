@@ -100,6 +100,7 @@ enum class ErrorCode : int16_t {
     PREFERRED_LEADER_NOT_AVAILABLE = 80,
     GROUP_MAX_SIZE_REACHED = 81,
     FENCED_INSTANCE_ID = 82,
+    UNSTABLE_OFFSET_COMMIT = 88,
     INVALID_UPDATE_VERSION = 95,
     UNKNOWN_TOPIC_ID = 100,
 };
@@ -119,8 +120,7 @@ struct RecordBatchAttributes {
     bool is_transactional;
     bool is_control_batch;
 
-    static constexpr int16_t encode(CompressionType comp, bool transactional,
-                                     bool control) {
+    static constexpr int16_t encode(CompressionType comp, bool transactional, bool control) {
         return static_cast<int16_t>(comp) | (transactional ? (1 << 4) : 0) |
                (control ? (1 << 5) : 0);
     }
@@ -208,4 +208,3 @@ struct TopicMetadata {
 };
 
 }  // namespace kawasan
-

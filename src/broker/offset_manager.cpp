@@ -5,6 +5,7 @@
 
 #include <cstring>
 #include <nlohmann/json.hpp>
+#include <set>
 
 #include "kawasan/common/logger.h"
 #include "kawasan/common/rocksdb_compat.h"
@@ -183,8 +184,11 @@ void OffsetManager::deleteGroup(const std::string& group_id) {
     size_t count = 0;
 
     for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
-        batch.Delete(it->key());
-        ++count;
+        const auto key = parseOffsetKey(it->key().ToString());
+        if (key && key->group_id == group_id) {
+            batch.Delete(it->key());
+            ++count;
+        }
     }
 
     if (!it->status().ok()) {
@@ -196,10 +200,8 @@ void OffsetManager::deleteGroup(const std::string& group_id) {
     const std::string group_meta_key = makeGroupMetadataKey(group_id);
     batch.Delete(group_meta_key);
 
-    if (count == 0) {
-        Logger::info("No offsets found for group={}", group_id);
-        return;
-    }
+    // Group membership can exist without any committed offsets. Its deletion
+    // must still reach the WriteBatch when the offset count is zero.
 
     rocksdb::WriteOptions write_opts;
     write_opts.sync = true;
@@ -238,22 +240,19 @@ bool OffsetManager::deleteOffset(const std::string& group_id, const std::string&
 }
 
 std::vector<std::string> OffsetManager::listGroups() const {
-    std::vector<std::string> groups;
-    std::string last_group;
+    std::set<std::string> groups;
 
     rocksdb::ReadOptions read_opts;
     std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(read_opts));
 
     for (it->Seek(kOffsetPrefix); it->Valid() && it->key().starts_with(kOffsetPrefix); it->Next()) {
         auto offset_key = parseOffsetKey(it->key().ToString());
-        if (offset_key.has_value() && offset_key->group_id != last_group) {
-            groups.push_back(offset_key->group_id);
-            last_group = offset_key->group_id;
-        }
+        if (offset_key)
+            groups.insert(offset_key->group_id);
     }
 
     Logger::debug("Listed {} groups", groups.size());
-    return groups;
+    return {groups.begin(), groups.end()};
 }
 
 std::vector<OffsetManager::OffsetKey> OffsetManager::listOffsetsForGroup(
@@ -266,7 +265,7 @@ std::vector<OffsetManager::OffsetKey> OffsetManager::listOffsetsForGroup(
 
     for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
         auto offset_key = parseOffsetKey(it->key().ToString());
-        if (offset_key.has_value()) {
+        if (offset_key && offset_key->group_id == group_id) {
             offset_keys.push_back(*offset_key);
         }
     }
@@ -278,6 +277,14 @@ std::vector<OffsetManager::OffsetKey> OffsetManager::listOffsetsForGroup(
 std::map<std::pair<std::string, int32_t>, int64_t> OffsetManager::fetchAllOffsets(
     const std::string& group_id) const {
     std::map<std::pair<std::string, int32_t>, int64_t> result;
+    for (const auto& [key, metadata] : fetchAllOffsetsWithMetadata(group_id))
+        result[key] = metadata.offset;
+    return result;
+}
+
+std::map<std::pair<std::string, int32_t>, OffsetManager::OffsetMetadata>
+OffsetManager::fetchAllOffsetsWithMetadata(const std::string& group_id) const {
+    std::map<std::pair<std::string, int32_t>, OffsetMetadata> result;
     const std::string prefix = makeGroupOffsetPrefix(group_id);
 
     rocksdb::ReadOptions read_opts;
@@ -285,10 +292,10 @@ std::map<std::pair<std::string, int32_t>, int64_t> OffsetManager::fetchAllOffset
 
     for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
         auto offset_key = parseOffsetKey(it->key().ToString());
-        if (offset_key.has_value()) {
+        if (offset_key && offset_key->group_id == group_id) {
             auto metadata = deserializeOffsetMetadata(it->value().ToString());
             if (metadata.has_value()) {
-                result[{offset_key->topic, offset_key->partition}] = metadata->offset;
+                result[{offset_key->topic, offset_key->partition}] = *metadata;
             }
         }
     }
@@ -550,21 +557,18 @@ std::optional<OffsetManager::OffsetKey> OffsetManager::parseOffsetKey(const std:
 
     const std::string suffix = key.substr(std::strlen(kOffsetPrefix));
 
-    // Find the first colon (separates group_id from topic)
-    size_t first_colon = suffix.find(':');
-    if (first_colon == std::string::npos) {
+    // Kafka topic names contain no colon; parse from the right so group IDs
+    // may contain arbitrary colons without changing their persisted keys.
+    const size_t last_colon = suffix.rfind(':');
+    if (last_colon == std::string::npos || last_colon == 0)
         return std::nullopt;
-    }
-
-    // Find the last colon (separates topic from partition)
-    size_t last_colon = suffix.rfind(':');
-    if (last_colon == std::string::npos || last_colon == first_colon) {
+    const size_t topic_colon = suffix.rfind(':', last_colon - 1);
+    if (topic_colon == std::string::npos)
         return std::nullopt;
-    }
 
     OffsetKey result;
-    result.group_id = suffix.substr(0, first_colon);
-    result.topic = suffix.substr(first_colon + 1, last_colon - first_colon - 1);
+    result.group_id = suffix.substr(0, topic_colon);
+    result.topic = suffix.substr(topic_colon + 1, last_colon - topic_colon - 1);
 
     try {
         result.partition = std::stoi(suffix.substr(last_colon + 1));

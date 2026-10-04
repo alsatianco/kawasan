@@ -112,8 +112,11 @@ and abort leaves it unchanged. Committed leader epoch survives transaction
 snapshots and offset-cache restart; legacy records read with epoch -1.
 
 Multi-broker transaction completion and coordinator replay remain experimental
-M10 work. OffsetFetch fetch-all/require-stable semantic checks are the next
-CM-4 follow-up; version advertisement alone does not establish cluster EOS.
+M10 work. OffsetFetch supports null topics (fetch all committed checkpoints)
+and returns UNSTABLE_OFFSET_COMMIT with unset offset/epoch/metadata when
+`require_stable` encounters a pending transactional checkpoint. Abort restores
+the previous stable checkpoint; completion publishes its offset and epoch.
+Group IDs containing colons remain distinct during scans and deletion.
 
 Kafka-generated header fixtures cover each transactional API at v2/v3, including
 flexible request and response tagged fields. Java verification requires actual

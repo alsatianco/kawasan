@@ -334,3 +334,32 @@ TEST_F(GroupCoordinatorTest, ReadsLegacyOffsetStorageAndRejectsTruncatedEpoch) {
     }
     EXPECT_FALSE(offset_mgr_->fetchOffsetWithMetadata("legacy", "input", 2));
 }
+
+TEST_F(GroupCoordinatorTest, OffsetGroupPrefixesDoNotShareOrDeleteNeighborCheckpoints) {
+    offset_mgr_->commitOffset("colon:parent", "input", 0, 10);
+    offset_mgr_->commitOffset("colon:parent:child", "input", 0, 20);
+    const auto all = offset_mgr_->fetchAllOffsets("colon:parent");
+    EXPECT_EQ(all.size(), 1u);
+    EXPECT_TRUE(all.find({"input", 0}) != all.end());
+    const auto keys = offset_mgr_->listOffsetsForGroup("colon:parent");
+    EXPECT_EQ(keys.size(), 1u);
+    ASSERT_FALSE(keys.empty());
+    EXPECT_EQ(keys[0].group_id, "colon:parent");
+    EXPECT_EQ(offset_mgr_->listGroups(),
+              (std::vector<std::string>{"colon:parent", "colon:parent:child"}));
+    offset_mgr_->deleteGroup("colon:parent");
+    EXPECT_FALSE(offset_mgr_->fetchOffset("colon:parent", "input", 0));
+    EXPECT_EQ(offset_mgr_->fetchOffset("colon:parent:child", "input", 0), 20);
+}
+
+TEST_F(GroupCoordinatorTest, DeleteGroupWithoutOffsetsRemovesPersistedMembership) {
+    OffsetManager::GroupMetadata metadata{};
+    metadata.state = "Empty";
+    metadata.protocol_type = "consumer";
+    metadata.protocol = "range";
+    metadata.generation = 12;
+    offset_mgr_->saveGroupMetadata("metadata-only", metadata);
+    ASSERT_TRUE(offset_mgr_->loadGroupMetadata("metadata-only"));
+    offset_mgr_->deleteGroup("metadata-only");
+    EXPECT_FALSE(offset_mgr_->loadGroupMetadata("metadata-only"));
+}

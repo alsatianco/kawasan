@@ -573,6 +573,24 @@ std::vector<protocol::OffsetFetchResponse::Topic> GroupCoordinator::handleOffset
 
     std::lock_guard<std::mutex> lock(mutex_);
 
+    if (request.fetchAllTopics()) {
+        for (const auto& [key, metadata] :
+             offset_manager_->fetchAllOffsetsWithMetadata(request.groupId())) {
+            if (topics.empty() || topics.back().topic != key.first) {
+                protocol::OffsetFetchResponse::Topic topic;
+                topic.topic = key.first;
+                topics.push_back(std::move(topic));
+            }
+            protocol::OffsetFetchResponse::Partition partition;
+            partition.partition = key.second;
+            partition.offset = metadata.offset;
+            partition.metadata = metadata.metadata;
+            partition.committed_leader_epoch = metadata.committed_leader_epoch;
+            topics.back().partitions.push_back(std::move(partition));
+        }
+        return topics;
+    }
+
     for (const auto& topic_request : request.topics()) {
         protocol::OffsetFetchResponse::Topic topic_response;
         topic_response.topic = topic_request.topic;

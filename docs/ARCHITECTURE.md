@@ -282,7 +282,12 @@ Legacy transactional commits without group membership and manual assignment do
 not require an in-memory joined group. TxnOffsetCommit v3 validates generation,
 member and optional static instance against the classic group before staging
 pending offsets. OffsetFetch reads the persistent OffsetManager directly; a
-genuinely uncommitted partition returns -1, including after restart.
+genuinely uncommitted partition returns -1, including after restart. Null topics
+fetch all committed checkpoints from a single offset-cache iterator snapshot.
+For `require_stable`, the broker snapshots pending transactional offsets before
+reading that cache and marks affected partitions UNSTABLE_OFFSET_COMMIT, with
+unset offset/epoch/metadata. Group scans/deletion filter the full parsed ID;
+colons in group IDs do not identify a neighboring group.
 
 Pending offsets carry committed leader epoch. Transaction snapshots use binary
 v2 when that field is present and read v1 with epoch -1. Offset cache records use
