@@ -2,7 +2,9 @@
 // Licensed under the Apache License, Version 2.0
 
 #include "kawasan/raft/raft_transport.h"
+
 #include <spdlog/spdlog.h>
+#include <sys/socket.h>
 
 #include <algorithm>
 #include <stdexcept>
@@ -19,15 +21,21 @@ namespace raft {
 //==============================================================================
 
 RaftTransport::RaftTransport(boost::asio::io_context& io_context, int local_peer_id)
-    : io_context_(io_context)
-    , local_peer_id_(local_peer_id)
-    , running_(false)
-    , listen_port_(0) {
+    : io_context_(io_context),
+      local_peer_id_(local_peer_id),
+      running_(false),
+      server_lifetime_(std::make_shared<ServerLifetime>()),
+      listen_port_(0) {
+    server_lifetime_->owner = this;
     spdlog::info("RaftTransport created for peer {}", local_peer_id_);
 }
 
 RaftTransport::~RaftTransport() {
     stop();
+    {
+        std::lock_guard<std::recursive_mutex> lifetime_lock(server_lifetime_->mutex);
+        server_lifetime_->owner = nullptr;
+    }
     std::map<int, std::unique_ptr<PeerWorker>> workers;
     {
         std::lock_guard<std::mutex> lock(peers_mutex_);
@@ -46,27 +54,28 @@ RaftTransport::PeerWorker::PeerWorker()
     : guard(boost::asio::make_work_guard(io)), thread([this] { io.run(); }) {}
 
 void RaftTransport::start(int port) {
+    std::lock_guard<std::recursive_mutex> lifetime_lock(server_lifetime_->mutex);
     std::lock_guard<std::mutex> lock(peers_mutex_);
-    
+
     if (running_) {
         spdlog::warn("RaftTransport already running on port {}", listen_port_);
         return;
     }
-    
+
     try {
         // Create acceptor and bind to port
-        acceptor_ = std::make_unique<tcp::acceptor>(
-            io_context_,
-            tcp::endpoint(tcp::v4(), port));
-        
+        acceptor_ = std::make_unique<tcp::acceptor>(io_context_, tcp::endpoint(tcp::v4(), port));
+
         listen_port_ = port;
         running_ = true;
-        
+        server_lifetime_->active = true;
+        ++server_lifetime_->generation;
+
         spdlog::info("RaftTransport started listening on port {}", port);
-        
+
         // Start accepting connections
         do_accept();
-        
+
     } catch (const std::exception& e) {
         spdlog::error("Failed to start RaftTransport on port {}: {}", port, e.what());
         throw std::runtime_error("Failed to start RaftTransport: " + std::string(e.what()));
@@ -74,15 +83,17 @@ void RaftTransport::start(int port) {
 }
 
 void RaftTransport::stop() {
+    std::lock_guard<std::recursive_mutex> lifetime_lock(server_lifetime_->mutex);
     std::lock_guard<std::mutex> lock(peers_mutex_);
-    
+
     if (!running_) {
         return;
     }
-    
+
     spdlog::info("Stopping RaftTransport...");
     running_ = false;
-    
+    server_lifetime_->active = false;
+
     // Close acceptor
     if (acceptor_ && acceptor_->is_open()) {
         boost::system::error_code ec;
@@ -91,26 +102,18 @@ void RaftTransport::stop() {
             spdlog::warn("Error closing acceptor: {}", ec.message());
         }
     }
-    
-    // Close all peer connections
+
+    // Native shutdown interrupts worker reads without concurrently closing
+    // their Asio socket implementation. Workers release/close it afterward.
     for (auto& [peer_id, peer] : peers_) {
         if (peer.socket && peer.socket->is_open()) {
-            boost::system::error_code ec;
-            peer.socket->close(ec);
-            if (ec) {
-                spdlog::warn("Error closing connection to peer {}: {}", peer_id, ec.message());
-            }
+            ::shutdown(peer.socket->native_handle(), SHUT_RDWR);
         }
         peer.connected = false;
     }
 
-    // opus2 Item 2: forcibly close all accepted-side session sockets
-    // so connected peers receive an immediate FIN. Skipping this leaves
-    // sessions holding their sockets open while their async chain
-    // unwinds, which makes peer-restart undetectable until the kernel's
-    // own keepalive timer fires (tens of seconds). Done after closing
-    // peer connections to minimize the window where a peer might still
-    // try to send to us.
+    // Stop accepted chains and send FIN immediately. Sessions retain their
+    // socket until pending asynchronous completions release the last reference.
     {
         std::lock_guard<std::mutex> session_lock(sessions_mutex_);
         for (auto& weak_session : active_sessions_) {
@@ -131,18 +134,18 @@ bool RaftTransport::is_running() const {
 
 void RaftTransport::add_peer(int peer_id, const std::string& host, int port) {
     std::lock_guard<std::mutex> lock(peers_mutex_);
-    
+
     if (peer_id == local_peer_id_) {
         spdlog::warn("Ignoring attempt to add self as peer (ID: {})", peer_id);
         return;
     }
-    
+
     PeerInfo peer;
     peer.host = host;
     peer.port = port;
     peer.connected = false;
     peer.retry_count = 0;
-    
+
     peers_[peer_id] = peer;
     if (!peer_workers_.count(peer_id)) {
         peer_workers_[peer_id] = std::make_unique<PeerWorker>();
@@ -152,7 +155,7 @@ void RaftTransport::add_peer(int peer_id, const std::string& host, int port) {
 
 void RaftTransport::remove_peer(int peer_id) {
     std::lock_guard<std::mutex> lock(peers_mutex_);
-    
+
     auto it = peers_.find(peer_id);
     if (it != peers_.end()) {
         // Close connection if open
@@ -160,7 +163,7 @@ void RaftTransport::remove_peer(int peer_id) {
             boost::system::error_code ec;
             it->second.socket->close(ec);
         }
-        
+
         peers_.erase(it);
         spdlog::info("Removed peer {}", peer_id);
     }
@@ -206,8 +209,8 @@ std::vector<uint8_t> RaftTransport::roundTrip(int peer_id, const std::vector<uin
         if (Clock::now() >= deadline) {
             // Queued behind a slow RPC to the same peer for longer than the
             // RPC is worth: the caller stopped waiting long ago.
-            throw std::runtime_error(std::string(rpc_name) + " to peer " +
-                                     std::to_string(peer_id) + " expired before sending");
+            throw std::runtime_error(std::string(rpc_name) + " to peer " + std::to_string(peer_id) +
+                                     " expired before sending");
         }
         try {
             auto socket = get_connection(peer_id, deadline);
@@ -269,8 +272,8 @@ std::future<Response> RaftTransport::sendRpc(int peer_id, std::vector<uint8_t> r
             std::invalid_argument("Unknown peer ID: " + std::to_string(peer_id))));
         return future;
     }
-    boost::asio::post(*worker_io, [this, peer_id, request = std::move(request), timeout,
-                                   rpc_name, decode, promise, enqueued]() {
+    boost::asio::post(*worker_io, [this, peer_id, request = std::move(request), timeout, rpc_name,
+                                   decode, promise, enqueued]() {
         try {
             promise->set_value(decode(roundTrip(peer_id, request, timeout, enqueued, rpc_name)));
         } catch (...) {
@@ -288,7 +291,7 @@ std::future<AppendEntriesResponse> RaftTransport::sendAppendEntries(
 }
 
 std::future<RequestVoteResponse> RaftTransport::sendRequestVote(int peer_id,
-                                                               const RequestVoteRequest& request) {
+                                                                const RequestVoteRequest& request) {
     return sendRpc<RequestVoteResponse>(
         peer_id, RequestVoteRequestCodec::encode(request), kRpcTimeout, "RequestVote",
         [](const std::vector<uint8_t>& data) { return RequestVoteResponseCodec::decode(data); });
@@ -296,7 +299,6 @@ std::future<RequestVoteResponse> RaftTransport::sendRequestVote(int peer_id,
 
 void RaftTransport::setAppendEntriesHandler(
     std::function<AppendEntriesResponse(const AppendEntriesRequest&)> handler) {
-    
     std::lock_guard<std::mutex> lock(handlers_mutex_);
     append_entries_handler_ = std::move(handler);
     spdlog::debug("AppendEntries handler set");
@@ -304,7 +306,6 @@ void RaftTransport::setAppendEntriesHandler(
 
 void RaftTransport::setRequestVoteHandler(
     std::function<RequestVoteResponse(const RequestVoteRequest&)> handler) {
-
     std::lock_guard<std::mutex> lock(handlers_mutex_);
     request_vote_handler_ = std::move(handler);
     spdlog::debug("RequestVote handler set");
@@ -312,8 +313,7 @@ void RaftTransport::setRequestVoteHandler(
 
 void RaftTransport::setInstallSnapshotHandler(InstallSnapshotHandler handler) {
     std::lock_guard<std::mutex> lock(handlers_mutex_);
-    install_snapshot_handler_ =
-        std::make_unique<InstallSnapshotHandler>(std::move(handler));
+    install_snapshot_handler_ = std::make_unique<InstallSnapshotHandler>(std::move(handler));
     spdlog::debug("InstallSnapshot handler set");
 }
 
@@ -324,7 +324,6 @@ std::future<InstallSnapshotResponse> RaftTransport::sendInstallSnapshot(
         [](const std::vector<uint8_t>& data) { return InstallSnapshotResponse::decode(data); });
 }
 
-
 //==============================================================================
 // Private Methods
 //==============================================================================
@@ -333,28 +332,24 @@ void RaftTransport::do_accept() {
     if (!running_ || !acceptor_) {
         return;
     }
-    
-    acceptor_->async_accept(
-        [this](boost::system::error_code ec, tcp::socket socket) {
-            if (!ec) {
-                spdlog::debug("Accepted new Raft connection from {}:{}",
-                    socket.remote_endpoint().address().to_string(),
-                    socket.remote_endpoint().port());
 
-                auto session = std::make_shared<Session>(std::move(socket), this);
-                // opus2 Item 2: register with the transport so stop()
-                // can forcibly close the socket on shutdown. Without
-                // this the session would keep the socket open until
-                // its async chain finished, leaving connected peers
-                // with undetectably-broken cached sockets.
-                registerSession(session);
+    auto lifetime = server_lifetime_;
+    const auto generation = lifetime->generation;
+    acceptor_->async_accept(
+        [lifetime, generation](boost::system::error_code ec, tcp::socket socket) {
+            std::lock_guard<std::recursive_mutex> lifetime_lock(lifetime->mutex);
+            if (!lifetime->active || lifetime->generation != generation) {
+                return;
+            }
+            auto* owner = lifetime->owner;
+            if (!ec) {
+                auto session = std::make_shared<Session>(std::move(socket), lifetime, generation);
+                owner->registerSession(session);
                 session->start();
             } else if (ec != boost::asio::error::operation_aborted) {
                 spdlog::error("Accept error: {}", ec.message());
             }
-
-            // Continue accepting
-            do_accept();
+            owner->do_accept();
         });
 }
 
@@ -363,9 +358,7 @@ void RaftTransport::registerSession(std::shared_ptr<Session> session) {
     // Compact: drop expired weak_ptrs to keep the vector bounded.
     active_sessions_.erase(
         std::remove_if(active_sessions_.begin(), active_sessions_.end(),
-                       [](const std::weak_ptr<Session>& w) {
-                           return w.expired();
-                       }),
+                       [](const std::weak_ptr<Session>& w) { return w.expired(); }),
         active_sessions_.end());
     active_sessions_.push_back(session);
 }
@@ -376,6 +369,9 @@ std::shared_ptr<tcp::socket> RaftTransport::get_connection(
     int port = 0;
     {
         std::lock_guard<std::mutex> lock(peers_mutex_);
+        if (!running_) {
+            throw std::runtime_error("RaftTransport is stopped");
+        }
         auto it = peers_.find(peer_id);
         if (it == peers_.end()) {
             throw std::invalid_argument("Unknown peer ID: " + std::to_string(peer_id));
@@ -384,9 +380,8 @@ std::shared_ptr<tcp::socket> RaftTransport::get_connection(
         if (peer.socket && peer.socket->is_open() && peer.connected) {
             return peer.socket;
         }
-        if (peer.retry_count > 0 &&
-            std::chrono::steady_clock::now() <
-                peer.last_retry + calculate_backoff(peer.retry_count)) {
+        if (peer.retry_count > 0 && std::chrono::steady_clock::now() <
+                                        peer.last_retry + calculate_backoff(peer.retry_count)) {
             throw std::runtime_error("Backing off before reconnecting to peer " +
                                      std::to_string(peer_id));
         }
@@ -413,6 +408,9 @@ std::shared_ptr<tcp::socket> RaftTransport::get_connection(
 
     std::lock_guard<std::mutex> lock(peers_mutex_);
     auto it = peers_.find(peer_id);
+    if (!running_) {
+        throw std::runtime_error("RaftTransport stopped while connecting");
+    }
     if (it == peers_.end()) {
         throw std::invalid_argument("Unknown peer ID: " + std::to_string(peer_id));
     }
@@ -437,21 +435,17 @@ std::chrono::milliseconds RaftTransport::calculate_backoff(int retry_count) {
 // Session Implementation
 //==============================================================================
 
-RaftTransport::Session::Session(tcp::socket socket, RaftTransport* transport)
-    : socket_(std::move(socket))
-    , transport_(transport) {
-}
+RaftTransport::Session::Session(tcp::socket socket, std::shared_ptr<ServerLifetime> lifetime,
+                                uint64_t generation)
+    : socket_(std::move(socket)),
+      native_fd_(socket_.native_handle()),
+      lifetime_(std::move(lifetime)),
+      generation_(generation) {}
 
 void RaftTransport::Session::shutdownSocket() {
-    // opus2 Item 2: idempotent socket shutdown. Called by
-    // RaftTransport::stop() to send an immediate FIN to the connected
-    // peer. Any in-flight async operations on this socket will fail
-    // with operation_aborted; their handlers will run normally on the
-    // io_context and drop their shared_from_this reference, releasing
-    // this Session object.
-    boost::system::error_code ec;
-    socket_.shutdown(tcp::socket::shutdown_both, ec);
-    socket_.close(ec);
+    if (!stopped_.exchange(true)) {
+        ::shutdown(native_fd_, SHUT_RDWR);
+    }
 }
 
 void RaftTransport::Session::start() {
@@ -459,101 +453,101 @@ void RaftTransport::Session::start() {
 }
 
 void RaftTransport::Session::do_read_header() {
+    if (stopped_) {
+        return;
+    }
     auto self = shared_from_this();
-    
+
     // Read 4-byte length header
     read_buffer_.resize(4);
-    
-    boost::asio::async_read(
-        socket_,
-        boost::asio::buffer(read_buffer_),
-        [this, self](boost::system::error_code ec, std::size_t /*length*/) {
-            if (!ec) {
-                // Parse length
-                uint32_t body_length = 
-                    (static_cast<uint32_t>(read_buffer_[0]) << 24) |
-                    (static_cast<uint32_t>(read_buffer_[1]) << 16) |
-                    (static_cast<uint32_t>(read_buffer_[2]) << 8) |
-                    static_cast<uint32_t>(read_buffer_[3]);
-                
-                if (body_length > kMaxMessageSize) {
-                    spdlog::error("Message too large: {} bytes", body_length);
-                    return;
-                }
-                
-                do_read_body(body_length);
-            } else if (ec != boost::asio::error::operation_aborted &&
-                       ec != boost::asio::error::eof) {
-                spdlog::error("Read header error: {}", ec.message());
-            }
-        });
+
+    boost::asio::async_read(socket_, boost::asio::buffer(read_buffer_),
+                            [this, self](boost::system::error_code ec, std::size_t /*length*/) {
+                                if (!ec) {
+                                    // Parse length
+                                    uint32_t body_length =
+                                        (static_cast<uint32_t>(read_buffer_[0]) << 24) |
+                                        (static_cast<uint32_t>(read_buffer_[1]) << 16) |
+                                        (static_cast<uint32_t>(read_buffer_[2]) << 8) |
+                                        static_cast<uint32_t>(read_buffer_[3]);
+
+                                    if (body_length > kMaxMessageSize) {
+                                        spdlog::error("Message too large: {} bytes", body_length);
+                                        return;
+                                    }
+
+                                    do_read_body(body_length);
+                                } else if (ec != boost::asio::error::operation_aborted &&
+                                           ec != boost::asio::error::eof) {
+                                    spdlog::error("Read header error: {}", ec.message());
+                                }
+                            });
 }
 
 void RaftTransport::Session::do_read_body(size_t body_length) {
+    if (stopped_) {
+        return;
+    }
     auto self = shared_from_this();
-    
+
     read_buffer_.resize(body_length);
-    
-    boost::asio::async_read(
-        socket_,
-        boost::asio::buffer(read_buffer_),
-        [this, self](boost::system::error_code ec, std::size_t /*length*/) {
-            if (!ec) {
-                handle_request(read_buffer_);
-                
-                // Continue reading next message
-                do_read_header();
-            } else if (ec != boost::asio::error::operation_aborted &&
-                       ec != boost::asio::error::eof) {
-                spdlog::error("Read body error: {}", ec.message());
-            }
-        });
+
+    boost::asio::async_read(socket_, boost::asio::buffer(read_buffer_),
+                            [this, self](boost::system::error_code ec, std::size_t /*length*/) {
+                                if (!ec) {
+                                    handle_request(read_buffer_);
+                                } else if (ec != boost::asio::error::operation_aborted &&
+                                           ec != boost::asio::error::eof) {
+                                    spdlog::error("Read body error: {}", ec.message());
+                                }
+                            });
 }
 
 void RaftTransport::Session::handle_request(const std::vector<uint8_t>& data) {
+    std::lock_guard<std::recursive_mutex> lifetime_lock(lifetime_->mutex);
+    if (!lifetime_->active || lifetime_->generation != generation_ || stopped_) {
+        return;
+    }
+    auto* transport = lifetime_->owner;
     try {
         // Peek at message type (second byte)
         if (data.size() < 2) {
             spdlog::error("Message too short to determine type");
             return;
         }
-        
+
         uint8_t message_type = data[1];
         std::vector<uint8_t> response_data;
-        
-        std::lock_guard<std::mutex> lock(transport_->handlers_mutex_);
-        
+
+        std::lock_guard<std::mutex> lock(transport->handlers_mutex_);
+
         switch (static_cast<RaftMessageType>(message_type)) {
             case RaftMessageType::APPEND_ENTRIES_REQ: {
-                if (!transport_->append_entries_handler_) {
+                if (!transport->append_entries_handler_) {
                     spdlog::warn("No AppendEntries handler set");
                     return;
                 }
-                
+
                 auto request = AppendEntriesRequestCodec::decode(data);
-                auto response = transport_->append_entries_handler_(request);
+                auto response = transport->append_entries_handler_(request);
                 response_data = AppendEntriesResponseCodec::encode(response);
                 break;
             }
-            
+
             case RaftMessageType::REQUEST_VOTE_REQ: {
-                if (!transport_->request_vote_handler_) {
+                if (!transport->request_vote_handler_) {
                     spdlog::warn("No RequestVote handler set");
                     return;
                 }
 
                 auto request = RequestVoteRequestCodec::decode(data);
-                auto response = transport_->request_vote_handler_(request);
+                auto response = transport->request_vote_handler_(request);
                 response_data = RequestVoteResponseCodec::encode(response);
                 break;
             }
 
             case RaftMessageType::INSTALL_SNAPSHOT_REQ: {
-                // Phase 5.2: dispatch InstallSnapshot. We pull the
-                // handler pointer outside the actual call so even a
-                // destructed transport's empty pointer is treated
-                // safely.
-                auto* handler_ptr = transport_->install_snapshot_handler_.get();
+                auto* handler_ptr = transport->install_snapshot_handler_.get();
                 if (!handler_ptr || !(*handler_ptr)) {
                     spdlog::warn("No InstallSnapshot handler set");
                     return;
@@ -568,40 +562,46 @@ void RaftTransport::Session::handle_request(const std::vector<uint8_t>& data) {
                 spdlog::error("Unknown message type: {}", message_type);
                 return;
         }
-        
+
         // Send response
         do_write(response_data);
-        
+
     } catch (const std::exception& e) {
         spdlog::error("Error handling request: {}", e.what());
     }
 }
 
 void RaftTransport::Session::do_write(const std::vector<uint8_t>& response) {
+    if (stopped_) {
+        return;
+    }
     auto self = shared_from_this();
-    
+
     // Prepend 4-byte length header
     uint32_t length = static_cast<uint32_t>(response.size());
     write_buffer_.clear();
     write_buffer_.reserve(4 + response.size());
-    
+
     // Big-endian length
     write_buffer_.push_back((length >> 24) & 0xFF);
     write_buffer_.push_back((length >> 16) & 0xFF);
     write_buffer_.push_back((length >> 8) & 0xFF);
     write_buffer_.push_back(length & 0xFF);
-    
+
     write_buffer_.insert(write_buffer_.end(), response.begin(), response.end());
-    
+
     boost::asio::async_write(
-        socket_,
-        boost::asio::buffer(write_buffer_),
+        socket_, boost::asio::buffer(write_buffer_),
         [self](boost::system::error_code ec, std::size_t /*length*/) {
-            if (ec && ec != boost::asio::error::operation_aborted) {
+            if (!ec) {
+                // Serialize responses before reading the next request, so
+                // pipelined requests cannot reuse an in-flight write buffer.
+                self->do_read_header();
+            } else if (ec != boost::asio::error::operation_aborted && !self->stopped_) {
                 spdlog::error("Write error: {}", ec.message());
             }
         });
 }
 
-} // namespace raft
-} // namespace kawasan
+}  // namespace raft
+}  // namespace kawasan

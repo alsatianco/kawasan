@@ -8,6 +8,12 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-04
 
+- Fence Raft accepted callbacks across stop, restart and destruction. Shutdown
+  drains active handlers and interrupts native sockets without closing an Asio
+  socket concurrently with its composed reads; response buffers are serialized.
+  Regressions cover an active handler and fragmented frames during repeated
+  stop/restart/destruction.
+
 - Prevent stale follower Fetch requests from automatically recreating deleted
   topics. Replica fetches now return UNKNOWN_TOPIC_OR_PARTITION for absent
   topics, with a socket regression covering missing and deleted topics.
