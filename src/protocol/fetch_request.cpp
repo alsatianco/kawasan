@@ -2,10 +2,9 @@
 
 namespace kawasan::protocol {
 
-// Phase 1.4: supports v0–v12. v13 topic_id refactor still deferred along
-// with the full KIP-227 FetchSessionManager — at wire level we round-trip
-// session_id / session_epoch but the broker only ever returns session_id=0
-// (full fetch).
+// Codecs support v0–v13, including raw topic UUIDs in topics and forgotten
+// topics. Advertisement requires broker-side identity/error handling. The
+// broker returns session_id=0 (full fetch) until P11 incremental sessions.
 
 void FetchRequest::encode(Buffer& buffer, int16_t api_version) const {
     const bool flex = api_version >= 12;
@@ -31,7 +30,7 @@ void FetchRequest::encode(Buffer& buffer, int16_t api_version) const {
     for (const auto& topic : topics_) {
         // Phase 1.4: v13 replaces topic_name STRING with topic_id UUID.
         if (use_topic_id) {
-            buffer.writeBytes(std::vector<uint8_t>(topic.topic_id.begin(), topic.topic_id.end()));
+            buffer.writeBytes(topic.topic_id.data(), topic.topic_id.size());
         } else if (flex) {
             buffer.writeCompactString(topic.topic);
         } else {
@@ -69,7 +68,9 @@ void FetchRequest::encode(Buffer& buffer, int16_t api_version) const {
         else
             buffer.writeInt32(static_cast<int32_t>(forgotten_topics_.size()));
         for (const auto& ft : forgotten_topics_) {
-            if (flex)
+            if (use_topic_id)
+                buffer.writeBytes(ft.topic_id.data(), ft.topic_id.size());
+            else if (flex)
                 buffer.writeCompactString(ft.topic);
             else
                 buffer.writeString(ft.topic);
@@ -148,7 +149,14 @@ void FetchRequest::decode(Buffer& buffer, int16_t api_version) {
         forgotten_topics_.clear();
         forgotten_topics_.resize(fc);
         for (int32_t i = 0; i < fc; ++i) {
-            forgotten_topics_[i].topic = flex ? buffer.readCompactString() : buffer.readString();
+            if (use_topic_id) {
+                const auto uuid = buffer.readBytes(16);
+                std::copy(uuid.begin(), uuid.end(), forgotten_topics_[i].topic_id.begin());
+                forgotten_topics_[i].has_topic_id = true;
+            } else {
+                forgotten_topics_[i].topic =
+                    flex ? buffer.readCompactString() : buffer.readString();
+            }
             int32_t pc = buffer.readArrayLength(flex);
             forgotten_topics_[i].partitions.resize(pc);
             for (int32_t j = 0; j < pc; ++j) {
@@ -167,36 +175,9 @@ void FetchRequest::decode(Buffer& buffer, int16_t api_version) {
 }
 
 size_t FetchRequest::size(int16_t api_version) const {
-    size_t result = sizeof(int32_t) * 3;  // replica_id, max_wait_ms, min_bytes
-    if (api_version >= 3)
-        result += sizeof(int32_t);
-    if (api_version >= 4)
-        result += sizeof(int8_t);
-    if (api_version >= 7)
-        result += sizeof(int32_t) * 2;
-    result += sizeof(int32_t);  // topic count
-    for (const auto& topic : topics_) {
-        result += sizeof(int16_t) + topic.topic.size() + sizeof(int32_t);
-        for ([[maybe_unused]] const auto& partition : topic.partitions) {
-            result += sizeof(int32_t);
-            if (api_version >= 9)
-                result += sizeof(int32_t);
-            result += sizeof(int64_t);
-            if (api_version >= 5)
-                result += sizeof(int64_t);
-            result += sizeof(int32_t);
-        }
-    }
-    if (api_version >= 7) {
-        result += sizeof(int32_t);
-        for (const auto& ft : forgotten_topics_) {
-            result += sizeof(int16_t) + ft.topic.size() + sizeof(int32_t);
-            result += sizeof(int32_t) * ft.partitions.size();
-        }
-    }
-    if (api_version >= 11)
-        result += sizeof(int16_t) + rack_id_.size();
-    return result;
+    Buffer encoded;
+    encode(encoded, api_version);
+    return encoded.size();
 }
 
 void FetchResponse::encode(Buffer& buffer, int16_t api_version) const {
@@ -216,7 +197,7 @@ void FetchResponse::encode(Buffer& buffer, int16_t api_version) const {
     for (const auto& topic : topics_) {
         // Phase 1.4: v13 response echoes topic_id instead of name.
         if (use_topic_id) {
-            buffer.writeBytes(std::vector<uint8_t>(topic.topic_id.begin(), topic.topic_id.end()));
+            buffer.writeBytes(topic.topic_id.data(), topic.topic_id.size());
         } else if (flex) {
             buffer.writeCompactString(topic.topic);
         } else {
@@ -338,29 +319,9 @@ void FetchResponse::decode(Buffer& buffer, int16_t api_version) {
 }
 
 size_t FetchResponse::size(int16_t api_version) const {
-    size_t result = sizeof(int32_t);
-    if (api_version >= 1)
-        result += sizeof(int32_t);
-    if (api_version >= 7)
-        result += sizeof(int16_t) + sizeof(int32_t);
-    for (const auto& topic : topics_) {
-        result += sizeof(int16_t) + topic.topic.size() + sizeof(int32_t);
-        for (const auto& partition : topic.partitions) {
-            result += sizeof(int32_t) + sizeof(int16_t) + sizeof(int64_t);
-            if (api_version >= 4)
-                result += sizeof(int64_t);
-            if (api_version >= 5)
-                result += sizeof(int64_t);
-            if (api_version >= 4) {
-                result += sizeof(int32_t);
-                result += sizeof(int64_t) * 2 * partition.aborted_transactions.size();
-            }
-            if (api_version >= 11)
-                result += sizeof(int32_t);
-            result += sizeof(int32_t) + partition.record_batches.size();
-        }
-    }
-    return result;
+    Buffer encoded;
+    encode(encoded, api_version);
+    return encoded.size();
 }
 
 }  // namespace kawasan::protocol

@@ -15,8 +15,8 @@ struct FetchPartition {
     PartitionId partition;
     int32_t current_leader_epoch = -1;  // v9+
     Offset fetch_offset;
-    int32_t last_fetched_epoch = -1;    // v12+ (we accept-and-ignore)
-    Offset log_start_offset = -1;       // v5+ — replica only; -1 = unset
+    int32_t last_fetched_epoch = -1;  // v12+ (we accept-and-ignore)
+    Offset log_start_offset = -1;     // v5+ — replica only; -1 = unset
     int32_t partition_max_bytes;
 };
 
@@ -35,12 +35,13 @@ struct FetchTopic {
 struct FetchForgottenTopic {
     std::string topic;
     std::vector<int32_t> partitions;
+    std::array<uint8_t, 16> topic_id{};  // v13+
+    bool has_topic_id = false;
 };
 
 /// @brief Fetch request for consuming records
 ///
-/// Phase 1.4 (partial): supports v0–v11. v12 flexible + v13 topic_id deferred
-/// alongside the full FetchSessionManager (KIP-227) backend.
+/// Wire codecs support v0–v13. Incremental session semantics remain P11.
 class FetchRequest {
 public:
     FetchRequest() = default;
@@ -76,10 +77,10 @@ private:
     int32_t max_wait_ms_ = 500;
     int32_t min_bytes_ = 1;
     int32_t max_bytes_ = 52428800;
-    int8_t isolation_level_ = 0;       // v4+; 0 = READ_UNCOMMITTED, 1 = READ_COMMITTED
-    int32_t session_id_ = 0;            // v7+
-    int32_t session_epoch_ = -1;        // v7+
-    std::string rack_id_;               // v11+
+    int8_t isolation_level_ = 0;  // v4+; 0 = READ_UNCOMMITTED, 1 = READ_COMMITTED
+    int32_t session_id_ = 0;      // v7+
+    int32_t session_epoch_ = -1;  // v7+
+    std::string rack_id_;         // v11+
     std::vector<FetchTopic> topics_;
     std::vector<FetchForgottenTopic> forgotten_topics_;
 };
@@ -137,4 +138,3 @@ private:
 };
 
 }  // namespace kawasan::protocol
-

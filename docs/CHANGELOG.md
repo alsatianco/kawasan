@@ -8,6 +8,11 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-04
 
+- Correct raw UUID encoding in Fetch v13 and DeleteTopics v6, including Fetch
+  forgotten-topic UUIDs and encoded size reporting. Kafka-generated request
+  and response fixtures catch the previous length prefixes and name decoding;
+  Fetch advertisement remains capped at v12 pending handler parity.
+
 - Fence Raft accepted callbacks across stop, restart and destruction. Shutdown
   drains active handlers and interrupts native sockets without closing an Asio
   socket concurrently with its composed reads; response buffers are serialized.

@@ -22,12 +22,10 @@ void DeleteTopicsRequest::encode(Buffer& buffer, int16_t api_version) const {
     }
     for (const auto& topic : topics_) {
         if (with_topic_id) {
-            const auto name_opt = topic.name.empty()
-                                      ? std::optional<std::string>{}
-                                      : std::optional<std::string>(topic.name);
+            const auto name_opt = topic.name.empty() ? std::optional<std::string>{}
+                                                     : std::optional<std::string>(topic.name);
             buffer.writeCompactNullableString(name_opt);
-            buffer.writeBytes(std::vector<uint8_t>(topic.topic_id.begin(),
-                                                  topic.topic_id.end()));
+            buffer.writeBytes(topic.topic_id.data(), topic.topic_id.size());
             buffer.writeEmptyTaggedFields();
         } else if (flex) {
             buffer.writeCompactString(topic.name);
@@ -36,7 +34,8 @@ void DeleteTopicsRequest::encode(Buffer& buffer, int16_t api_version) const {
         }
     }
     buffer.writeInt32(timeout_ms_);
-    if (flex) buffer.writeEmptyTaggedFields();
+    if (flex)
+        buffer.writeEmptyTaggedFields();
 }
 
 void DeleteTopicsRequest::decode(Buffer& buffer, int16_t api_version) {
@@ -50,17 +49,16 @@ void DeleteTopicsRequest::decode(Buffer& buffer, int16_t api_version) {
             const auto name_opt = buffer.readCompactNullableString();
             topics_[i].name = name_opt.value_or("");
             const auto uuid_bytes = buffer.readBytes(16);
-            std::copy(uuid_bytes.begin(), uuid_bytes.end(),
-                      topics_[i].topic_id.begin());
+            std::copy(uuid_bytes.begin(), uuid_bytes.end(), topics_[i].topic_id.begin());
             topics_[i].has_topic_id = true;
             buffer.skipTaggedFields();
         } else {
-            topics_[i].name =
-                flex ? buffer.readCompactString() : buffer.readString();
+            topics_[i].name = flex ? buffer.readCompactString() : buffer.readString();
         }
     }
     timeout_ms_ = buffer.readInt32();
-    if (flex) buffer.skipTaggedFields();
+    if (flex)
+        buffer.skipTaggedFields();
 }
 
 void DeleteTopicsResponse::encode(Buffer& buffer, int16_t api_version) const {
@@ -76,12 +74,10 @@ void DeleteTopicsResponse::encode(Buffer& buffer, int16_t api_version) const {
     }
     for (const auto& result : results_) {
         if (with_topic_id) {
-            const auto name_opt = result.name.empty()
-                                      ? std::optional<std::string>{}
-                                      : std::optional<std::string>(result.name);
+            const auto name_opt = result.name.empty() ? std::optional<std::string>{}
+                                                      : std::optional<std::string>(result.name);
             buffer.writeCompactNullableString(name_opt);
-            buffer.writeBytes(std::vector<uint8_t>(result.topic_id.begin(),
-                                                  result.topic_id.end()));
+            buffer.writeBytes(result.topic_id.data(), result.topic_id.size());
         } else if (flex) {
             buffer.writeCompactString(result.name);
         } else {
@@ -94,9 +90,11 @@ void DeleteTopicsResponse::encode(Buffer& buffer, int16_t api_version) const {
                                      : std::optional<std::string>(result.error_message);
             buffer.writeCompactNullableString(msg_opt);
         }
-        if (flex) buffer.writeEmptyTaggedFields();
+        if (flex)
+            buffer.writeEmptyTaggedFields();
     }
-    if (flex) buffer.writeEmptyTaggedFields();
+    if (flex)
+        buffer.writeEmptyTaggedFields();
 }
 
 void DeleteTopicsResponse::decode(Buffer& buffer, int16_t api_version) {
@@ -113,20 +111,20 @@ void DeleteTopicsResponse::decode(Buffer& buffer, int16_t api_version) {
             const auto name_opt = buffer.readCompactNullableString();
             results_[i].name = name_opt.value_or("");
             const auto uuid_bytes = buffer.readBytes(16);
-            std::copy(uuid_bytes.begin(), uuid_bytes.end(),
-                      results_[i].topic_id.begin());
+            std::copy(uuid_bytes.begin(), uuid_bytes.end(), results_[i].topic_id.begin());
         } else {
-            results_[i].name =
-                flex ? buffer.readCompactString() : buffer.readString();
+            results_[i].name = flex ? buffer.readCompactString() : buffer.readString();
         }
         results_[i].error_code = static_cast<ErrorCode>(buffer.readInt16());
         if (api_version >= 5) {
             auto message = buffer.readCompactNullableString();
             results_[i].error_message = message.value_or("");
         }
-        if (flex) buffer.skipTaggedFields();
+        if (flex)
+            buffer.skipTaggedFields();
     }
-    if (flex) buffer.skipTaggedFields();
+    if (flex)
+        buffer.skipTaggedFields();
 }
 
 }  // namespace kawasan::protocol

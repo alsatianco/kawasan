@@ -45,8 +45,11 @@ still requires the recovery harness and M9 scheduled nightlies; clustering
 remains experimental.
 
 Wire regression fixtures are emitted by Kafka 4.2's generated codecs in
-[WireFixtures.java](../tests/clients/java/src/main/java/WireFixtures.java),
-independent of Kawasan. Regenerate with:
+[WireFixtures.java](../tests/clients/java/src/fixtures/java/WireFixtures.java),
+independent of Kawasan. The generator uses the opt-in `wire-fixtures` Maven
+profile, keeping Kafka 4.2 internal schema classes out of the Java 3.9 matrix
+build. Fixtures include UUID, SASL, DeleteRecords and OffsetFetch shapes;
+regressions are added before each corresponding correctness repair. Regenerate with:
 
 ```bash
 bash tests/clients/java/generate-fixtures.sh tests/clients/fixtures/kafka-4.2-wire.json
@@ -57,3 +60,8 @@ DescribeGroups v4/v5 responses include the nullable static-member instance ID
 between member ID and client ID, as required by the
 [Kafka schema](https://github.com/apache/kafka/blob/4.2.0/clients/src/main/resources/common/message/DescribeGroupsResponse.json).
 This field must be encoded even for dynamic members (as null).
+
+Fetch v13 and DeleteTopics v6 UUIDs occupy exactly 16 raw bytes, including
+Fetch's forgotten-topic entries. Golden comparisons cover both request and
+response codecs, and Fetch's reported sizes follow the encoded wire shape.
+Fetch remains capped at v12 until handler lookup/errors and profile gates land.
