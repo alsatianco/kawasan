@@ -100,6 +100,33 @@ public class WireFixtures {
         var acl = new DescribeAclsResponseData.AclDescription().setPrincipal("User:a").setHost("*").setOperation((byte)3).setPermissionType((byte)3);
         var aclResource = new DescribeAclsResponseData.DescribeAclsResource().setResourceType((byte)2).setResourceName("t").setPatternType((byte)3).setAcls(List.of(acl));
         add("describe-acls-response-v1",new DescribeAclsResponseData().setErrorMessage(null).setResources(List.of(aclResource)),(short)1);
+        var txnTopics = new AddPartitionsToTxnRequestData.AddPartitionsToTxnTopicCollection();
+        txnTopics.add(new AddPartitionsToTxnRequestData.AddPartitionsToTxnTopic().setName("t").setPartitions(List.of(0)));
+        add("add-partitions-to-txn-request-v3",new AddPartitionsToTxnRequestData().setV3AndBelowTransactionalId("tx")
+            .setV3AndBelowProducerId(42).setV3AndBelowProducerEpoch((short)7).setV3AndBelowTopics(txnTopics),(short)3);
+        var txnPartitionResults = new AddPartitionsToTxnResponseData.AddPartitionsToTxnPartitionResultCollection();
+        txnPartitionResults.add(new AddPartitionsToTxnResponseData.AddPartitionsToTxnPartitionResult().setPartitionIndex(0).setPartitionErrorCode((short)47));
+        var txnTopicResults = new AddPartitionsToTxnResponseData.AddPartitionsToTxnTopicResultCollection();
+        txnTopicResults.add(new AddPartitionsToTxnResponseData.AddPartitionsToTxnTopicResult().setName("t").setResultsByPartition(txnPartitionResults));
+        add("add-partitions-to-txn-response-v3",new AddPartitionsToTxnResponseData().setResultsByTopicV3AndBelow(txnTopicResults),(short)3);
+        add("add-offsets-to-txn-request-v3",new AddOffsetsToTxnRequestData().setTransactionalId("tx").setProducerId(42)
+            .setProducerEpoch((short)7).setGroupId("g"),(short)3);
+        add("add-offsets-to-txn-response-v3",new AddOffsetsToTxnResponseData().setErrorCode((short)47),(short)3);
+        add("end-txn-request-v3",new EndTxnRequestData().setTransactionalId("tx").setProducerId(42).setProducerEpoch((short)7).setCommitted(true),(short)3);
+        add("end-txn-response-v3",new EndTxnResponseData().setErrorCode((short)47),(short)3);
+        var commitPartition = new TxnOffsetCommitRequestData.TxnOffsetCommitRequestPartition().setPartitionIndex(0).setCommittedOffset(42)
+            .setCommittedLeaderEpoch(3).setCommittedMetadata("meta");
+        var commitTopic = new TxnOffsetCommitRequestData.TxnOffsetCommitRequestTopic().setName("t").setPartitions(List.of(commitPartition));
+        var commitRequest = new TxnOffsetCommitRequestData().setTransactionalId("tx").setGroupId("g").setProducerId(42)
+            .setProducerEpoch((short)7).setTopics(List.of(commitTopic));
+        add("txn-offset-commit-request-v2",commitRequest,(short)2);
+        commitRequest.setGenerationId(9).setMemberId("m").setGroupInstanceId("instance");
+        add("txn-offset-commit-request-v3",commitRequest,(short)3);
+        commitRequest.setGroupInstanceId(null);
+        add("txn-offset-commit-dynamic-request-v3",commitRequest,(short)3);
+        var commitResultPartition = new TxnOffsetCommitResponseData.TxnOffsetCommitResponsePartition().setPartitionIndex(0).setErrorCode((short)22);
+        var commitResultTopic = new TxnOffsetCommitResponseData.TxnOffsetCommitResponseTopic().setName("t").setPartitions(List.of(commitResultPartition));
+        add("txn-offset-commit-response-v3",new TxnOffsetCommitResponseData().setTopics(List.of(commitResultTopic)),(short)3);
         System.out.println(new ObjectMapper().writerWithDefaultPrettyPrinter().writeValueAsString(fixtures));
     }
 }

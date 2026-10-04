@@ -8,6 +8,11 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-04
 
+- Decode and encode TxnOffsetCommit's v2 committed leader epoch and v3
+  generation/member/static-instance fields. Kafka-generated v2/v3 regressions
+  cover the wire boundaries; reused requests reset group metadata and topics.
+  Transactional API advertisement waits for CM-4 handler validation.
+
 - Require the initialized producer ID and exact epoch on all four transactional
   mutation APIs. Reject future epochs, unmapped producer IDs and unknown/empty
   transaction IDs; AddPartitions/AddOffsets no longer fabricate producer identity.

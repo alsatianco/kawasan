@@ -16,6 +16,7 @@
 #include "kawasan/protocol/offset_fetch_request.h"
 #include "kawasan/protocol/produce_request.h"
 #include "kawasan/protocol/sasl_request.h"
+#include "kawasan/protocol/txn_request.h"
 
 namespace {
 std::vector<uint8_t> golden(const std::string& name) {
@@ -352,4 +353,63 @@ TEST(ApiVersionParityTest, DescribeLogDirsBoundsEveryNestedArrayBeforeAllocation
                 EXPECT_TRUE(result.logDirs()[0].topics[0].partitions.empty());
         }
     }
+}
+
+TEST(ApiVersionParityTest, TransactionalV3BodiesMatchKafkaGeneratedCodecs) {
+    auto check = [](auto message, const std::string& key) {
+        const auto bytes = golden(key);
+        kawasan::Buffer input(bytes);
+        ASSERT_NO_THROW(message.decode(input, 3));
+        EXPECT_EQ(input.remaining(), 0u);
+        kawasan::Buffer encoded;
+        message.encode(encoded, 3);
+        EXPECT_EQ(std::vector<uint8_t>(encoded.data(), encoded.data() + encoded.size()), bytes);
+    };
+    using namespace kawasan::protocol;
+    check(AddPartitionsToTxnRequest{}, "add-partitions-to-txn-request-v3");
+    check(AddPartitionsToTxnResponse{}, "add-partitions-to-txn-response-v3");
+    check(AddOffsetsToTxnRequest{}, "add-offsets-to-txn-request-v3");
+    check(AddOffsetsToTxnResponse{}, "add-offsets-to-txn-response-v3");
+    check(EndTxnRequest{}, "end-txn-request-v3");
+    check(EndTxnResponse{}, "end-txn-response-v3");
+    check(TxnOffsetCommitResponse{}, "txn-offset-commit-response-v3");
+}
+
+TEST(ApiVersionParityTest, TxnOffsetCommitDecodesKafkaLeaderEpochAndGroupMetadata) {
+    for (int16_t version : {2, 3}) {
+        const auto bytes = golden("txn-offset-commit-request-v" + std::to_string(version));
+        kawasan::Buffer input(bytes);
+        kawasan::protocol::TxnOffsetCommitRequest request;
+        ASSERT_NO_THROW(request.decode(input, version));
+        EXPECT_EQ(input.remaining(), 0u);
+        ASSERT_EQ(request.topics().size(), 1u);
+        ASSERT_EQ(request.topics()[0].partitions.size(), 1u);
+        EXPECT_EQ(request.topics()[0].partitions[0].offset, 42);
+        EXPECT_EQ(request.topics()[0].partitions[0].metadata, "meta");
+        EXPECT_EQ(request.topics()[0].partitions[0].committed_leader_epoch, 3);
+        EXPECT_EQ(request.generationId(), version == 3 ? 9 : -1);
+        EXPECT_EQ(request.memberId(), version == 3 ? "m" : "");
+        EXPECT_EQ(request.groupInstanceId(),
+                  version == 3 ? std::optional<std::string>("instance") : std::nullopt);
+        kawasan::Buffer encoded;
+        request.encode(encoded, version);
+        EXPECT_EQ(std::vector<uint8_t>(encoded.data(), encoded.data() + encoded.size()), bytes);
+    }
+}
+
+TEST(ApiVersionParityTest, TxnOffsetCommitReuseResetsGroupMetadataAndTopics) {
+    kawasan::protocol::TxnOffsetCommitRequest request;
+    kawasan::Buffer static_input(golden("txn-offset-commit-request-v3"));
+    request.decode(static_input, 3);
+    ASSERT_EQ(request.groupInstanceId(), "instance");
+    kawasan::Buffer dynamic_input(golden("txn-offset-commit-dynamic-request-v3"));
+    request.decode(dynamic_input, 3);
+    EXPECT_FALSE(request.groupInstanceId());
+    EXPECT_EQ(request.topics().size(), 1u);
+    kawasan::Buffer classic_input(golden("txn-offset-commit-request-v2"));
+    request.decode(classic_input, 2);
+    EXPECT_EQ(request.generationId(), -1);
+    EXPECT_TRUE(request.memberId().empty());
+    EXPECT_FALSE(request.groupInstanceId());
+    EXPECT_EQ(request.topics().size(), 1u);
 }

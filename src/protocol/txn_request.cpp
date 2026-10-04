@@ -14,21 +14,32 @@ namespace kawasan::protocol {
 // ---- AddPartitionsToTxn ----
 void AddPartitionsToTxnRequest::encode(Buffer& buf, int16_t v) const {
     const bool flex = v >= 3;
-    if (flex) buf.writeCompactString(transactional_id_);
-    else buf.writeString(transactional_id_);
+    if (flex)
+        buf.writeCompactString(transactional_id_);
+    else
+        buf.writeString(transactional_id_);
     buf.writeInt64(producer_id_);
     buf.writeInt16(producer_epoch_);
-    if (flex) buf.writeCompactArrayLen(static_cast<int32_t>(topics_.size()));
-    else buf.writeInt32(static_cast<int32_t>(topics_.size()));
+    if (flex)
+        buf.writeCompactArrayLen(static_cast<int32_t>(topics_.size()));
+    else
+        buf.writeInt32(static_cast<int32_t>(topics_.size()));
     for (const auto& t : topics_) {
-        if (flex) buf.writeCompactString(t.topic);
-        else buf.writeString(t.topic);
-        if (flex) buf.writeCompactArrayLen(static_cast<int32_t>(t.partitions.size()));
-        else buf.writeInt32(static_cast<int32_t>(t.partitions.size()));
-        for (int32_t p : t.partitions) buf.writeInt32(p);
-        if (flex) buf.writeEmptyTaggedFields();
+        if (flex)
+            buf.writeCompactString(t.topic);
+        else
+            buf.writeString(t.topic);
+        if (flex)
+            buf.writeCompactArrayLen(static_cast<int32_t>(t.partitions.size()));
+        else
+            buf.writeInt32(static_cast<int32_t>(t.partitions.size()));
+        for (int32_t p : t.partitions)
+            buf.writeInt32(p);
+        if (flex)
+            buf.writeEmptyTaggedFields();
     }
-    if (flex) buf.writeEmptyTaggedFields();
+    if (flex)
+        buf.writeEmptyTaggedFields();
 }
 
 void AddPartitionsToTxnRequest::decode(Buffer& buf, int16_t v) {
@@ -41,31 +52,43 @@ void AddPartitionsToTxnRequest::decode(Buffer& buf, int16_t v) {
         PartitionList t;
         t.topic = flex ? buf.readCompactString() : buf.readString();
         int32_t pc = flex ? buf.readCompactArrayLen() : buf.readInt32();
-        for (int32_t j = 0; j < pc; ++j) t.partitions.push_back(buf.readInt32());
-        if (flex) buf.skipTaggedFields();
+        for (int32_t j = 0; j < pc; ++j)
+            t.partitions.push_back(buf.readInt32());
+        if (flex)
+            buf.skipTaggedFields();
         topics_.push_back(std::move(t));
     }
-    if (flex) buf.skipTaggedFields();
+    if (flex)
+        buf.skipTaggedFields();
 }
 
 void AddPartitionsToTxnResponse::encode(Buffer& buf, int16_t v) const {
     const bool flex = v >= 3;
     buf.writeInt32(throttle_time_ms_);
-    if (flex) buf.writeCompactArrayLen(static_cast<int32_t>(topics_.size()));
-    else buf.writeInt32(static_cast<int32_t>(topics_.size()));
+    if (flex)
+        buf.writeCompactArrayLen(static_cast<int32_t>(topics_.size()));
+    else
+        buf.writeInt32(static_cast<int32_t>(topics_.size()));
     for (const auto& t : topics_) {
-        if (flex) buf.writeCompactString(t.topic);
-        else buf.writeString(t.topic);
-        if (flex) buf.writeCompactArrayLen(static_cast<int32_t>(t.partitions.size()));
-        else buf.writeInt32(static_cast<int32_t>(t.partitions.size()));
+        if (flex)
+            buf.writeCompactString(t.topic);
+        else
+            buf.writeString(t.topic);
+        if (flex)
+            buf.writeCompactArrayLen(static_cast<int32_t>(t.partitions.size()));
+        else
+            buf.writeInt32(static_cast<int32_t>(t.partitions.size()));
         for (const auto& p : t.partitions) {
             buf.writeInt32(p.partition);
             buf.writeInt16(static_cast<int16_t>(p.error_code));
-            if (flex) buf.writeEmptyTaggedFields();
+            if (flex)
+                buf.writeEmptyTaggedFields();
         }
-        if (flex) buf.writeEmptyTaggedFields();
+        if (flex)
+            buf.writeEmptyTaggedFields();
     }
-    if (flex) buf.writeEmptyTaggedFields();
+    if (flex)
+        buf.writeEmptyTaggedFields();
 }
 
 void AddPartitionsToTxnResponse::decode(Buffer& buf, int16_t v) {
@@ -80,25 +103,33 @@ void AddPartitionsToTxnResponse::decode(Buffer& buf, int16_t v) {
             PartitionResult p;
             p.partition = buf.readInt32();
             p.error_code = static_cast<ErrorCode>(buf.readInt16());
-            if (flex) buf.skipTaggedFields();
+            if (flex)
+                buf.skipTaggedFields();
             t.partitions.push_back(p);
         }
-        if (flex) buf.skipTaggedFields();
+        if (flex)
+            buf.skipTaggedFields();
         topics_.push_back(std::move(t));
     }
-    if (flex) buf.skipTaggedFields();
+    if (flex)
+        buf.skipTaggedFields();
 }
 
 // ---- AddOffsetsToTxn ----
 void AddOffsetsToTxnRequest::encode(Buffer& buf, int16_t v) const {
     const bool flex = v >= 3;
-    if (flex) buf.writeCompactString(transactional_id_);
-    else buf.writeString(transactional_id_);
+    if (flex)
+        buf.writeCompactString(transactional_id_);
+    else
+        buf.writeString(transactional_id_);
     buf.writeInt64(producer_id_);
     buf.writeInt16(producer_epoch_);
-    if (flex) buf.writeCompactString(group_id_);
-    else buf.writeString(group_id_);
-    if (flex) buf.writeEmptyTaggedFields();
+    if (flex)
+        buf.writeCompactString(group_id_);
+    else
+        buf.writeString(group_id_);
+    if (flex)
+        buf.writeEmptyTaggedFields();
 }
 
 void AddOffsetsToTxnRequest::decode(Buffer& buf, int16_t v) {
@@ -107,32 +138,38 @@ void AddOffsetsToTxnRequest::decode(Buffer& buf, int16_t v) {
     producer_id_ = buf.readInt64();
     producer_epoch_ = buf.readInt16();
     group_id_ = flex ? buf.readCompactString() : buf.readString();
-    if (flex) buf.skipTaggedFields();
+    if (flex)
+        buf.skipTaggedFields();
 }
 
 void AddOffsetsToTxnResponse::encode(Buffer& buf, int16_t v) const {
     const bool flex = v >= 3;
     buf.writeInt32(throttle_time_ms_);
     buf.writeInt16(static_cast<int16_t>(error_code_));
-    if (flex) buf.writeEmptyTaggedFields();
+    if (flex)
+        buf.writeEmptyTaggedFields();
 }
 
 void AddOffsetsToTxnResponse::decode(Buffer& buf, int16_t v) {
     const bool flex = v >= 3;
     throttle_time_ms_ = buf.readInt32();
     error_code_ = static_cast<ErrorCode>(buf.readInt16());
-    if (flex) buf.skipTaggedFields();
+    if (flex)
+        buf.skipTaggedFields();
 }
 
 // ---- EndTxn ----
 void EndTxnRequest::encode(Buffer& buf, int16_t v) const {
     const bool flex = v >= 3;
-    if (flex) buf.writeCompactString(transactional_id_);
-    else buf.writeString(transactional_id_);
+    if (flex)
+        buf.writeCompactString(transactional_id_);
+    else
+        buf.writeString(transactional_id_);
     buf.writeInt64(producer_id_);
     buf.writeInt16(producer_epoch_);
     buf.writeInt8(committed_ ? 1 : 0);
-    if (flex) buf.writeEmptyTaggedFields();
+    if (flex)
+        buf.writeEmptyTaggedFields();
 }
 
 void EndTxnRequest::decode(Buffer& buf, int16_t v) {
@@ -141,52 +178,76 @@ void EndTxnRequest::decode(Buffer& buf, int16_t v) {
     producer_id_ = buf.readInt64();
     producer_epoch_ = buf.readInt16();
     committed_ = (buf.readInt8() != 0);
-    if (flex) buf.skipTaggedFields();
+    if (flex)
+        buf.skipTaggedFields();
 }
 
 void EndTxnResponse::encode(Buffer& buf, int16_t v) const {
     const bool flex = v >= 3;
     buf.writeInt32(throttle_time_ms_);
     buf.writeInt16(static_cast<int16_t>(error_code_));
-    if (flex) buf.writeEmptyTaggedFields();
+    if (flex)
+        buf.writeEmptyTaggedFields();
 }
 
 void EndTxnResponse::decode(Buffer& buf, int16_t v) {
     const bool flex = v >= 3;
     throttle_time_ms_ = buf.readInt32();
     error_code_ = static_cast<ErrorCode>(buf.readInt16());
-    if (flex) buf.skipTaggedFields();
+    if (flex)
+        buf.skipTaggedFields();
 }
 
 // ---- TxnOffsetCommit ----
 void TxnOffsetCommitRequest::encode(Buffer& buf, int16_t v) const {
     const bool flex = v >= 3;
-    if (flex) buf.writeCompactString(transactional_id_);
-    else buf.writeString(transactional_id_);
-    if (flex) buf.writeCompactString(group_id_);
-    else buf.writeString(group_id_);
+    if (flex)
+        buf.writeCompactString(transactional_id_);
+    else
+        buf.writeString(transactional_id_);
+    if (flex)
+        buf.writeCompactString(group_id_);
+    else
+        buf.writeString(group_id_);
     buf.writeInt64(producer_id_);
     buf.writeInt16(producer_epoch_);
-    if (flex) buf.writeCompactArrayLen(static_cast<int32_t>(topics_.size()));
-    else buf.writeInt32(static_cast<int32_t>(topics_.size()));
+    if (v >= 3) {
+        buf.writeInt32(generation_id_);
+        buf.writeCompactString(member_id_);
+        buf.writeCompactNullableString(group_instance_id_);
+    }
+    if (flex)
+        buf.writeCompactArrayLen(static_cast<int32_t>(topics_.size()));
+    else
+        buf.writeInt32(static_cast<int32_t>(topics_.size()));
     for (const auto& t : topics_) {
-        if (flex) buf.writeCompactString(t.topic);
-        else buf.writeString(t.topic);
-        if (flex) buf.writeCompactArrayLen(static_cast<int32_t>(t.partitions.size()));
-        else buf.writeInt32(static_cast<int32_t>(t.partitions.size()));
+        if (flex)
+            buf.writeCompactString(t.topic);
+        else
+            buf.writeString(t.topic);
+        if (flex)
+            buf.writeCompactArrayLen(static_cast<int32_t>(t.partitions.size()));
+        else
+            buf.writeInt32(static_cast<int32_t>(t.partitions.size()));
         for (const auto& p : t.partitions) {
             buf.writeInt32(p.partition);
             buf.writeInt64(p.offset);
-            const auto meta_opt = p.metadata.empty()
-                                      ? std::optional<std::string>{}
-                                      : std::optional<std::string>(p.metadata);
-            if (flex) buf.writeCompactNullableString(meta_opt);
-            else buf.writeNullableString(meta_opt);
-            if (flex) buf.writeEmptyTaggedFields();
+            if (v >= 2)
+                buf.writeInt32(p.committed_leader_epoch);
+            const auto meta_opt = p.metadata.empty() ? std::optional<std::string>{}
+                                                     : std::optional<std::string>(p.metadata);
+            if (flex)
+                buf.writeCompactNullableString(meta_opt);
+            else
+                buf.writeNullableString(meta_opt);
+            if (flex)
+                buf.writeEmptyTaggedFields();
         }
-        if (flex) buf.writeEmptyTaggedFields();
+        if (flex)
+            buf.writeEmptyTaggedFields();
     }
-    if (flex) buf.writeEmptyTaggedFields();
+    if (flex)
+        buf.writeEmptyTaggedFields();
 }
 
 void TxnOffsetCommitRequest::decode(Buffer& buf, int16_t v) {
@@ -195,44 +256,61 @@ void TxnOffsetCommitRequest::decode(Buffer& buf, int16_t v) {
     group_id_ = flex ? buf.readCompactString() : buf.readString();
     producer_id_ = buf.readInt64();
     producer_epoch_ = buf.readInt16();
-    int32_t n = flex ? buf.readCompactArrayLen() : buf.readInt32();
+    generation_id_ = v >= 3 ? buf.readInt32() : -1;
+    member_id_ = v >= 3 ? buf.readCompactString() : "";
+    group_instance_id_ = v >= 3 ? buf.readCompactNullableString() : std::nullopt;
+    topics_.clear();
+    int32_t n = buf.readArrayLength(flex);
     for (int32_t i = 0; i < n; ++i) {
         TopicOffsets t;
         t.topic = flex ? buf.readCompactString() : buf.readString();
-        int32_t pc = flex ? buf.readCompactArrayLen() : buf.readInt32();
+        int32_t pc = buf.readArrayLength(flex);
         for (int32_t j = 0; j < pc; ++j) {
             PartitionOffset p;
             p.partition = buf.readInt32();
             p.offset = buf.readInt64();
+            p.committed_leader_epoch = v >= 2 ? buf.readInt32() : -1;
             auto meta = flex ? buf.readCompactNullableString() : buf.readNullableString();
             p.metadata = meta.value_or("");
-            if (flex) buf.skipTaggedFields();
+            if (flex)
+                buf.skipTaggedFields();
             t.partitions.push_back(p);
         }
-        if (flex) buf.skipTaggedFields();
+        if (flex)
+            buf.skipTaggedFields();
         topics_.push_back(std::move(t));
     }
-    if (flex) buf.skipTaggedFields();
+    if (flex)
+        buf.skipTaggedFields();
 }
 
 void TxnOffsetCommitResponse::encode(Buffer& buf, int16_t v) const {
     const bool flex = v >= 3;
     buf.writeInt32(throttle_time_ms_);
-    if (flex) buf.writeCompactArrayLen(static_cast<int32_t>(topics_.size()));
-    else buf.writeInt32(static_cast<int32_t>(topics_.size()));
+    if (flex)
+        buf.writeCompactArrayLen(static_cast<int32_t>(topics_.size()));
+    else
+        buf.writeInt32(static_cast<int32_t>(topics_.size()));
     for (const auto& t : topics_) {
-        if (flex) buf.writeCompactString(t.topic);
-        else buf.writeString(t.topic);
-        if (flex) buf.writeCompactArrayLen(static_cast<int32_t>(t.partitions.size()));
-        else buf.writeInt32(static_cast<int32_t>(t.partitions.size()));
+        if (flex)
+            buf.writeCompactString(t.topic);
+        else
+            buf.writeString(t.topic);
+        if (flex)
+            buf.writeCompactArrayLen(static_cast<int32_t>(t.partitions.size()));
+        else
+            buf.writeInt32(static_cast<int32_t>(t.partitions.size()));
         for (const auto& p : t.partitions) {
             buf.writeInt32(p.partition);
             buf.writeInt16(static_cast<int16_t>(p.error_code));
-            if (flex) buf.writeEmptyTaggedFields();
+            if (flex)
+                buf.writeEmptyTaggedFields();
         }
-        if (flex) buf.writeEmptyTaggedFields();
+        if (flex)
+            buf.writeEmptyTaggedFields();
     }
-    if (flex) buf.writeEmptyTaggedFields();
+    if (flex)
+        buf.writeEmptyTaggedFields();
 }
 
 void TxnOffsetCommitResponse::decode(Buffer& buf, int16_t v) {
@@ -247,13 +325,16 @@ void TxnOffsetCommitResponse::decode(Buffer& buf, int16_t v) {
             PartitionResult p;
             p.partition = buf.readInt32();
             p.error_code = static_cast<ErrorCode>(buf.readInt16());
-            if (flex) buf.skipTaggedFields();
+            if (flex)
+                buf.skipTaggedFields();
             t.partitions.push_back(p);
         }
-        if (flex) buf.skipTaggedFields();
+        if (flex)
+            buf.skipTaggedFields();
         topics_.push_back(std::move(t));
     }
-    if (flex) buf.skipTaggedFields();
+    if (flex)
+        buf.skipTaggedFields();
 }
 
 }  // namespace kawasan::protocol

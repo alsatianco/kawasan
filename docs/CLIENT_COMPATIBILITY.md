@@ -99,3 +99,9 @@ An unmapped ID or unknown/empty transaction returns INVALID_PRODUCER_ID_MAPPING;
 an unequal epoch returns INVALID_PRODUCER_EPOCH. Socket regressions cover all
 four APIs and confirm rejected requests preserve the valid transaction. Version
 caps remain at v0 until CM-4's wire and group-generation validation are complete.
+
+Kafka-generated transactional fixtures cover AddPartitionsToTxn, AddOffsetsToTxn,
+EndTxn and TxnOffsetCommit v3. TxnOffsetCommit v2 inserts committed leader epoch
+before metadata; v3 adds generation, member and nullable instance ID before topics.
+Codec reuse resets those group fields and replaces topics. These wire repairs are
+independent of the v3 advertisement gate, which requires real group validation.
