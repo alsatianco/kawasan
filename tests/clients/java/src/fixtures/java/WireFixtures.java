@@ -3,6 +3,7 @@ import java.util.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.kafka.common.message.*;
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.protocol.*;
 
 /** Golden bytes emitted by Kafka's generated codecs, independently of Kawasan. */
@@ -66,6 +67,22 @@ public class WireFixtures {
         var deleteResponses = new DeleteTopicsResponseData.DeletableTopicResultCollection();
         deleteResponses.add(new DeleteTopicsResponseData.DeletableTopicResult().setName("t").setTopicId(uuid).setErrorMessage("error"));
         add("delete-topics-response-v6",new DeleteTopicsResponseData().setResponses(deleteResponses),(short)6);
+        var produceTopics = new ProduceRequestData.TopicProduceDataCollection();
+        produceTopics.add(new ProduceRequestData.TopicProduceData().setName("t").setPartitionData(List.of(
+            new ProduceRequestData.PartitionProduceData().setIndex(0).setRecords(MemoryRecords.readableRecords(ByteBuffer.wrap(new byte[]{1,2}))))));
+        var produceResults = new ProduceResponseData.TopicProduceResponseCollection();
+        produceResults.add(new ProduceResponseData.TopicProduceResponse().setName("t").setPartitionResponses(List.of(
+            new ProduceResponseData.PartitionProduceResponse().setIndex(0).setBaseOffset(42).setLogAppendTimeMs(-1).setLogStartOffset(0))));
+        for (short v : new short[]{10,11}) {
+            add("produce-request-v"+v,new ProduceRequestData().setAcks((short)-1).setTimeoutMs(5000).setTopicData(produceTopics),v);
+            add("produce-response-v"+v,new ProduceResponseData().setResponses(produceResults),v);
+        }
+        var listPartition = new ListOffsetsRequestData.ListOffsetsPartition().setPartitionIndex(0).setCurrentLeaderEpoch(-1).setTimestamp(-4);
+        var listTopic = new ListOffsetsRequestData.ListOffsetsTopic().setName("t").setPartitions(List.of(listPartition));
+        add("list-offsets-request-v8",new ListOffsetsRequestData().setReplicaId(-1).setIsolationLevel((byte)1).setTopics(List.of(listTopic)),(short)8);
+        var listResult = new ListOffsetsResponseData.ListOffsetsPartitionResponse().setPartitionIndex(0).setTimestamp(-1).setOffset(42).setLeaderEpoch(3);
+        var listResultTopic = new ListOffsetsResponseData.ListOffsetsTopicResponse().setName("t").setPartitions(List.of(listResult));
+        add("list-offsets-response-v8",new ListOffsetsResponseData().setTopics(List.of(listResultTopic)),(short)8);
         System.out.println(new ObjectMapper().writerWithDefaultPrettyPrinter().writeValueAsString(fixtures));
     }
 }

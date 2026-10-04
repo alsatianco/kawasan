@@ -64,10 +64,18 @@ This field must be encoded even for dynamic members (as null).
 Fetch v13 and DeleteTopics v6 UUIDs occupy exactly 16 raw bytes, including
 Fetch's forgotten-topic entries. Golden comparisons cover both request and
 response codecs, and Fetch's reported sizes follow the encoded wire shape.
-Fetch remains capped at v12 until handler lookup/errors and profile gates land.
+Fetch v13 is advertised in the default `4.x` profile after indexed UUID lookup,
+UNKNOWN_TOPIC_ID handling and socket/profile gates.
 
 SASL v2 and DeleteRecords v2 use compact bodies with nested tagged fields;
 OffsetFetch v9 inserts nullable member ID and member epoch before group topics.
 Golden tests cover these shapes independently of Kawasan's encoders, including
-classic null membership. These codec repairs alone do not raise advertised
-versions or implement KIP-848 membership.
+classic null membership. The default `4.x` profile advertises these versions. KIP-848 member references
+are explicitly rejected; classic null/-1 references are supported.
+
+The `3.x` profile is tested with pinned librdkafka 2.8.0 in an additional CI leg.
+ApiVersions and dispatcher limits share one table; native socket checks cover
+above-cap error replies, UUID record fetching and long-poll wakeup, ListOffsets
+EARLIEST_LOCAL (-4), and classic OffsetFetch v9. The matrix retains broker debug
+request logs so actual negotiated versions can be inspected alongside case
+results. See [the profile settings](CONFIGURATION.md#protocol-compatibility).

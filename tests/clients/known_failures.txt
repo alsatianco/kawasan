@@ -4,7 +4,5 @@ java-4.2.0	admin-configs	AssertionError: config round trip	CM-3	DescribeConfigs 
 java-4.2.0	admin-log-dirs	UnsupportedVersionException: The node does not support DESCRIBE_LOG_DIRS	CM-3	Java 4.2 requires DescribeLogDirs v1 minimum; candidate advertises v0
 java-4.2.0	admin-acls	UnsupportedVersionException: The node does not support DESCRIBE_ACLS	CM-3	Java 4.2 requires DescribeAcls v1 minimum; candidate advertises v0
 java-4.2.0	eos-offsets	UnsupportedVersionException: Broker doesn't support group metadata commit API on version 0	CM-4	TxnOffsetCommit v3 with generation validation is required
-java-4.2.0	api-parity	AssertionError: api parity:	CM-3	Modern hot-path versions are not advertised
 java-3.9.1	admin-configs	AssertionError: config round trip	CM-3	DescribeConfigs does not return the persisted per-topic override
 java-3.9.1	eos-offsets	UnsupportedVersionException: Broker doesn't support group metadata commit API on version 0	CM-4	TxnOffsetCommit v3 with generation validation is required
-java-3.9.1	api-parity	AssertionError: api parity:	CM-3	Modern hot-path versions are not advertised

@@ -36,6 +36,8 @@ services:
       KAWASAN_PORT: "9092"
       KAWASAN_LOG_DIR: "/var/lib/kawasan/data"
       KAWASAN_LOG_LEVEL: "info"
+      KAWASAN_COMPAT_API_PROFILE: "${COMPAT_API_PROFILE:-4.x}"
+    command: ["kawasan-broker", "--config", "/etc/kawasan/server.properties", "--log-level", "${CLIENT_MATRIX_BROKER_LOG_LEVEL:-info}"]
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "9092"]
       interval: 5s

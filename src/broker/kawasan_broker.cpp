@@ -16,6 +16,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -68,17 +69,16 @@ namespace kawasan::broker {
 
 namespace {
 constexpr int16_t kMetadataMaxVersion = 12;  // Phase 1.2
-constexpr int16_t kProduceMaxVersion = 9;    // Phase 1.3
-constexpr int16_t kFetchMaxVersion =
-    12;  // Phase 1.4 (v13 wire-format ready; advertise stays at v12 — librdkafka still rejects)
-constexpr int16_t kListOffsetsMaxVersion = 7;      // Phase 1.5
+constexpr int16_t kProduceMaxVersion = 11;   // CM-3
+constexpr int16_t kFetchMaxVersion = 13;     // CM-3: persisted controller UUIDs
+constexpr int16_t kListOffsetsMaxVersion = 8;      // CM-3: EARLIEST_LOCAL
 constexpr int16_t kFindCoordinatorMaxVersion = 4;  // Phase 1.6
 constexpr int16_t kJoinGroupMaxVersion = 9;        // Phase 1.7
 constexpr int16_t kSyncGroupMaxVersion = 5;        // Phase 1.8
 constexpr int16_t kHeartbeatMaxVersion = 4;        // Phase 1.9
 constexpr int16_t kLeaveGroupMaxVersion = 5;       // Phase 1.10
 constexpr int16_t kOffsetCommitMaxVersion = 8;     // Phase 1.11
-constexpr int16_t kOffsetFetchMaxVersion = 8;      // Phase 1.12 (v8 multi-group supported)
+constexpr int16_t kOffsetFetchMaxVersion = 9;      // CM-3: classic/null membership
 constexpr int16_t kDescribeGroupsMaxVersion = 5;   // Phase 1.13
 constexpr int16_t kListGroupsMaxVersion = 4;       // Phase 1.14
 }  // namespace
@@ -152,6 +152,11 @@ bool KawasanBroker::authorize(const RequestDispatcher::RequestContext& context, 
 }
 
 KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
+    const auto compatibility_profile =
+        config_.get<std::string>("compatibility.max.api.version.profile", "4.x");
+    if (compatibility_profile != "4.x" && compatibility_profile != "3.x") {
+        throw std::invalid_argument("compatibility.max.api.version.profile must be 4.x or 3.x");
+    }
     broker_id_ = config_.get<BrokerId>("broker.id");
     host_ = config_.get<std::string>("host", "localhost");
     advertised_host_ = config_.get<std::string>("advertised.host", host_);
@@ -705,7 +710,7 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
         {protocol::ApiKey::DESCRIBE_LOG_DIRS, 0, 0},
         {protocol::ApiKey::ALTER_REPLICA_LOG_DIRS, 0, 0},
         {protocol::ApiKey::ELECT_LEADERS, 0, 1},
-        {protocol::ApiKey::DELETE_RECORDS, 0, 0},
+        {protocol::ApiKey::DELETE_RECORDS, 0, 2},
         {protocol::ApiKey::DELETE_GROUPS, 0, 0},
         {protocol::ApiKey::OFFSET_DELETE, 0, 0},
         {protocol::ApiKey::CREATE_PARTITIONS, 0, 0},
@@ -718,7 +723,7 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
         {protocol::ApiKey::DELETE_ACLS, 0, 0},
         // Phase 4.2a: SASL PLAIN handshake + authenticate.
         {protocol::ApiKey::SASL_HANDSHAKE, 0, 1},
-        {protocol::ApiKey::SASL_AUTHENTICATE, 0, 1},
+        {protocol::ApiKey::SASL_AUTHENTICATE, 0, 2},
         // Phase 3.3 scaffolding: transactional APIs (v0 only — covers
         // kafka-python + librdkafka negotiation; full semantics deferred).
         {protocol::ApiKey::ADD_PARTITIONS_TO_TXN, 0, 0},
@@ -726,6 +731,17 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
         {protocol::ApiKey::END_TXN, 0, 0},
         {protocol::ApiKey::TXN_OFFSET_COMMIT, 0, 0},
     };
+    if (compatibility_profile == "3.x") {
+        const std::map<protocol::ApiKey, int16_t> caps{
+            {protocol::ApiKey::PRODUCE, 9},        {protocol::ApiKey::FETCH, 12},
+            {protocol::ApiKey::LIST_OFFSETS, 7},   {protocol::ApiKey::OFFSET_FETCH, 8},
+            {protocol::ApiKey::DELETE_RECORDS, 0}, {protocol::ApiKey::SASL_AUTHENTICATE, 1}};
+        for (auto& api : supported_api_versions_) {
+            if (const auto it = caps.find(api.api_key); it != caps.end()) {
+                api.max_version = std::min(api.max_version, it->second);
+            }
+        }
+    }
     registerProtocolHandlers();
 
     Logger::info("Initialized KawasanBroker with ID {} on {}:{}", broker_id_, host_, port_);
@@ -1602,8 +1618,28 @@ void KawasanBroker::registerProtocolHandlers() {
         return;
     }
     using Context = RequestDispatcher::RequestContext;
+    // The advertised table is the single source of dispatcher limits. Error
+    // responses to a profile-capped request still use its known codec shape.
+    auto register_handler = [&](protocol::ApiKey key, int16_t codec_min, int16_t codec_max,
+                                RequestDispatcher::HandlerFunc handler,
+                                RequestDispatcher::ErrorBuilder errors) {
+        const auto api =
+            std::find_if(supported_api_versions_.begin(), supported_api_versions_.end(),
+                         [key](const auto& entry) { return entry.api_key == key; });
+        if (api == supported_api_versions_.end() || api->min_version < codec_min ||
+            api->max_version > codec_max) {
+            throw std::logic_error("advertised API range exceeds registered codec range");
+        }
+        request_dispatcher_->registerHandler(
+            key, api->min_version, api->max_version, std::move(handler),
+            [errors = std::move(errors), codec_min, codec_max](const Context& ctx, ErrorCode code,
+                                                               int16_t /*version*/) {
+                return errors(ctx, code,
+                              std::clamp<int16_t>(ctx.header.apiVersion(), codec_min, codec_max));
+            });
+    };
 
-    request_dispatcher_->registerHandler(
+    register_handler(
         protocol::ApiKey::API_VERSIONS, 0, 4,
         [this](Context& context) {
             RequestDispatcher::HandlerResult result;
@@ -1614,7 +1650,7 @@ void KawasanBroker::registerProtocolHandlers() {
             return buildApiVersionsError(context, code, version);
         });
 
-    request_dispatcher_->registerHandler(
+    register_handler(
         protocol::ApiKey::METADATA, 0, kMetadataMaxVersion,
         [this](Context& context) {
             RequestDispatcher::HandlerResult result;
@@ -1625,7 +1661,7 @@ void KawasanBroker::registerProtocolHandlers() {
             return buildMetadataError(context, code, version);
         });
 
-    request_dispatcher_->registerHandler(
+    register_handler(
         protocol::ApiKey::CREATE_TOPICS, 0, 7,  // Phase 1.15
         [this](Context& context) {
             RequestDispatcher::HandlerResult result;
@@ -1636,7 +1672,7 @@ void KawasanBroker::registerProtocolHandlers() {
             return buildCreateTopicsError(context, code, version);
         });
 
-    request_dispatcher_->registerHandler(
+    register_handler(
         protocol::ApiKey::DELETE_TOPICS, 0, 6,  // Phase 1.16 (v6: topic_id supported)
         [this](Context& context) {
             RequestDispatcher::HandlerResult result;
@@ -1647,35 +1683,35 @@ void KawasanBroker::registerProtocolHandlers() {
             return buildDeleteTopicsError(context, code, version);
         });
 
-    request_dispatcher_->registerHandler(
+    register_handler(
         protocol::ApiKey::PRODUCE, 0, kProduceMaxVersion,
         [this](Context& context) { return handleProduce(context); },
         [this](const Context& context, ErrorCode code, int16_t version) {
             return buildProduceError(context, code, version);
         });
 
-    request_dispatcher_->registerHandler(
+    register_handler(
         protocol::ApiKey::FETCH, 0, kFetchMaxVersion,
         [this](Context& context) { return handleFetch(context); },
         [this](const Context& context, ErrorCode code, int16_t version) {
             return buildFetchError(context, code, version);
         });
 
-    request_dispatcher_->registerHandler(
+    register_handler(
         protocol::ApiKey::LIST_OFFSETS, 0, kListOffsetsMaxVersion,
         [this](Context& context) { return handleListOffsets(context); },
         [this](const Context& context, ErrorCode code, int16_t version) {
             return buildListOffsetsError(context, code, version);
         });
 
-    request_dispatcher_->registerHandler(
+    register_handler(
         protocol::ApiKey::FIND_COORDINATOR, 0, kFindCoordinatorMaxVersion,
         [this](Context& context) { return handleFindCoordinator(context); },
         [this](const Context& context, ErrorCode code, int16_t version) {
             return buildFindCoordinatorError(context, code, version);
         });
 
-    request_dispatcher_->registerHandler(
+    register_handler(
         protocol::ApiKey::JOIN_GROUP, 0, kJoinGroupMaxVersion,
         [this](Context& context) {
             RequestDispatcher::HandlerResult result;
@@ -1686,7 +1722,7 @@ void KawasanBroker::registerProtocolHandlers() {
             return buildJoinGroupError(context, code, version);
         });
 
-    request_dispatcher_->registerHandler(
+    register_handler(
         protocol::ApiKey::SYNC_GROUP, 0, kSyncGroupMaxVersion,
         [this](Context& context) {
             RequestDispatcher::HandlerResult result;
@@ -1697,7 +1733,7 @@ void KawasanBroker::registerProtocolHandlers() {
             return buildSyncGroupError(context, code, version);
         });
 
-    request_dispatcher_->registerHandler(
+    register_handler(
         protocol::ApiKey::HEARTBEAT, 0, kHeartbeatMaxVersion,
         [this](Context& context) {
             RequestDispatcher::HandlerResult result;
@@ -1708,7 +1744,7 @@ void KawasanBroker::registerProtocolHandlers() {
             return buildHeartbeatError(context, code, version);
         });
 
-    request_dispatcher_->registerHandler(
+    register_handler(
         protocol::ApiKey::LEAVE_GROUP, 0, kLeaveGroupMaxVersion,
         [this](Context& context) {
             RequestDispatcher::HandlerResult result;
@@ -1719,7 +1755,7 @@ void KawasanBroker::registerProtocolHandlers() {
             return buildLeaveGroupError(context, code, version);
         });
 
-    request_dispatcher_->registerHandler(
+    register_handler(
         protocol::ApiKey::OFFSET_COMMIT, 0, kOffsetCommitMaxVersion,
         [this](Context& context) {
             RequestDispatcher::HandlerResult result;
@@ -1730,7 +1766,7 @@ void KawasanBroker::registerProtocolHandlers() {
             return buildOffsetCommitError(context, code, version);
         });
 
-    request_dispatcher_->registerHandler(
+    register_handler(
         protocol::ApiKey::OFFSET_FETCH, 0, kOffsetFetchMaxVersion,
         [this](Context& context) {
             RequestDispatcher::HandlerResult result;
@@ -1741,7 +1777,7 @@ void KawasanBroker::registerProtocolHandlers() {
             return buildOffsetFetchError(context, code, version);
         });
 
-    request_dispatcher_->registerHandler(
+    register_handler(
         protocol::ApiKey::DESCRIBE_GROUPS, 0, kDescribeGroupsMaxVersion,
         [this](Context& context) {
             RequestDispatcher::HandlerResult result;
@@ -1752,7 +1788,7 @@ void KawasanBroker::registerProtocolHandlers() {
             return buildDescribeGroupsError(context, code, version);
         });
 
-    request_dispatcher_->registerHandler(
+    register_handler(
         protocol::ApiKey::LIST_GROUPS, 0, kListGroupsMaxVersion,
         [this](Context& context) {
             RequestDispatcher::HandlerResult result;
@@ -1763,7 +1799,7 @@ void KawasanBroker::registerProtocolHandlers() {
             return buildListGroupsError(context, code, version);
         });
 
-    request_dispatcher_->registerHandler(
+    register_handler(
         protocol::ApiKey::DESCRIBE_CONFIGS, 0, 4,
         [this](Context& context) {
             RequestDispatcher::HandlerResult result;
@@ -1774,7 +1810,7 @@ void KawasanBroker::registerProtocolHandlers() {
             return buildDescribeConfigsError(context, code, version);
         });
 
-    request_dispatcher_->registerHandler(
+    register_handler(
         protocol::ApiKey::DESCRIBE_CLUSTER, 0, 1,  // Phase 1.17
         [this](Context& context) {
             RequestDispatcher::HandlerResult result;
@@ -1786,7 +1822,7 @@ void KawasanBroker::registerProtocolHandlers() {
         });
 
     // Phase 1.18: InitProducerId (API 22). Minimal viable — see header note.
-    request_dispatcher_->registerHandler(
+    register_handler(
         protocol::ApiKey::INIT_PRODUCER_ID, 0, 4,
         [this](Context& context) {
             RequestDispatcher::HandlerResult result;
@@ -1798,7 +1834,7 @@ void KawasanBroker::registerProtocolHandlers() {
         });
 
     // Phase 1.19: OffsetForLeaderEpoch (API 23). Single-broker stub.
-    request_dispatcher_->registerHandler(
+    register_handler(
         protocol::ApiKey::OFFSET_FOR_LEADER_EPOCH, 0, 4,
         [this](Context& context) {
             RequestDispatcher::HandlerResult result;
@@ -1810,7 +1846,7 @@ void KawasanBroker::registerProtocolHandlers() {
         });
 
     // Phase 4.1a: AlterConfigs.
-    request_dispatcher_->registerHandler(
+    register_handler(
         protocol::ApiKey::ALTER_CONFIGS, 0, 2,
         [this](Context& context) {
             RequestDispatcher::HandlerResult result;
@@ -1822,7 +1858,7 @@ void KawasanBroker::registerProtocolHandlers() {
         });
 
     // Phase 4.1b: IncrementalAlterConfigs.
-    request_dispatcher_->registerHandler(
+    register_handler(
         protocol::ApiKey::INCREMENTAL_ALTER_CONFIGS, 0, 1,
         [this](Context& context) {
             RequestDispatcher::HandlerResult result;
@@ -1836,14 +1872,42 @@ void KawasanBroker::registerProtocolHandlers() {
     // Phase 4.1c-m: admin batch (each shares a trivial error builder).
     auto reg_admin = [&](protocol::ApiKey k, int16_t mn, int16_t mx,
                          Buffer (KawasanBroker::*fn)(RequestDispatcher::RequestContext&)) {
-        request_dispatcher_->registerHandler(
+        register_handler(
             k, mn, mx,
             [this, fn](Context& ctx) {
                 RequestDispatcher::HandlerResult r;
                 r.payload = (this->*fn)(ctx);
                 return r;
             },
-            [this](const Context& ctx, ErrorCode /*code*/, int16_t /*ver*/) {
+            [this, k](const Context& ctx, ErrorCode code, int16_t ver) {
+                if (k == protocol::ApiKey::SASL_AUTHENTICATE) {
+                    protocol::SaslAuthenticateResponse response;
+                    response.setErrorCode(code);
+                    response.setErrorMessage(KawasanException::toString(code));
+                    return encodeResponse(ctx,
+                                          [&](Buffer& buffer) { response.encode(buffer, ver); });
+                }
+                if (k == protocol::ApiKey::DELETE_RECORDS) {
+                    protocol::DeleteRecordsResponse response;
+                    try {
+                        Buffer input = ctx.payload;
+                        input.setPosition(ctx.payload_start);
+                        protocol::DeleteRecordsRequest request;
+                        request.decode(input, ver);
+                        for (const auto& topic : request.topics()) {
+                            protocol::DeleteRecordsResponse::TopicResult result;
+                            result.topic = topic.topic;
+                            for (const auto& partition : topic.partitions) {
+                                result.partitions.push_back({partition.partition, -1, code});
+                            }
+                            response.addTopic(std::move(result));
+                        }
+                    } catch (const std::exception&) {
+                        response.addTopic({"__kawasan_error__", {{-1, -1, code}}});
+                    }
+                    return encodeResponse(ctx,
+                                          [&](Buffer& buffer) { response.encode(buffer, ver); });
+                }
                 return buildEmptyErrorResponse(ctx);
             });
     };
@@ -1851,7 +1915,7 @@ void KawasanBroker::registerProtocolHandlers() {
     reg_admin(protocol::ApiKey::ALTER_REPLICA_LOG_DIRS, 0, 0,
               &KawasanBroker::handleAlterReplicaLogDirs);
     reg_admin(protocol::ApiKey::ELECT_LEADERS, 0, 1, &KawasanBroker::handleElectLeaders);
-    reg_admin(protocol::ApiKey::DELETE_RECORDS, 0, 0, &KawasanBroker::handleDeleteRecords);
+    reg_admin(protocol::ApiKey::DELETE_RECORDS, 0, 2, &KawasanBroker::handleDeleteRecords);
     reg_admin(protocol::ApiKey::DELETE_GROUPS, 0, 0, &KawasanBroker::handleDeleteGroups);
     reg_admin(protocol::ApiKey::OFFSET_DELETE, 0, 0, &KawasanBroker::handleOffsetDelete);
     reg_admin(protocol::ApiKey::CREATE_PARTITIONS, 0, 0, &KawasanBroker::handleCreatePartitions);
@@ -1866,7 +1930,7 @@ void KawasanBroker::registerProtocolHandlers() {
 
     // Phase 4.2a: SASL PLAIN.
     reg_admin(protocol::ApiKey::SASL_HANDSHAKE, 0, 1, &KawasanBroker::handleSaslHandshake);
-    reg_admin(protocol::ApiKey::SASL_AUTHENTICATE, 0, 1, &KawasanBroker::handleSaslAuthenticate);
+    reg_admin(protocol::ApiKey::SASL_AUTHENTICATE, 0, 2, &KawasanBroker::handleSaslAuthenticate);
 
     // Phase 3.3 scaffolding: transactional APIs. Advertised v0 only —
     // sufficient for kafka-python and librdkafka to negotiate; higher
@@ -2735,21 +2799,25 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
             topic_response.topic = topic.topic;
             topic_response.topic_id = topic.topic_id;
 
-            // Phase 1.4: v13 sends topic_id instead of name. Resolve here
-            // so the rest of the handler can use the name uniformly.
+            // Resolve the committed UUID without auto-creating an unknown ID.
             std::string lookup_name = topic.topic;
-            if (topic.has_topic_id && metadata_controller_) {
-                for (const auto& m : metadata_controller_->describeTopics({})) {
-                    if (m.topic_id == topic.topic_id) {
-                        lookup_name = m.name;
-                        topic_response.topic = m.name;
-                        break;
-                    }
+            std::optional<TopicMetadata> topic_metadata_opt;
+            ErrorCode topic_error = ErrorCode::UNKNOWN_TOPIC_OR_PARTITION;
+            if (topic.has_topic_id) {
+                if (metadata_controller_) {
+                    topic_metadata_opt = metadata_controller_->topicById(topic.topic_id);
                 }
+                if (topic_metadata_opt) {
+                    lookup_name = topic_metadata_opt->name;
+                    topic_response.topic = lookup_name;  // delayed-watch keys use the name
+                    topic_error = topic_metadata_opt->error_code;
+                } else {
+                    topic_error = ErrorCode::UNKNOWN_TOPIC_ID;
+                }
+            } else {
+                std::tie(topic_metadata_opt, topic_error) =
+                    getTopicMetadata(lookup_name, !is_follower && auto_create_topics_enabled_);
             }
-
-            auto [topic_metadata_opt, topic_error] =
-                getTopicMetadata(lookup_name, !is_follower && auto_create_topics_enabled_);
 
             // Authorization: READ on the topic (no-op when the authorizer is
             // disabled, the default). Deny → each requested partition fails with
@@ -3306,8 +3374,9 @@ RequestDispatcher::HandlerResult KawasanBroker::handleListOffsets(
                     // Latest offset (high watermark / end of log)
                     partition_response.offset = committed_offset;
                     partition_response.timestamp = partition.timestamp;
-                } else if (partition.timestamp == -2) {
-                    // Earliest offset (log start offset)
+                } else if (partition.timestamp == -2 ||
+                           (context.header.apiVersion() >= 8 && partition.timestamp == -4)) {
+                    // EARLIEST / EARLIEST_LOCAL: all retained data is local.
                     partition_response.offset = log->logStartOffset();
                     partition_response.timestamp = partition.timestamp;
                 } else if (partition.timestamp == -3) {
@@ -3797,7 +3866,14 @@ Buffer KawasanBroker::handleOffsetFetch(RequestDispatcher::RequestContext& conte
             }
             single.setRequireStable(request.requireStable());
             ErrorCode group_error = ErrorCode::NONE;
-            const auto topics = fetch_owned(single, group_error);
+            std::vector<protocol::OffsetFetchResponse::Topic> topics;
+            if (api_v >= 9 && (g.member_id.has_value() || g.member_epoch != -1)) {
+                // ConsumerGroupHeartbeat/KIP-848 membership is deferred to CM-12.
+                // Never silently treat a new-protocol member as a classic group.
+                group_error = ErrorCode::UNSUPPORTED_VERSION;
+            } else {
+                topics = fetch_owned(single, group_error);
+            }
             protocol::OffsetFetchResponse::Group rg;
             rg.group_id = g.group_id;
             rg.error_code = group_error;
@@ -3831,9 +3907,29 @@ Buffer KawasanBroker::buildOffsetFetchError(const RequestDispatcher::RequestCont
                                             ErrorCode code, int16_t response_version) const {
     protocol::OffsetFetchResponse response;
     response.setErrorCode(code);
-    response.setTopics({});
-
     const int16_t version = std::clamp<int16_t>(response_version, 0, kOffsetFetchMaxVersion);
+    if (version >= 8) {
+        try {
+            Buffer input = context.payload;
+            input.setPosition(context.payload_start);
+            protocol::OffsetFetchRequest request;
+            request.decode(input, version);
+            for (const auto& group : request.groups()) {
+                protocol::OffsetFetchResponse::Group result;
+                result.group_id = group.group_id;
+                result.error_code = code;
+                response.addGroup(std::move(result));
+            }
+        } catch (const std::exception&) {
+            response.addGroup({"__kawasan_error__", {}, code});
+        }
+    } else {
+        protocol::OffsetFetchResponse::Partition partition;
+        partition.error = code;
+        protocol::OffsetFetchResponse::Topic topic;
+        topic.partitions.push_back(partition);
+        response.setTopics({topic});
+    }
     return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 

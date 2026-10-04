@@ -10,7 +10,9 @@
 #include "kawasan/protocol/delete_topics_request.h"
 #include "kawasan/protocol/describe_groups_request.h"
 #include "kawasan/protocol/fetch_request.h"
+#include "kawasan/protocol/list_offsets_request.h"
 #include "kawasan/protocol/offset_fetch_request.h"
+#include "kawasan/protocol/produce_request.h"
 #include "kawasan/protocol/sasl_request.h"
 
 namespace {
@@ -207,4 +209,45 @@ TEST(ApiVersionParityTest, OffsetFetchV9ResponseMatchesKafkaAndResetsDecodedGrou
     kawasan::Buffer encoded;
     response.encode(encoded, 9);
     EXPECT_EQ(encoded.vector(), bytes);
+}
+
+TEST(ApiVersionParityTest, ProduceV10AndV11MatchKafka) {
+    for (int16_t version : {10, 11}) {
+        kawasan::Buffer request_input(golden("produce-request-v" + std::to_string(version)));
+        kawasan::protocol::ProduceRequest request;
+        ASSERT_NO_THROW(request.decode(request_input, version));
+        EXPECT_EQ(request_input.remaining(), 0u);
+        kawasan::Buffer encoded_request;
+        request.encode(encoded_request, version);
+        EXPECT_EQ(encoded_request.vector(), golden("produce-request-v" + std::to_string(version)));
+        kawasan::Buffer response_input(golden("produce-response-v" + std::to_string(version)));
+        kawasan::protocol::ProduceResponse response;
+        ASSERT_NO_THROW(response.decode(response_input, version));
+        EXPECT_EQ(response_input.remaining(), 0u);
+        kawasan::Buffer encoded_response;
+        response.encode(encoded_response, version);
+        EXPECT_EQ(encoded_response.vector(),
+                  golden("produce-response-v" + std::to_string(version)));
+    }
+}
+
+TEST(ApiVersionParityTest, ListOffsetsV8MatchesKafka) {
+    const auto request_bytes = golden("list-offsets-request-v8");
+    kawasan::Buffer request_input(request_bytes);
+    kawasan::protocol::ListOffsetsRequest request;
+    ASSERT_NO_THROW(request.decode(request_input, 8));
+    ASSERT_EQ(request.topics().size(), 1u);
+    EXPECT_EQ(request.topics()[0].partitions[0].timestamp, -4);
+    EXPECT_EQ(request_input.remaining(), 0u);
+    kawasan::Buffer encoded_request;
+    request.encode(encoded_request, 8);
+    EXPECT_EQ(encoded_request.vector(), request_bytes);
+    const auto response_bytes = golden("list-offsets-response-v8");
+    kawasan::Buffer response_input(response_bytes);
+    kawasan::protocol::ListOffsetsResponse response;
+    ASSERT_NO_THROW(response.decode(response_input, 8));
+    EXPECT_EQ(response_input.remaining(), 0u);
+    kawasan::Buffer encoded_response;
+    response.encode(encoded_response, 8);
+    EXPECT_EQ(encoded_response.vector(), response_bytes);
 }

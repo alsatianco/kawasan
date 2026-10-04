@@ -48,6 +48,9 @@ public:
     struct RequestContext {
         protocol::RequestHeader header;
         Buffer payload;
+        // Snapshot taken by dispatch before decoding, so error builders can
+        // recover requested group/topic identities after a decoder throws.
+        size_t payload_start = 0;
         size_t frame_size_bytes = 0;
         std::string peer_identity;
         // Points to the owning connection's state (nullptr only in unit tests
@@ -63,14 +66,13 @@ public:
     };
 
     using HandlerFunc = std::function<HandlerResult(RequestContext&)>;
-    using ErrorBuilder = std::function<Buffer(const RequestContext&, ErrorCode error,
-                                              int16_t response_version)>;
+    using ErrorBuilder =
+        std::function<Buffer(const RequestContext&, ErrorCode error, int16_t response_version)>;
 
     explicit RequestDispatcher(std::shared_ptr<metrics::RequestMetrics> metrics);
 
-    void registerHandler(protocol::ApiKey api_key, int16_t min_version,
-                         int16_t max_version, HandlerFunc handler,
-                         ErrorBuilder error_builder = nullptr);
+    void registerHandler(protocol::ApiKey api_key, int16_t min_version, int16_t max_version,
+                         HandlerFunc handler, ErrorBuilder error_builder = nullptr);
 
     DispatchResult dispatch(RequestContext context);
 
@@ -85,13 +87,10 @@ private:
     using HandlerList = std::vector<HandlerRegistration>;
 
     const HandlerList* findHandlers(protocol::ApiKey api_key) const;
-    const HandlerRegistration* selectHandler(const HandlerList& list,
-                                             int16_t version) const;
-    Buffer buildLegacyErrorPayload(const RequestContext& context,
-                                   ErrorCode code) const;
-    Buffer buildErrorPayload(const HandlerRegistration* registration,
-                             const RequestContext& context, ErrorCode code,
-                             int16_t response_version) const;
+    const HandlerRegistration* selectHandler(const HandlerList& list, int16_t version) const;
+    Buffer buildLegacyErrorPayload(const RequestContext& context, ErrorCode code) const;
+    Buffer buildErrorPayload(const HandlerRegistration* registration, const RequestContext& context,
+                             ErrorCode code, int16_t response_version) const;
     std::vector<uint8_t> wrapFrame(const Buffer& payload) const;
     DispatchResult finalize(protocol::ApiKey api_key, size_t request_bytes,
                             const HandlerResult& result) const;

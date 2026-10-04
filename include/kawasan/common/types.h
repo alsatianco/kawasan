@@ -101,6 +101,7 @@ enum class ErrorCode : int16_t {
     GROUP_MAX_SIZE_REACHED = 81,
     FENCED_INSTANCE_ID = 82,
     INVALID_UPDATE_VERSION = 95,
+    UNKNOWN_TOPIC_ID = 100,
 };
 
 // Compression types

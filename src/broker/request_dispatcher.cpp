@@ -23,6 +23,7 @@ void RequestDispatcher::registerHandler(protocol::ApiKey api_key, int16_t min_ve
 
 RequestDispatcher::DispatchResult RequestDispatcher::dispatch(
     RequestContext context) {
+    context.payload_start = context.payload.position();
     const auto key_value = static_cast<int16_t>(context.header.apiKey());
     const auto handlers = findHandlers(context.header.apiKey());
 

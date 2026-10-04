@@ -5,13 +5,17 @@ on:
   workflow_dispatch:
 jobs:
   clients:
-    name: ${{ matrix.profile }} dual oracle
+    name: ${{ matrix.profile }} (${{ matrix.compat }}) dual oracle
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         profile: [java-3.9.1, java-4.2.0, rdkafka-2.8.0, rdkafka-2.15.1, python]
+        compat: ['4.x']
+        include:
+          - profile: rdkafka-2.8.0
+            compat: '3.x'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -23,9 +27,10 @@ jobs:
         env:
           CLIENT_MATRIX_EVIDENCE: ${{ runner.temp }}/client-matrix
           PROFILE: ${{ matrix.profile }}
+          COMPAT_API_PROFILE: ${{ matrix.compat }}
         run: bash tests/clients/run.sh "$PROFILE"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: client-matrix-${{ matrix.profile }}
+          name: client-matrix-${{ matrix.profile }}-${{ matrix.compat }}
           path: ${{ runner.temp }}/client-matrix

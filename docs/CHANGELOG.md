@@ -8,6 +8,14 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-04
 
+- Add CM-3 core API parity and the `4.x`/`3.x` compatibility profile. Advertise
+  Produce 11, Fetch 13, ListOffsets 8, OffsetFetch 9, DeleteRecords 2 and SASL
+  Authenticate 2 by default, with one table enforcing dispatcher caps. Fetch
+  uses indexed UUID resolution and UNKNOWN_TOPIC_ID without auto-creation;
+  ListOffsets supports EARLIEST_LOCAL. Reject deferred KIP-848 member references.
+  Preserve flexible error bodies and requested groups/partitions above caps.
+  Add socket/golden gates and a pinned legacy-profile client CI leg.
+
 - Implement flexible SASL v2 and DeleteRecords v2 bodies and OffsetFetch v9
   nullable member ID/epoch fields. Kafka-generated golden regressions cover
   both directions and classic null membership. Advertisement follows handler

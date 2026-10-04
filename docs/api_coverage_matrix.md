@@ -11,12 +11,12 @@ Currently advertised by Kawasan: **42**.
 
 | Key | API | Kawasan range | Kafka 4.2 max |
 |----:|-----|:---:|:---:|
-| 0 | `PRODUCE` | 0–9 | 11 |
-| 1 | `FETCH` | 0–12 | 16 |
-| 2 | `LIST_OFFSETS` | 0–7 | 8 |
+| 0 | `PRODUCE` | 0–11 | 11 |
+| 1 | `FETCH` | 0–13 | 16 |
+| 2 | `LIST_OFFSETS` | 0–8 | 8 |
 | 3 | `METADATA` | 0–12 | 12 |
 | 8 | `OFFSET_COMMIT` | 0–8 | 9 |
-| 9 | `OFFSET_FETCH` | 0–8 | 9 |
+| 9 | `OFFSET_FETCH` | 0–9 | 9 |
 | 10 | `FIND_COORDINATOR` | 0–4 | 4 |
 | 11 | `JOIN_GROUP` | 0–9 | 9 |
 | 12 | `HEARTBEAT` | 0–4 | 4 |
@@ -28,7 +28,7 @@ Currently advertised by Kawasan: **42**.
 | 18 | `API_VERSIONS` | 0–4 | 3 |
 | 19 | `CREATE_TOPICS` | 0–7 | 7 |
 | 20 | `DELETE_TOPICS` | 0–6 | 6 |
-| 21 | `DELETE_RECORDS` | 0–0 | 2 |
+| 21 | `DELETE_RECORDS` | 0–2 | 2 |
 | 22 | `INIT_PRODUCER_ID` | 0–4 | 4 |
 | 23 | `OFFSET_FOR_LEADER_EPOCH` | 0–4 | 4 |
 | 24 | `ADD_PARTITIONS_TO_TXN` | 0–0 | 5 |
@@ -42,7 +42,7 @@ Currently advertised by Kawasan: **42**.
 | 33 | `ALTER_CONFIGS` | 0–2 | 2 |
 | 34 | `ALTER_REPLICA_LOG_DIRS` | 0–0 | 2 |
 | 35 | `DESCRIBE_LOG_DIRS` | 0–0 | 4 |
-| 36 | `SASL_AUTHENTICATE` | 0–1 | 2 |
+| 36 | `SASL_AUTHENTICATE` | 0–2 | 2 |
 | 37 | `CREATE_PARTITIONS` | 0–0 | 3 |
 | 42 | `DELETE_GROUPS` | 0–0 | 2 |
 | 43 | `ELECT_LEADERS` | 0–1 | 2 |

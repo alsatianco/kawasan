@@ -9,6 +9,7 @@ Broker configuration-key reference for Kawasan. This page documents the file for
 - [Which keys are actually honored](#which-keys-are-actually-honored)
 - [Identity](#identity)
 - [Topics and auto-creation](#topics-and-auto-creation)
+- [Protocol compatibility](#protocol-compatibility)
 - [Network](#network)
 - [Storage paths](#storage-paths)
 - [Log segments and retention](#log-segments-and-retention)
@@ -81,6 +82,27 @@ Read in `src/broker/kawasan_broker.cpp`; also surfaced through DescribeConfigs.
 | `auto.create.topics.enable` | bool | `true` | Honored | Auto-create a topic on first produce/metadata/fetch (honored only when the client also allows auto-creation). Disable to require explicit CreateTopics. |
 | `num.partitions` | int | `1` | Honored | Default partition count for auto-created topics. Values `<= 0` fall back to 1. |
 | `delete.topic.enable` | bool | `true` | Inert | Accepted for Kafka tooling compatibility; DeleteTopics is always served regardless. |
+
+## Protocol compatibility
+
+| Key | Type | Default | Status | Purpose |
+|-----|------|---------|--------|---------|
+| `compatibility.max.api.version.profile` | string | `4.x` | Honored | `4.x` advertises Produce 11, Fetch 13, ListOffsets 8, OffsetFetch 9, DeleteRecords 2 and SASL Authenticate 2. `3.x` caps these at 9, 12, 7, 8, 0 and 1 respectively. Other APIs retain their own supported ranges. Unknown profiles fail before services start. |
+
+The same table sets ApiVersions advertisement and dispatcher acceptance. A
+request above a profile cap is rejected without running its handler; where
+its codec is known, errors preserve the requested wire shape. Fetch v13 uses
+persisted controller-assigned UUIDs and returns `UNKNOWN_TOPIC_ID` for missing
+IDs without auto-creation. OffsetFetch v9 supports classic groups with null
+member ID and epoch -1; KIP-848 member references return `UNSUPPORTED_VERSION`
+until ConsumerGroupHeartbeat semantics land in CM-12.
+
+The container config accepts `KAWASAN_COMPAT_API_PROFILE`; ecosystem/client
+Compose checks expose it as `COMPAT_API_PROFILE`. For example:
+
+```bash
+COMPAT_API_PROFILE=3.x bash tests/clients/run.sh rdkafka-2.8.0
+```
 
 ## Network
 

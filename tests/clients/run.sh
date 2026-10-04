@@ -8,6 +8,7 @@ EVIDENCE="${CLIENT_MATRIX_EVIDENCE:-$(mktemp -d /tmp/kawasan-client-matrix-XXXXX
 mkdir -p "$EVIDENCE"
 EVIDENCE="$(cd "$EVIDENCE" && pwd)"
 echo "Evidence: $EVIDENCE"
+export CLIENT_MATRIX_BROKER_LOG_LEVEL="${CLIENT_MATRIX_BROKER_LOG_LEVEL:-debug}"
 TARGET=""
 COMPOSE=""
 BROKER=""
@@ -48,4 +49,8 @@ for TARGET in kafka kawasan; do
     python3 "$ROOT/tests/clients/results.py" "$PROFILE" "$TARGET" "$EVIDENCE/$TARGET/results.jsonl"
     cleanup
     BROKER=""
+    if [[ "$TARGET" == kawasan ]]; then
+        python3 "$ROOT/tests/clients/negotiated.py" "$PROFILE" "${COMPAT_API_PROFILE:-4.x}" \
+            "$EVIDENCE/kawasan-broker.log" > "$EVIDENCE/negotiated.json"
+    fi
 done

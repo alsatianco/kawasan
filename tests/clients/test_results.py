@@ -28,5 +28,25 @@ class ResultGateTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate("python", "kawasan", [{"case": "produce-consume", "status": "FAIL", "error": "broken"}], allow)
 
+class NegotiatedVersionsTest(unittest.TestCase):
+    def test_java_requires_actual_modern_requests(self):
+        from negotiated import observed_versions, verify
+        evidence = "\n".join(f"Client peer request api_key={key} version={version} correlation_id=8"
+                             for key, version in [(0, 11), (1, 13), (2, 8), (9, 9)])
+        actual = observed_versions(evidence)
+        self.assertEqual(verify(actual, "java-4.2.0", "4.x"), [])
+        self.assertTrue(verify({}, "java-4.2.0", "4.x"))
+        actual[1] = {12}
+        self.assertTrue(verify(actual, "java-4.2.0", "4.x"))
+
+    def test_legacy_profile_rejects_requests_above_caps(self):
+        from negotiated import verify
+        self.assertEqual(verify({0: {9}, 1: {12}}, "rdkafka-2.8.0", "3.x"), [])
+        self.assertTrue(verify({0: {11}, 1: {13}}, "rdkafka-2.8.0", "3.x"))
+
+    def test_unknown_profile_is_not_acceptance(self):
+        from negotiated import verify
+        self.assertTrue(verify({0: {11}, 1: {13}}, "rdkafka-2.15.1", "invalid"))
+
 if __name__ == "__main__":
     unittest.main()

@@ -137,3 +137,9 @@ add_executable(chaos_kill_test chaos_kill_test.cpp)
 target_link_libraries(chaos_kill_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME ChaosKillTest COMMAND chaos_kill_test)
 set_tests_properties(ChaosKillTest PROPERTIES TIMEOUT 60)
+
+# CM-3: actual advertisement, dispatcher profile caps and UUID/offset wire semantics.
+add_executable(client_api_parity_test client_api_parity_test.cpp)
+target_link_libraries(client_api_parity_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME ClientApiParityTest COMMAND client_api_parity_test)
+set_tests_properties(ClientApiParityTest PROPERTIES TIMEOUT 90)
