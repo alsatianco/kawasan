@@ -478,3 +478,7 @@ The listen port is `monitoring.port`. It **defaults to 9094** (used by the dev, 
 - [./FAQ.md](./FAQ.md) · [./CONTRIBUTING.md](./CONTRIBUTING.md) · [./CHANGELOG.md](./CHANGELOG.md)
 - [../helm/kawasan/README.md](../helm/kawasan/README.md) — Helm chart
 - [../CLAUDE.md](../CLAUDE.md) — build commands and coding conventions
+
+The M10 coordinator storage and upgrade decision is recorded in
+[ADR 0001](adr/0001-replicated-coordinator-state.md); it is a design contract,
+not a claim that coordinator failover is implemented.
