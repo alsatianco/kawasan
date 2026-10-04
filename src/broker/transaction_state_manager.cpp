@@ -1,6 +1,8 @@
 #include "kawasan/broker/transaction_state_manager.h"
 
 #include <algorithm>
+#include <limits>
+#include <map>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -92,12 +94,19 @@ TransactionCoordinator::TxnSnapshot TransactionStateManager::deserialize(
     s.producer_id = buf.readInt64();
     s.producer_epoch = buf.readInt16();
     s.transaction_timeout_ms = buf.readInt32();
-    s.state = static_cast<TransactionCoordinator::State>(buf.readInt8());
+    const auto state = buf.readInt8();
+    if (state < 0 || state > static_cast<int8_t>(TransactionCoordinator::State::PrepareEpochFence))
+        throw std::runtime_error("txn-state: unknown transaction state");
+    s.state = static_cast<TransactionCoordinator::State>(state);
     s.state_start_time_ms = buf.readInt64();
 
-    const int32_t pcount = buf.readInt32();
-    if (pcount < 0)
-        throw std::runtime_error("txn-state: negative partition count");
+    auto count = [&](size_t minimum_bytes) {
+        const int32_t value = buf.readInt32();
+        if (value < 0 || static_cast<size_t>(value) > buf.remaining() / minimum_bytes)
+            throw std::runtime_error("txn-state: invalid array count");
+        return value;
+    };
+    const int32_t pcount = count(16);
     s.partitions.reserve(static_cast<size_t>(pcount));
     for (int32_t i = 0; i < pcount; ++i) {
         TransactionCoordinator::TxnPartition p;
@@ -107,9 +116,7 @@ TransactionCoordinator::TxnSnapshot TransactionStateManager::deserialize(
         s.partitions.push_back(std::move(p));
     }
 
-    const int32_t ocount = buf.readInt32();
-    if (ocount < 0)
-        throw std::runtime_error("txn-state: negative offset count");
+    const int32_t ocount = count(version >= 2 ? 28 : 24);
     s.pending_offsets.reserve(static_cast<size_t>(ocount));
     for (int32_t i = 0; i < ocount; ++i) {
         TransactionCoordinator::PendingOffset po;
@@ -121,6 +128,8 @@ TransactionCoordinator::TxnSnapshot TransactionStateManager::deserialize(
         po.committed_leader_epoch = version >= 2 ? buf.readInt32() : -1;
         s.pending_offsets.push_back(std::move(po));
     }
+    if (buf.remaining() != 0)
+        throw std::runtime_error("txn-state: trailing snapshot bytes");
     return s;
 }
 
@@ -210,6 +219,72 @@ std::vector<TransactionCoordinator::TxnSnapshot> TransactionStateManager::loadAl
         }
     }
     return out;
+}
+
+std::vector<TransactionCoordinator::TxnSnapshot> TransactionStateManager::loadCommittedPartition(
+    int partition) {
+    if (partition < 0 || partition >= num_partitions_)
+        throw std::out_of_range("txn-state: invalid replay partition");
+    if (!log_manager_)
+        throw std::runtime_error("txn-state: no log manager for committed replay");
+    auto* log = log_manager_->getLog(kTopic, partition);
+    if (!log)
+        throw std::runtime_error("txn-state: missing local partition for committed replay");
+    // The acquisition caller must serialize ownership/truncation around this
+    // scan. Appends above the captured HW are deliberately excluded.
+    const Offset end = log->highWatermark();
+    if (end > log->logEndOffset())
+        throw std::runtime_error("txn-state: high watermark exceeds local log end");
+    Offset offset = log->logStartOffset();
+    std::map<std::string, TransactionCoordinator::TxnSnapshot> latest;
+    constexpr size_t chunk_bytes = 8 * 1024 * 1024;
+    while (offset < end) {
+        const auto batches = log->read(offset, chunk_bytes);
+        if (batches.empty())
+            throw std::runtime_error("txn-state: unreadable committed prefix");
+        Offset next = offset;
+        for (const auto& batch : batches) {
+            if (batch.baseOffset() >= end)
+                break;
+            const auto delta = batch.lastOffsetDelta();
+            if (delta < 0 || batch.baseOffset() < 0 ||
+                batch.baseOffset() > std::numeric_limits<Offset>::max() - delta - 1 ||
+                batch.isControlBatch())
+                throw std::runtime_error("txn-state: invalid committed batch");
+            next = std::max(next, batch.baseOffset() + delta + 1);
+            int32_t previous = -1;
+            for (const auto& record : batch.records()) {
+                if (record.offset_delta <= previous || record.offset_delta > delta)
+                    throw std::runtime_error("txn-state: invalid committed record offset");
+                previous = record.offset_delta;
+                const Offset absolute = batch.baseOffset() + record.offset_delta;
+                if (absolute < offset || absolute >= end)
+                    continue;
+                if (!record.key || record.key->empty())
+                    throw std::runtime_error("txn-state: missing transaction key");
+                const std::string key(record.key->begin(), record.key->end());
+                if (partitionFor(key, num_partitions_) != partition)
+                    throw std::runtime_error("txn-state: transaction key in wrong partition");
+                if (!record.value) {
+                    latest.erase(key);
+                    continue;
+                }
+                auto snapshot = deserialize(*record.value);
+                if (snapshot.transactional_id != key || snapshot.producer_id < 0 ||
+                    snapshot.producer_epoch < 0)
+                    throw std::runtime_error("txn-state: invalid transaction identity");
+                latest[key] = std::move(snapshot);
+            }
+        }
+        if (next <= offset)
+            throw std::runtime_error("txn-state: committed replay made no progress");
+        offset = next;
+    }
+    std::vector<TransactionCoordinator::TxnSnapshot> result;
+    result.reserve(latest.size());
+    for (auto& [_, snapshot] : latest)
+        result.push_back(std::move(snapshot));
+    return result;
 }
 
 }  // namespace kawasan::broker

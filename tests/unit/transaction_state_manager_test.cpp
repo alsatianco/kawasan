@@ -7,10 +7,30 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstdlib>
+#include <new>
 #include <string>
 
 #include "kawasan/broker/transaction_coordinator.h"
 #include "kawasan/common/buffer.h"
+
+namespace {
+thread_local bool measure_snapshot_allocations = false;
+thread_local size_t largest_snapshot_allocation = 0;
+}  // namespace
+
+// This test binary measures allocations only inside the malformed decoder call.
+void* operator new(std::size_t size) {
+    if (measure_snapshot_allocations)
+        largest_snapshot_allocation = std::max(largest_snapshot_allocation, size);
+    if (void* value = std::malloc(size ? size : 1))
+        return value;
+    throw std::bad_alloc();
+}
+void operator delete(void* value) noexcept {
+    std::free(value);
+}
 
 namespace kawasan::broker {
 namespace {
@@ -101,6 +121,42 @@ TEST(TxnStateSerialization, EmptySnapshotRoundTrips) {
     EXPECT_EQ(decoded.state, State::Empty);
     EXPECT_TRUE(decoded.partitions.empty());
     EXPECT_TRUE(decoded.pending_offsets.empty());
+}
+
+TEST(TxnStateSerialization, BoundsBothArraysBeforeAllocatingFromTruncatedSnapshots) {
+    Snapshot empty;
+    empty.transactional_id = "t";
+    for (uint8_t version : {1, 2}) {
+        for (bool partitions : {true, false}) {
+            auto bytes = TSM::serialize(empty);
+            bytes[0] = version;
+            const auto position = bytes.size() - (partitions ? 8 : 4);
+            bytes[position] = 0;
+            bytes[position + 1] = 0;
+            bytes[position + 2] = 0x10;
+            bytes[position + 3] = 0;  // 4096 entries with at most four bytes remaining
+            largest_snapshot_allocation = 0;
+            measure_snapshot_allocations = true;
+            bool rejected = false;
+            try {
+                (void)TSM::deserialize(bytes);
+            } catch (const std::exception&) {
+                rejected = true;
+            }
+            measure_snapshot_allocations = false;
+            EXPECT_TRUE(rejected);
+            EXPECT_LE(largest_snapshot_allocation, 1024u);
+        }
+    }
+}
+
+TEST(TxnStateSerialization, RejectsUnknownStateAndTrailingBytes) {
+    auto snapshot = makeSnapshot();
+    snapshot.state = static_cast<State>(99);
+    EXPECT_THROW(TSM::deserialize(TSM::serialize(snapshot)), std::runtime_error);
+    auto bytes = TSM::serialize(makeSnapshot());
+    bytes.push_back(0);
+    EXPECT_THROW(TSM::deserialize(bytes), std::runtime_error);
 }
 
 TEST(TxnStateSerialization, RejectsGarbage) {

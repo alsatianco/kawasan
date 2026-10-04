@@ -131,7 +131,7 @@ The orchestration layer. `KawasanBroker` constructs and wires every subsystem be
 | `GroupCoordinator` | Consumer-group lifecycle: JoinGroup/SyncGroup/Heartbeat/LeaveGroup, rebalance generations, and member tracking. Persists group state and offsets through `OffsetManager`. |
 | `OffsetManager` | RocksDB-backed consumer offset and group-metadata store. See [Consumer offset storage](#consumer-offset-storage). |
 | `TransactionCoordinator` | Transactional-producer and exactly-once support (InitProducerId with epoch fencing, AddPartitionsToTxn, two-phase EndTxn, TxnOffsetCommit). |
-| `TransactionStateManager` | Persists transaction-coordinator snapshots to the `__transaction_state` internal topic (fsynced regardless of `log.durability`) and replays them on startup. |
+| `TransactionStateManager` | Persists transaction snapshots to `__transaction_state` and replays them on startup. Its strict HW-bounded partition replay API is available for M10; acquisition integration is pending. |
 | `QuotaManager` | Per-client produce/consume byte-rate quotas (`quota.producer.default` / `quota.consumer.default`), returning `throttle_time_ms`. |
 | `ProducerStateManager` | Tracks `(topic, partition, producer_id)` state for idempotent/duplicate detection; exposes entry/eviction metrics. |
 | `FetchSessionManager` | Incremental-fetch session state (KIP-227 style fetch sessions). |
@@ -258,7 +258,14 @@ The configuration loader (`src/common/config.cpp`) accepts **two** file formats 
 
 Both formats produce the same typed config map, so `broker.id`, `log.dirs`, and the rest behave identically regardless of format. String values in either format support environment-variable substitution with `${VAR}` and `${VAR:default}` syntax. The full key reference is in [./CONFIGURATION.md](./CONFIGURATION.md).
 
-Abort history is reconstructed from retained transactional data and ABORT control markers before startup serves traffic. The index keeps each transaction's first offset and marker offset, so a Fetch starting inside an aborted range includes its earlier start. EndTxn updates the index and deduplicates an already-recovered producer/marker pair when replay re-drives completion; Fetch prunes entries whose markers precede the retained log start. The historical 1,000-entry eviction limit is removed. Rebuilding this index currently requires a full retained-log scan at startup; producer-state snapshots still bound producer sequence replay, but do not checkpoint abort history. Coordinator replay independently restores in-flight LSO holds. Cross-broker transaction recovery remains M10.
+Abort history is reconstructed from retained transactional data and ABORT control markers before startup serves traffic. The index keeps each transaction's first offset and marker offset, so a Fetch starting inside an aborted range includes its earlier start. EndTxn updates the index and deduplicates an already-recovered producer/marker pair when replay re-drives completion; Fetch prunes entries whose markers precede the retained log start. The historical 1,000-entry eviction limit is removed. Rebuilding this index currently requires a full retained-log scan at startup; producer-state snapshots still bound producer sequence replay, but do not checkpoint abort history. Coordinator replay independently restores in-flight LSO holds. Cross-broker transaction recovery remains M10. The new
+`TransactionStateManager::loadCommittedPartition` reads only an existing local
+partition below a captured HW, validates key/identity/routing, applies tombstones
+and fails on malformed committed data rather than returning a partial cache.
+The acquisition caller must fence ownership and truncation around this scan.
+Snapshot decoding bounds both arrays before reservation and rejects unknown
+states/trailing bytes. This API is not yet wired to ownership: legacy startup
+still uses loadAll, and internal coordinator topics remain RF=1.
 
 In a cluster, promotion rebuilds producer sequence state from the retained partition log before the replica becomes writable. A per-partition lock serializes promotion, Produce and replica ingestion/truncation. Followers do not write producer snapshots; control batches do not advance producer sequence state. This recovery scan currently reads the full retained log on promotion. The new leadership also records its inherited log-end offset and defers consumer Fetch/ListOffsets until fresh ISR progress confirms that prefix. Replica Fetch continues during this transition, and ISR expansion requires the inherited prefix rather than the stale checkpoint. Empty and sole-replica leaders are immediately readable; readiness resets on a new leader epoch. This prevents exposing a stale follower/checkpoint HW before safe recovery advances it.
 

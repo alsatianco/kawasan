@@ -8,6 +8,12 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-05
 
+- Add strict, partition-scoped transaction replay below a captured high watermark
+  for M10 acquisition. Validate record identity/routing and apply tombstones;
+  refuse malformed committed state or missing local logs. Bound snapshot arrays
+  before allocation and reject unknown states/trailing bytes. Ownership hooks,
+  replicated coordinator appends and clustered-format activation remain pending.
+
 - Honor OffsetFetch fetch-all and require-stable semantics. Hide checkpoints
   behind UNSTABLE_OFFSET_COMMIT while their transactional update is pending.
   Preserve complete checkpoint metadata in fetch-all. Parse offset keys from

@@ -9,6 +9,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <iostream>
 #include <memory>
 #include <string>
 
@@ -83,6 +84,10 @@ protected:
         dir_ = makeDir();
     }
     void TearDown() override {
+        if (HasFailure()) {
+            std::cerr << "Retained transaction recovery data: " << dir_ << '\n';
+            return;
+        }
         if (!dir_.empty() && fs::exists(dir_))
             fs::remove_all(dir_);
     }
@@ -229,3 +234,120 @@ TEST_F(TxnRecoveryTest, ControlMarkerDiscoverableAfterReopen) {
 }
 
 }  // namespace
+
+// M10: acquisition must consume only the committed prefix of its own partition.
+TEST_F(TxnRecoveryTest, ScopedReplayExcludesUncommittedAndOtherPartitions) {
+    LogManager lm(dir_);
+    TransactionStateManager tsm(&lm, 2);
+    TransactionCoordinator tc;
+    std::vector<std::string> ids(2);
+    for (int i = 0; ids[0].empty() || ids[1].empty(); ++i) {
+        const std::string id = "scoped-" + std::to_string(i);
+        ids[TransactionStateManager::partitionFor(id, 2)] = id;
+    }
+    for (int partition : {0, 1}) {
+        tc.recordInitProducerId(ids[partition], 100 + partition, 0, 60000);
+        tsm.persist(*tc.describe(ids[partition]));
+    }
+    tc.addPartitions(ids[0], {{"input", 0, 9}});
+    tc.stagePendingOffsets(ids[0], {{"group", "input", 0, 42, "checkpoint", 17}});
+    tc.prepareCommit(ids[0]);
+    tsm.persist(*tc.describe(ids[0]));
+    auto* log = lm.getLog(TransactionStateManager::kTopic, 0);
+    ASSERT_EQ(log->logEndOffset(), 2);
+    log->setHighWatermark(1);
+    auto prefix = tsm.loadCommittedPartition(0);
+    ASSERT_EQ(prefix.size(), 1u);
+    EXPECT_EQ(prefix[0].transactional_id, ids[0]);
+    EXPECT_EQ(prefix[0].state, State::Empty);
+    EXPECT_TRUE(prefix[0].pending_offsets.empty());
+    log->setHighWatermark(2);
+    prefix = tsm.loadCommittedPartition(0);
+    ASSERT_EQ(prefix.size(), 1u);
+    EXPECT_EQ(prefix[0].state, State::PrepareCommit);
+    ASSERT_EQ(prefix[0].pending_offsets.size(), 1u);
+    EXPECT_EQ(prefix[0].pending_offsets[0].committed_leader_epoch, 17);
+    const auto other = tsm.loadCommittedPartition(1);
+    ASSERT_EQ(other.size(), 1u);
+    EXPECT_EQ(other[0].transactional_id, ids[1]);
+    EXPECT_EQ(other[0].state, State::Empty);
+}
+
+TEST_F(TxnRecoveryTest, ScopedReplayRejectsMalformedCommittedStateAndKeyMismatch) {
+    LogManager lm(dir_);
+    TransactionStateManager tsm(&lm, 1);
+    auto* log = lm.getOrCreateLog(TransactionStateManager::kTopic, 0);
+    kawasan::Record malformed("broken", "invalid snapshot");
+    log->append({malformed}, true);
+    log->setHighWatermark(0);
+    EXPECT_TRUE(tsm.loadCommittedPartition(0).empty());
+    log->setHighWatermark(1);
+    EXPECT_THROW(tsm.loadCommittedPartition(0), std::runtime_error);
+    log->truncateSuffix(0);
+    TransactionCoordinator tc;
+    tc.recordInitProducerId("actual", 1, 0, 60000);
+    kawasan::Record mismatch;
+    mismatch.key = std::vector<uint8_t>{'w', 'r', 'o', 'n', 'g'};
+    mismatch.value = TransactionStateManager::serialize(*tc.describe("actual"));
+    log->append({mismatch}, true);
+    EXPECT_THROW(tsm.loadCommittedPartition(0), std::runtime_error);
+}
+
+TEST_F(TxnRecoveryTest, ScopedReplayAppliesTxnTombstones) {
+    LogManager lm(dir_);
+    TransactionStateManager tsm(&lm, 1);
+    TransactionCoordinator tc;
+    tc.recordInitProducerId("removed", 9, 0, 60000);
+    tsm.persist(*tc.describe("removed"));
+    auto* log = lm.getLog(TransactionStateManager::kTopic, 0);
+    kawasan::Record tombstone;
+    tombstone.key = std::vector<uint8_t>{'r', 'e', 'm', 'o', 'v', 'e', 'd'};
+    log->append({tombstone}, true);
+    EXPECT_TRUE(tsm.loadCommittedPartition(0).empty());
+}
+
+TEST_F(TxnRecoveryTest, ScopedReplayDoesNotCreateMissingLogsOrAcceptInvalidPartitions) {
+    LogManager lm(dir_);
+    TransactionStateManager tsm(&lm, 2);
+    EXPECT_THROW(tsm.loadCommittedPartition(0), std::runtime_error);
+    EXPECT_EQ(lm.getLog(TransactionStateManager::kTopic, 0), nullptr);
+    EXPECT_THROW(tsm.loadCommittedPartition(-1), std::out_of_range);
+    EXPECT_THROW(tsm.loadCommittedPartition(2), std::out_of_range);
+}
+
+TEST_F(TxnRecoveryTest, ScopedReplayBoundsRecordsInsideOneBatch) {
+    LogManager lm(dir_);
+    TransactionStateManager tsm(&lm, 1);
+    TransactionCoordinator tc;
+    tc.recordInitProducerId("committed", 15, 0, 60000);
+    kawasan::Record valid;
+    const std::string key = "committed";
+    valid.key = std::vector<uint8_t>(key.begin(), key.end());
+    valid.value = TransactionStateManager::serialize(*tc.describe(key));
+    auto* log = lm.getOrCreateLog(TransactionStateManager::kTopic, 0);
+    log->append({valid, kawasan::Record("uncommitted", "malformed snapshot")}, true);
+    log->setHighWatermark(1);
+    const auto snapshots = tsm.loadCommittedPartition(0);
+    ASSERT_EQ(snapshots.size(), 1u);
+    EXPECT_EQ(snapshots[0].transactional_id, "committed");
+    log->setHighWatermark(2);
+    EXPECT_THROW(tsm.loadCommittedPartition(0), std::runtime_error);
+}
+
+TEST_F(TxnRecoveryTest, ScopedReplayRejectsKeysInTheWrongPartition) {
+    LogManager lm(dir_);
+    TransactionStateManager tsm(&lm, 2);
+    std::string id;
+    for (int i = 0; id.empty(); ++i) {
+        const auto candidate = "wrong-route-" + std::to_string(i);
+        if (TransactionStateManager::partitionFor(candidate, 2) == 1)
+            id = candidate;
+    }
+    TransactionCoordinator tc;
+    tc.recordInitProducerId(id, 20, 0, 60000);
+    kawasan::Record record;
+    record.key = std::vector<uint8_t>(id.begin(), id.end());
+    record.value = TransactionStateManager::serialize(*tc.describe(id));
+    lm.getOrCreateLog(TransactionStateManager::kTopic, 0)->append({record}, true);
+    EXPECT_THROW(tsm.loadCommittedPartition(0), std::runtime_error);
+}
