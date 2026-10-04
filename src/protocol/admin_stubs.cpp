@@ -313,10 +313,7 @@ void AlterPartitionResponse::decode(Buffer& buf, int16_t /*v*/) {
 // Wire format follows Kafka's DescribeAcls/CreateAcls/DeleteAcls schemas.
 // v2+ is flexible (compact strings + tagged fields); v1 added pattern_type.
 //
-// For simplicity (and because the harness doesn't exercise SASL yet),
-// only v0 is fully decoded for incoming requests — that's the version
-// kafka-python and most CLIs send when SASL isn't enabled. The wire
-// shape at v0:
+// Classic v0 request shape (v1 inserts pattern_type):
 //   DescribeAclsRequest: resource_type INT8, resource_name NULLABLE_STRING,
 //                        principal NULLABLE_STRING, host NULLABLE_STRING,
 //                        operation INT8, permission_type INT8

@@ -706,7 +706,7 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
         // Phase 4.1b: IncrementalAlterConfigs (modern per-key SET/DELETE/...).
         {protocol::ApiKey::INCREMENTAL_ALTER_CONFIGS, 0, 1},
         // Phase 4.1c-m: admin batch.
-        {protocol::ApiKey::DESCRIBE_LOG_DIRS, 0, 0},
+        {protocol::ApiKey::DESCRIBE_LOG_DIRS, 0, 1},
         {protocol::ApiKey::ALTER_REPLICA_LOG_DIRS, 0, 0},
         {protocol::ApiKey::ELECT_LEADERS, 0, 1},
         {protocol::ApiKey::DELETE_RECORDS, 0, 2},
@@ -717,7 +717,7 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
         {protocol::ApiKey::LIST_TRANSACTIONS, 0, 0},
         {protocol::ApiKey::DESCRIBE_TRANSACTIONS, 0, 0},
         {protocol::ApiKey::ALTER_PARTITION, 0, 0},
-        {protocol::ApiKey::DESCRIBE_ACLS, 0, 0},
+        {protocol::ApiKey::DESCRIBE_ACLS, 0, 1},
         {protocol::ApiKey::CREATE_ACLS, 0, 0},
         {protocol::ApiKey::DELETE_ACLS, 0, 0},
         // Phase 4.2a: SASL PLAIN handshake + authenticate.
@@ -1910,7 +1910,7 @@ void KawasanBroker::registerProtocolHandlers() {
                 return buildEmptyErrorResponse(ctx);
             });
     };
-    reg_admin(protocol::ApiKey::DESCRIBE_LOG_DIRS, 0, 0, &KawasanBroker::handleDescribeLogDirs);
+    reg_admin(protocol::ApiKey::DESCRIBE_LOG_DIRS, 0, 1, &KawasanBroker::handleDescribeLogDirs);
     reg_admin(protocol::ApiKey::ALTER_REPLICA_LOG_DIRS, 0, 0,
               &KawasanBroker::handleAlterReplicaLogDirs);
     reg_admin(protocol::ApiKey::ELECT_LEADERS, 0, 1, &KawasanBroker::handleElectLeaders);
@@ -1923,7 +1923,7 @@ void KawasanBroker::registerProtocolHandlers() {
     reg_admin(protocol::ApiKey::DESCRIBE_TRANSACTIONS, 0, 0,
               &KawasanBroker::handleDescribeTransactions);
     reg_admin(protocol::ApiKey::ALTER_PARTITION, 0, 0, &KawasanBroker::handleAlterPartition);
-    reg_admin(protocol::ApiKey::DESCRIBE_ACLS, 0, 0, &KawasanBroker::handleDescribeAcls);
+    reg_admin(protocol::ApiKey::DESCRIBE_ACLS, 0, 1, &KawasanBroker::handleDescribeAcls);
     reg_admin(protocol::ApiKey::CREATE_ACLS, 0, 0, &KawasanBroker::handleCreateAcls);
     reg_admin(protocol::ApiKey::DELETE_ACLS, 0, 0, &KawasanBroker::handleDeleteAcls);
 

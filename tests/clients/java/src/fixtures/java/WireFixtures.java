@@ -87,6 +87,19 @@ public class WireFixtures {
         var topicConfig = new DescribeConfigsResponseData.DescribeConfigsResourceResult().setName("segment.bytes").setValue("4096").setConfigSource((byte)1).setDocumentation(null);
         var configResult = new DescribeConfigsResponseData.DescribeConfigsResult().setErrorMessage(null).setResourceType((byte)2).setResourceName("t").setConfigs(List.of(defaultConfig, topicConfig));
         for (short v : new short[]{1,4}) add("describe-configs-response-v"+v,new DescribeConfigsResponseData().setResults(List.of(configResult)),v);
+        var logTopics = new DescribeLogDirsRequestData.DescribableLogDirTopicCollection();
+        logTopics.add(new DescribeLogDirsRequestData.DescribableLogDirTopic().setTopic("t").setPartitions(List.of(0)));
+        add("describe-log-dirs-request-v1",new DescribeLogDirsRequestData().setTopics(logTopics),(short)1);
+        add("describe-log-dirs-all-request-v1",new DescribeLogDirsRequestData().setTopics(null),(short)1);
+        var logPartition = new DescribeLogDirsResponseData.DescribeLogDirsPartition().setPartitionIndex(0).setPartitionSize(4096).setOffsetLag(3).setIsFutureKey(false);
+        var logTopic = new DescribeLogDirsResponseData.DescribeLogDirsTopic().setName("t").setPartitions(List.of(logPartition));
+        var logResult = new DescribeLogDirsResponseData.DescribeLogDirsResult().setLogDir("/logs").setTopics(List.of(logTopic));
+        add("describe-log-dirs-response-v1",new DescribeLogDirsResponseData().setResults(List.of(logResult)),(short)1);
+        add("describe-acls-request-v1",new DescribeAclsRequestData().setResourceTypeFilter((byte)2).setResourceNameFilter("t")
+            .setPatternTypeFilter((byte)3).setPrincipalFilter("User:a").setHostFilter("*").setOperation((byte)3).setPermissionType((byte)3),(short)1);
+        var acl = new DescribeAclsResponseData.AclDescription().setPrincipal("User:a").setHost("*").setOperation((byte)3).setPermissionType((byte)3);
+        var aclResource = new DescribeAclsResponseData.DescribeAclsResource().setResourceType((byte)2).setResourceName("t").setPatternType((byte)3).setAcls(List.of(acl));
+        add("describe-acls-response-v1",new DescribeAclsResponseData().setErrorMessage(null).setResources(List.of(aclResource)),(short)1);
         System.out.println(new ObjectMapper().writerWithDefaultPrettyPrinter().writeValueAsString(fixtures));
     }
 }

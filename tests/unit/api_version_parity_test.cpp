@@ -7,6 +7,7 @@
 
 #include "kawasan/common/buffer.h"
 #include "kawasan/protocol/admin_misc_requests.h"
+#include "kawasan/protocol/admin_stubs.h"
 #include "kawasan/protocol/delete_topics_request.h"
 #include "kawasan/protocol/describe_configs_request.h"
 #include "kawasan/protocol/describe_groups_request.h"
@@ -288,5 +289,67 @@ TEST(ApiVersionParityTest, DescribeConfigsUsesKafkaDefaultAndDynamicTopicSources
         kawasan::Buffer encoded;
         response.encode(encoded, version);
         EXPECT_EQ(std::vector<uint8_t>(encoded.data(), encoded.data() + encoded.size()), bytes);
+    }
+}
+
+TEST(ApiVersionParityTest, ModernAdminV1MatchesKafkaGeneratedCodecs) {
+    auto check = [](auto message, const std::string& key) {
+        const auto bytes = golden(key);
+        kawasan::Buffer input(bytes);
+        message.decode(input, 1);
+        EXPECT_EQ(input.remaining(), 0u);
+        kawasan::Buffer encoded;
+        message.encode(encoded, 1);
+        EXPECT_EQ(std::vector<uint8_t>(encoded.data(), encoded.data() + encoded.size()), bytes);
+    };
+    check(kawasan::protocol::DescribeLogDirsRequest{}, "describe-log-dirs-request-v1");
+    check(kawasan::protocol::DescribeLogDirsRequest{}, "describe-log-dirs-all-request-v1");
+    check(kawasan::protocol::DescribeLogDirsResponse{}, "describe-log-dirs-response-v1");
+    check(kawasan::protocol::DescribeAclsRequest{}, "describe-acls-request-v1");
+    check(kawasan::protocol::DescribeAclsResponse{}, "describe-acls-response-v1");
+}
+
+TEST(ApiVersionParityTest, TruncatedDescribeLogDirsDoesNotAllocateDeclaredTopics) {
+    kawasan::Buffer input;
+    input.writeInt32(4096);
+    kawasan::protocol::DescribeLogDirsRequest request;
+    EXPECT_THROW(request.decode(input, 1), std::exception);
+    EXPECT_LT(request.topics().size(), 4096u);
+}
+
+TEST(ApiVersionParityTest, DescribeLogDirsBoundsEveryNestedArrayBeforeAllocation) {
+    using namespace kawasan;
+    using namespace kawasan::protocol;
+    for (int16_t version : {0, 1}) {
+        Buffer request;
+        request.writeInt32(1);
+        request.writeString("t");
+        request.writeInt32(4096);
+        DescribeLogDirsRequest decoded;
+        EXPECT_THROW(decoded.decode(request, version), std::exception);
+        ASSERT_EQ(decoded.topics().size(), 1u);
+        EXPECT_TRUE(decoded.topics()[0].partitions.empty());
+        for (int level : {0, 1, 2}) {
+            Buffer response;
+            response.writeInt32(0);
+            response.writeInt32(level == 0 ? 4096 : 1);
+            if (level >= 1) {
+                response.writeInt16(0);
+                response.writeString("/logs");
+                response.writeInt32(level == 1 ? 4096 : 1);
+            }
+            if (level >= 2) {
+                response.writeString("t");
+                response.writeInt32(4096);
+            }
+            DescribeLogDirsResponse result;
+            EXPECT_THROW(result.decode(response, version), std::exception);
+            if (level == 0)
+                EXPECT_TRUE(result.logDirs().empty());
+            else if (level == 1)
+                EXPECT_TRUE(result.logDirs()[0].topics.empty());
+            else
+                EXPECT_TRUE(result.logDirs()[0].topics[0].partitions.empty());
+        }
     }
 }

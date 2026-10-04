@@ -15,6 +15,7 @@
 #include "kawasan/common/logger.h"
 #include "kawasan/common/socket_deadline.h"
 #include "kawasan/protocol/admin_misc_requests.h"
+#include "kawasan/protocol/admin_stubs.h"
 #include "kawasan/protocol/alter_configs_request.h"
 #include "kawasan/protocol/create_topics_request.h"
 #include "kawasan/protocol/fetch_request.h"
@@ -493,4 +494,59 @@ TEST_F(ClientApiParityTest, ZeroTimeRetentionRemovesRolledSegments) {
     log->cleanup();
     EXPECT_EQ(log->logStartOffset(), 1);
     EXPECT_EQ(log->logEndOffset(), 2);
+}
+
+TEST_F(ClientApiParityTest, DescribeLogDirsV1ReportsRealPartitionSizes) {
+    start();
+    EXPECT_EQ(versions().at(ApiKey::DESCRIBE_LOG_DIRS), 1);
+    create("modern-log-dirs");
+    produce("modern-log-dirs");
+    DescribeLogDirsRequest request;
+    request.addTopic({"modern-log-dirs", {0}});
+    auto body = call(ApiKey::DESCRIBE_LOG_DIRS, 1, request);
+    ASSERT_GE(body.remaining(), 8u);
+    DescribeLogDirsResponse response;
+    response.decode(body, 1);
+    ASSERT_EQ(response.logDirs().size(), 1u);
+    ASSERT_EQ(response.logDirs()[0].topics.size(), 1u);
+    EXPECT_EQ(response.logDirs()[0].topics[0].topic, "modern-log-dirs");
+    ASSERT_EQ(response.logDirs()[0].topics[0].partitions.size(), 1u);
+    EXPECT_GT(response.logDirs()[0].topics[0].partitions[0].size_bytes, 0);
+    EXPECT_EQ(response.logDirs()[0].topics[0].partitions[0].offset_lag, 0);
+}
+
+TEST_F(ClientApiParityTest, DescribeAclsV1FiltersLiteralBindings) {
+    start();
+    EXPECT_EQ(versions().at(ApiKey::DESCRIBE_ACLS), 1);
+    CreateAclsRequest created;
+    created.creations.push_back({2, "modern-acls", 3, "User:a", "*", 3, 3});
+    auto creation = call(ApiKey::CREATE_ACLS, 0, created);
+    creation.readInt32();
+    ASSERT_EQ(creation.readInt32(), 1);
+    ASSERT_EQ(creation.readInt16(), 0);
+    DescribeAclsRequest request;
+    request.resource_type = 2;
+    request.resource_name_filter = "modern-acls";
+    request.pattern_type = 3;
+    auto body = call(ApiKey::DESCRIBE_ACLS, 1, request);
+    ASSERT_GE(body.remaining(), 12u);
+    body.readInt32();
+    EXPECT_EQ(body.readInt16(), 0);
+    body.readNullableString();
+    ASSERT_EQ(body.readInt32(), 1);
+    EXPECT_EQ(body.readInt8(), 2);
+    EXPECT_EQ(body.readString(), "modern-acls");
+    EXPECT_EQ(body.readInt8(), 3);
+    ASSERT_EQ(body.readInt32(), 1);
+    EXPECT_EQ(body.readString(), "User:a");
+    EXPECT_EQ(body.readString(), "*");
+    EXPECT_EQ(body.readInt8(), 3);
+    EXPECT_EQ(body.readInt8(), 3);
+    EXPECT_EQ(body.remaining(), 0u);
+    request.pattern_type = 4;
+    auto filtered = call(ApiKey::DESCRIBE_ACLS, 1, request);
+    filtered.readInt32();
+    EXPECT_EQ(filtered.readInt16(), 0);
+    filtered.readNullableString();
+    EXPECT_EQ(filtered.readInt32(), 0);
 }

@@ -8,6 +8,10 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-04
 
+- Advertise and dispatch DescribeLogDirs v1 and DescribeAcls v1 after Kafka
+  golden and socket checks. Modern Java AdminClient can read partition sizes
+  and literal ACL filters. Bound DescribeLogDirs arrays before allocation.
+
 - Replicate and persist topic config replacements and incremental operations
   through Raft, fence changes with topic UUIDs, and update already-open logs.
   Validate supported runtime keys, preserve broker defaults and durability mode,

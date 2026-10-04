@@ -86,3 +86,10 @@ v1/v4 response fixtures cover source encoding; socket tests cover validation,
 restart, override removal and changes to already-open logs. The three-broker check
 is `scripts/tests/test_topic_configs_cm3.py`, retaining controller-failover evidence
 under its fresh `BASE` directory.
+
+DescribeLogDirs and DescribeAcls support v1, the minimum supported by Java 4.2.
+Kafka-generated fixtures cover filtered/all-log requests, sizes/lag and ACL
+patterns. Socket tests verify advertised caps, real partition sizes and stored
+literal ACL filtering. DescribeLogDirs bounds every array level before allocating.
+ACL storage remains local and in memory until CM-9; this version change adds no
+persistence or cluster authorization guarantee.

@@ -1,11 +1,19 @@
-// Phase 4.1 — minimal-but-correct encoders/decoders for the admin-misc batch.
-// Each API supports v0 only (the schema is stable across versions for our
-// purposes; clients negotiate down). Where the spec went flexible we keep the
-// non-flexible path; later revisits can add compact strings.
+// Admin-misc codecs use classic or flexible bodies at their schema boundaries.
 
 #include "kawasan/protocol/admin_misc_requests.h"
 
 namespace kawasan::protocol {
+
+namespace {
+int32_t readLogDirsArrayLength(Buffer& buffer, size_t element_min_bytes, bool nullable = false) {
+    const auto count = buffer.readInt32();
+    if (count == -1 && nullable)
+        return count;
+    if (count < 0 || static_cast<size_t>(count) > buffer.remaining() / element_min_bytes)
+        throw std::runtime_error("Invalid DescribeLogDirs array length");
+    return count;
+}
+}  // namespace
 
 // ---------- DescribeLogDirs ----------
 
@@ -24,7 +32,7 @@ void DescribeLogDirsRequest::encode(Buffer& buf, int16_t /*v*/) const {
 }
 
 void DescribeLogDirsRequest::decode(Buffer& buf, int16_t /*v*/) {
-    int32_t tc = buf.readInt32();
+    int32_t tc = readLogDirsArrayLength(buf, 6, true);
     if (tc < 0) {
         fetch_all_ = true;
         topics_.clear();
@@ -34,8 +42,8 @@ void DescribeLogDirsRequest::decode(Buffer& buf, int16_t /*v*/) {
     topics_.resize(tc);
     for (int32_t i = 0; i < tc; ++i) {
         topics_[i].topic = buf.readString();
-        int32_t pc = buf.readInt32();
-        topics_[i].partitions.resize(pc < 0 ? 0 : pc);
+        int32_t pc = readLogDirsArrayLength(buf, 4);
+        topics_[i].partitions.resize(pc);
         for (int32_t j = 0; j < pc; ++j)
             topics_[i].partitions[j] = buf.readInt32();
     }
@@ -63,17 +71,17 @@ void DescribeLogDirsResponse::encode(Buffer& buf, int16_t /*v*/) const {
 
 void DescribeLogDirsResponse::decode(Buffer& buf, int16_t /*v*/) {
     throttle_time_ms_ = buf.readInt32();
-    int32_t dc = buf.readInt32();
-    log_dirs_.resize(dc < 0 ? 0 : dc);
+    int32_t dc = readLogDirsArrayLength(buf, 8);
+    log_dirs_.resize(dc);
     for (int32_t i = 0; i < dc; ++i) {
         log_dirs_[i].error_code = static_cast<ErrorCode>(buf.readInt16());
         log_dirs_[i].log_dir = buf.readString();
-        int32_t tc = buf.readInt32();
-        log_dirs_[i].topics.resize(tc < 0 ? 0 : tc);
+        int32_t tc = readLogDirsArrayLength(buf, 6);
+        log_dirs_[i].topics.resize(tc);
         for (int32_t j = 0; j < tc; ++j) {
             log_dirs_[i].topics[j].topic = buf.readString();
-            int32_t pc = buf.readInt32();
-            log_dirs_[i].topics[j].partitions.resize(pc < 0 ? 0 : pc);
+            int32_t pc = readLogDirsArrayLength(buf, 21);
+            log_dirs_[i].topics[j].partitions.resize(pc);
             for (int32_t k = 0; k < pc; ++k) {
                 log_dirs_[i].topics[j].partitions[k].partition = buf.readInt32();
                 log_dirs_[i].topics[j].partitions[k].size_bytes = buf.readInt64();
