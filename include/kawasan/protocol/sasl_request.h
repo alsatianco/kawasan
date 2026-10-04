@@ -23,6 +23,7 @@ public:
     void setMechanism(const std::string& m) { mechanism_ = m; }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
+
 private:
     std::string mechanism_;
 };
@@ -33,6 +34,7 @@ public:
     void setEnabledMechanisms(std::vector<std::string> v) { enabled_mechanisms_ = std::move(v); }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
+
 private:
     ErrorCode error_code_ = ErrorCode::NONE;
     std::vector<std::string> enabled_mechanisms_;
@@ -43,12 +45,14 @@ private:
 //   Request: auth_bytes BYTES
 //   Response: error_code, error_message NULLABLE_STRING, auth_bytes BYTES,
 //             session_lifetime_ms INT64 (v1+)
+//   v2: flexible compact bytes/nullable message and tagged fields.
 class SaslAuthenticateRequest {
 public:
     const std::vector<uint8_t>& authBytes() const { return auth_bytes_; }
     void setAuthBytes(std::vector<uint8_t> b) { auth_bytes_ = std::move(b); }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
+
 private:
     std::vector<uint8_t> auth_bytes_;
 };
@@ -61,6 +65,7 @@ public:
     void setSessionLifetimeMs(int64_t v) { session_lifetime_ms_ = v; }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
+
 private:
     ErrorCode error_code_ = ErrorCode::NONE;
     std::string error_message_;

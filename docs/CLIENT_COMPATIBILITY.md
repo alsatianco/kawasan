@@ -65,3 +65,9 @@ Fetch v13 and DeleteTopics v6 UUIDs occupy exactly 16 raw bytes, including
 Fetch's forgotten-topic entries. Golden comparisons cover both request and
 response codecs, and Fetch's reported sizes follow the encoded wire shape.
 Fetch remains capped at v12 until handler lookup/errors and profile gates land.
+
+SASL v2 and DeleteRecords v2 use compact bodies with nested tagged fields;
+OffsetFetch v9 inserts nullable member ID and member epoch before group topics.
+Golden tests cover these shapes independently of Kawasan's encoders, including
+classic null membership. These codec repairs alone do not raise advertised
+versions or implement KIP-848 membership.

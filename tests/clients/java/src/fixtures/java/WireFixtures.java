@@ -43,6 +43,8 @@ public class WireFixtures {
         var offsetTopic = new OffsetFetchRequestData.OffsetFetchRequestTopics().setName("t").setPartitionIndexes(List.of(0));
         var offsetGroup = new OffsetFetchRequestData.OffsetFetchRequestGroup().setGroupId("g").setMemberId("m").setMemberEpoch(7).setTopics(List.of(offsetTopic));
         add("offset-fetch-request-v9",new OffsetFetchRequestData().setGroups(List.of(offsetGroup)).setRequireStable(true),(short)9);
+        offsetGroup.setMemberId(null).setMemberEpoch(-1);
+        add("offset-fetch-classic-request-v9",new OffsetFetchRequestData().setGroups(List.of(offsetGroup)).setRequireStable(true),(short)9);
         var offsetResult = new OffsetFetchResponseData.OffsetFetchResponsePartitions().setPartitionIndex(0).setCommittedOffset(42).setCommittedLeaderEpoch(3).setMetadata("meta");
         var offsetResultTopic = new OffsetFetchResponseData.OffsetFetchResponseTopics().setName("t").setPartitions(List.of(offsetResult));
         var offsetResultGroup = new OffsetFetchResponseData.OffsetFetchResponseGroup().setGroupId("g").setTopics(List.of(offsetResultTopic));

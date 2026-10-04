@@ -5,7 +5,7 @@
 namespace kawasan::protocol {
 
 void OffsetFetchRequest::encode(Buffer& buffer, int16_t api_version) const {
-    if (api_version < 0 || api_version > 8) {
+    if (api_version < 0 || api_version > 9) {
         throw ProtocolException("Unsupported OffsetFetch request version");
     }
     const bool flex = api_version >= 6;
@@ -15,6 +15,10 @@ void OffsetFetchRequest::encode(Buffer& buffer, int16_t api_version) const {
         buffer.writeCompactArrayLen(static_cast<int32_t>(groups_.size()));
         for (const auto& g : groups_) {
             buffer.writeCompactString(g.group_id);
+            if (api_version >= 9) {
+                buffer.writeCompactNullableString(g.member_id);
+                buffer.writeInt32(g.member_epoch);
+            }
             if (g.fetch_all_topics) {
                 buffer.writeUnsignedVarInt(0);  // null array
             } else {
@@ -35,8 +39,10 @@ void OffsetFetchRequest::encode(Buffer& buffer, int16_t api_version) const {
         return;
     }
 
-    if (flex) buffer.writeCompactString(group_id_);
-    else buffer.writeString(group_id_);
+    if (flex)
+        buffer.writeCompactString(group_id_);
+    else
+        buffer.writeString(group_id_);
 
     // v2+ allows null topics to mean "all topics".
     if (fetch_all_topics_ && api_version >= 2) {
@@ -52,8 +58,10 @@ void OffsetFetchRequest::encode(Buffer& buffer, int16_t api_version) const {
             buffer.writeInt32(static_cast<int32_t>(topics_.size()));
         }
         for (const auto& topic : topics_) {
-            if (flex) buffer.writeCompactString(topic.topic);
-            else buffer.writeString(topic.topic);
+            if (flex)
+                buffer.writeCompactString(topic.topic);
+            else
+                buffer.writeString(topic.topic);
             if (flex) {
                 buffer.writeCompactArrayLen(static_cast<int32_t>(topic.partitions.size()));
             } else {
@@ -62,18 +70,20 @@ void OffsetFetchRequest::encode(Buffer& buffer, int16_t api_version) const {
             for (const auto& p : topic.partitions) {
                 buffer.writeInt32(p.partition);
             }
-            if (flex) buffer.writeEmptyTaggedFields();
+            if (flex)
+                buffer.writeEmptyTaggedFields();
         }
     }
 
     if (api_version >= 7) {
         buffer.writeInt8(require_stable_ ? 1 : 0);
     }
-    if (flex) buffer.writeEmptyTaggedFields();
+    if (flex)
+        buffer.writeEmptyTaggedFields();
 }
 
 void OffsetFetchRequest::decode(Buffer& buffer, int16_t api_version) {
-    if (api_version < 0 || api_version > 8) {
+    if (api_version < 0 || api_version > 9) {
         throw ProtocolException("Unsupported OffsetFetch request version");
     }
     const bool flex = api_version >= 6;
@@ -90,6 +100,10 @@ void OffsetFetchRequest::decode(Buffer& buffer, int16_t api_version) {
         for (int32_t gi = 0; gi < group_count; ++gi) {
             Group g;
             g.group_id = buffer.readCompactString();
+            if (api_version >= 9) {
+                g.member_id = buffer.readCompactNullableString();
+                g.member_epoch = buffer.readInt32();
+            }
             const uint32_t raw = buffer.readUnsignedVarInt();
             if (raw == 0) {
                 g.fetch_all_topics = true;
@@ -173,11 +187,12 @@ void OffsetFetchRequest::decode(Buffer& buffer, int16_t api_version) {
     if (api_version >= 7) {
         require_stable_ = (buffer.readInt8() != 0);
     }
-    if (flex) buffer.skipTaggedFields();
+    if (flex)
+        buffer.skipTaggedFields();
 }
 
 void OffsetFetchResponse::encode(Buffer& buffer, int16_t api_version) const {
-    if (api_version < 0 || api_version > 8) {
+    if (api_version < 0 || api_version > 9) {
         throw ProtocolException("Unsupported OffsetFetch response version");
     }
     const bool flex = api_version >= 6;
@@ -221,8 +236,10 @@ void OffsetFetchResponse::encode(Buffer& buffer, int16_t api_version) const {
         buffer.writeInt32(static_cast<int32_t>(topics_.size()));
     }
     for (const auto& topic : topics_) {
-        if (flex) buffer.writeCompactString(topic.topic);
-        else buffer.writeString(topic.topic);
+        if (flex)
+            buffer.writeCompactString(topic.topic);
+        else
+            buffer.writeString(topic.topic);
         if (flex) {
             buffer.writeCompactArrayLen(static_cast<int32_t>(topic.partitions.size()));
         } else {
@@ -234,30 +251,35 @@ void OffsetFetchResponse::encode(Buffer& buffer, int16_t api_version) const {
             if (api_version >= 5) {
                 buffer.writeInt32(p.committed_leader_epoch);
             }
-            const auto meta_opt = p.metadata.empty()
-                                      ? std::optional<std::string>{}
-                                      : std::optional<std::string>(p.metadata);
-            if (flex) buffer.writeCompactNullableString(meta_opt);
-            else buffer.writeNullableString(meta_opt);
+            const auto meta_opt = p.metadata.empty() ? std::optional<std::string>{}
+                                                     : std::optional<std::string>(p.metadata);
+            if (flex)
+                buffer.writeCompactNullableString(meta_opt);
+            else
+                buffer.writeNullableString(meta_opt);
             buffer.writeInt16(static_cast<int16_t>(p.error));
-            if (flex) buffer.writeEmptyTaggedFields();
+            if (flex)
+                buffer.writeEmptyTaggedFields();
         }
-        if (flex) buffer.writeEmptyTaggedFields();
+        if (flex)
+            buffer.writeEmptyTaggedFields();
     }
     // v2+ moves top-level error_code to AFTER topics in the response.
     if (api_version >= 2) {
         buffer.writeInt16(static_cast<int16_t>(error_code_));
     }
-    if (flex) buffer.writeEmptyTaggedFields();
+    if (flex)
+        buffer.writeEmptyTaggedFields();
 }
 
 void OffsetFetchResponse::decode(Buffer& buffer, int16_t api_version) {
-    if (api_version < 0 || api_version > 8) {
+    if (api_version < 0 || api_version > 9) {
         throw ProtocolException("Unsupported OffsetFetch response version");
     }
     const bool flex = api_version >= 6;
 
-    // Phase 1.12: v8 multi-group response.
+    // v8/v9 multi-group response.
+    groups_.clear();
     if (api_version >= 8) {
         throttle_time_ms_ = buffer.readInt32();
         const int32_t gc = buffer.readCompactArrayLen();
@@ -294,8 +316,7 @@ void OffsetFetchResponse::decode(Buffer& buffer, int16_t api_version) {
     if (api_version >= 3) {
         throttle_time_ms_ = buffer.readInt32();
     }
-    const int32_t topic_count =
-        flex ? buffer.readCompactArrayLen() : buffer.readInt32();
+    const int32_t topic_count = flex ? buffer.readCompactArrayLen() : buffer.readInt32();
     topics_.clear();
     topics_.reserve(topic_count < 0 ? 0 : topic_count);
     for (int32_t i = 0; i < topic_count; ++i) {
@@ -310,20 +331,22 @@ void OffsetFetchResponse::decode(Buffer& buffer, int16_t api_version) {
             if (api_version >= 5) {
                 p.committed_leader_epoch = buffer.readInt32();
             }
-            auto meta = flex ? buffer.readCompactNullableString()
-                             : buffer.readNullableString();
+            auto meta = flex ? buffer.readCompactNullableString() : buffer.readNullableString();
             p.metadata = meta.value_or("");
             p.error = static_cast<ErrorCode>(buffer.readInt16());
-            if (flex) buffer.skipTaggedFields();
+            if (flex)
+                buffer.skipTaggedFields();
             t.partitions.push_back(std::move(p));
         }
-        if (flex) buffer.skipTaggedFields();
+        if (flex)
+            buffer.skipTaggedFields();
         topics_.push_back(std::move(t));
     }
     if (api_version >= 2) {
         error_code_ = static_cast<ErrorCode>(buffer.readInt16());
     }
-    if (flex) buffer.skipTaggedFields();
+    if (flex)
+        buffer.skipTaggedFields();
 }
 
 }  // namespace kawasan::protocol

@@ -17,7 +17,8 @@ void DescribeLogDirsRequest::encode(Buffer& buf, int16_t /*v*/) const {
         for (const auto& t : topics_) {
             buf.writeString(t.topic);
             buf.writeInt32(static_cast<int32_t>(t.partitions.size()));
-            for (int32_t p : t.partitions) buf.writeInt32(p);
+            for (int32_t p : t.partitions)
+                buf.writeInt32(p);
         }
     }
 }
@@ -35,7 +36,8 @@ void DescribeLogDirsRequest::decode(Buffer& buf, int16_t /*v*/) {
         topics_[i].topic = buf.readString();
         int32_t pc = buf.readInt32();
         topics_[i].partitions.resize(pc < 0 ? 0 : pc);
-        for (int32_t j = 0; j < pc; ++j) topics_[i].partitions[j] = buf.readInt32();
+        for (int32_t j = 0; j < pc; ++j)
+            topics_[i].partitions[j] = buf.readInt32();
     }
 }
 
@@ -134,12 +136,14 @@ void AlterReplicaLogDirsResponse::decode(Buffer& buf, int16_t /*v*/) {
 // ---------- ElectLeaders ----------
 
 void ElectLeadersRequest::encode(Buffer& buf, int16_t v) const {
-    if (v >= 1) buf.writeInt8(election_type_);
+    if (v >= 1)
+        buf.writeInt8(election_type_);
     buf.writeInt32(static_cast<int32_t>(topics_.size()));
     for (const auto& t : topics_) {
         buf.writeString(t.topic);
         buf.writeInt32(static_cast<int32_t>(t.partitions.size()));
-        for (int32_t p : t.partitions) buf.writeInt32(p);
+        for (int32_t p : t.partitions)
+            buf.writeInt32(p);
     }
     buf.writeInt32(timeout_ms_);
 }
@@ -152,14 +156,16 @@ void ElectLeadersRequest::decode(Buffer& buf, int16_t v) {
         topics_[i].topic = buf.readString();
         int32_t pc = buf.readInt32();
         topics_[i].partitions.resize(pc < 0 ? 0 : pc);
-        for (int32_t j = 0; j < pc; ++j) topics_[i].partitions[j] = buf.readInt32();
+        for (int32_t j = 0; j < pc; ++j)
+            topics_[i].partitions[j] = buf.readInt32();
     }
     timeout_ms_ = buf.readInt32();
 }
 
 void ElectLeadersResponse::encode(Buffer& buf, int16_t v) const {
     buf.writeInt32(throttle_time_ms_);
-    if (v >= 1) buf.writeInt16(static_cast<int16_t>(error_code_));
+    if (v >= 1)
+        buf.writeInt16(static_cast<int16_t>(error_code_));
     buf.writeInt32(static_cast<int32_t>(topics_.size()));
     for (const auto& t : topics_) {
         buf.writeString(t.topic);
@@ -167,9 +173,8 @@ void ElectLeadersResponse::encode(Buffer& buf, int16_t v) const {
         for (const auto& p : t.partitions) {
             buf.writeInt32(p.partition);
             buf.writeInt16(static_cast<int16_t>(p.error_code));
-            const auto msg = p.error_message.empty()
-                                 ? std::optional<std::string>{}
-                                 : std::optional<std::string>(p.error_message);
+            const auto msg = p.error_message.empty() ? std::optional<std::string>{}
+                                                     : std::optional<std::string>(p.error_message);
             buf.writeNullableString(msg);
         }
     }
@@ -186,8 +191,7 @@ void ElectLeadersResponse::decode(Buffer& buf, int16_t v) {
         topics_[i].partitions.resize(pc < 0 ? 0 : pc);
         for (int32_t j = 0; j < pc; ++j) {
             topics_[i].partitions[j].partition = buf.readInt32();
-            topics_[i].partitions[j].error_code =
-                static_cast<ErrorCode>(buf.readInt16());
+            topics_[i].partitions[j].error_code = static_cast<ErrorCode>(buf.readInt16());
             auto msg = buf.readNullableString();
             topics_[i].partitions[j].error_message = msg.value_or("");
         }
@@ -196,76 +200,123 @@ void ElectLeadersResponse::decode(Buffer& buf, int16_t v) {
 
 // ---------- DeleteRecords ----------
 
-void DeleteRecordsRequest::encode(Buffer& buf, int16_t /*v*/) const {
-    buf.writeInt32(static_cast<int32_t>(topics_.size()));
+void DeleteRecordsRequest::encode(Buffer& buf, int16_t v) const {
+    const bool flex = v >= 2;
+    if (flex)
+        buf.writeCompactArrayLen(static_cast<int32_t>(topics_.size()));
+    else
+        buf.writeInt32(static_cast<int32_t>(topics_.size()));
     for (const auto& t : topics_) {
-        buf.writeString(t.topic);
-        buf.writeInt32(static_cast<int32_t>(t.partitions.size()));
+        if (flex) {
+            buf.writeCompactString(t.topic);
+            buf.writeCompactArrayLen(static_cast<int32_t>(t.partitions.size()));
+        } else {
+            buf.writeString(t.topic);
+            buf.writeInt32(static_cast<int32_t>(t.partitions.size()));
+        }
         for (const auto& p : t.partitions) {
             buf.writeInt32(p.partition);
             buf.writeInt64(p.offset);
+            if (flex)
+                buf.writeEmptyTaggedFields();
         }
+        if (flex)
+            buf.writeEmptyTaggedFields();
     }
     buf.writeInt32(timeout_ms_);
+    if (flex)
+        buf.writeEmptyTaggedFields();
 }
 
-void DeleteRecordsRequest::decode(Buffer& buf, int16_t /*v*/) {
-    int32_t tc = buf.readInt32();
-    topics_.resize(tc < 0 ? 0 : tc);
+void DeleteRecordsRequest::decode(Buffer& buf, int16_t v) {
+    const bool flex = v >= 2;
+    const int32_t tc = buf.readArrayLength(flex);
+    topics_.clear();
+    topics_.resize(tc);
     for (int32_t i = 0; i < tc; ++i) {
-        topics_[i].topic = buf.readString();
-        int32_t pc = buf.readInt32();
-        topics_[i].partitions.resize(pc < 0 ? 0 : pc);
+        topics_[i].topic = flex ? buf.readCompactString() : buf.readString();
+        const int32_t pc = buf.readArrayLength(flex);
+        topics_[i].partitions.resize(pc);
         for (int32_t j = 0; j < pc; ++j) {
             topics_[i].partitions[j].partition = buf.readInt32();
             topics_[i].partitions[j].offset = buf.readInt64();
+            if (flex)
+                buf.skipTaggedFields();
         }
+        if (flex)
+            buf.skipTaggedFields();
     }
     timeout_ms_ = buf.readInt32();
+    if (flex)
+        buf.skipTaggedFields();
 }
 
-void DeleteRecordsResponse::encode(Buffer& buf, int16_t /*v*/) const {
+void DeleteRecordsResponse::encode(Buffer& buf, int16_t v) const {
+    const bool flex = v >= 2;
     buf.writeInt32(throttle_time_ms_);
-    buf.writeInt32(static_cast<int32_t>(topics_.size()));
+    if (flex)
+        buf.writeCompactArrayLen(static_cast<int32_t>(topics_.size()));
+    else
+        buf.writeInt32(static_cast<int32_t>(topics_.size()));
     for (const auto& t : topics_) {
-        buf.writeString(t.topic);
-        buf.writeInt32(static_cast<int32_t>(t.partitions.size()));
+        if (flex) {
+            buf.writeCompactString(t.topic);
+            buf.writeCompactArrayLen(static_cast<int32_t>(t.partitions.size()));
+        } else {
+            buf.writeString(t.topic);
+            buf.writeInt32(static_cast<int32_t>(t.partitions.size()));
+        }
         for (const auto& p : t.partitions) {
             buf.writeInt32(p.partition);
             buf.writeInt64(p.low_watermark);
             buf.writeInt16(static_cast<int16_t>(p.error_code));
+            if (flex)
+                buf.writeEmptyTaggedFields();
         }
+        if (flex)
+            buf.writeEmptyTaggedFields();
     }
+    if (flex)
+        buf.writeEmptyTaggedFields();
 }
 
-void DeleteRecordsResponse::decode(Buffer& buf, int16_t /*v*/) {
+void DeleteRecordsResponse::decode(Buffer& buf, int16_t v) {
+    const bool flex = v >= 2;
     throttle_time_ms_ = buf.readInt32();
-    int32_t tc = buf.readInt32();
-    topics_.resize(tc < 0 ? 0 : tc);
+    const int32_t tc = buf.readArrayLength(flex);
+    topics_.clear();
+    topics_.resize(tc);
     for (int32_t i = 0; i < tc; ++i) {
-        topics_[i].topic = buf.readString();
-        int32_t pc = buf.readInt32();
-        topics_[i].partitions.resize(pc < 0 ? 0 : pc);
+        topics_[i].topic = flex ? buf.readCompactString() : buf.readString();
+        const int32_t pc = buf.readArrayLength(flex);
+        topics_[i].partitions.resize(pc);
         for (int32_t j = 0; j < pc; ++j) {
             topics_[i].partitions[j].partition = buf.readInt32();
             topics_[i].partitions[j].low_watermark = buf.readInt64();
-            topics_[i].partitions[j].error_code =
-                static_cast<ErrorCode>(buf.readInt16());
+            topics_[i].partitions[j].error_code = static_cast<ErrorCode>(buf.readInt16());
+            if (flex)
+                buf.skipTaggedFields();
         }
+        if (flex)
+            buf.skipTaggedFields();
     }
+    if (flex)
+        buf.skipTaggedFields();
 }
 
 // ---------- DeleteGroups ----------
 
 void DeleteGroupsRequest::encode(Buffer& buf, int16_t /*v*/) const {
     buf.writeInt32(static_cast<int32_t>(groups_.size()));
-    for (const auto& g : groups_) buf.writeString(g);
+    for (const auto& g : groups_)
+        buf.writeString(g);
 }
 
 void DeleteGroupsRequest::decode(Buffer& buf, int16_t /*v*/) {
     int32_t n = buf.readInt32();
     groups_.resize(n < 0 ? 0 : n);
-    for (int32_t i = 0; i < n; ++i) groups_[i] = buf.readString();
+    for (int32_t i = 0; i < n; ++i)
+        groups_[i] = buf.readString();
 }
 
 void DeleteGroupsResponse::encode(Buffer& buf, int16_t /*v*/) const {
@@ -295,7 +346,8 @@ void OffsetDeleteRequest::encode(Buffer& buf, int16_t /*v*/) const {
     for (const auto& t : topics_) {
         buf.writeString(t.topic);
         buf.writeInt32(static_cast<int32_t>(t.partitions.size()));
-        for (const auto& p : t.partitions) buf.writeInt32(p.partition);
+        for (const auto& p : t.partitions)
+            buf.writeInt32(p.partition);
     }
 }
 
@@ -338,8 +390,7 @@ void OffsetDeleteResponse::decode(Buffer& buf, int16_t /*v*/) {
         topics_[i].partitions.resize(pc < 0 ? 0 : pc);
         for (int32_t j = 0; j < pc; ++j) {
             topics_[i].partitions[j].partition = buf.readInt32();
-            topics_[i].partitions[j].error_code =
-                static_cast<ErrorCode>(buf.readInt16());
+            topics_[i].partitions[j].error_code = static_cast<ErrorCode>(buf.readInt16());
         }
     }
 }
@@ -358,7 +409,8 @@ void CreatePartitionsRequest::encode(Buffer& buf, int16_t /*v*/) const {
             buf.writeInt32(static_cast<int32_t>(t.assignments.size()));
             for (const auto& a : t.assignments) {
                 buf.writeInt32(static_cast<int32_t>(a.size()));
-                for (int32_t b : a) buf.writeInt32(b);
+                for (int32_t b : a)
+                    buf.writeInt32(b);
             }
         }
     }
@@ -394,9 +446,8 @@ void CreatePartitionsResponse::encode(Buffer& buf, int16_t /*v*/) const {
     for (const auto& r : results_) {
         buf.writeString(r.topic);
         buf.writeInt16(static_cast<int16_t>(r.error_code));
-        const auto msg = r.error_message.empty()
-                             ? std::optional<std::string>{}
-                             : std::optional<std::string>(r.error_message);
+        const auto msg = r.error_message.empty() ? std::optional<std::string>{}
+                                                 : std::optional<std::string>(r.error_message);
         buf.writeNullableString(msg);
     }
 }

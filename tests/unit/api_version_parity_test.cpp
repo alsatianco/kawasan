@@ -6,9 +6,12 @@
 #include <vector>
 
 #include "kawasan/common/buffer.h"
+#include "kawasan/protocol/admin_misc_requests.h"
 #include "kawasan/protocol/delete_topics_request.h"
 #include "kawasan/protocol/describe_groups_request.h"
 #include "kawasan/protocol/fetch_request.h"
+#include "kawasan/protocol/offset_fetch_request.h"
+#include "kawasan/protocol/sasl_request.h"
 
 namespace {
 std::vector<uint8_t> golden(const std::string& name) {
@@ -108,4 +111,100 @@ TEST(ApiVersionParityTest, DeleteTopicsV6ResponseEmitsRawUuid) {
     kawasan::Buffer encoded;
     response.encode(encoded, 6);
     EXPECT_EQ(std::vector<uint8_t>(encoded.data(), encoded.data() + encoded.size()), bytes);
+}
+
+TEST(ApiVersionParityTest, SaslV2RequestMatchesKafka) {
+    kawasan::protocol::SaslAuthenticateRequest request;
+    request.setAuthBytes({1, 2, 3});
+    kawasan::Buffer encoded;
+    request.encode(encoded, 2);
+    const auto bytes = golden("sasl-request-v2");
+    ASSERT_EQ(encoded.vector(), bytes);
+    kawasan::Buffer input(bytes);
+    kawasan::protocol::SaslAuthenticateRequest decoded;
+    ASSERT_NO_THROW(decoded.decode(input, 2));
+    EXPECT_EQ(decoded.authBytes(), (std::vector<uint8_t>{1, 2, 3}));
+    EXPECT_EQ(input.remaining(), 0u);
+}
+
+TEST(ApiVersionParityTest, SaslV2ResponseMatchesKafka) {
+    kawasan::protocol::SaslAuthenticateResponse response;
+    kawasan::Buffer input(golden("sasl-response-v2"));
+    ASSERT_NO_THROW(response.decode(input, 2));
+    EXPECT_EQ(input.remaining(), 0u);
+    kawasan::Buffer encoded;
+    response.encode(encoded, 2);
+    EXPECT_EQ(encoded.vector(), golden("sasl-response-v2"));
+}
+
+TEST(ApiVersionParityTest, DeleteRecordsV2RequestMatchesKafka) {
+    // Seed the public request through its classic decoder to avoid making the
+    // pre-fix decoder allocate a huge array from compact Kafka bytes.
+    kawasan::Buffer classic;
+    classic.writeInt32(1);
+    classic.writeString("t");
+    classic.writeInt32(1);
+    classic.writeInt32(0);
+    classic.writeInt64(42);
+    classic.writeInt32(5000);
+    kawasan::protocol::DeleteRecordsRequest request;
+    request.decode(classic, 0);
+    kawasan::Buffer encoded;
+    request.encode(encoded, 2);
+    const auto bytes = golden("delete-records-request-v2");
+    ASSERT_EQ(encoded.vector(), bytes);
+    kawasan::Buffer input(bytes);
+    kawasan::protocol::DeleteRecordsRequest decoded;
+    ASSERT_NO_THROW(decoded.decode(input, 2));
+    EXPECT_EQ(input.remaining(), 0u);
+    ASSERT_EQ(decoded.topics().size(), 1u);
+    EXPECT_EQ(decoded.topics()[0].partitions[0].offset, 42);
+    EXPECT_EQ(decoded.timeoutMs(), 5000);
+}
+
+TEST(ApiVersionParityTest, DeleteRecordsV2ResponseMatchesKafka) {
+    kawasan::protocol::DeleteRecordsResponse response;
+    response.addTopic({"t", {{0, 42, kawasan::ErrorCode::NONE}}});
+    kawasan::Buffer encoded;
+    response.encode(encoded, 2);
+    const auto bytes = golden("delete-records-response-v2");
+    ASSERT_EQ(encoded.vector(), bytes);
+    kawasan::Buffer input(bytes);
+    kawasan::protocol::DeleteRecordsResponse decoded;
+    ASSERT_NO_THROW(decoded.decode(input, 2));
+    EXPECT_EQ(input.remaining(), 0u);
+    kawasan::Buffer reencoded;
+    decoded.encode(reencoded, 2);
+    EXPECT_EQ(reencoded.vector(), bytes);
+}
+
+TEST(ApiVersionParityTest, OffsetFetchV9RequestMatchesKafka) {
+    for (const auto name : {"offset-fetch-request-v9", "offset-fetch-classic-request-v9"}) {
+        const auto bytes = golden(name);
+        kawasan::Buffer input(bytes);
+        kawasan::protocol::OffsetFetchRequest request;
+        ASSERT_NO_THROW(request.decode(input, 9));
+        EXPECT_EQ(input.remaining(), 0u);
+        ASSERT_EQ(request.groups().size(), 1u);
+        EXPECT_EQ(request.groups()[0].group_id, "g");
+        EXPECT_TRUE(request.requireStable());
+        kawasan::Buffer encoded;
+        request.encode(encoded, 9);
+        EXPECT_EQ(encoded.vector(), bytes);
+    }
+}
+
+TEST(ApiVersionParityTest, OffsetFetchV9ResponseMatchesKafkaAndResetsDecodedGroups) {
+    const auto bytes = golden("offset-fetch-response-v9");
+    kawasan::Buffer input(bytes);
+    kawasan::protocol::OffsetFetchResponse response;
+    ASSERT_NO_THROW(response.decode(input, 9));
+    EXPECT_EQ(input.remaining(), 0u);
+    kawasan::Buffer repeated(bytes);
+    ASSERT_NO_THROW(response.decode(repeated, 9));
+    ASSERT_EQ(response.groups().size(), 1u);
+    EXPECT_EQ(response.groups()[0].topics[0].partitions[0].offset, 42);
+    kawasan::Buffer encoded;
+    response.encode(encoded, 9);
+    EXPECT_EQ(encoded.vector(), bytes);
 }

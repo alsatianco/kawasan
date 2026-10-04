@@ -8,6 +8,11 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-04
 
+- Implement flexible SASL v2 and DeleteRecords v2 bodies and OffsetFetch v9
+  nullable member ID/epoch fields. Kafka-generated golden regressions cover
+  both directions and classic null membership. Advertisement follows handler
+  validation and profile gates; KIP-848 group semantics remain deferred.
+
 - Correct raw UUID encoding in Fetch v13 and DeleteTopics v6, including Fetch
   forgotten-topic UUIDs and encoded size reporting. Kafka-generated request
   and response fixtures catch the previous length prefixes and name decoding;

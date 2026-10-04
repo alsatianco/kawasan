@@ -11,12 +11,13 @@ namespace kawasan::protocol {
 
 /// @brief OffsetFetch request
 ///
-/// Phase 1.12: supports v0–v8.
+/// Phase 1.12: supports v0–v9.
 ///   v0:   group_id + topics[] (partitions required, null not allowed)
 ///   v2+:  topics may be null (fetch ALL committed offsets for the group)
 ///   v6:   flexible (compact strings + tagged fields)
 ///   v7:   + require_stable BOOL
-///   v8:   shape change — groups[] of {group_id, topics?, member_id?, member_epoch}
+///   v8:   shape change — groups[] of {group_id, topics?}
+///   v9:   adds nullable member_id and member_epoch before topics
 class OffsetFetchRequest {
 public:
     struct Partition {
@@ -31,8 +32,8 @@ public:
     // Phase 1.12: v8 multi-group form.
     struct Group {
         std::string group_id;
-        std::string member_id;   // v9+, but kept here for forward-compat
-        int32_t member_epoch = -1;  // v9+
+        std::optional<std::string> member_id;  // v9+, null for classic groups
+        int32_t member_epoch = -1;             // v9+
         bool fetch_all_topics = false;
         std::vector<Topic> topics;
     };
@@ -65,19 +66,18 @@ public:
 
 private:
     std::string group_id_;
-    bool fetch_all_topics_ = false;   // v2+ semantics: null topics array
-    bool require_stable_ = false;     // v7+
+    bool fetch_all_topics_ = false;  // v2+ semantics: null topics array
+    bool require_stable_ = false;    // v7+
     std::vector<Topic> topics_;
-    std::vector<Group> groups_;       // v8+
+    std::vector<Group> groups_;  // v8+
 };
 
 /// @brief OffsetFetch response
 ///
-///   v0:    topics[{ topic, partitions[{ partition, offset, metadata, error }] }], error_code (after)
-///   v3+:   + throttle_time_ms (first), error_code at top level (after topics)
-///   v5+:   + partitions.committed_leader_epoch INT32
-///   v6:    flexible
-///   v8:    shape change — groups[] of {group_id, topics, error_code}
+///   v0:    topics[{ topic, partitions[{ partition, offset, metadata, error }] }], error_code
+///   (after) v3+:   + throttle_time_ms (first), error_code at top level (after topics) v5+:   +
+///   partitions.committed_leader_epoch INT32 v6:    flexible v8:    shape change — groups[] of
+///   {group_id, topics, error_code}
 class OffsetFetchResponse {
 public:
     struct Partition {
@@ -119,7 +119,7 @@ private:
     ErrorCode error_code_ = ErrorCode::NONE;
     int32_t throttle_time_ms_ = 0;
     std::vector<Topic> topics_;
-    std::vector<Group> groups_;       // v8+
+    std::vector<Group> groups_;  // v8+
 };
 
 }  // namespace kawasan::protocol
