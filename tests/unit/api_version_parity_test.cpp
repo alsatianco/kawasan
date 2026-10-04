@@ -251,3 +251,25 @@ TEST(ApiVersionParityTest, ListOffsetsV8MatchesKafka) {
     response.encode(encoded_response, 8);
     EXPECT_EQ(encoded_response.vector(), response_bytes);
 }
+
+TEST(ApiVersionParityTest, TruncatedOffsetFetchDoesNotAllocateDeclaredGroupsOrTopics) {
+    for (int16_t version : {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}) {
+        kawasan::Buffer malformed;
+        if (version < 6) {
+            malformed.writeString("g");
+            malformed.writeInt32(4096);
+        } else {
+            if (version < 8) {
+                malformed.writeCompactString("g");
+            }
+            malformed.writeCompactArrayLen(4096);
+        }
+        malformed.writeUnsignedVarInt(0);  // cannot contain the declared entries
+        kawasan::protocol::OffsetFetchRequest request;
+        EXPECT_THROW(request.decode(malformed, version), std::exception);
+        // Reject before reserving thousands of objects from a few wire bytes.
+        // This probes retained allocation, independent of the exception text.
+        EXPECT_LE(request.groups().capacity(), malformed.size());
+        EXPECT_LE(request.topics().capacity(), malformed.size());
+    }
+}

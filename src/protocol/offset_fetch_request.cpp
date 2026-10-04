@@ -94,7 +94,7 @@ void OffsetFetchRequest::decode(Buffer& buffer, int16_t api_version) {
     // the first group into the legacy fields so the existing handler
     // logic continues to work for single-group requests.
     if (api_version >= 8) {
-        const int32_t group_count = buffer.readCompactArrayLen();
+        const int32_t group_count = buffer.readArrayLength(true);
         groups_.clear();
         groups_.reserve(group_count < 0 ? 0 : group_count);
         for (int32_t gi = 0; gi < group_count; ++gi) {
@@ -108,11 +108,14 @@ void OffsetFetchRequest::decode(Buffer& buffer, int16_t api_version) {
             if (raw == 0) {
                 g.fetch_all_topics = true;
             } else {
+                if (raw - 1 > buffer.remaining()) {
+                    throw ProtocolException("OffsetFetch topic count exceeds remaining bytes");
+                }
                 const int32_t tc = static_cast<int32_t>(raw - 1);
                 for (int32_t i = 0; i < tc; ++i) {
                     Topic t;
                     t.topic = buffer.readCompactString();
-                    int32_t pc = buffer.readCompactArrayLen();
+                    int32_t pc = buffer.readArrayLength(true);
                     for (int32_t j = 0; j < pc; ++j) {
                         Partition p;
                         p.partition = buffer.readInt32();
@@ -146,12 +149,15 @@ void OffsetFetchRequest::decode(Buffer& buffer, int16_t api_version) {
             // null array — fetch all topics (v2+ only; pre-v2 this would be an error)
             fetch_all_topics_ = (api_version >= 2);
         } else {
+            if (raw - 1 > buffer.remaining()) {
+                throw ProtocolException("OffsetFetch topic count exceeds remaining bytes");
+            }
             const int32_t topic_count = static_cast<int32_t>(raw - 1);
             topics_.reserve(topic_count);
             for (int32_t i = 0; i < topic_count; ++i) {
                 Topic t;
                 t.topic = buffer.readCompactString();
-                int32_t pc = buffer.readCompactArrayLen();
+                int32_t pc = buffer.readArrayLength(true);
                 t.partitions.reserve(pc < 0 ? 0 : pc);
                 for (int32_t j = 0; j < pc; ++j) {
                     Partition p;
@@ -167,11 +173,14 @@ void OffsetFetchRequest::decode(Buffer& buffer, int16_t api_version) {
         if (topic_count < 0) {
             fetch_all_topics_ = (api_version >= 2);
         } else {
+            if (static_cast<size_t>(topic_count) > buffer.remaining()) {
+                throw ProtocolException("OffsetFetch topic count exceeds remaining bytes");
+            }
             topics_.reserve(topic_count);
             for (int32_t i = 0; i < topic_count; ++i) {
                 Topic t;
                 t.topic = buffer.readString();
-                int32_t pc = buffer.readInt32();
+                int32_t pc = buffer.readArrayLength(false);
                 t.partitions.reserve(pc < 0 ? 0 : pc);
                 for (int32_t j = 0; j < pc; ++j) {
                     Partition p;
@@ -282,15 +291,15 @@ void OffsetFetchResponse::decode(Buffer& buffer, int16_t api_version) {
     groups_.clear();
     if (api_version >= 8) {
         throttle_time_ms_ = buffer.readInt32();
-        const int32_t gc = buffer.readCompactArrayLen();
+        const int32_t gc = buffer.readArrayLength(true);
         for (int32_t gi = 0; gi < gc; ++gi) {
             Group g;
             g.group_id = buffer.readCompactString();
-            int32_t tc = buffer.readCompactArrayLen();
+            int32_t tc = buffer.readArrayLength(true);
             for (int32_t i = 0; i < tc; ++i) {
                 Topic t;
                 t.topic = buffer.readCompactString();
-                int32_t pc = buffer.readCompactArrayLen();
+                int32_t pc = buffer.readArrayLength(true);
                 for (int32_t j = 0; j < pc; ++j) {
                     Partition p;
                     p.partition = buffer.readInt32();
@@ -316,13 +325,13 @@ void OffsetFetchResponse::decode(Buffer& buffer, int16_t api_version) {
     if (api_version >= 3) {
         throttle_time_ms_ = buffer.readInt32();
     }
-    const int32_t topic_count = flex ? buffer.readCompactArrayLen() : buffer.readInt32();
+    const int32_t topic_count = buffer.readArrayLength(flex);
     topics_.clear();
     topics_.reserve(topic_count < 0 ? 0 : topic_count);
     for (int32_t i = 0; i < topic_count; ++i) {
         Topic t;
         t.topic = flex ? buffer.readCompactString() : buffer.readString();
-        int32_t pc = flex ? buffer.readCompactArrayLen() : buffer.readInt32();
+        int32_t pc = buffer.readArrayLength(flex);
         t.partitions.reserve(pc < 0 ? 0 : pc);
         for (int32_t j = 0; j < pc; ++j) {
             Partition p;

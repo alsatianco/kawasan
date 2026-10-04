@@ -8,6 +8,10 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-04
 
+- Bound OffsetFetch array counts before allocating group/topic storage. A
+  truncated-request regression proves thousands of declared entries cannot
+  reserve memory from a few bytes; classic and grouped versions are covered.
+
 - Add CM-3 core API parity and the `4.x`/`3.x` compatibility profile. Advertise
   Produce 11, Fetch 13, ListOffsets 8, OffsetFetch 9, DeleteRecords 2 and SASL
   Authenticate 2 by default, with one table enforcing dispatcher caps. Fetch
