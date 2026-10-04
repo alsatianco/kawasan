@@ -116,7 +116,8 @@ These run against a live broker and validate the Kafka drop-in contract:
 
 | Suite | What it does | How to run |
 |-------|--------------|------------|
-| `tests/compatibility/` | Client-library round-trips (kafka-python implemented; KafkaJS, Sarama, Java client present). | `scripts/run_compatibility_tests.sh` starts a broker and drives the clients. |
+| `tests/clients/` | [Java/librdkafka dual-oracle matrix](CLIENT_COMPATIBILITY.md). | `bash tests/clients/run.sh PROFILE` |
+| `tests/compatibility/` | Legacy client-library round-trips (kafka-python, KafkaJS, Sarama). | `scripts/run_compatibility_tests.sh` starts a broker and drives the clients. |
 | `tests/ecosystem/` | Drop-in contract harness: each check runs against **both** Apache Kafka (oracle) and Kawasan (candidate) via Docker Compose, covering api-compat, idempotent/transactional produce, compaction, ACLs, SASL, Schema Registry, Kafka UI, Kafka Connect, ksqlDB, Streams EOS, etc. | `tests/ecosystem/scripts/run_all.sh kafka` for the oracle baseline, then `run_all.sh kawasan` for the candidate. See [Operations](./OPERATIONS.md) for harness details. |
 | `scripts/tests/` | Python integration scripts (kafka-python / librdkafka) for offset, ordering, consumer-group, and metadata behaviors, plus the multi-broker replication suites (`cluster_harness.sh`, `test_replication_m5.py`, `test_isr_shrink_m6.py`). | `python3 scripts/tests/<script>.py` with a broker up; cluster suites manage their own 3-broker cluster via the harness. |
 

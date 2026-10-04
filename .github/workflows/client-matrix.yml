@@ -1,0 +1,31 @@
+name: client-matrix
+on:
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+jobs:
+  clients:
+    name: ${{ matrix.profile }} dual oracle
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [java-3.9.1, java-4.2.0, rdkafka-2.8.0, rdkafka-2.15.1, python]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify result gate
+        run: python3 -m unittest discover -s tests/clients -p test_results.py
+      - name: Run Kafka oracle then Kawasan candidate
+        env:
+          CLIENT_MATRIX_EVIDENCE: ${{ runner.temp }}/client-matrix
+          PROFILE: ${{ matrix.profile }}
+        run: bash tests/clients/run.sh "$PROFILE"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: client-matrix-${{ matrix.profile }}
+          path: ${{ runner.temp }}/client-matrix

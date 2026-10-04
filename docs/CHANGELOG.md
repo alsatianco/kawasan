@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgrade and operational procedures see [./OPERATIONS.md](./OPERATIONS.md); for the full protocol surface see [./api_coverage_matrix.md](./api_coverage_matrix.md).
 
+## 2026-10-04
+
+- Add the Java 3.9.1/4.2.0 and two-version librdkafka client matrix, retaining
+  kafka-python as a baseline. Each leg verifies Kafka before Kawasan and
+  retains evidence. The strict result gate rejects skips, incomplete runs,
+  changed failures and stale allowlist entries. Java compatibility gaps remain
+  explicitly allowlisted; see [client checks](CLIENT_COMPATIBILITY.md).
+- Decide the M10 experimental-cluster storage boundary in
+  [ADR 0001](adr/0001-replicated-coordinator-state.md). M10 is not implemented;
+  clustering remains experimental pending its prerequisites and acceptance gates.
+
 ## [Unreleased]
 
 Single-node durability, security and quotas; durable single-node transactions (M1–M3); and multi-broker replication, automatic clean leader failover, fencing, epoch-based divergence recovery, and coordinator routing (M4–M8). Single-node remains the primary supported mode. Multi-broker remains experimental pending randomized-fault validation and durable coordinator failover.

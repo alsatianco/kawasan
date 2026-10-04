@@ -23,3 +23,8 @@ add_test(NAME ConsistencyCheckerTest
 add_test(NAME NemesisTest
     COMMAND ${Python3_EXECUTABLE} -m unittest discover
             -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_nemesis.py)
+
+# CM-1 result gate must reject missing cases, skips, and stale allowlists.
+add_test(NAME ClientMatrixResultTest
+    COMMAND ${Python3_EXECUTABLE} -m unittest discover
+            -s ${CMAKE_SOURCE_DIR}/tests/clients -p test_results.py)
