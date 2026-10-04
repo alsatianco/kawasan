@@ -59,6 +59,9 @@ TopicOperationResult MetadataController::createTopic(const TopicSpecification& s
     MetadataCommand command;
     command.type = MetadataCommandType::CREATE_TOPIC;
     command.topic_spec = spec;
+    if (command.topic_spec.topic_id == std::array<uint8_t, 16>{}) {
+        command.topic_spec.topic_id = newTopicId();
+    }
     // M8-A2: in a cluster the controller decides the assignment and ships it in
     // the replicated command, so every broker applies identical leadership even
     // if their broker lists ever differ. Single-node commands stay unchanged.
@@ -204,6 +207,7 @@ std::vector<uint8_t> MetadataController::serializeCommand(const MetadataCommand&
     if (command.type == MetadataCommandType::CREATE_TOPIC) {
         json["type"] = "create";
         json["topic"]["name"] = command.topic_spec.name;
+        json["topic"]["topic_id"] = command.topic_spec.topic_id;
         json["topic"]["num_partitions"] = command.topic_spec.num_partitions;
         json["topic"]["replication_factor"] = command.topic_spec.replication_factor;
         json["topic"]["assignments"] = command.topic_spec.assignments;
@@ -242,6 +246,22 @@ MetadataCommand MetadataController::deserializeCommand(const std::vector<uint8_t
         command.type = MetadataCommandType::CREATE_TOPIC;
         auto topic = json.at("topic");
         command.topic_spec.name = topic.at("name").get<std::string>();
+        if (topic.contains("topic_id")) {
+            const auto& id = topic.at("topic_id");
+            if (!id.is_array() || id.size() != 16) {
+                throw std::runtime_error("Invalid topic ID in Raft create command");
+            }
+            for (size_t i = 0; i < 16; ++i) {
+                if (!id[i].is_number_integer() || id[i].get<int64_t>() < 0 ||
+                    id[i].get<int64_t>() > 255) {
+                    throw std::runtime_error("Invalid topic ID byte in Raft create command");
+                }
+                command.topic_spec.topic_id[i] = id[i].get<uint8_t>();
+            }
+            if (command.topic_spec.topic_id == std::array<uint8_t, 16>{}) {
+                throw std::runtime_error("Zero topic ID in Raft create command");
+            }
+        }
         command.topic_spec.num_partitions = topic.at("num_partitions").get<int32_t>();
         command.topic_spec.replication_factor = topic.at("replication_factor").get<int16_t>();
         command.topic_spec.assignments =

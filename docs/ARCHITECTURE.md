@@ -231,6 +231,21 @@ The history is populated in multi-broker mode only. A broker that becomes a part
 
 Consumer offsets and group metadata are stored in a separate RocksDB database (not under the partition log dirs) — see [Consumer offset storage](#consumer-offset-storage). Streams state stores keep their own RocksDB directories — see [Kawasan Streams](#kawasan-streams).
 
+### Topic identities
+
+The controller assigns a topic UUID before committing CREATE_TOPIC. The UUID
+travels in the Raft command, is stored in `topics.json`, and has an indexed
+ID-to-metadata lookup in MetadataStore. Restart preserves it; a new creation
+after deletion receives a new UUID. Metadata without a UUID and historical
+CREATE_TOPIC commands derive the same stable legacy UUID from cluster ID and
+topic name, then persist it. Invalid, zero or duplicate persisted IDs fail
+loading rather than being replaced silently.
+
+Upgrade all brokers of an experimental cluster together. Old binaries cannot
+apply the new UUID contract and would regenerate independent IDs. Legacy topics
+get a one-time identity change, so clients must refresh metadata. This groundwork
+does not yet advertise Fetch v13; its wire and handler prerequisites remain.
+
 ### Configuration formats
 
 The configuration loader (`src/common/config.cpp`) accepts **two** file formats and auto-detects which one a file uses by its first non-whitespace byte:

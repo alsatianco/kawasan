@@ -754,6 +754,18 @@ If the UI still shows the cluster offline: check `docker logs kafka-ui`, confirm
 
 ## Running the test suites
 
+Topic-identity cluster verification uses the local three-broker harness and
+retains its logs and data directory:
+
+```bash
+BASE=/tmp/kawasan-topic-identity-new python3 scripts/tests/test_topic_identity_cm3.py
+```
+
+Use a fresh BASE and free ports 19092/19192/19292 (plus adjacent Raft and
+monitoring ports). It checks UUID convergence, controller restart and topic
+recreation. A failed or interrupted run is not a pass.
+
+
 ### Ecosystem compatibility harness (dual-broker oracle)
 
 `tests/ecosystem/` is the contract for "drop-in replacement for single-server Kafka". Every smoke test runs against **both** brokers — **Apache Kafka 4.2.0** (`apache/kafka:4.2.0`) as the behavioral oracle and **Kawasan** as the candidate — so the diff between PASS-on-Kafka and PASS-on-Kawasan answers "real bug or test bug?". It requires a working Docker host, `kcat`, and the pinned Python clients in `tests/ecosystem/requirements.txt`. Host ports 9092, 9094, 9097 and 8081–8083/8088 must be free.

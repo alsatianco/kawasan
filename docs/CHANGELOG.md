@@ -8,6 +8,11 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-04
 
+- Persist controller-assigned topic UUIDs in both metadata and Raft commands,
+  add indexed lookup, and migrate missing legacy IDs deterministically.
+  Reject malformed or duplicate stored IDs. Upgrade experimental clusters
+  together; this change does not yet advertise Fetch v13.
+
 - Fix DescribeGroups v4/v5 static-member instance-ID encoding and decoding.
   Kafka-generated golden bytes cover null and named instances; Java AdminClient
   can now describe active consumer groups without a parser failure.

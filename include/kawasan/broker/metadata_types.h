@@ -9,6 +9,9 @@
 
 namespace kawasan::broker {
 
+/// @brief Allocate a UUID once at the controller before replicating a create command.
+std::array<uint8_t, 16> newTopicId();
+
 /// @brief Topic definition provided by admin operations.
 struct TopicSpecification {
     std::string name;
@@ -16,6 +19,7 @@ struct TopicSpecification {
     int16_t replication_factor = -1;
     std::vector<std::vector<BrokerId>> assignments;
     std::map<std::string, std::string> configs;
+    std::array<uint8_t, 16> topic_id{};
 };
 
 /// @brief Result of topic mutation commands.

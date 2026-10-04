@@ -53,6 +53,10 @@ public:
         return store_.describeTopics(names);
     }
 
+    std::optional<TopicMetadata> topicById(const std::array<uint8_t, 16>& id) const {
+        return store_.topicById(id);
+    }
+
     std::vector<BrokerMetadata> brokers() const { return store_.brokers(); }
     std::string clusterId() const { return store_.clusterId(); }
 

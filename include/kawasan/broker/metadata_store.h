@@ -61,6 +61,9 @@ public:
     /// @brief Returns topic metadata for the requested topics (all if empty).
     std::vector<TopicMetadata> describeTopics(const std::vector<std::string>& topic_names) const;
 
+    /// @brief Resolve a durable topic ID without scanning all topics.
+    std::optional<TopicMetadata> topicById(const std::array<uint8_t, 16>& id) const;
+
     /// @brief Returns known brokers.
     std::vector<BrokerMetadata> brokers() const;
 
@@ -121,6 +124,7 @@ private:
     mutable int64_t persisted_applied_index_ = 0;
     std::vector<BrokerMetadata> brokers_;
     std::map<std::string, TopicState, std::less<>> topics_;
+    std::map<std::array<uint8_t, 16>, std::string> topic_names_by_id_;
 };
 
 }  // namespace kawasan::broker

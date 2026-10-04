@@ -220,3 +220,7 @@ target_link_libraries(api_version_parity_test PRIVATE kawasan GTest::gtest GTest
 target_compile_definitions(api_version_parity_test PRIVATE
     KAWASAN_WIRE_FIXTURES="${CMAKE_SOURCE_DIR}/tests/clients/fixtures/kafka-4.2-wire.json")
 add_test(NAME ApiVersionParityTest COMMAND api_version_parity_test)
+
+add_executable(topic_identity_test topic_identity_test.cpp)
+target_link_libraries(topic_identity_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME TopicIdentityTest COMMAND topic_identity_test)

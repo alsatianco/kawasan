@@ -1,5 +1,7 @@
 #include "kawasan/broker/metadata_store.h"
 
+#include <openssl/sha.h>
+
 #include <algorithm>
 #include <array>
 #include <filesystem>
@@ -47,12 +49,7 @@ namespace {
 
 constexpr const char* kMetadataFileName = "topics.json";
 
-// Phase 1.4 / 1.16: generate a deterministic per-process UUID for a new
-// topic. Production deployments should persist this so the same topic
-// re-creates with the same UUID, but for a single-process broker this
-// suffices to give clients a stable handle within the lifetime of the
-// process. RFC 4122 §4.1.2 type 4 (random) variant — we use a simple
-// PRNG seeded once per process.
+// New create commands carry one controller-assigned RFC 4122 random UUID.
 std::array<uint8_t, 16> generateTopicId() {
     static thread_local std::mt19937_64 rng{std::random_device{}()};
     std::array<uint8_t, 16> id{};
@@ -68,13 +65,48 @@ std::array<uint8_t, 16> generateTopicId() {
     return id;
 }
 
+// Pre-UUID metadata and historical Raft commands must converge independently
+// on each broker. New commands never take this path, so delete/re-create gets
+// a new identity. A length prefix makes the cluster/name namespace unambiguous.
+std::array<uint8_t, 16> legacyTopicId(const std::string& cluster, const std::string& name) {
+    const auto key =
+        "kawasan-legacy-topic:" + std::to_string(cluster.size()) + ":" + cluster + name;
+    std::array<uint8_t, SHA256_DIGEST_LENGTH> digest{};
+    SHA256(reinterpret_cast<const unsigned char*>(key.data()), key.size(), digest.data());
+    std::array<uint8_t, 16> id{};
+    std::copy_n(digest.begin(), id.size(), id.begin());
+    id[6] = (id[6] & 0x0f) | 0x80;  // UUID v8: application-defined stable legacy identity
+    id[8] = (id[8] & 0x3f) | 0x80;
+    return id;
+}
+
+std::array<uint8_t, 16> topicIdFromJson(const nlohmann::json& json) {
+    if (!json.is_array() || json.size() != 16) {
+        throw std::runtime_error("Invalid persisted topic ID length");
+    }
+    std::array<uint8_t, 16> id{};
+    for (size_t i = 0; i < id.size(); ++i) {
+        if (!json[i].is_number_integer() || json[i].get<int64_t>() < 0 ||
+            json[i].get<int64_t>() > 255) {
+            throw std::runtime_error("Invalid persisted topic ID byte");
+        }
+        id[i] = json[i].get<uint8_t>();
+    }
+    if (id == std::array<uint8_t, 16>{}) {
+        throw std::runtime_error("Zero persisted topic ID");
+    }
+    return id;
+}
+
 TopicMetadata buildTopicMetadata(const TopicSpecification& spec,
                                  const std::vector<BrokerMetadata>& brokers,
-                                 BrokerId local_broker_id) {
+                                 BrokerId local_broker_id, const std::string& cluster_id) {
     TopicMetadata metadata;
     metadata.error_code = ErrorCode::NONE;
     metadata.name = spec.name;
-    metadata.topic_id = generateTopicId();
+    metadata.topic_id = spec.topic_id == std::array<uint8_t, 16>{}
+                            ? legacyTopicId(cluster_id, spec.name)
+                            : spec.topic_id;
     metadata.is_internal = false;
     metadata.partitions.reserve(static_cast<size_t>(spec.num_partitions));
 
@@ -172,6 +204,10 @@ PartitionMetadata partitionFromJson(const nlohmann::json& j) {
 
 }  // namespace
 
+std::array<uint8_t, 16> newTopicId() {
+    return generateTopicId();
+}
+
 MetadataStore::MetadataStore(std::string metadata_dir, std::string cluster_id,
                              const BrokerMetadata& local_broker, storage::LogManager* log_manager)
     : metadata_dir_(std::move(metadata_dir)),
@@ -220,11 +256,22 @@ void MetadataStore::load() {
     ensureLocalBrokerLocked(local_broker_);
 
     topics_.clear();
+    topic_names_by_id_.clear();
+    bool upgraded_ids = false;
     if (json.contains("topics")) {
         for (const auto& topic_json : json["topics"]) {
             TopicState state;
             state.metadata.error_code = ErrorCode::NONE;
             state.metadata.name = topic_json.at("name").get<std::string>();
+            if (topic_json.contains("topic_id")) {
+                state.metadata.topic_id = topicIdFromJson(topic_json.at("topic_id"));
+            } else {
+                state.metadata.topic_id = legacyTopicId(cluster_id_, state.metadata.name);
+                upgraded_ids = true;
+            }
+            if (!topic_names_by_id_.emplace(state.metadata.topic_id, state.metadata.name).second) {
+                throw std::runtime_error("Duplicate persisted topic ID");
+            }
             state.metadata.is_internal = topic_json.value("is_internal", false);
             state.metadata.partitions.clear();
             for (const auto& partition_json : topic_json.at("partitions")) {
@@ -235,6 +282,10 @@ void MetadataStore::load() {
             }
             topics_[state.metadata.name] = std::move(state);
         }
+    }
+
+    if (upgraded_ids) {
+        persistLocked();
     }
 
     // 0A.4: re-register per-topic LogConfig overrides so logs created lazily
@@ -260,7 +311,11 @@ TopicOperationResult MetadataStore::applyCreate(const TopicSpecification& spec) 
     }
 
     TopicState state;
-    state.metadata = buildTopicMetadata(spec, brokers_, local_broker_id_);
+    state.metadata = buildTopicMetadata(spec, brokers_, local_broker_id_, cluster_id_);
+    if (topic_names_by_id_.contains(state.metadata.topic_id)) {
+        return TopicOperationResult::failure(ErrorCode::INVALID_REQUEST, "Topic ID already exists");
+    }
+    topic_names_by_id_.emplace(state.metadata.topic_id, spec.name);
     state.configs = spec.configs;
     topics_[spec.name] = state;
 
@@ -298,6 +353,7 @@ TopicOperationResult MetadataStore::applyDelete(const std::string& topic_name) {
         }
     }
 
+    topic_names_by_id_.erase(it->second.metadata.topic_id);
     topics_.erase(it);
     persistLocked();
     Logger::info("Deleted topic {}", topic_name);
@@ -491,6 +547,15 @@ std::vector<TopicMetadata> MetadataStore::describeTopics(
     return result;
 }
 
+std::optional<TopicMetadata> MetadataStore::topicById(const std::array<uint8_t, 16>& id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto name = topic_names_by_id_.find(id);
+    if (name == topic_names_by_id_.end()) {
+        return std::nullopt;
+    }
+    return topics_.at(name->second).metadata;
+}
+
 std::vector<BrokerMetadata> MetadataStore::brokers() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return brokers_;
@@ -611,6 +676,7 @@ void MetadataStore::persistLocked() const {
     for (const auto& [name, state] : topics_) {
         nlohmann::json topic_json;
         topic_json["name"] = name;
+        topic_json["topic_id"] = state.metadata.topic_id;
         topic_json["is_internal"] = state.metadata.is_internal;
         topic_json["configs"] = state.configs;
         topic_json["partitions"] = nlohmann::json::array();
@@ -674,6 +740,7 @@ std::string MetadataStore::computeChecksum() const {
         const auto& state = topics_.at(name);
         nlohmann::json topic_json;
         topic_json["name"] = name;
+        topic_json["topic_id"] = state.metadata.topic_id;
         topic_json["is_internal"] = state.metadata.is_internal;
 
         // Add partitions in sorted order
