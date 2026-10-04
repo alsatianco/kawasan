@@ -122,3 +122,10 @@ Kafka-generated header fixtures cover each transactional API at v2/v3, including
 flexible request and response tagged fields. Java verification requires actual
 v3 requests on API 24/25/26/28. The JVM leg has a 300-second execution limit;
 interrupted or incomplete result files fail the matrix gate.
+
+The final CM-4 local gates pass: native CTest 77/77; both Java profiles each
+11/11 against Kafka and Kawasan, both librdkafka profiles and the 3.x leg each
+4/4, Python 1/1; both Docker ecosystems 21/21. Every leg has zero skips and the
+failure allowlist is empty. Ecosystem `21_streams_eos.sh` tests confluent-kafka
+KIP-447 behavior; actual JVM Streams and Connect data-flow coverage belongs to
+CM-6 and M10 acceptance. Scheduled M9 nightlies remain a separate gate.
