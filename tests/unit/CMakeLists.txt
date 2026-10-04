@@ -214,3 +214,9 @@ add_test(NAME DelayedOperationPurgatoryTest COMMAND delayed_operation_purgatory_
 add_executable(log_open_failure_test log_open_failure_test.cpp)
 target_link_libraries(log_open_failure_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME LogOpenFailureTest COMMAND log_open_failure_test)
+
+add_executable(api_version_parity_test api_version_parity_test.cpp)
+target_link_libraries(api_version_parity_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+target_compile_definitions(api_version_parity_test PRIVATE
+    KAWASAN_WIRE_FIXTURES="${CMAKE_SOURCE_DIR}/tests/clients/fixtures/kafka-4.2-wire.json")
+add_test(NAME ApiVersionParityTest COMMAND api_version_parity_test)

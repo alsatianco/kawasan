@@ -14,19 +14,21 @@ void DescribeGroupsRequest::encode(Buffer& buffer, int16_t api_version) const {
         buffer.writeInt32(static_cast<int32_t>(groups_.size()));
     }
     for (const auto& group : groups_) {
-        if (flex) buffer.writeCompactString(group);
-        else buffer.writeString(group);
+        if (flex)
+            buffer.writeCompactString(group);
+        else
+            buffer.writeString(group);
     }
     if (api_version >= 3) {
         buffer.writeInt8(include_authorized_operations_ ? 1 : 0);
     }
-    if (flex) buffer.writeEmptyTaggedFields();
+    if (flex)
+        buffer.writeEmptyTaggedFields();
 }
 
 void DescribeGroupsRequest::decode(Buffer& buffer, int16_t api_version) {
     const bool flex = api_version >= 5;
-    const int32_t group_count =
-        flex ? buffer.readCompactArrayLen() : buffer.readInt32();
+    const int32_t group_count = flex ? buffer.readCompactArrayLen() : buffer.readInt32();
     groups_.clear();
     groups_.reserve(group_count < 0 ? 0 : group_count);
     for (int32_t i = 0; i < group_count; ++i) {
@@ -37,7 +39,8 @@ void DescribeGroupsRequest::decode(Buffer& buffer, int16_t api_version) {
     } else {
         include_authorized_operations_ = false;
     }
-    if (flex) buffer.skipTaggedFields();
+    if (flex)
+        buffer.skipTaggedFields();
 }
 
 void DescribeGroupsResponse::encode(Buffer& buffer, int16_t api_version) const {
@@ -72,6 +75,7 @@ void DescribeGroupsResponse::encode(Buffer& buffer, int16_t api_version) const {
         for (const auto& member : group.members) {
             if (flex) {
                 buffer.writeCompactString(member.member_id);
+                buffer.writeCompactNullableString(member.group_instance_id);
                 buffer.writeCompactString(member.client_id);
                 buffer.writeCompactString(member.client_host);
                 buffer.writeCompactBytes(member.member_metadata);
@@ -79,6 +83,9 @@ void DescribeGroupsResponse::encode(Buffer& buffer, int16_t api_version) const {
                 buffer.writeEmptyTaggedFields();
             } else {
                 buffer.writeString(member.member_id);
+                if (api_version >= 4) {
+                    buffer.writeNullableString(member.group_instance_id);
+                }
                 buffer.writeString(member.client_id);
                 buffer.writeString(member.client_host);
                 buffer.writeBytes(member.member_metadata);
@@ -89,9 +96,11 @@ void DescribeGroupsResponse::encode(Buffer& buffer, int16_t api_version) const {
         if (api_version >= 3) {
             buffer.writeInt32(group.authorized_operations);
         }
-        if (flex) buffer.writeEmptyTaggedFields();
+        if (flex)
+            buffer.writeEmptyTaggedFields();
     }
-    if (flex) buffer.writeEmptyTaggedFields();
+    if (flex)
+        buffer.writeEmptyTaggedFields();
 }
 
 void DescribeGroupsResponse::decode(Buffer& buffer, int16_t api_version) {
@@ -99,8 +108,7 @@ void DescribeGroupsResponse::decode(Buffer& buffer, int16_t api_version) {
     if (api_version >= 1) {
         throttle_time_ms_ = buffer.readInt32();
     }
-    const int32_t group_count =
-        flex ? buffer.readCompactArrayLen() : buffer.readInt32();
+    const int32_t group_count = flex ? buffer.readCompactArrayLen() : buffer.readInt32();
     groups_.clear();
     groups_.reserve(group_count < 0 ? 0 : group_count);
 
@@ -119,13 +127,13 @@ void DescribeGroupsResponse::decode(Buffer& buffer, int16_t api_version) {
             group.protocol_data = buffer.readString();
         }
 
-        const int32_t member_count =
-            flex ? buffer.readCompactArrayLen() : buffer.readInt32();
+        const int32_t member_count = flex ? buffer.readCompactArrayLen() : buffer.readInt32();
         group.members.reserve(member_count < 0 ? 0 : member_count);
         for (int32_t j = 0; j < member_count; ++j) {
             Member member;
             if (flex) {
                 member.member_id = buffer.readCompactString();
+                member.group_instance_id = buffer.readCompactNullableString();
                 member.client_id = buffer.readCompactString();
                 member.client_host = buffer.readCompactString();
                 member.member_metadata = buffer.readCompactBytes();
@@ -133,6 +141,9 @@ void DescribeGroupsResponse::decode(Buffer& buffer, int16_t api_version) {
                 buffer.skipTaggedFields();
             } else {
                 member.member_id = buffer.readString();
+                if (api_version >= 4) {
+                    member.group_instance_id = buffer.readNullableString();
+                }
                 member.client_id = buffer.readString();
                 member.client_host = buffer.readString();
                 member.member_metadata = buffer.readBytesWithLength();
@@ -144,10 +155,12 @@ void DescribeGroupsResponse::decode(Buffer& buffer, int16_t api_version) {
         if (api_version >= 3) {
             group.authorized_operations = buffer.readInt32();
         }
-        if (flex) buffer.skipTaggedFields();
+        if (flex)
+            buffer.skipTaggedFields();
         groups_.push_back(std::move(group));
     }
-    if (flex) buffer.skipTaggedFields();
+    if (flex)
+        buffer.skipTaggedFields();
 }
 
 }  // namespace kawasan::protocol

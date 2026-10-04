@@ -43,3 +43,17 @@ Never use this setting for acceptance.
 These checks prove client behavior against a single broker. Cluster acceptance
 still requires the recovery harness and M9 scheduled nightlies; clustering
 remains experimental.
+
+Wire regression fixtures are emitted by Kafka 4.2's generated codecs in
+[WireFixtures.java](../tests/clients/java/src/main/java/WireFixtures.java),
+independent of Kawasan. Regenerate with:
+
+```bash
+bash tests/clients/java/generate-fixtures.sh tests/clients/fixtures/kafka-4.2-wire.json
+ctest --test-dir build -R ApiVersionParityTest --output-on-failure
+```
+
+DescribeGroups v4/v5 responses include the nullable static-member instance ID
+between member ID and client ID, as required by the
+[Kafka schema](https://github.com/apache/kafka/blob/4.2.0/clients/src/main/resources/common/message/DescribeGroupsResponse.json).
+This field must be encoded even for dynamic members (as null).

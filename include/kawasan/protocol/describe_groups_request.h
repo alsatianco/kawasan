@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,7 @@ class DescribeGroupsResponse {
 public:
     struct Member {
         std::string member_id;
+        std::optional<std::string> group_instance_id;  // v4+
         std::string client_id;
         std::string client_host;
         std::vector<uint8_t> member_metadata;
@@ -55,9 +57,7 @@ public:
 
     DescribeGroupsResponse() = default;
 
-    void setThrottleTimeMs(int32_t throttle_time_ms) {
-        throttle_time_ms_ = throttle_time_ms;
-    }
+    void setThrottleTimeMs(int32_t throttle_time_ms) { throttle_time_ms_ = throttle_time_ms; }
     void setGroups(const std::vector<Group>& groups) { groups_ = groups; }
 
     int32_t throttleTimeMs() const { return throttle_time_ms_; }

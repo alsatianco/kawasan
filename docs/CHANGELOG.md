@@ -8,6 +8,10 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-04
 
+- Fix DescribeGroups v4/v5 static-member instance-ID encoding and decoding.
+  Kafka-generated golden bytes cover null and named instances; Java AdminClient
+  can now describe active consumer groups without a parser failure.
+
 - Add the Java 3.9.1/4.2.0 and two-version librdkafka client matrix, retaining
   kafka-python as a baseline. Each leg verifies Kafka before Kawasan and
   retains evidence. The strict result gate rejects skips, incomplete runs,
