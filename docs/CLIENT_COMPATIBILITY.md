@@ -93,3 +93,9 @@ patterns. Socket tests verify advertised caps, real partition sizes and stored
 literal ACL filtering. DescribeLogDirs bounds every array level before allocating.
 ACL storage remains local and in memory until CM-9; this version change adds no
 persistence or cluster authorization guarantee.
+
+Transactional mutation APIs require a producer initialized with InitProducerId.
+An unmapped ID or unknown/empty transaction returns INVALID_PRODUCER_ID_MAPPING;
+an unequal epoch returns INVALID_PRODUCER_EPOCH. Socket regressions cover all
+four APIs and confirm rejected requests preserve the valid transaction. Version
+caps remain at v0 until CM-4's wire and group-generation validation are complete.

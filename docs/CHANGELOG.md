@@ -8,6 +8,10 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-04
 
+- Require the initialized producer ID and exact epoch on all four transactional
+  mutation APIs. Reject future epochs, unmapped producer IDs and unknown/empty
+  transaction IDs; AddPartitions/AddOffsets no longer fabricate producer identity.
+
 - Advertise and dispatch DescribeLogDirs v1 and DescribeAcls v1 after Kafka
   golden and socket checks. Modern Java AdminClient can read partition sizes
   and literal ACL filters. Bound DescribeLogDirs arrays before allocation.

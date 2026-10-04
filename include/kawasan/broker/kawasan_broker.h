@@ -195,11 +195,9 @@ private:
     /// `producer_id` at/after `from_offset` — the idempotency guard that stops
     /// crash-recovery re-drive from writing a duplicate marker.
     bool logHasControlBatchForProducer(storage::Log* log, int64_t producer_id, Offset from_offset);
-    /// @brief M2: true if `req_epoch` is older than the coordinator's stored
-    /// epoch for `transactional_id` — the request is from a fenced (zombie)
-    /// producer and must be rejected with INVALID_PRODUCER_EPOCH. False if the
-    /// txn is unknown (nothing to fence yet).
-    bool txnEpochFenced(const std::string& transactional_id, int16_t req_epoch);
+    /// @brief Require an initialized transaction's exact producer ID and epoch.
+    ErrorCode validateTxnProducer(const std::string& transactional_id, int64_t producer_id,
+                                  int16_t producer_epoch);
     /// @brief M2: background loop that auto-aborts Ongoing transactions past
     /// their transaction.timeout.ms so a hung producer never blocks
     /// read_committed consumers forever.

@@ -1169,14 +1169,16 @@ void KawasanBroker::persistTxnState(const std::string& transactional_id) {
     }
 }
 
-bool KawasanBroker::txnEpochFenced(const std::string& transactional_id, int16_t req_epoch) {
+ErrorCode KawasanBroker::validateTxnProducer(const std::string& transactional_id,
+                                             int64_t producer_id, int16_t producer_epoch) {
     if (!transaction_coordinator_ || transactional_id.empty())
-        return false;
-    auto snap = transaction_coordinator_->describe(transactional_id);
-    // Unknown txn: nothing to fence (it is auto-registered at this epoch).
-    if (!snap.has_value())
-        return false;
-    return req_epoch < snap->producer_epoch;
+        return ErrorCode::INVALID_PRODUCER_ID_MAPPING;
+    const auto snapshot = transaction_coordinator_->describe(transactional_id);
+    if (!snapshot || snapshot->producer_id != producer_id)
+        return ErrorCode::INVALID_PRODUCER_ID_MAPPING;
+    if (snapshot->producer_epoch != producer_epoch)
+        return ErrorCode::INVALID_PRODUCER_EPOCH;
+    return ErrorCode::NONE;
 }
 
 void KawasanBroker::transactionSweepLoop() {
@@ -5645,9 +5647,7 @@ Buffer KawasanBroker::handleAddPartitionsToTxn(RequestDispatcher::RequestContext
     const ErrorCode txn_error =
         !isCoordinatorFor(req.transactionalId(), protocol::CoordinatorType::TRANSACTION)
             ? ErrorCode::NOT_COORDINATOR
-        : txnEpochFenced(req.transactionalId(), req.producerEpoch())
-            ? ErrorCode::INVALID_PRODUCER_EPOCH
-            : ErrorCode::NONE;
+            : validateTxnProducer(req.transactionalId(), req.producerId(), req.producerEpoch());
     if (txn_error != ErrorCode::NONE) {
         protocol::AddPartitionsToTxnResponse resp;
         resp.setThrottleTimeMs(0);
@@ -5665,16 +5665,8 @@ Buffer KawasanBroker::handleAddPartitionsToTxn(RequestDispatcher::RequestContext
         return encodeResponse(context,
                               [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
     }
-    // Phase 3.3: register the txn in the coordinator (idempotent — if
-    // already registered, it stays) and record the participating
-    // partitions so EndTxn can later emit control records to them.
+    // Only InitProducerId can establish a transaction's producer identity.
     if (transaction_coordinator_ && !req.transactionalId().empty()) {
-        // Don't reset state if the txn is already known.
-        if (!transaction_coordinator_->describe(req.transactionalId()).has_value()) {
-            transaction_coordinator_->recordInitProducerId(req.transactionalId(), req.producerId(),
-                                                           req.producerEpoch(),
-                                                           /*timeout=*/60000);
-        }
         // M1: capture each partition's first_offset (current log end) so it
         // can be persisted and replayed to re-arm the LSO hold after a crash.
         std::vector<TransactionCoordinator::TxnPartition> partitions;
@@ -5733,9 +5725,7 @@ Buffer KawasanBroker::handleAddOffsetsToTxn(RequestDispatcher::RequestContext& c
     const ErrorCode txn_error =
         !isCoordinatorFor(req.transactionalId(), protocol::CoordinatorType::TRANSACTION)
             ? ErrorCode::NOT_COORDINATOR
-        : txnEpochFenced(req.transactionalId(), req.producerEpoch())
-            ? ErrorCode::INVALID_PRODUCER_EPOCH
-            : ErrorCode::NONE;
+            : validateTxnProducer(req.transactionalId(), req.producerId(), req.producerEpoch());
     if (txn_error != ErrorCode::NONE) {
         protocol::AddOffsetsToTxnResponse resp;
         resp.setThrottleTimeMs(0);
@@ -5750,11 +5740,6 @@ Buffer KawasanBroker::handleAddOffsetsToTxn(RequestDispatcher::RequestContext& c
     // was a no-op that returned NONE without registering anything, so a Streams
     // EOS commit silently skipped the offsets-partition step.
     if (transaction_coordinator_ && !req.transactionalId().empty()) {
-        if (!transaction_coordinator_->describe(req.transactionalId()).has_value()) {
-            transaction_coordinator_->recordInitProducerId(req.transactionalId(), req.producerId(),
-                                                           req.producerEpoch(),
-                                                           /*timeout=*/60000);
-        }
         // Route the group to its __consumer_offsets partition (same routing
         // as offset-commit mirroring and FindCoordinator).
         const int32_t target =
@@ -5791,34 +5776,33 @@ Buffer KawasanBroker::handleEndTxn(RequestDispatcher::RequestContext& context) {
         return encodeResponse(
             context, [&](Buffer& buffer) { response.encode(buffer, context.header.apiVersion()); });
     }
-    if (transaction_coordinator_ && !req.transactionalId().empty()) {
-        // M2: fence a stale-epoch (zombie) producer.
-        if (txnEpochFenced(req.transactionalId(), req.producerEpoch())) {
-            end_error = ErrorCode::INVALID_PRODUCER_EPOCH;
+    const auto identity_error =
+        validateTxnProducer(req.transactionalId(), req.producerId(), req.producerEpoch());
+    if (identity_error != ErrorCode::NONE) {
+        end_error = identity_error;
+    } else {
+        auto snap = transaction_coordinator_->describe(req.transactionalId());
+        if (!snap.has_value()) {
+            end_error = ErrorCode::INVALID_TXN_STATE;
+        } else if (snap->state != TransactionCoordinator::State::Ongoing) {
+            // M2: the txn is not Ongoing — e.g. the timeout sweep already
+            // aborted it, or it's already terminal. A commit/abort here
+            // can't proceed; tell the client so it doesn't assume success.
+            end_error = ErrorCode::INVALID_TXN_STATE;
         } else {
-            auto snap = transaction_coordinator_->describe(req.transactionalId());
-            if (!snap.has_value()) {
-                end_error = ErrorCode::INVALID_TXN_STATE;
-            } else if (snap->state != TransactionCoordinator::State::Ongoing) {
-                // M2: the txn is not Ongoing — e.g. the timeout sweep already
-                // aborted it, or it's already terminal. A commit/abort here
-                // can't proceed; tell the client so it doesn't assume success.
-                end_error = ErrorCode::INVALID_TXN_STATE;
+            std::vector<TransactionCoordinator::TxnPartition> participating;
+            if (req.committed()) {
+                participating = transaction_coordinator_->prepareCommit(req.transactionalId());
             } else {
-                std::vector<TransactionCoordinator::TxnPartition> participating;
-                if (req.committed()) {
-                    participating = transaction_coordinator_->prepareCommit(req.transactionalId());
-                } else {
-                    participating = transaction_coordinator_->prepareAbort(req.transactionalId());
-                }
-                // Step 1: persist the Prepare snapshot (durable before markers).
-                persistTxnState(req.transactionalId());
-                // Step 2: complete the transaction (emit markers, apply/discard
-                // offsets, update the isolation tracker). Shared with replay.
-                finishTxnCompletion(req.transactionalId(), req.producerId(), req.producerEpoch(),
-                                    req.committed(), participating, snap->pending_offsets,
-                                    /*is_replay=*/false);
+                participating = transaction_coordinator_->prepareAbort(req.transactionalId());
             }
+            // Step 1: persist the Prepare snapshot (durable before markers).
+            persistTxnState(req.transactionalId());
+            // Step 2: complete the transaction (emit markers, apply/discard
+            // offsets, update the isolation tracker). Shared with replay.
+            finishTxnCompletion(req.transactionalId(), req.producerId(), req.producerEpoch(),
+                                req.committed(), participating, snap->pending_offsets,
+                                /*is_replay=*/false);
         }
     }
     protocol::EndTxnResponse resp;
@@ -5838,9 +5822,7 @@ Buffer KawasanBroker::handleTxnOffsetCommit(RequestDispatcher::RequestContext& c
     const ErrorCode txn_error =
         !isCoordinatorFor(req.transactionalId(), protocol::CoordinatorType::TRANSACTION)
             ? ErrorCode::NOT_COORDINATOR
-        : txnEpochFenced(req.transactionalId(), req.producerEpoch())
-            ? ErrorCode::INVALID_PRODUCER_EPOCH
-            : ErrorCode::NONE;
+            : validateTxnProducer(req.transactionalId(), req.producerId(), req.producerEpoch());
     if (txn_error != ErrorCode::NONE) {
         protocol::TxnOffsetCommitResponse resp;
         resp.setThrottleTimeMs(0);

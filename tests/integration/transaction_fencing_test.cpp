@@ -158,6 +158,41 @@ ErrorCode endTxn(asio::ip::tcp::socket& s, int32_t corr, const std::string& txn,
     return static_cast<ErrorCode>(resp.readInt16());
 }
 
+ErrorCode txnOperation(asio::ip::tcp::socket& socket, ApiKey key, int32_t corr,
+                       const std::string& txn, int64_t pid, int16_t epoch) {
+    Buffer payload = header(key, 0, corr);
+    payload.writeString(txn);
+    if (key == ApiKey::TXN_OFFSET_COMMIT)
+        payload.writeString("mapping-group");
+    payload.writeInt64(pid);
+    payload.writeInt16(epoch);
+    if (key == ApiKey::ADD_OFFSETS_TO_TXN)
+        payload.writeString("mapping-group");
+    else if (key == ApiKey::END_TXN)
+        payload.writeInt8(1);
+    else {
+        payload.writeInt32(1);
+        payload.writeString("mapping-topic");
+        payload.writeInt32(1);
+        payload.writeInt32(0);
+        if (key == ApiKey::TXN_OFFSET_COMMIT) {
+            payload.writeInt64(42);
+            payload.writeInt16(-1);
+        }
+    }
+    Buffer response(roundTrip(socket, payload));
+    ResponseHeader response_header;
+    response_header.decode(response);
+    response.readInt32();
+    if (key == ApiKey::ADD_PARTITIONS_TO_TXN || key == ApiKey::TXN_OFFSET_COMMIT) {
+        EXPECT_EQ(response.readInt32(), 1);
+        response.readString();
+        EXPECT_EQ(response.readInt32(), 1);
+        response.readInt32();
+    }
+    return static_cast<ErrorCode>(response.readInt16());
+}
+
 asio::ip::tcp::socket connect(asio::io_context& io, uint16_t port) {
     asio::ip::tcp::socket s(io);
     s.connect(asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), port));
@@ -224,6 +259,43 @@ TEST(TransactionFencingTest, HungTransactionIsAutoAbortedByTimeout) {
     EXPECT_EQ(endTxn(s, 3, txn, init.producer_id, init.producer_epoch, /*committed=*/true),
               ErrorCode::INVALID_TXN_STATE);
 
+    broker.stop();
+    std::filesystem::remove_all(dir);
+}
+
+TEST(TransactionFencingTest, EveryTxnApiRejectsWrongProducerAndFutureEpoch) {
+    ensureLogger();
+    const auto dir = makeLogDir();
+    kawasan::broker::KawasanBroker broker(makeConfig(dir, 10000));
+    broker.start();
+    asio::io_context io;
+    auto socket = connect(io, static_cast<uint16_t>(broker.port()));
+    int corr = 1;
+    for (ApiKey key : {ApiKey::ADD_PARTITIONS_TO_TXN, ApiKey::ADD_OFFSETS_TO_TXN, ApiKey::END_TXN,
+                       ApiKey::TXN_OFFSET_COMMIT}) {
+        SCOPED_TRACE(static_cast<int>(key));
+        const auto txn = "mapping-" + std::to_string(static_cast<int>(key));
+        const auto initialized = initProducerId(socket, corr++, txn, 60000);
+        ASSERT_EQ(initialized.error, ErrorCode::NONE);
+        ASSERT_EQ(addPartitions(socket, corr++, txn, initialized.producer_id,
+                                initialized.producer_epoch, "mapping-topic", 0),
+                  ErrorCode::NONE);
+        EXPECT_EQ(txnOperation(socket, key, corr++, txn, initialized.producer_id + 1000,
+                               initialized.producer_epoch),
+                  ErrorCode::INVALID_PRODUCER_ID_MAPPING);
+        EXPECT_EQ(txnOperation(socket, key, corr++, txn, initialized.producer_id,
+                               initialized.producer_epoch + 1),
+                  ErrorCode::INVALID_PRODUCER_EPOCH);
+        EXPECT_EQ(txnOperation(socket, key, corr++, "unknown-" + txn, initialized.producer_id,
+                               initialized.producer_epoch),
+                  ErrorCode::INVALID_PRODUCER_ID_MAPPING);
+        EXPECT_EQ(txnOperation(socket, key, corr++, "", initialized.producer_id,
+                               initialized.producer_epoch),
+                  ErrorCode::INVALID_PRODUCER_ID_MAPPING);
+        EXPECT_EQ(
+            endTxn(socket, corr++, txn, initialized.producer_id, initialized.producer_epoch, true),
+            ErrorCode::NONE);
+    }
     broker.stop();
     std::filesystem::remove_all(dir);
 }
