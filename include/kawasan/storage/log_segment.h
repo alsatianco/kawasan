@@ -27,7 +27,7 @@ public:
     LogSegment& operator=(LogSegment&&) noexcept;
 
     /// @brief Appends a record batch to the segment
-    /// @param batch The record batch to append
+    /// @param batch The record batch to append; baseOffset must equal nextOffset.
     /// @param sync If true, fsync the write (RocksDB WriteOptions.sync) before
     ///        returning so the record is durable across a power loss. If false,
     ///        the write is WAL-buffered only. Defaults to true (durability-first).

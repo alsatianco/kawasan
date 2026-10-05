@@ -8,6 +8,10 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-05
 
+- Validate stored batch offset spans and header/key identity during recovery.
+  Propagate RocksDB iterator errors so a corrupt table cannot reopen as an
+  empty segment. Reject mismatched segment append offsets before writing.
+
 - Allow follower catch-up across committed compaction gaps using the current
   leader's Fetch high watermark. Open a segment at the leader-assigned base to
   preserve offsets; reject ordinary/uncommitted gaps and keep follower HW

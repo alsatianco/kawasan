@@ -146,8 +146,16 @@ void LogSegment::open() {
         last_offset = decodeOffsetKey(key_str);
         std::vector<uint8_t> bytes(value.begin(), value.end());
         RecordBatch batch = RecordBatch::deserialize(bytes);
+        if (!batch.hasValidOffsetSpan() || batch.baseOffset() != last_offset)
+            throw StorageException(ErrorCode::CORRUPT_MESSAGE,
+                                   "Invalid stored record batch offset span or key in " + path_);
         last_batch_span = batch.offsetSpan();
     }
+
+    if (!it->status().ok())
+        throw StorageException(
+            ErrorCode::KAFKA_STORAGE_ERROR,
+            "Failed to scan log segment " + path_ + ": " + it->status().ToString());
 
     if (size_bytes_ > 0) {
         next_offset_ = last_offset + last_batch_span;
@@ -163,9 +171,10 @@ Offset LogSegment::append(const RecordBatch& batch, bool sync) {
         throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR, "Cannot append to closed segment");
     }
 
-    if (!batch.hasValidOffsetSpan() || next_offset_ < 0 ||
+    if (batch.baseOffset() != next_offset_ || !batch.hasValidOffsetSpan() || next_offset_ < 0 ||
         next_offset_ > std::numeric_limits<Offset>::max() - batch.offsetSpan())
-        throw StorageException(ErrorCode::CORRUPT_MESSAGE, "Invalid record batch offset span");
+        throw StorageException(ErrorCode::CORRUPT_MESSAGE,
+                               "Invalid record batch offset span or base");
 
     Offset offset = next_offset_;
 

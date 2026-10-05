@@ -1,18 +1,22 @@
 #include "kawasan/storage/log_segment.h"
 
 #include <gtest/gtest.h>
+#include <rocksdb/db.h>
+#include <rocksdb/options.h>
 
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <thread>
 #include <vector>
 
 #include "../sparse_record_batch.h"
 #include "kawasan/common/error.h"
 #include "kawasan/common/logger.h"
+#include "kawasan/common/rocksdb_compat.h"
 #include "kawasan/storage/record_batch.h"
 
 namespace kawasan::storage {
@@ -373,6 +377,98 @@ TEST_F(LogSegmentTest, SparseSpanNearOffsetLimitRejectsOverflowBeforeWriting) {
     EXPECT_THROW(segment.append(makeTestBatch(maximum, {"overflow"})), StorageException);
     EXPECT_EQ(segment.nextOffset(), maximum);
     EXPECT_EQ(segment.size(), before);
+}
+
+TEST_F(LogSegmentTest, RejectsPersistedInvalidSpansAndMismatchedOffsetKeys) {
+    const auto maximum = std::numeric_limits<Offset>::max();
+    struct InvalidBatch {
+        Offset key;
+        Offset wire_base;
+        int32_t last_delta;
+    };
+    const std::vector<InvalidBatch> invalid = {{0, 0, -2},
+                                               {0, 0, -1},
+                                               {0, 0, 1},
+                                               {0, 0, 8},
+                                               {0, -1, 9},
+                                               {0, 1, 9},
+                                               {maximum - 5, maximum - 5, 9}};
+    for (size_t index = 0; index < invalid.size(); ++index) {
+        SCOPED_TRACE(index);
+        const auto& fixture = invalid[index];
+        const auto path = test_dir_ + "/persisted-invalid-" + std::to_string(index);
+        {
+            LogSegment segment(fixture.key, path);
+            segment.close();
+        }
+        {
+            // Model an old writer or damaged offset metadata without invalidating
+            // CRC. The production append guard must not sanitize the fixture.
+            rocksdb::Options options;
+            std::unique_ptr<rocksdb::DB> db;
+            ASSERT_TRUE(openRocksDb(options, path, db).ok());
+            const auto bytes =
+                test_support::sparseBatch(fixture.wire_base, fixture.last_delta).serialize();
+            Buffer key;
+            key.writeInt64(fixture.key);
+            rocksdb::WriteOptions write_options;
+            write_options.sync = true;
+            ASSERT_TRUE(
+                db->Put(write_options,
+                        rocksdb::Slice(reinterpret_cast<const char*>(key.data()), key.size()),
+                        rocksdb::Slice(reinterpret_cast<const char*>(bytes.data()), bytes.size()))
+                    .ok());
+        }
+        EXPECT_THROW({ LogSegment reopened(fixture.key, path); }, StorageException);
+    }
+}
+
+TEST_F(LogSegmentTest, CorruptSstCannotReopenAsEmptySegment) {
+    const auto path = test_dir_ + "/corrupt-sst";
+    {
+        LogSegment segment(0, path);
+        segment.append(makeTestBatch(0, {"must-not-disappear"}));
+        segment.flush();
+        segment.close();
+    }
+    std::filesystem::path table;
+    for (const auto& entry : std::filesystem::directory_iterator(path)) {
+        if (entry.path().extension() == ".sst") {
+            table = entry.path();
+            break;
+        }
+    }
+    ASSERT_FALSE(table.empty());
+    {
+        std::fstream stream(table, std::ios::binary | std::ios::in | std::ios::out);
+        ASSERT_TRUE(stream.good());
+        stream.seekg(10);
+        char byte;
+        stream.read(&byte, 1);
+        ASSERT_TRUE(stream.good());
+        byte ^= 1;
+        stream.seekp(10);
+        stream.write(&byte, 1);
+        ASSERT_TRUE(stream.good());
+    }
+    EXPECT_THROW({ LogSegment reopened(0, path); }, StorageException);
+}
+
+TEST_F(LogSegmentTest, RejectsWireBaseDifferentFromAssignedOffsetBeforeWriting) {
+    const auto path = test_dir_ + "/mismatched-append";
+    {
+        LogSegment segment(42, path);
+        for (Offset base : {0, 43, 100}) {
+            SCOPED_TRACE(base);
+            EXPECT_THROW(segment.append(makeTestBatch(base, {"wrong-offset"})), StorageException);
+            EXPECT_EQ(segment.nextOffset(), 42);
+            EXPECT_EQ(segment.size(), 0u);
+        }
+        ASSERT_EQ(segment.append(makeTestBatch(42, {"correct-offset"})), 42);
+        segment.close();
+    }
+    LogSegment reopened(42, path);
+    EXPECT_EQ(reopened.nextOffset(), 43);
 }
 
 }  // namespace kawasan::storage

@@ -235,6 +235,14 @@ leader covering every omitted offset. It opens a new segment at the wire base
 rather than relabeling the batch. Ordinary or uncommitted gaps still require
 reconciliation; replicated append never advances follower HW.
 
+Recovery validates each stored batch's span and verifies its header base against
+the RocksDB key before deriving LEO. Iterator read errors propagate instead of
+turning a corrupted table into an empty or partial recovered segment. Segment
+append requires the wire base to equal its assigned next offset and rejects a
+mismatch before writing. LogManager quarantines corrupt partition directories
+before creating a fresh log; M10's authoritative-log opening path still requires
+strict failure propagation before activation.
+
 Compaction uses only whole plain batches whose end is at or below HW. Both
 replacement references and deletion targets obey that boundary, so an
 uncommitted tail cannot erase committed state before election truncates it.
@@ -263,8 +271,9 @@ loading rather than being replaced silently.
 
 Upgrade all brokers of an experimental cluster together. Old binaries cannot
 apply the new UUID contract and would regenerate independent IDs. Legacy topics
-get a one-time identity change, so clients must refresh metadata. This groundwork
-does not yet advertise Fetch v13; its wire and handler prerequisites remain.
+get a one-time identity change, so clients must refresh metadata. The default `4.x`
+compatibility profile advertises Fetch v13 with UUID resolution; `3.x` caps Fetch
+at v12. See [API compatibility profiles](CONFIGURATION.md#protocol-compatibility).
 
 ### Configuration formats
 
