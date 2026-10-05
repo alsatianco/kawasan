@@ -7,10 +7,13 @@
 
 #include <chrono>
 #include <filesystem>
+#include <iostream>
 #include <string>
 #include <vector>
 
+#include "../sparse_record_batch.h"
 #include "kawasan/common/buffer.h"
+#include "kawasan/common/error.h"
 #include "kawasan/common/logger.h"
 #include "kawasan/storage/log.h"
 #include "kawasan/storage/record_batch.h"
@@ -70,6 +73,10 @@ protected:
         follower_dir_ = makeDir("follower");
     }
     void TearDown() override {
+        if (HasFailure()) {
+            std::cerr << "Retained sparse replica data: " << follower_dir_ << '\n';
+            return;
+        }
         for (const auto& d : {leader_dir_, follower_dir_}) {
             if (fs::exists(d))
                 fs::remove_all(d);
@@ -173,4 +180,36 @@ TEST_F(ReplicatedAppendTest, GapBatchIsRefused) {
     // Now the previously-gapped batch fits.
     EXPECT_EQ(follower.appendReplicatedBatch(batches[1]), Result::kAppended);
     EXPECT_EQ(follower.logEndOffset(), 4);
+}
+
+TEST_F(ReplicatedAppendTest, SparseWireSpanDefinesReplicaLeoDuplicateAndOverlap) {
+    {
+        Log follower("sparse", 0, follower_dir_);
+        const auto sparse = kawasan::test_support::sparseBatch();
+        ASSERT_EQ(follower.appendReplicatedBatch(sparse), Result::kAppended);
+        EXPECT_EQ(follower.logEndOffset(), 10);
+        EXPECT_EQ(follower.highWatermark(), 0);
+        EXPECT_EQ(follower.appendReplicatedBatch(sparse), Result::kDuplicate);
+        EXPECT_EQ(follower.appendReplicatedBatch(kawasan::test_support::sparseBatch(0, 11)),
+                  Result::kOverlap);
+        auto next = makeBatch({"next"});
+        next.setBaseOffset(10);
+        EXPECT_EQ(follower.appendReplicatedBatch(next), Result::kAppended);
+        EXPECT_EQ(follower.logEndOffset(), 11);
+        follower.close();
+    }
+    Log reopened("sparse", 0, follower_dir_);
+    EXPECT_EQ(reopened.logEndOffset(), 11);
+    EXPECT_EQ(reopened.highWatermark(), 0);
+}
+
+TEST_F(ReplicatedAppendTest, RejectsInvalidSparseSpanWithoutRegressingLeo) {
+    for (int32_t delta : {-2, -1, 1, 8}) {
+        SCOPED_TRACE(delta);
+        Log follower("invalid", 0, follower_dir_ + "/invalid-" + std::to_string(delta));
+        EXPECT_THROW(follower.appendReplicatedBatch(kawasan::test_support::sparseBatch(0, delta)),
+                     kawasan::StorageException);
+        EXPECT_EQ(follower.logEndOffset(), 0);
+        EXPECT_EQ(follower.highWatermark(), 0);
+    }
 }

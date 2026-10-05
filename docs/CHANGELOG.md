@@ -8,6 +8,11 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-05
 
+- Preserve sparse Kafka batch offset spans through append, reopen, reads, replica
+  overlap detection and suffix truncation. Reject invalid spans/offset overflow
+  before writing. Advance legacy transaction replay by the batch span so a large
+  sparse batch cannot hide a later snapshot across a read-chunk boundary.
+
 - Add strict, partition-scoped transaction replay below a captured high watermark
   for M10 acquisition. Validate record identity/routing and apply tombstones;
   refuse malformed committed state or missing local logs. Bound snapshot arrays

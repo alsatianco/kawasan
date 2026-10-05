@@ -6,6 +6,7 @@
 #include <zstd.h>
 
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 #include "kawasan/common/logger.h"
@@ -702,6 +703,21 @@ size_t RecordBatch::size() const {
 
 bool RecordBatch::isValid() const {
     return crc_ == computeCrc();
+}
+
+bool RecordBatch::hasValidOffsetSpan() const {
+    const Offset span = offsetSpan();
+    if (span <= 0 || base_offset_ < 0 || base_offset_ > std::numeric_limits<Offset>::max() - span)
+        return false;
+    Offset previous = -1;
+    for (size_t index = 0; index < records_.size(); ++index) {
+        const auto supplied = records_[index].offset_delta;
+        const Offset delta = supplied >= 0 ? supplied : static_cast<Offset>(index);
+        if (delta <= previous || delta >= span)
+            return false;
+        previous = delta;
+    }
+    return true;
 }
 
 uint32_t RecordBatch::computeCrc() const {

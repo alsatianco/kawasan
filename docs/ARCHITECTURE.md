@@ -225,6 +225,14 @@ Partition logs live under the directories named by `log.dirs`. Each topic-partit
 
 The directory for a partition is `<log.dirs>/<topic>-<partition>`; segment subdirectories are the base offset rendered as a plain decimal string. On startup `Log::loadSegments` scans the partition directory, parses each subdirectory name as a base offset, and reopens the segments in order. A new segment is rolled when the active segment exceeds `log.segment.bytes` (`LogConfig::segment_size`, default 1 GB) or, when enabled, the time bound `segment.ms` (`LogConfig::segment_ms`, default disabled). Retention (`retention.bytes` / time-based) and `cleanup.policy` (delete vs compact) are applied by the cleanup thread.
 
+A batch occupies `lastOffsetDelta + 1` assigned offsets, including holes left by
+compaction. Segment append, reopen, reads and whole-batch suffix truncation use
+that span rather than the retained record count. Appends reject invalid spans,
+unordered/out-of-range record deltas and offset overflow before writing. Replica
+duplicate/overlap checks use the same span. Gaps between separate compacted
+batches still require a replication policy before coordinator logs become
+authoritative.
+
 `leader-epoch-checkpoint` (`LeaderEpochCache`, M8-F) records which leader epoch began at which offset, in Kafka's text format: a version line, a count line, then `epoch start_offset` lines. `Log` drops epochs that begin at or after a suffix truncation and clamps the oldest epoch on prefix deletion. If the file is missing or unreadable, the log starts with no epoch history. That's the case for logs written before M8.
 
 The history is populated in multi-broker mode only. A broker that becomes a partition's leader, or is re-elected at a higher epoch, records the new epoch starting at its current log end (`ReplicaManager::reconcileReplica`). Followers record epoch boundaries from the `partition_leader_epoch` stamped on the batches they replicate (`Log::appendReplicatedBatch`). Leader appends (`appendBatch`, `append`) are stamped with the latest cached epoch. That field lies outside the batch CRC, as in Kafka. A single-node log never records an epoch, so its batches keep the `-1` stamp they always had.

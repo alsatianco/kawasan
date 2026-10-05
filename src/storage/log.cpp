@@ -238,13 +238,15 @@ Offset Log::appendBatch(RecordBatch batch, bool advance_high_watermark) {
 Log::ReplicaAppendResult Log::appendReplicatedBatch(const RecordBatch& batch) {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    if (!batch.hasValidOffsetSpan())
+        throw StorageException(ErrorCode::CORRUPT_MESSAGE, "Invalid replicated batch offset span");
     const Offset wire_base = batch.baseOffset();
     const Offset leo = endOffsetUnlocked();
     // Idempotent re-delivery: the leader may resend a batch the follower already
     // has (e.g. after a reconnect). Skip it — re-appending would double-key and
     // over-count the segment's next-offset.
     if (wire_base < leo) {
-        const Offset wire_end = wire_base + static_cast<Offset>(batch.records().size());
+        const Offset wire_end = wire_base + batch.offsetSpan();
         return wire_end > leo ? ReplicaAppendResult::kOverlap : ReplicaAppendResult::kDuplicate;
     }
     // A hole: the follower is missing offsets in [leo, wire_base). It must NOT

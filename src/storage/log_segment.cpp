@@ -1,5 +1,4 @@
 #include "kawasan/storage/log_segment.h"
-#include "kawasan/common/rocksdb_compat.h"
 
 #include <rocksdb/cache.h>
 #include <rocksdb/db.h>
@@ -8,11 +7,13 @@
 #include <rocksdb/table.h>
 
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <utility>
 
 #include "kawasan/common/error.h"
 #include "kawasan/common/logger.h"
+#include "kawasan/common/rocksdb_compat.h"
 
 namespace kawasan::storage {
 
@@ -136,7 +137,7 @@ void LogSegment::open() {
     size_bytes_ = 0;
     next_offset_ = base_offset_;
     Offset last_offset = base_offset_;
-    size_t last_batch_records = 0;
+    Offset last_batch_span = 0;
 
     for (it->SeekToFirst(); it->Valid(); it->Next()) {
         std::string key_str = it->key().ToString();
@@ -145,11 +146,11 @@ void LogSegment::open() {
         last_offset = decodeOffsetKey(key_str);
         std::vector<uint8_t> bytes(value.begin(), value.end());
         RecordBatch batch = RecordBatch::deserialize(bytes);
-        last_batch_records = batch.records().size();
+        last_batch_span = batch.offsetSpan();
     }
 
     if (size_bytes_ > 0) {
-        next_offset_ = last_offset + static_cast<Offset>(last_batch_records);
+        next_offset_ = last_offset + last_batch_span;
     }
 
     Logger::info("Opened log segment at {} with base offset {}", path_, base_offset_);
@@ -161,6 +162,10 @@ Offset LogSegment::append(const RecordBatch& batch, bool sync) {
     if (closed_) {
         throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR, "Cannot append to closed segment");
     }
+
+    if (!batch.hasValidOffsetSpan() || next_offset_ < 0 ||
+        next_offset_ > std::numeric_limits<Offset>::max() - batch.offsetSpan())
+        throw StorageException(ErrorCode::CORRUPT_MESSAGE, "Invalid record batch offset span");
 
     Offset offset = next_offset_;
 
@@ -183,7 +188,7 @@ Offset LogSegment::append(const RecordBatch& batch, bool sync) {
     }
 
     size_bytes_ += data.size();
-    next_offset_ += batch.records().size();
+    next_offset_ += batch.offsetSpan();
 
     return offset;
 }
@@ -206,7 +211,7 @@ std::optional<RecordBatch> LogSegment::read(Offset offset) {
     auto batch = RecordBatch::deserialize(data);
 
     Offset batch_base = decodeOffsetKey(it->key().ToString());
-    Offset batch_end = batch_base + static_cast<Offset>(batch.records().size());
+    Offset batch_end = batch_base + batch.offsetSpan();
 
     // Verify the requested offset actually falls within this batch
     if (offset < batch_base || offset >= batch_end) {
@@ -252,7 +257,7 @@ std::vector<uint8_t> LogSegment::readRaw(Offset start_offset, size_t max_bytes) 
         // only for the boundary check; downstream gets the raw bytes.
         std::vector<uint8_t> bytes(value.data(), value.data() + value.size());
         auto batch_check = RecordBatch::deserialize(bytes);
-        const Offset batch_end = batch_base + static_cast<Offset>(batch_check.records().size());
+        const Offset batch_end = batch_base + batch_check.offsetSpan();
         if (batch_end <= start_offset) {
             it->Next();
             continue;
@@ -295,7 +300,7 @@ std::vector<RecordBatch> LogSegment::read(Offset start_offset, size_t max_bytes)
         auto batch = RecordBatch::deserialize(data);
 
         // Skip this batch if it ends entirely before the requested start_offset
-        Offset batch_end = batch_base + static_cast<Offset>(batch.records().size());
+        Offset batch_end = batch_base + batch.offsetSpan();
         if (batch_end <= start_offset) {
             it->Next();
             continue;
@@ -397,7 +402,7 @@ Offset LogSegment::truncateTo(Offset target) {
     std::vector<std::string> keys;
     size_t freed = 0;
 
-    // A batch that straddles `target` (base < target < base + record_count).
+    // A batch that straddles `target` (base < target < base + offset_span).
     {
         std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(rocksdb::ReadOptions()));
         it->SeekForPrev(encodeOffsetKey(target));
@@ -407,7 +412,7 @@ Offset LogSegment::truncateTo(Offset target) {
             if (base < target) {
                 auto batch =
                     RecordBatch::deserialize(std::vector<uint8_t>(value.begin(), value.end()));
-                if (base + static_cast<Offset>(batch.records().size()) > target) {
+                if (base + batch.offsetSpan() > target) {
                     keys.push_back(it->key().ToString());
                     freed += value.size();
                 }
@@ -435,7 +440,7 @@ Offset LogSegment::truncateTo(Offset target) {
         const Offset base = decodeOffsetKey(last->key().ToString());
         const std::string value = last->value().ToString();
         auto batch = RecordBatch::deserialize(std::vector<uint8_t>(value.begin(), value.end()));
-        next_offset_ = base + static_cast<Offset>(batch.records().size());
+        next_offset_ = base + batch.offsetSpan();
     } else {
         next_offset_ = base_offset_;
     }

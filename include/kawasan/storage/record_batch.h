@@ -20,6 +20,8 @@ public:
     uint32_t crc() const { return crc_; }
     int16_t attributes() const { return attributes_; }
     int32_t lastOffsetDelta() const { return last_offset_delta_; }
+    /// Number of assigned offsets, including holes left by compaction.
+    Offset offsetSpan() const { return static_cast<Offset>(last_offset_delta_) + 1; }
     Timestamp firstTimestamp() const { return first_timestamp_; }
     Timestamp maxTimestamp() const { return max_timestamp_; }
     int64_t producerId() const { return producer_id_; }
@@ -64,6 +66,8 @@ public:
 
     // Validation
     bool isValid() const;
+    /// Validate offset span and ordered record deltas independently of CRC.
+    bool hasValidOffsetSpan() const;
     uint32_t computeCrc() const;
 
     /// @brief Phase EX-10: build a control batch carrying a COMMIT or

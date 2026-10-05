@@ -7,12 +7,14 @@
 // state restored faithfully.
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <iostream>
 #include <memory>
 #include <string>
 
+#include "../sparse_record_batch.h"
 #include "kawasan/broker/isolation_tracker.h"
 #include "kawasan/broker/transaction_coordinator.h"
 #include "kawasan/broker/transaction_state_manager.h"
@@ -350,4 +352,40 @@ TEST_F(TxnRecoveryTest, ScopedReplayRejectsKeysInTheWrongPartition) {
     record.value = TransactionStateManager::serialize(*tc.describe(id));
     lm.getOrCreateLog(TransactionStateManager::kTopic, 0)->append({record}, true);
     EXPECT_THROW(tsm.loadCommittedPartition(0), std::runtime_error);
+}
+
+TEST_F(TxnRecoveryTest, SparseSnapshotBatchReplaysAcrossChunkBoundary) {
+    LogManager lm(dir_);
+    TransactionStateManager tsm(&lm, 1);
+    TransactionCoordinator tc;
+    tc.recordInitProducerId("large", 100, 0, 60000);
+    tc.addPartitions("large", {{"input", 0, 0}});
+    tc.stagePendingOffsets("large",
+                           {{"group", "input", 0, 9, std::string(8 * 1024 * 1024, 'm'), 17}});
+    tc.recordInitProducerId("updated", 101, 0, 60000);
+    RecordBatch batch;
+    int32_t delta = 2;
+    for (const std::string id : {"large", "updated"}) {
+        kawasan::Record record;
+        record.key = std::vector<uint8_t>(id.begin(), id.end());
+        record.value = TransactionStateManager::serialize(*tc.describe(id));
+        record.offset_delta = delta;
+        batch.addRecord(record);
+        delta = 9;
+    }
+    auto* log = lm.getOrCreateLog(TransactionStateManager::kTopic, 0);
+    ASSERT_EQ(log->appendReplicatedBatch(kawasan::test_support::batchWithWireSpan(batch, 9)),
+              kawasan::storage::Log::ReplicaAppendResult::kAppended);
+    ASSERT_EQ(log->logEndOffset(), 10);
+    tc.recordInitProducerId("updated", 101, 1, 60000);
+    tsm.persist(*tc.describe("updated"));
+    for (bool committed : {false, true}) {
+        const auto snapshots = committed ? tsm.loadCommittedPartition(0) : tsm.loadAll();
+        ASSERT_EQ(snapshots.size(), 2u);
+        const auto updated = std::find_if(snapshots.begin(), snapshots.end(), [](const auto& s) {
+            return s.transactional_id == "updated";
+        });
+        ASSERT_NE(updated, snapshots.end());
+        EXPECT_EQ(updated->producer_epoch, 1);
+    }
 }

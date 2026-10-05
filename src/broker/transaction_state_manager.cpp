@@ -191,8 +191,7 @@ std::vector<TransactionCoordinator::TxnSnapshot> TransactionStateManager::loadAl
                 break;
             Offset next = off;
             for (const auto& batch : batches) {
-                next = std::max(next,
-                                batch.baseOffset() + static_cast<Offset>(batch.records().size()));
+                next = std::max(next, batch.baseOffset() + batch.offsetSpan());
                 for (const auto& rec : batch.records()) {
                     if (!rec.value)
                         continue;
