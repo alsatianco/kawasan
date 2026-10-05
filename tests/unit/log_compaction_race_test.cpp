@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <iostream>
 #include <map>
 #include <string>
 #include <thread>
@@ -63,6 +64,10 @@ protected:
     void SetUp() override { ensureLoggerInitialized(); }
 
     void TearDown() override {
+        if (HasFailure()) {
+            std::cerr << "Retained compaction data: " << test_dir_ << '\n';
+            return;
+        }
         if (!test_dir_.empty() && std::filesystem::exists(test_dir_)) {
             std::filesystem::remove_all(test_dir_);
         }
@@ -151,6 +156,96 @@ TEST_F(LogCompactionRaceTest, CompactionDropsSupersededBatchesInRolledSegments) 
     ASSERT_EQ(surviving.count(2), 1u) << "latest value must always survive";
     EXPECT_EQ(surviving[2], "v3");
     EXPECT_EQ(log.logEndOffset(), 3);
+}
+
+TEST_F(LogCompactionRaceTest, UncommittedReplacementCannotEraseCommittedValue) {
+    test_dir_ = makeTestDir("uncommitted-replacement");
+    LogConfig config;
+    config.cleanup_policy_compact = true;
+    config.cleanup_policy_delete = false;
+    config.segment_size = 1;
+    config.flush_mode = FlushMode::kAsync;
+    Log log("coordinator-state", 0, test_dir_, config);
+    log.append({makeKeyedRecord("id", "committed")});
+    log.appendBatch(makeKeyedBatch(1, "id", "uncommitted"), false);
+    ASSERT_EQ(log.highWatermark(), 1);
+    log.cleanup();
+    log.truncateSuffix(1);  // election discards the uncommitted replacement
+    auto batches = log.read(0, 1024);
+    ASSERT_EQ(batches.size(), 1u);
+    EXPECT_EQ(valueToString(batches.front().records().front()), "committed");
+}
+
+TEST_F(LogCompactionRaceTest, BatchCrossingWatermarkCannotSupersedeOrBeDeleted) {
+    test_dir_ = makeTestDir("partial-watermark");
+    LogConfig config;
+    config.cleanup_policy_compact = true;
+    config.cleanup_policy_delete = false;
+    config.segment_size = 1;
+    config.flush_mode = FlushMode::kAsync;
+    Log log("partial-state", 0, test_dir_, config);
+    log.append({makeKeyedRecord("id", "old")});
+    RecordBatch partial;
+    partial.addRecord(makeKeyedRecord("id", "partial-1"));
+    partial.addRecord(makeKeyedRecord("id", "partial-2"));
+    log.appendBatch(partial, false);
+    log.appendBatch(makeKeyedBatch(3, "id", "tail"), false);
+    log.setHighWatermark(2);  // inside the middle batch, whose end is 3
+    log.cleanup();
+    auto batches = log.read(0, 4096);
+    ASSERT_EQ(batches.size(), 3u);
+    EXPECT_EQ(batches[0].baseOffset(), 0);
+    EXPECT_EQ(batches[1].baseOffset(), 1);
+    EXPECT_EQ(batches[1].records().size(), 2u);
+}
+
+TEST_F(LogCompactionRaceTest, TransactionalReplacementCannotErasePlainCommittedValue) {
+    test_dir_ = makeTestDir("transactional-replacement");
+    LogConfig config;
+    config.cleanup_policy_compact = true;
+    config.cleanup_policy_delete = false;
+    config.segment_size = 1;
+    config.flush_mode = FlushMode::kAsync;
+    Log log("transactional-state", 0, test_dir_, config);
+    log.append({makeKeyedRecord("id", "plain")});
+    auto pending = makeKeyedBatch(1, "id", "pending");
+    pending.setAttributes(1 << 4);
+    pending.setProducerId(17);
+    pending.setProducerEpoch(0);
+    log.appendBatch(pending);
+    log.appendBatch(RecordBatch::makeControlBatch(17, 0, 2, false, 0));
+    log.cleanup();
+    auto batches = log.read(0, 4096);
+    ASSERT_EQ(batches.size(), 3u);
+    EXPECT_EQ(valueToString(batches[0].records()[0]), "plain");
+    EXPECT_TRUE(batches[1].isTransactional());
+    EXPECT_TRUE(batches[2].isControlBatch());
+}
+
+TEST_F(LogCompactionRaceTest, PreserveTransactionalDataAndEveryControlMarker) {
+    test_dir_ = makeTestDir("transactional-history");
+    LogConfig config;
+    config.cleanup_policy_compact = true;
+    config.cleanup_policy_delete = false;
+    config.segment_size = 1;
+    config.flush_mode = FlushMode::kAsync;
+    Log log("transactional-history", 0, test_dir_, config);
+    auto data = makeKeyedBatch(0, "id", "transactional");
+    data.setAttributes(1 << 4);
+    data.setProducerId(17);
+    data.setProducerEpoch(0);
+    log.appendBatch(data);
+    log.appendBatch(RecordBatch::makeControlBatch(17, 0, 1, true, 0));
+    log.appendBatch(RecordBatch::makeControlBatch(18, 0, 2, true, 0));
+    log.append({makeKeyedRecord("id", "later-plain")});
+    log.cleanup();
+    auto batches = log.read(0, 4096);
+    ASSERT_EQ(batches.size(), 4u);
+    EXPECT_TRUE(batches[0].isTransactional());
+    EXPECT_EQ(batches[1].producerId(), 17);
+    EXPECT_TRUE(batches[1].isControlBatch());
+    EXPECT_EQ(batches[2].producerId(), 18);
+    EXPECT_TRUE(batches[2].isControlBatch());
 }
 
 // Regression net: compaction loops concurrently with a producer forcing

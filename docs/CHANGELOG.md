@@ -8,6 +8,11 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-05
 
+- Restrict compaction to fully HW-committed plain batches. Uncommitted or
+  partially committed replacements cannot erase committed coordinator state.
+  Preserve transactional batches and every control marker until compaction can
+  determine transaction outcomes; those records no longer supersede plain data.
+
 - Preserve sparse Kafka batch offset spans through append, reopen, reads, replica
   overlap detection and suffix truncation. Reject invalid spans/offset overflow
   before writing. Advance legacy transaction replay by the batch span so a large

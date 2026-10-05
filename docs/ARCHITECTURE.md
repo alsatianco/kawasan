@@ -233,6 +233,13 @@ duplicate/overlap checks use the same span. Gaps between separate compacted
 batches still require a replication policy before coordinator logs become
 authoritative.
 
+Compaction uses only whole plain batches whose end is at or below HW. Both
+replacement references and deletion targets obey that boundary, so an
+uncommitted tail cannot erase committed state before election truncates it.
+Transactional data and control markers are preserved by compaction until a
+cleaner can determine transaction outcomes. This retains more history on
+transactional compacted topics; ordinary time/size retention is separate.
+
 `leader-epoch-checkpoint` (`LeaderEpochCache`, M8-F) records which leader epoch began at which offset, in Kafka's text format: a version line, a count line, then `epoch start_offset` lines. `Log` drops epochs that begin at or after a suffix truncation and clamps the oldest epoch on prefix deletion. If the file is missing or unreadable, the log starts with no epoch history. That's the case for logs written before M8.
 
 The history is populated in multi-broker mode only. A broker that becomes a partition's leader, or is re-elected at a higher epoch, records the new epoch starting at its current log end (`ReplicaManager::reconcileReplica`). Followers record epoch boundaries from the `partition_leader_epoch` stamped on the batches they replicate (`Log::appendReplicatedBatch`). Leader appends (`appendBatch`, `append`) are stamped with the latest cached epoch. That field lies outside the batch CRC, as in Kafka. A single-node log never records an epoch, so its batches keep the `-1` stamp they always had.

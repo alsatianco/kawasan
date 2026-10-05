@@ -565,11 +565,9 @@ void Log::cleanup() {
     }
 
     if (config_.cleanup_policy_compact && segments_.size() > 0) {
-        // Phase 3.2: production-grade streaming compaction.
-        //
         // Two-pass algorithm, bounded by unique-key count (not log size):
-        //   1. Build offset map: scan all non-active segments; for each
-        //      record key, record the highest offset where it appeared.
+        //   1. Build offset map from fully HW-committed plain batches, including
+        //      the active segment as a reference (never a deletion target).
         //   2. For each non-active segment, iterate batches; delete any
         //      batch whose every record is superseded by a later one for
         //      the same key, with tombstones preserved within
@@ -582,6 +580,17 @@ void Log::cleanup() {
         const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                    std::chrono::system_clock::now().time_since_epoch())
                                    .count();
+
+        // Replication commit is required before a replacement may erase an
+        // older value. HW alone does not imply transaction commit: preserve
+        // transactional data and control markers until an outcome-aware cleaner
+        // exists, both as deletion targets and as superseding references.
+        const Offset clean_end = high_watermark_;
+        const auto eligible = [clean_end](const RecordBatch& batch) {
+            return batch.hasValidOffsetSpan() &&
+                   batch.baseOffset() + batch.offsetSpan() <= clean_end &&
+                   !batch.isTransactional() && !batch.isControlBatch();
+        };
 
         // Pass 1: build offset map across all segments (active and non-active
         // both contribute the "latest" reference; we just don't delete from
@@ -597,13 +606,17 @@ void Log::cleanup() {
                 continue;
             }
             for (const auto& batch : batches) {
+                if (!eligible(batch))
+                    continue;
                 const Offset base = batch.baseOffset();
                 const auto& records = batch.records();
                 for (size_t i = 0; i < records.size(); ++i) {
                     if (!records[i].key)
                         continue;
                     std::string key(records[i].key->begin(), records[i].key->end());
-                    const Offset rec_offset = base + static_cast<Offset>(i);
+                    const Offset rec_offset =
+                        base + (records[i].offset_delta >= 0 ? records[i].offset_delta
+                                                             : static_cast<Offset>(i));
                     auto it = latest_offset.find(key);
                     if (it == latest_offset.end() || rec_offset > it->second) {
                         latest_offset[key] = rec_offset;
@@ -631,6 +644,8 @@ void Log::cleanup() {
                 continue;
             }
             for (const auto& batch : batches) {
+                if (!eligible(batch))
+                    continue;
                 const Offset base = batch.baseOffset();
                 const auto& records = batch.records();
                 bool keep = false;
@@ -641,7 +656,9 @@ void Log::cleanup() {
                         break;
                     }
                     std::string key(records[i].key->begin(), records[i].key->end());
-                    const Offset rec_offset = base + static_cast<Offset>(i);
+                    const Offset rec_offset =
+                        base + (records[i].offset_delta >= 0 ? records[i].offset_delta
+                                                             : static_cast<Offset>(i));
                     auto it = latest_offset.find(key);
                     if (it != latest_offset.end() && it->second == rec_offset) {
                         keep = true;
