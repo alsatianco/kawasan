@@ -28,6 +28,11 @@ public:
     MetadataStore(const MetadataStore&) = delete;
     MetadataStore& operator=(const MetadataStore&) = delete;
 
+    /// @brief Opt in before load; runtime activation remains gated in KawasanBroker.
+    void configureCoordinatorFormat(const CoordinatorFormat& expected, const std::string& log_dir);
+    TopicOperationResult applyCoordinatorFormat(const CoordinatorFormat& format);
+    std::optional<CoordinatorFormat> coordinatorFormat() const;
+
     /// @brief Loads metadata from disk (creates empty store if missing).
     void load();
 
@@ -122,7 +127,12 @@ private:
     BrokerMetadata local_broker_;
     storage::LogManager* log_manager_;
 
+    std::unique_ptr<CoordinatorFormatStorage> format_storage_;
+    std::optional<CoordinatorFormat> expected_format_;
+    std::optional<CoordinatorFormat> coordinator_format_;
+
     mutable std::mutex mutex_;
+    bool loaded_ = false;
     int64_t applied_index_ = 0;
     mutable int64_t persisted_applied_index_ = 0;
     std::vector<BrokerMetadata> brokers_;

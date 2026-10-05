@@ -224,3 +224,11 @@ add_test(NAME ApiVersionParityTest COMMAND api_version_parity_test)
 add_executable(topic_identity_test topic_identity_test.cpp)
 target_link_libraries(topic_identity_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME TopicIdentityTest COMMAND topic_identity_test)
+
+add_executable(coordinator_format_test coordinator_format_test.cpp)
+target_link_libraries(coordinator_format_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME CoordinatorFormatTest COMMAND coordinator_format_test)
+
+add_executable(group_state_manager_test group_state_manager_test.cpp)
+target_link_libraries(group_state_manager_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME GroupStateManagerTest COMMAND group_state_manager_test)

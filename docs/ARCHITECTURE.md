@@ -126,9 +126,10 @@ The orchestration layer. `KawasanBroker` constructs and wires every subsystem be
 | `TcpServer` (`network/`) | Boost.Asio TCP server: accepts connections across one or more acceptors, reads length-prefixed request frames, calls the dispatcher, and writes responses. Optionally TLS-wrapped for the Kafka protocol. |
 | `ReplicaManager` | Leader/follower bookkeeping and replication. Leader side: records each follower's fetch offset, computes the ISR-derived high watermark, tracks leader epochs, and proposes ISR shrink/expand from fetch recency (`computeIsrUpdate`). Follower side (multi-broker): the fetcher thread pulls batches from partition leaders via per-leader `PeerClient`s. In single-node mode this broker is always the leader for every partition. |
 | `PeerClient` | Minimal broker-to-broker Kafka client: replica Fetch (v4, `replica_id` = own broker id) and AlterPartition RPCs to peers. |
-| `MetadataController` | Applies metadata mutations through the Raft log (five commands: `CREATE_TOPIC`, `DELETE_TOPIC`, `UPDATE_ISR`, `INCREASE_PARTITIONS`, `UPDATE_LEADER`) and serves cached metadata back to handlers. |
+| `MetadataController` | Applies topic/config/ISR/leader mutations through Raft and serves cached metadata. Its opt-in M10 format declaration establishes the immutable coordinator storage contract. |
 | `MetadataStore` / `metadata_types.h` | Persistent and in-memory representation of cluster metadata (topics, partitions, brokers). |
 | `GroupCoordinator` | Consumer-group lifecycle: JoinGroup/SyncGroup/Heartbeat/LeaveGroup, rebalance generations, and member tracking. Persists group state and offsets through `OffsetManager`. |
+| `CoordinatorFormatStorage` / `GroupStateManager` | Staged M10 format admission, durable replica reservations and complete group/offset/pending records with committed partition replay. Broker activation and ownership integration remain pending. |
 | `OffsetManager` | RocksDB-backed consumer offset and group-metadata store. See [Consumer offset storage](#consumer-offset-storage). |
 | `TransactionCoordinator` | Transactional-producer and exactly-once support (InitProducerId with epoch fencing, AddPartitionsToTxn, two-phase EndTxn, TxnOffsetCommit). |
 | `TransactionStateManager` | Persists transaction snapshots to `__transaction_state` and replays them on startup. Its strict HW-bounded partition replay API is available for M10; acquisition integration is pending. |
@@ -249,8 +250,9 @@ the RocksDB key before deriving LEO. Iterator read errors propagate instead of
 turning a corrupted table into an empty or partial recovered segment. Segment
 append requires the wire base to equal its assigned next offset and rejects a
 mismatch before writing. LogManager quarantines corrupt partition directories
-before creating a fresh log; M10's authoritative-log opening path still requires
-strict failure propagation before activation.
+before creating a fresh log by default. Authoritative topics instead require
+existing databases and a valid HW checkpoint, propagating every failure without
+quarantine or replacement. Fresh replicas require explicit format admission.
 
 Compaction uses only whole plain batches whose end is at or below HW. Both
 replacement references and deletion targets obey that boundary, so an
@@ -556,4 +558,10 @@ The listen port is `monitoring.port`. It **defaults to 9094** (used by the dev, 
 
 The M10 coordinator storage and upgrade decision is recorded in
 [ADR 0001](adr/0001-replicated-coordinator-state.md); it is a design contract,
-not a claim that coordinator failover is implemented.
+not a claim that coordinator failover is implemented. Format-v1 declarations
+commit through Raft; a local manifest binds the version, cluster ID, routing and
+partition counts and durably reserves assigned fresh replicas before creation.
+Missing reserved sources and partial/legacy/mixed formats fail closed. Complete
+binary group identities, checkpoints, pending transactional offsets and tombstones
+can rebuild one committed partition image below HW. Runtime activation, safe
+acquisition/cache installation and ISR-committed writes are still required.

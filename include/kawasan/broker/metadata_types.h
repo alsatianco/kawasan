@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "kawasan/broker/coordinator_format.h"
 #include "kawasan/common/types.h"
 
 namespace kawasan::broker {
@@ -42,6 +43,7 @@ struct TopicOperationResult {
 
 /// @brief Metadata command types replicated via Raft.
 enum class MetadataCommandType {
+    DECLARE_COORDINATOR_FORMAT,
     CREATE_TOPIC,
     DELETE_TOPIC,
     UPDATE_ISR,
@@ -59,6 +61,7 @@ struct TopicConfigChange {
 /// @brief Command payload stored in the Raft log.
 struct MetadataCommand {
     MetadataCommandType type = MetadataCommandType::CREATE_TOPIC;
+    CoordinatorFormat coordinator_format;
     TopicSpecification topic_spec;
     std::string topic_name;
     std::array<uint8_t, 16> expected_topic_id{};

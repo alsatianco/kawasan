@@ -480,6 +480,14 @@ Multi-broker Raft replication is **not production-hardened**. Followers replicat
 - Use an odd broker count (3, 5) so Raft can form a majority.
 - Remember inter-broker Raft traffic is **plaintext** regardless of `raft.ssl.*` (see [Configuration essentials](#configuration-essentials)) — isolate it at the network layer.
 
+M10's [coordinator migration contract](adr/0001-replicated-coordinator-state.md)
+requires a verified fresh-cluster cutover for legacy clustered coordinator data.
+Format declaration/manifest primitives are present, but runtime activation is
+still gated. The current broker refuses a formatted store before opening legacy
+caches. Retain both metadata and partition data; do not remove a manifest or
+missing-source reservation to make startup succeed. Such removal does not rebuild
+authoritative state, and no automatic converter is provided.
+
 For production-grade durability today, run a single broker with synchronous writes (default) plus disciplined backups rather than relying on replication.
 
 ---

@@ -6,8 +6,10 @@ add_library(kawasan_broker OBJECT
     tcp_server.cpp
     request_dispatcher.cpp
     request_metrics.cpp
+    coordinator_format.cpp
     metadata_store.cpp
     metadata_controller.cpp
+    group_state_manager.cpp
     group_coordinator.cpp
     offset_manager.cpp
     replica_manager.cpp

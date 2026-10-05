@@ -219,13 +219,50 @@ MetadataStore::MetadataStore(std::string metadata_dir, std::string cluster_id,
       local_broker_(local_broker),
       log_manager_(log_manager) {}
 
+void MetadataStore::configureCoordinatorFormat(const CoordinatorFormat& expected,
+                                               const std::string& log_dir) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    expected.validate();
+    if (expected.cluster_id != cluster_id_ || format_storage_ || loaded_ || !topics_.empty() ||
+        applied_index_)
+        throw std::runtime_error("Coordinator format must match the cluster and precede load");
+    format_storage_ = std::make_unique<CoordinatorFormatStorage>(expected, log_dir, metadata_dir_);
+    expected_format_ = expected;
+    if (log_manager_) {
+        log_manager_->setAuthoritativeTopic("__consumer_offsets");
+        log_manager_->setAuthoritativeTopic("__transaction_state");
+    }
+}
+
+std::optional<CoordinatorFormat> MetadataStore::coordinatorFormat() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return coordinator_format_;
+}
+
+TopicOperationResult MetadataStore::applyCoordinatorFormat(const CoordinatorFormat& format) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    format.validate();
+    if (!expected_format_ || format != *expected_format_)
+        throw std::runtime_error("Coordinator declaration conflicts with configured mode/format");
+    if (!coordinator_format_ &&
+        (topics_.contains("__consumer_offsets") || topics_.contains("__transaction_state")))
+        throw std::runtime_error(
+            "Legacy coordinator metadata requires ADR 0001 fresh-cluster cutover");
+    format_storage_->admit(format);
+    coordinator_format_ = format;
+    persistLocked();
+    return {};
+}
+
 void MetadataStore::load() {
     std::lock_guard<std::mutex> lock(mutex_);
-    fs::create_directories(metadata_dir_);
-
     if (!fs::exists(metadata_file_)) {
+        if (format_storage_)
+            format_storage_->admit(std::nullopt);
+        fs::create_directories(metadata_dir_);
         brokers_.push_back(local_broker_);
         persistLocked();
+        loaded_ = true;
         Logger::info("Bootstrapped empty metadata store at {}", metadata_file_);
         return;
     }
@@ -238,6 +275,35 @@ void MetadataStore::load() {
 
     nlohmann::json json;
     in >> json;
+
+    // Validate the complete format contract before metadata upgrades or log/cache mutation.
+    std::optional<CoordinatorFormat> declaration;
+    if (json.contains("coordinator_format")) {
+        declaration = CoordinatorFormat::deserialize(json.at("coordinator_format").dump());
+        if (!format_storage_)
+            throw std::runtime_error("Formatted coordinator metadata requires replicated mode");
+    }
+    if (format_storage_) {
+        if (json.at("cluster_id").get<std::string>() != expected_format_->cluster_id)
+            throw std::runtime_error("Coordinator cluster ID changed");
+        for (const auto& topic : json.at("topics")) {
+            const auto name = topic.at("name").get<std::string>();
+            if (name != "__consumer_offsets" && name != "__transaction_state")
+                continue;
+            if (!declaration || topic.at("partitions").size() !=
+                                    static_cast<size_t>(expected_format_->partitionCount(name)))
+                throw std::runtime_error(
+                    "Legacy or changed coordinator partition metadata; see ADR 0001");
+            int32_t expected_partition = 0;
+            for (const auto& partition : topic.at("partitions"))
+                if (partition.at("partition").get<int64_t>() != expected_partition++)
+                    throw std::runtime_error("Coordinator partition identity changed");
+            if (topic.at("configs").value("cleanup.policy", "delete") != "compact")
+                throw std::runtime_error("Coordinator source requires compact-only retention");
+        }
+        format_storage_->admit(declaration);
+        coordinator_format_ = declaration;
+    }
 
     cluster_id_ = json.value("cluster_id", cluster_id_);
     applied_index_ = json.value("applied_index", int64_t{0});
@@ -300,11 +366,25 @@ void MetadataStore::load() {
         }
     }
 
+    loaded_ = true;
     Logger::info("Loaded {} topics from {}", topics_.size(), metadata_file_);
 }
 
 TopicOperationResult MetadataStore::applyCreate(const TopicSpecification& spec) {
     std::lock_guard<std::mutex> lock(mutex_);
+    const bool coordinator_topic =
+        spec.name == "__consumer_offsets" || spec.name == "__transaction_state";
+    if (format_storage_ && coordinator_topic &&
+        (!coordinator_format_ ||
+         spec.num_partitions != coordinator_format_->partitionCount(spec.name)))
+        return TopicOperationResult::failure(
+            ErrorCode::INVALID_REQUEST,
+            "Coordinator creation requires matching committed format/count");
+    if (format_storage_ && coordinator_topic &&
+        (!spec.configs.contains("cleanup.policy") ||
+         spec.configs.at("cleanup.policy") != "compact"))
+        return TopicOperationResult::failure(ErrorCode::INVALID_CONFIG,
+                                             "Coordinator source requires compact-only retention");
     auto validation = validateCreateLocked(spec);
     if (validation.error_code != ErrorCode::NONE) {
         return validation;
@@ -315,19 +395,25 @@ TopicOperationResult MetadataStore::applyCreate(const TopicSpecification& spec) 
     if (topic_names_by_id_.contains(state.metadata.topic_id)) {
         return TopicOperationResult::failure(ErrorCode::INVALID_REQUEST, "Topic ID already exists");
     }
-    topic_names_by_id_.emplace(state.metadata.topic_id, spec.name);
     state.configs = spec.configs;
-    topics_[spec.name] = state;
 
     // 0A.4: register the per-topic LogConfig (cleanup.policy, retention, etc.)
     // BEFORE creating the partition logs so the per-topic config takes effect.
     if (log_manager_) {
         log_manager_->configureTopic(spec.name, spec.configs);
         for (const auto& partition : state.metadata.partitions) {
-            log_manager_->getOrCreateLog(spec.name, partition.partition);
+            if (format_storage_ && coordinator_topic) {
+                if (std::find(partition.replicas.begin(), partition.replicas.end(),
+                              local_broker_id_) != partition.replicas.end())
+                    format_storage_->openReplica(*log_manager_, spec.name, partition.partition);
+            } else {
+                log_manager_->getOrCreateLog(spec.name, partition.partition);
+            }
         }
     }
 
+    topic_names_by_id_.emplace(state.metadata.topic_id, spec.name);
+    topics_[spec.name] = state;
     persistLocked();
     Logger::info("Created topic {} with {} partitions", spec.name, spec.num_partitions);
 
@@ -356,6 +442,10 @@ TopicOperationResult MetadataStore::applyConfigs(const MetadataCommand& command,
         return TopicOperationResult::failure(ErrorCode::UNKNOWN_TOPIC_OR_PARTITION,
                                              "Topic does not exist or was recreated");
     }
+    if (format_storage_ &&
+        (command.topic_name == "__consumer_offsets" || command.topic_name == "__transaction_state"))
+        return TopicOperationResult::failure(ErrorCode::INVALID_CONFIG,
+                                             "Coordinator source configs are fixed by the format");
     auto configs =
         command.replace_configs ? std::map<std::string, std::string>{} : it->second.configs;
     std::set<std::string> changed;
@@ -456,6 +546,10 @@ TopicOperationResult MetadataStore::applyConfigs(const MetadataCommand& command,
 
 TopicOperationResult MetadataStore::applyDelete(const std::string& topic_name) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (format_storage_ &&
+        (topic_name == "__consumer_offsets" || topic_name == "__transaction_state"))
+        return TopicOperationResult::failure(ErrorCode::INVALID_REQUEST,
+                                             "Coordinator format fixes topic identity/count");
 
     auto it = topics_.find(topic_name);
     if (it == topics_.end()) {
@@ -482,6 +576,10 @@ TopicOperationResult MetadataStore::applyDelete(const std::string& topic_name) {
 TopicOperationResult MetadataStore::applyIncreasePartitions(const std::string& topic_name,
                                                             int32_t new_total_count) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (format_storage_ &&
+        (topic_name == "__consumer_offsets" || topic_name == "__transaction_state"))
+        return TopicOperationResult::failure(ErrorCode::INVALID_REQUEST,
+                                             "Coordinator format fixes topic identity/count");
 
     auto it = topics_.find(topic_name);
     if (it == topics_.end()) {
@@ -774,6 +872,8 @@ void MetadataStore::ensureLocalBrokerLocked(const BrokerMetadata& broker) {
 void MetadataStore::persistLocked() const {
     nlohmann::json json;
     json["cluster_id"] = cluster_id_;
+    if (coordinator_format_)
+        json["coordinator_format"] = nlohmann::json::parse(coordinator_format_->serialize());
     json["brokers"] = nlohmann::json::array();
     for (const auto& broker : brokers_) {
         nlohmann::json broker_json;

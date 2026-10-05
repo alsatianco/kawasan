@@ -22,6 +22,15 @@ public:
     MetadataController(const MetadataController&) = delete;
     MetadataController& operator=(const MetadataController&) = delete;
 
+    void configureCoordinatorFormat(const CoordinatorFormat& format, const std::string& log_dir) {
+        store_.configureCoordinatorFormat(format, log_dir);
+        format_configured_ = true;
+    }
+    TopicOperationResult declareCoordinatorFormat(const CoordinatorFormat& format);
+    std::optional<CoordinatorFormat> coordinatorFormat() const {
+        return store_.coordinatorFormat();
+    }
+
     /// @brief Loads persisted metadata and installs commit hooks.
     void start();
 
@@ -99,6 +108,8 @@ private:
     // Indices whose waiter timed out; their eventual commit is dropped.
     std::unordered_set<int64_t> abandoned_;
     bool stopped_ = false;
+    bool format_configured_ = false;
+    std::atomic<bool> format_failed_{false};
 };
 
 }  // namespace kawasan::broker

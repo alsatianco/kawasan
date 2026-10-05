@@ -142,6 +142,28 @@ Log* LogManager::getOrCreateLog(const std::string& topic, PartitionId partition)
     }
 }
 
+Log* LogManager::initializeAuthoritativeLog(const std::string& topic, PartitionId partition) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    const TopicPartition tp{topic, partition};
+    const auto dir = getLogDir(topic, partition);
+    if (partition < 0 || !authoritative_topics_.contains(topic) || logs_.contains(tp) ||
+        fs::exists(dir)) {
+        throw StorageException(
+            ErrorCode::KAFKA_STORAGE_ERROR,
+            "Fresh authoritative initialization requires an absent source: " + dir);
+    }
+    auto config = default_config_;
+    if (auto it = topic_configs_.find(topic); it != topic_configs_.end())
+        config = it->second;
+    // Constructor persists the empty HW checkpoint. Flush the RocksDB source,
+    // then reopen through the same strict validation used on restart.
+    auto fresh = std::make_unique<Log>(topic, partition, dir, config);
+    fresh->flush();
+    fresh->close();
+    fresh.reset();
+    return registerLogLocked(tp, std::make_unique<Log>(topic, partition, dir, config, false));
+}
+
 Log* LogManager::registerLogLocked(const TopicPartition& tp, std::unique_ptr<Log> log) {
     if (recover_hw_to_log_end_ && !authoritative_topics_.contains(tp.topic)) {
         log->setHighWatermark(log->logEndOffset());

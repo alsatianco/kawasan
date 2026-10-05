@@ -1,8 +1,9 @@
 # Replicated coordinator state and the experimental-cluster upgrade boundary
 
-Status: accepted design for M10; strict committed-partition transaction replay
-and opt-in authoritative log opening implemented. Clustered format, acquisition
-integration and acceptance tests remain pending.
+Status: accepted design for M10. Strict committed-partition transaction/group
+replay, authoritative log opening, Raft format declarations and local manifests
+are implemented as opt-in primitives. Broker runtime activation, acquisition,
+ISR-committed persistence and failover acceptance remain pending.
 
 M10 will make committed `__consumer_offsets` and `__transaction_state` log
 records authoritative in clustered mode. Each new owner must rebuild only its
@@ -65,3 +66,22 @@ M10 remains gated on CM-1, CM-3 and CM-4 and must prove offset continuity,
 coordinator-kill recovery, cross-broker marker retries and transaction-mode chaos.
 The M9 seven-scheduled-nightly gate stays separate and clustering remains
 experimental while either acceptance gate is open.
+
+The format-v1 checkpoint uses `DECLARE_COORDINATOR_FORMAT` in the metadata Raft
+log and `metadata.dir/coordinator-format.json` locally. Its immutable fields are
+version, cluster ID, `java-byte-hash-unsigned-mod-v1` routing and the two internal
+topic partition counts. The manifest records replica reservations before fresh
+storage creation and fsyncs its directory after atomic replacement. Interrupted
+initialization, missing reserved sources and partial/mismatched declarations fail
+closed; deleting a cache cannot authorize fresh source creation. Only assigned
+local coordinator replicas are initialized when a formatted CREATE_TOPIC commits.
+Coordinator topic identities, counts and compact-only configs cannot be changed.
+
+`GroupStateManager` supplies versioned binary group identities (including static
+members and assignments), offsets, producer/epoch-scoped pending transactional
+offsets and exact-key tombstones. Partition replay reads only below captured HW,
+uses assigned offset spans and validates identities/routing before returning an
+image. A group deletion requires tombstones for all of its group/offset/pending
+keys. Ownership fencing, cache installation and committed writes are subsequent
+M10 work; these primitives do not activate replicated coordinator mode. The
+current broker refuses formatted stores before opening its legacy offset cache.

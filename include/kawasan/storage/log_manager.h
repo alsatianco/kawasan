@@ -75,6 +75,10 @@ public:
     /// @return Pointer to the log
     Log* getOrCreateLog(const std::string& topic, PartitionId partition);
 
+    /// @brief Explicit fresh-source initialization; requires authoritative policy
+    /// and an absent directory. The format admission caller durably reserves it first.
+    Log* initializeAuthoritativeLog(const std::string& topic, PartitionId partition);
+
     /// @brief Gets a log for the given topic-partition
     /// @param topic Topic name
     /// @param partition Partition ID

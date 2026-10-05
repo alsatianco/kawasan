@@ -29,6 +29,8 @@ void MetadataController::start() {
     }
     store_.load();
     if (raft_node_ && raft_node_->lastLogIndex() < store_.appliedIndex()) {
+        if (format_configured_)
+            throw std::runtime_error("Formatted coordinator metadata lost its Raft history");
         // The Raft log was replaced (e.g. its directory was wiped): its indexes
         // restart, so the store's applied index no longer refers to it.
         Logger::warn("Raft log ends at index {} but metadata was applied up to {}; resetting the "
@@ -53,6 +55,18 @@ void MetadataController::stop() {
         raft_node_->setCommitCallback(nullptr);
         commit_callback_installed_ = false;
     }
+}
+
+TopicOperationResult MetadataController::declareCoordinatorFormat(const CoordinatorFormat& format) {
+    format.validate();
+    if (!raft_node_) {
+        return TopicOperationResult::failure(ErrorCode::INVALID_REQUEST,
+                                             "Coordinator format requires a Raft commit");
+    }
+    MetadataCommand command;
+    command.type = MetadataCommandType::DECLARE_COORDINATOR_FORMAT;
+    command.coordinator_format = format;
+    return replicateAndAwait(command);
 }
 
 TopicOperationResult MetadataController::createTopic(const TopicSpecification& spec) {
@@ -141,6 +155,10 @@ TopicOperationResult MetadataController::increasePartitions(const std::string& t
 }
 
 TopicOperationResult MetadataController::replicateAndAwait(const MetadataCommand& command) {
+    if (format_failed_.load())
+        return TopicOperationResult::failure(
+            ErrorCode::KAFKA_STORAGE_ERROR,
+            "Coordinator format application failed; restart after repair");
     if (!raft_node_) {
         return applyCommand(command);
     }
@@ -201,6 +219,8 @@ TopicOperationResult MetadataController::replicateAndAwait(const MetadataCommand
 
 TopicOperationResult MetadataController::applyCommand(const MetadataCommand& command) {
     switch (command.type) {
+        case MetadataCommandType::DECLARE_COORDINATOR_FORMAT:
+            return store_.applyCoordinatorFormat(command.coordinator_format);
         case MetadataCommandType::CREATE_TOPIC:
             return store_.applyCreate(command.topic_spec);
         case MetadataCommandType::ALTER_CONFIGS:
@@ -224,7 +244,10 @@ TopicOperationResult MetadataController::applyCommand(const MetadataCommand& com
 
 std::vector<uint8_t> MetadataController::serializeCommand(const MetadataCommand& command) {
     nlohmann::json json;
-    if (command.type == MetadataCommandType::CREATE_TOPIC) {
+    if (command.type == MetadataCommandType::DECLARE_COORDINATOR_FORMAT) {
+        json["type"] = "coordinator_format";
+        json["format"] = nlohmann::json::parse(command.coordinator_format.serialize());
+    } else if (command.type == MetadataCommandType::CREATE_TOPIC) {
         json["type"] = "create";
         json["topic"]["name"] = command.topic_spec.name;
         json["topic"]["topic_id"] = command.topic_spec.topic_id;
@@ -274,7 +297,10 @@ MetadataCommand MetadataController::deserializeCommand(const std::vector<uint8_t
     auto json = nlohmann::json::parse(bytes.begin(), bytes.end());
     MetadataCommand command;
     auto type = json.at("type").get<std::string>();
-    if (type == "create") {
+    if (type == "coordinator_format") {
+        command.type = MetadataCommandType::DECLARE_COORDINATOR_FORMAT;
+        command.coordinator_format = CoordinatorFormat::deserialize(json.at("format").dump());
+    } else if (type == "create") {
         command.type = MetadataCommandType::CREATE_TOPIC;
         auto topic = json.at("topic");
         command.topic_spec.name = topic.at("name").get<std::string>();
@@ -365,7 +391,17 @@ void MetadataController::handleCommit(const raft::LogEntry& entry) {
         fulfillPending(entry.index, TopicOperationResult{});
         return;
     }
+    if (format_failed_.load()) {
+        fulfillPending(entry.index,
+                       TopicOperationResult::failure(ErrorCode::KAFKA_STORAGE_ERROR,
+                                                     "Coordinator format application failed"));
+        return;
+    }
+    const auto previous_index = store_.appliedIndex();
+    bool format_command = false;
     try {
+        format_command =
+            nlohmann::json::parse(entry.data).value("type", "") == "coordinator_format";
         auto command = deserializeCommand(entry.data);
         store_.setAppliedIndex(entry.index);
         auto result = applyCommand(command);
@@ -377,6 +413,10 @@ void MetadataController::handleCommit(const raft::LogEntry& entry) {
 
         fulfillPending(entry.index, result);
     } catch (const std::exception& ex) {
+        if (format_configured_ || format_command) {
+            store_.setAppliedIndex(previous_index);
+            format_failed_.store(true);
+        }
         Logger::error("Failed to apply metadata command at index {}: {}", entry.index, ex.what());
         TopicOperationResult failure;
         failure.error_code = ErrorCode::KAFKA_STORAGE_ERROR;

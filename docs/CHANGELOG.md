@@ -8,12 +8,21 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-05
 
+- Stage the M10 coordinator format-v1 contract: Raft-committed declarations,
+  fsynced local manifests and explicit fresh authoritative replica initialization.
+  Reject legacy/mixed/partial formats, routing/count changes and missing reserved
+  sources before replay or mutation. Add complete binary group/offset/pending
+  checkpoint records and HW-bounded partition replay with exact-key tombstones.
+  Keep broker activation gated until acquisition and ISR-committed writes exist;
+  the current runtime refuses formatted stores before opening legacy caches.
+
 - Add opt-in authoritative-topic opening to LogManager. Require existing segment
   databases and a valid high-watermark checkpoint; propagate corruption and
   environmental failures without quarantine or empty replacement. Preserve the
   stored committed prefix even when HW-to-LEO recovery is enabled. Refuse policy
-  changes after a topic is opened. Replicated coordinator format activation and
-  fresh-replica bootstrap remain pending; existing single-node behavior is unchanged.
+  changes after a topic is opened. Broker format activation remains pending;
+  explicit fresh-replica initialization is now
+  available through format admission. Existing single-node behavior is unchanged.
 
 - Recover sparse producer sequence ranges, including empty compacted batches,
   and traverse large batches during broker restart, promotion, transaction-marker

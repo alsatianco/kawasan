@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "kawasan/broker/acl_store.h"
+#include "kawasan/broker/coordinator_format.h"
 #include "kawasan/broker/coordinator_routing.h"
 #include "kawasan/broker/fetch_session_manager.h"
 #include "kawasan/broker/isolation_tracker.h"
@@ -196,6 +197,10 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
 
     log_dir_ = config_.get<std::string>("log.dirs", "/tmp/kawasan-logs");
     metadata_dir_ = config_.get<std::string>("metadata.dir", log_dir_ + "/meta");
+
+    // Format primitives are staged until replicated acquisition/appends exist.
+    // Reject mixed stores before OffsetManager, LogManager or Raft can mutate them.
+    CoordinatorFormatStorage::rejectFormattedLegacyRuntime(metadata_dir_);
 
     storage::LogConfig configured_log;
     const auto default_segment_bytes = static_cast<int64_t>(configured_log.segment_size);
