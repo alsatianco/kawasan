@@ -89,8 +89,8 @@ public:
     enum class ReplicaAppendResult {
         kAppended,   ///< batch written at its leader-assigned base offset
         kDuplicate,  ///< the whole batch lies below local LEO — already have it
-        kGap,        ///< wire base offset > local LEO — follower diverged; caller
-                     ///< must stop and reconcile with the leader
+        kGap,        ///< unapproved wire base offset > local LEO; caller must
+                     ///< stop and reconcile with the leader
         kOverlap,    ///< batch starts below local LEO but extends past it: our
                      ///< tail from its base differs (e.g. a truncation cut into a
                      ///< batch); caller truncates to the base and appends again
@@ -100,13 +100,17 @@ public:
     /// its leader-assigned base offset and WITHOUT advancing the high watermark.
     /// A follower's log must be offset-identical to the leader's, so — unlike
     /// appendBatch, which reassigns the base offset to the local LEO — this
-    /// requires the batch's wire base offset to equal the local log-end-offset
-    /// (strict contiguity), because the underlying segment keys the record at its
-    /// own next-offset. The high watermark is driven separately by the follower
-    /// adopting the leader's reported HW (setHighWatermark), never by this append.
+    /// requires contiguity unless a compacted log receives an explicit leader HW
+    /// covering the entire omitted range. An approved gap starts a new segment
+    /// at the wire base, preserving offsets. The high watermark is driven separately by the
+    /// follower adopting the leader's reported HW (setHighWatermark), never by this append.
     /// @param batch A batch already deserialized from the leader's fetched bytes
     ///        (its CRC was validated during deserialization).
-    ReplicaAppendResult appendReplicatedBatch(const RecordBatch& batch);
+    /// @param leader_high_watermark Optional gap authorization from a successful
+    ///        Fetch from the current, epoch-fenced leader. The caller must hold
+    ///        its partition write/ownership fence. -1 retains strict contiguity.
+    ReplicaAppendResult appendReplicatedBatch(const RecordBatch& batch,
+                                              Offset leader_high_watermark = -1);
 
     /// @brief Reads records from the log
     /// @param start_offset Starting offset
@@ -217,6 +221,7 @@ private:
 
     void loadSegments();
     void rollNewSegment();
+    void rollNewSegment(Offset base_offset);
     LogSegment* activeSegment();
     const LogSegment* activeSegment() const;
     bool shouldRollForTime() const;

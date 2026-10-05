@@ -213,3 +213,64 @@ TEST_F(ReplicatedAppendTest, RejectsInvalidSparseSpanWithoutRegressingLeo) {
         EXPECT_EQ(follower.highWatermark(), 0);
     }
 }
+
+TEST_F(ReplicatedAppendTest, CompactedGapRequiresExplicitLeaderCommitBound) {
+    kawasan::storage::LogConfig config;
+    config.cleanup_policy_compact = true;
+    config.cleanup_policy_delete = false;
+    auto batch = makeBatch({"after-gap"});
+    batch.setBaseOffset(5);
+    Log follower("compact", 0, follower_dir_, config);
+    EXPECT_EQ(follower.appendReplicatedBatch(batch), Result::kGap);
+    EXPECT_EQ(follower.appendReplicatedBatch(batch, 4), Result::kGap);
+    EXPECT_EQ(follower.logEndOffset(), 0);
+    EXPECT_EQ(follower.highWatermark(), 0);
+    // HW is an exclusive offset: HW=5 covers every omitted offset 0..4.
+    EXPECT_EQ(follower.appendReplicatedBatch(batch, 5), Result::kAppended);
+    EXPECT_EQ(follower.logEndOffset(), 6);
+    EXPECT_EQ(follower.highWatermark(), 0);
+    ASSERT_EQ(follower.read(0, 4096).size(), 1u);
+    EXPECT_EQ(follower.read(0, 4096)[0].baseOffset(), 5);
+    EXPECT_EQ(follower.appendReplicatedBatch(batch, 5), Result::kDuplicate);
+}
+
+TEST_F(ReplicatedAppendTest, OrdinaryTopicRejectsGapDespiteLeaderCommitBound) {
+    Log follower("ordinary", 0, follower_dir_);
+    auto batch = makeBatch({"missing-prefix"});
+    batch.setBaseOffset(5);
+    EXPECT_EQ(follower.appendReplicatedBatch(batch, 10), Result::kGap);
+    EXPECT_EQ(follower.logEndOffset(), 0);
+    EXPECT_EQ(follower.highWatermark(), 0);
+    EXPECT_TRUE(follower.read(0, 4096).empty());
+}
+
+TEST_F(ReplicatedAppendTest, CompactedGapPreservesPrefixAndOffsetsAcrossReopenAndTruncation) {
+    kawasan::storage::LogConfig config;
+    config.cleanup_policy_compact = true;
+    config.cleanup_policy_delete = false;
+    {
+        Log follower("compact", 0, follower_dir_, config);
+        ASSERT_EQ(follower.appendReplicatedBatch(makeBatch({"prefix"})), Result::kAppended);
+        auto gap = makeBatch({"after-gap"});
+        gap.setBaseOffset(5);
+        ASSERT_EQ(follower.appendReplicatedBatch(gap, 5), Result::kAppended);
+        auto next = makeBatch({"next"});
+        next.setBaseOffset(6);
+        ASSERT_EQ(follower.appendReplicatedBatch(next), Result::kAppended);
+        EXPECT_EQ(follower.logEndOffset(), 7);
+        follower.close();
+    }
+    Log reopened("compact", 0, follower_dir_, config);
+    EXPECT_EQ(reopened.logEndOffset(), 7);
+    EXPECT_EQ(reopened.highWatermark(), 0);
+    const auto raw = splitBatches(reopened.readRaw(0, 4096));
+    ASSERT_EQ(raw.size(), 3u);
+    EXPECT_EQ(raw[0].baseOffset(), 0);
+    EXPECT_EQ(raw[1].baseOffset(), 5);
+    EXPECT_EQ(raw[2].baseOffset(), 6);
+    EXPECT_EQ(reopened.truncateSuffix(6), 6);
+    EXPECT_EQ(reopened.truncateSuffix(5), 1);
+    const auto prefix = reopened.read(0, 4096);
+    ASSERT_EQ(prefix.size(), 1u);
+    EXPECT_EQ(prefix[0].baseOffset(), 0);
+}

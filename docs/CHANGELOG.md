@@ -8,6 +8,11 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-05
 
+- Allow follower catch-up across committed compaction gaps using the current
+  leader's Fetch high watermark. Open a segment at the leader-assigned base to
+  preserve offsets; reject ordinary/uncommitted gaps and keep follower HW
+  separate. Add a real three-broker pause/compact/catch-up regression.
+
 - Restrict compaction to fully HW-committed plain batches. Uncommitted or
   partially committed replacements cannot erase committed coordinator state.
   Preserve transactional batches and every control marker until compaction can

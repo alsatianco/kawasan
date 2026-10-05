@@ -437,8 +437,8 @@ bool ReplicaManager::fetchPartitionFromLeader(const FetchTask& task) {
     if (!broker_->isPartitionLeadership(task.tp, task.leader, task.leader_epoch))
         return true;
 
-    // Ingest the leader's raw batches, offset-preserved. Stop on a gap (the
-    // follower diverged; reconcile with the leader first).
+    // Ingest the current epoch-fenced leader's raw batches. Only a compacted
+    // log may cross holes covered by the leader's HW; other gaps reconcile.
     if (!result->record_batches.empty()) {
         Buffer buf(result->record_batches);
         while (buf.remaining() >= 12) {
@@ -450,12 +450,12 @@ bool ReplicaManager::fetchPartitionFromLeader(const FetchTask& task) {
                              task.tp.partition, e.what());
                 break;
             }
-            auto r = task.log->appendReplicatedBatch(batch);
+            auto r = task.log->appendReplicatedBatch(batch, result->high_watermark);
             if (r == storage::Log::ReplicaAppendResult::kOverlap) {
                 // Our tail from this batch's base differs from the leader's: the
                 // leader is authoritative, so take its whole batch.
                 task.log->truncateSuffix(batch.baseOffset());
-                r = task.log->appendReplicatedBatch(batch);
+                r = task.log->appendReplicatedBatch(batch, result->high_watermark);
             }
             if (r == storage::Log::ReplicaAppendResult::kGap) {
                 setEpochCheckPending(task, true);  // diverged; reconcile first
@@ -666,7 +666,7 @@ std::optional<std::vector<BrokerId>> ReplicaManager::computeIsrUpdate(const Topi
     }
     const auto& info = it->second;
     if (info.pending_isr)
-        return info.pending_isr; // An ambiguous RPC retries the same expansion safely.
+        return info.pending_isr;  // An ambiguous RPC retries the same expansion safely.
     const Offset hw =
         info.log ? std::max(info.log->highWatermark(), info.leadership_read_floor) : 0;
 

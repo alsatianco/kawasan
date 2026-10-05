@@ -50,6 +50,11 @@ add_executable(replica_fetch_test replica_fetch_test.cpp)
 target_link_libraries(replica_fetch_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME ReplicaFetchTest COMMAND replica_fetch_test)
 
+add_executable(compacted_replication_test compacted_replication_test.cpp)
+target_link_libraries(compacted_replication_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME CompactedReplicationTest COMMAND compacted_replication_test)
+set_tests_properties(CompactedReplicationTest PROPERTIES TIMEOUT 150)
+
 # M8-E2: Fetch / ListOffsets current_leader_epoch fencing
 add_executable(leader_epoch_fencing_test leader_epoch_fencing_test.cpp)
 target_link_libraries(leader_epoch_fencing_test PRIVATE kawasan GTest::gtest GTest::gtest_main)

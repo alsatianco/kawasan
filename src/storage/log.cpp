@@ -235,7 +235,8 @@ Offset Log::appendBatch(RecordBatch batch, bool advance_high_watermark) {
     return offset;
 }
 
-Log::ReplicaAppendResult Log::appendReplicatedBatch(const RecordBatch& batch) {
+Log::ReplicaAppendResult Log::appendReplicatedBatch(const RecordBatch& batch,
+                                                    Offset leader_high_watermark) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (!batch.hasValidOffsetSpan())
@@ -249,23 +250,26 @@ Log::ReplicaAppendResult Log::appendReplicatedBatch(const RecordBatch& batch) {
         const Offset wire_end = wire_base + batch.offsetSpan();
         return wire_end > leo ? ReplicaAppendResult::kOverlap : ReplicaAppendResult::kDuplicate;
     }
-    // A hole: the follower is missing offsets in [leo, wire_base). It must NOT
-    // append here — the segment would relabel the batch to `leo` and silently
-    // corrupt offsets. The fetcher stops and re-fetches from `leo` (leader-epoch
-    // truncation is M7); report the gap.
-    if (wire_base > leo) {
+    // Only the current leader's committed prefix on a compacted topic may
+    // authorize omitted offsets. Ordinary gaps and uncommitted holes still
+    // require reconciliation. Never key this batch at the old local LEO.
+    const bool gap = wire_base > leo;
+    if (gap && (!config_.cleanup_policy_compact || leader_high_watermark < wire_base)) {
         Logger::warn("Replicated append gap on {}-{}: wire base {} > local LEO {}", topic_,
                      partition_, wire_base, leo);
         return ReplicaAppendResult::kGap;
     }
 
     auto* segment = activeSegment();
-    if (shouldRollForTime() || (segment && segment->size() >= config_.segment_size)) {
+    if (gap) {
+        rollNewSegment(wire_base);
+        segment = activeSegment();
+    } else if (shouldRollForTime() || (segment && segment->size() >= config_.segment_size)) {
         rollNewSegment();
         segment = activeSegment();
     }
 
-    // Do NOT reassign the base offset: wire_base == leo == segment->nextOffset(),
+    // Do NOT reassign the base offset: wire_base == segment->nextOffset(),
     // so the segment keys the record at the leader's offset and it is preserved.
     // Do NOT advance the high watermark — a follower's HW is leader-driven.
     segment->append(batch, config_.flush_mode == FlushMode::kSync);
@@ -726,7 +730,10 @@ void Log::loadSegments() {
 }
 
 void Log::rollNewSegment() {
-    Offset base_offset = endOffsetUnlocked();
+    rollNewSegment(endOffsetUnlocked());
+}
+
+void Log::rollNewSegment(Offset base_offset) {
     std::string segment_path = log_dir_ + "/" + std::to_string(base_offset);
 
     if (!segments_.empty()) {

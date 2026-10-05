@@ -229,9 +229,11 @@ A batch occupies `lastOffsetDelta + 1` assigned offsets, including holes left by
 compaction. Segment append, reopen, reads and whole-batch suffix truncation use
 that span rather than the retained record count. Appends reject invalid spans,
 unordered/out-of-range record deltas and offset overflow before writing. Replica
-duplicate/overlap checks use the same span. Gaps between separate compacted
-batches still require a replication policy before coordinator logs become
-authoritative.
+duplicate/overlap checks use the same span. A follower may cross gaps between separate batches only on a compacted topic,
+with an explicit HW from a successful Fetch from the current epoch-fenced
+leader covering every omitted offset. It opens a new segment at the wire base
+rather than relabeling the batch. Ordinary or uncommitted gaps still require
+reconciliation; replicated append never advances follower HW.
 
 Compaction uses only whole plain batches whose end is at or below HW. Both
 replacement references and deletion targets obey that boundary, so an
