@@ -1,8 +1,8 @@
 # Replicated coordinator state and the experimental-cluster upgrade boundary
 
 Status: accepted design for M10; strict committed-partition transaction replay
-primitive implemented. Clustered format, acquisition integration and acceptance
-tests remain pending.
+and opt-in authoritative log opening implemented. Clustered format, acquisition
+integration and acceptance tests remain pending.
 
 M10 will make committed `__consumer_offsets` and `__transaction_state` log
 records authoritative in clustered mode. Each new owner must rebuild only its

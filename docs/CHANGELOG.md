@@ -8,6 +8,13 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-05
 
+- Add opt-in authoritative-topic opening to LogManager. Require existing segment
+  databases and a valid high-watermark checkpoint; propagate corruption and
+  environmental failures without quarantine or empty replacement. Preserve the
+  stored committed prefix even when HW-to-LEO recovery is enabled. Refuse policy
+  changes after a topic is opened. Replicated coordinator format activation and
+  fresh-replica bootstrap remain pending; existing single-node behavior is unchanged.
+
 - Recover sparse producer sequence ranges, including empty compacted batches,
   and traverse large batches during broker restart, promotion, transaction-marker
   recovery and timestamp scans. Wrap sequences without signed overflow; preserve

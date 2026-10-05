@@ -100,12 +100,16 @@ LogConfig LogConfig::fromMap(const std::map<std::string, std::string>& configs) 
 }
 
 Log::Log(const std::string& topic, PartitionId partition, const std::string& log_dir,
-         const LogConfig& config)
+         const LogConfig& config, bool create_if_missing)
     : topic_(topic), partition_(partition), log_dir_(log_dir), config_(config) {
-    // Create log directory if it doesn't exist
-    fs::create_directories(log_dir);
+    if (create_if_missing) {
+        fs::create_directories(log_dir);
+    } else if (!fs::is_directory(log_dir)) {
+        throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR,
+                               "Missing authoritative log directory: " + log_dir);
+    }
 
-    loadSegments();
+    loadSegments(create_if_missing);
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -115,7 +119,7 @@ Log::Log(const std::string& topic, PartitionId partition, const std::string& log
         }
     }
 
-    loadCheckpoint();
+    loadCheckpoint(!create_if_missing);
     epoch_cache_ = std::make_unique<LeaderEpochCache>(log_dir_ + "/leader-epoch-checkpoint");
     {
         // The log may have lost a tail the checkpoint still describes.
@@ -698,8 +702,12 @@ void Log::cleanup() {
     }
 }
 
-void Log::loadSegments() {
+void Log::loadSegments(bool create_if_missing) {
     if (!fs::exists(log_dir_)) {
+        if (!create_if_missing) {
+            throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR,
+                                   "Missing authoritative log directory: " + log_dir_);
+        }
         return;
     }
 
@@ -717,12 +725,17 @@ void Log::loadSegments() {
         }
     }
 
+    if (!create_if_missing && segment_paths.empty()) {
+        throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR,
+                               "Missing authoritative log segments: " + log_dir_);
+    }
+
     // Sort by base offset
     std::sort(segment_paths.begin(), segment_paths.end());
 
     // Load segments
     for (const auto& [base_offset, path] : segment_paths) {
-        segments_.push_back(std::make_unique<LogSegment>(base_offset, path));
+        segments_.push_back(std::make_unique<LogSegment>(base_offset, path, create_if_missing));
     }
     if (!segments_.empty()) {
         segments_.back()->setActive(true);
@@ -789,9 +802,9 @@ Offset Log::startOffsetUnlocked() const {
     return segments_.front()->baseOffset();
 }
 
-void Log::loadCheckpoint() {
+void Log::loadCheckpoint(bool strict) {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto checkpoint = readCheckpointFromDisk();
+    auto checkpoint = readCheckpointFromDisk(strict);
     const Offset start = startOffsetUnlocked();
     const Offset end = endOffsetUnlocked();
 
@@ -800,6 +813,13 @@ void Log::loadCheckpoint() {
         Offset stored_end;
         Offset stored_hw;
         std::tie(stored_start, stored_end, stored_hw) = *checkpoint;
+
+        if (strict && (stored_start < 0 || stored_end < stored_start || stored_hw < stored_start ||
+                       stored_hw > stored_end || stored_start != start || stored_end > end ||
+                       stored_hw < start || stored_hw > end)) {
+            throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR,
+                                   "Invalid authoritative log checkpoint: " + checkpointPath());
+        }
 
         if (stored_start != start || stored_end != end) {
             Logger::warn("Checkpoint mismatch for {}-{} (stored start={}, end={}, actual "
@@ -810,6 +830,10 @@ void Log::loadCheckpoint() {
         const Offset clamped_hw = std::clamp(stored_hw, start, end);
         high_watermark_ = clamped_hw;
     } else {
+        if (strict) {
+            throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR,
+                                   "Missing authoritative log checkpoint: " + checkpointPath());
+        }
         high_watermark_ = end;
     }
 
@@ -877,10 +901,15 @@ void Log::persistCheckpointLocked() const {
     }
 }
 
-std::optional<std::tuple<Offset, Offset, Offset>> Log::readCheckpointFromDisk() const {
+std::optional<std::tuple<Offset, Offset, Offset>> Log::readCheckpointFromDisk(bool strict) const {
     const std::string path = checkpointPath();
     std::ifstream in(path);
     if (!in.is_open()) {
+        if (strict) {
+            throw StorageException(
+                ErrorCode::KAFKA_STORAGE_ERROR,
+                "Cannot read authoritative log checkpoint " + path + ": " + std::strerror(errno));
+        }
         return std::nullopt;
     }
 
@@ -900,7 +929,16 @@ std::optional<std::tuple<Offset, Offset, Offset>> Log::readCheckpointFromDisk() 
         const auto key = line.substr(0, pos);
         const auto value_str = line.substr(pos + 1);
         try {
-            Offset value = std::stoll(value_str);
+            size_t consumed = 0;
+            Offset value = std::stoll(value_str, &consumed);
+            if (strict && consumed != value_str.size()) {
+                throw std::invalid_argument("Trailing checkpoint data");
+            }
+            if (strict &&
+                ((key == "log_start_offset" && saw_start) || (key == "log_end_offset" && saw_end) ||
+                 (key == "high_watermark" && saw_hw))) {
+                throw std::invalid_argument("Duplicate checkpoint entry");
+            }
             if (key == "log_start_offset") {
                 start = value;
                 saw_start = true;
@@ -912,12 +950,25 @@ std::optional<std::tuple<Offset, Offset, Offset>> Log::readCheckpointFromDisk() 
                 saw_hw = true;
             }
         } catch (const std::exception& ex) {
+            if (strict) {
+                throw StorageException(
+                    ErrorCode::KAFKA_STORAGE_ERROR,
+                    "Invalid authoritative log checkpoint " + path + ": " + ex.what());
+            }
             Logger::warn("Invalid checkpoint entry '{}' for {}-{}: {}", line, topic_, partition_,
                          ex.what());
         }
     }
 
+    if (strict && in.bad()) {
+        throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR,
+                               "Failed to read authoritative log checkpoint: " + path);
+    }
     if (!saw_start || !saw_end || !saw_hw) {
+        if (strict) {
+            throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR,
+                                   "Incomplete authoritative log checkpoint: " + path);
+        }
         return std::nullopt;
     }
 

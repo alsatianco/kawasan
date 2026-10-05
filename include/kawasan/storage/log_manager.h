@@ -10,6 +10,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "kawasan/common/types.h"
@@ -60,7 +61,15 @@ public:
     LogManager(LogManager&&) = delete;
     LogManager& operator=(LogManager&&) = delete;
 
-    /// @brief Gets or creates a log for the given topic-partition
+    /// @brief Require existing authoritative storage for every partition of a topic.
+    /// Set before opening any partition. The policy persists across closeAll(),
+    /// cannot be disabled, and applies to every getOrCreateLog call: missing or
+    /// corrupt sources propagate errors without quarantine or empty replacement.
+    /// Fresh replicas must be initialized explicitly by the format/bootstrap path.
+    void setAuthoritativeTopic(const std::string& topic);
+
+    /// @brief Gets or creates a log for the given topic-partition.
+    /// Authoritative topics only reopen existing, validated storage.
     /// @param topic Topic name
     /// @param partition Partition ID
     /// @return Pointer to the log
@@ -136,6 +145,7 @@ private:
     std::map<TopicPartition, std::unique_ptr<Log>> logs_;
     // 0A.4: per-topic config overrides (cleanup.policy etc. from CreateTopics).
     std::unordered_map<std::string, LogConfig> topic_configs_;
+    std::unordered_set<std::string> authoritative_topics_;
     mutable std::shared_mutex mutex_;  // Changed to shared_mutex for better concurrency
     Log::ChangeListener change_listener_;
     bool running_ = false;

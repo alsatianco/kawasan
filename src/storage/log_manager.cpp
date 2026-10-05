@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <thread>
 
+#include "kawasan/common/error.h"
 #include "kawasan/common/logger.h"
 
 namespace fs = std::filesystem;
@@ -43,6 +44,21 @@ bool isEnvironmentalOpenError(const std::string& what) {
 
 }  // namespace
 
+void LogManager::setAuthoritativeTopic(const std::string& topic) {
+    std::unique_lock<std::shared_mutex> write_lock(mutex_);
+    if (authoritative_topics_.contains(topic)) {
+        return;
+    }
+    for (const auto& [tp, _] : logs_) {
+        if (tp.topic == topic) {
+            throw StorageException(
+                ErrorCode::KAFKA_STORAGE_ERROR,
+                "Authoritative policy must be set before opening topic " + topic);
+        }
+    }
+    authoritative_topics_.insert(topic);
+}
+
 Log* LogManager::getOrCreateLog(const std::string& topic, PartitionId partition) {
     TopicPartition tp{topic, partition};
 
@@ -64,8 +80,8 @@ Log* LogManager::getOrCreateLog(const std::string& topic, PartitionId partition)
         return it->second.get();
     }
 
-    // Create new log. Opening may throw on corrupted on-disk state (handled
-    // by quarantining the directory) or on environmental errors (rethrown).
+    // Authoritative sources require existing storage and propagate all failures.
+    // Other topics retain quarantine/recreation for non-environmental failures.
     std::string log_dir = getLogDir(topic, partition);
     // 0A.4: prefer the per-topic config registered via setTopicConfig() so
     // that cleanup.policy and friends from CreateTopics are honored.
@@ -74,9 +90,10 @@ Log* LogManager::getOrCreateLog(const std::string& topic, PartitionId partition)
     if (cfg_it != topic_configs_.end()) {
         effective_config = cfg_it->second;
     }
+    const bool authoritative = authoritative_topics_.contains(topic);
     try {
         Log* log_ptr = registerLogLocked(
-            tp, std::make_unique<Log>(topic, partition, log_dir, effective_config));
+            tp, std::make_unique<Log>(topic, partition, log_dir, effective_config, !authoritative));
         Logger::info(
             "Created log for topic {} partition {} (cleanup.policy: {}{}{})", topic, partition,
             effective_config.cleanup_policy_delete ? "delete" : "",
@@ -86,11 +103,11 @@ Log* LogManager::getOrCreateLog(const std::string& topic, PartitionId partition)
             effective_config.cleanup_policy_compact ? "compact" : "");
         return log_ptr;
     } catch (const std::exception& ex) {
-        // Never destroy data on open failure. Environmental errors (RocksDB
-        // LOCK held by another process, fd exhaustion, permissions, full disk)
-        // must surface: "recovering" them would either wipe a healthy log or
-        // pull it out from under the process that holds it.
-        if (isEnvironmentalOpenError(ex.what())) {
+        // Authoritative failures never enter quarantine/recreation.
+        // Environmental errors (LOCK held, fd exhaustion, permissions, full disk)
+        // must also surface: "recovering" them would either wipe a healthy log
+        // or pull it out from under the process that holds it.
+        if (authoritative || isEnvironmentalOpenError(ex.what())) {
             Logger::error("Failed to open log for {}-{} at {}: {}", topic, partition, log_dir,
                           ex.what());
             throw;
@@ -126,7 +143,7 @@ Log* LogManager::getOrCreateLog(const std::string& topic, PartitionId partition)
 }
 
 Log* LogManager::registerLogLocked(const TopicPartition& tp, std::unique_ptr<Log> log) {
-    if (recover_hw_to_log_end_) {
+    if (recover_hw_to_log_end_ && !authoritative_topics_.contains(tp.topic)) {
         log->setHighWatermark(log->logEndOffset());
     }
     if (change_listener_) {

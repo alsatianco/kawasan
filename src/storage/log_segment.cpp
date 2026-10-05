@@ -7,6 +7,7 @@
 #include <rocksdb/table.h>
 
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <utility>
@@ -48,9 +49,9 @@ static Offset decodeOffsetKey(const std::string& key) {
     return static_cast<Offset>(u_offset);
 }
 
-LogSegment::LogSegment(Offset base_offset, const std::string& path)
+LogSegment::LogSegment(Offset base_offset, const std::string& path, bool create_if_missing)
     : base_offset_(base_offset), path_(path), next_offset_(base_offset) {
-    open();
+    open(create_if_missing);
 }
 
 LogSegment::LogSegment(LogSegment&& other) noexcept {
@@ -99,9 +100,15 @@ static std::shared_ptr<rocksdb::Cache>& sharedBlockCache() {
     return cache;
 }
 
-void LogSegment::open() {
+void LogSegment::open(bool create_if_missing) {
+    // RocksDB can create LOCK/LOG files even when create_if_missing is false.
+    // Detect absent databases before asking it to open authoritative storage.
+    if (!create_if_missing && !std::filesystem::is_regular_file(path_ + "/CURRENT")) {
+        throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR,
+                               "Missing authoritative segment database: " + path_);
+    }
     rocksdb::Options options;
-    options.create_if_missing = true;
+    options.create_if_missing = create_if_missing;
     // Phase 5.1: snappy block-level compression. Cheap on CPU, ~2-3× shrink
     // on typical record-batch payloads. We still pay zero CPU on the read
     // path when records are returned via the raw-bytes fetch path, since

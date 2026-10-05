@@ -48,8 +48,11 @@ struct LogConfig {
 /// @brief Manages a log (collection of segments) for a topic-partition
 class Log {
 public:
+    /// @param create_if_missing False requires existing segments and a valid HW
+    /// checkpoint; no missing source is bootstrapped during recovery. Later
+    /// appends may still roll new segments normally.
     Log(const std::string& topic, PartitionId partition, const std::string& log_dir,
-        const LogConfig& config = LogConfig());
+        const LogConfig& config = LogConfig(), bool create_if_missing = true);
     ~Log();
 
     // Disable copy, allow move
@@ -219,7 +222,7 @@ private:
         }
     }
 
-    void loadSegments();
+    void loadSegments(bool create_if_missing);
     void rollNewSegment();
     void rollNewSegment(Offset base_offset);
     LogSegment* activeSegment();
@@ -229,9 +232,10 @@ private:
     Offset endOffsetUnlocked() const;
     Offset startOffsetUnlocked() const;
     void stampLeaderEpochLocked(RecordBatch& batch) const;
-    void loadCheckpoint();
+    void loadCheckpoint(bool strict);
     void persistCheckpointLocked() const;
-    std::optional<std::tuple<Offset, Offset, Offset>> readCheckpointFromDisk() const;
+    std::optional<std::tuple<Offset, Offset, Offset>> readCheckpointFromDisk(
+        bool strict = false) const;
     std::string checkpointPath() const;
 
     std::string topic_;

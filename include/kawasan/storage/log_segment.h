@@ -17,7 +17,8 @@ namespace kawasan::storage {
 /// @brief Manages a single log segment
 class LogSegment {
 public:
-    LogSegment(Offset base_offset, const std::string& path);
+    // Existing authoritative segments must never be initialized as empty databases.
+    LogSegment(Offset base_offset, const std::string& path, bool create_if_missing = true);
     ~LogSegment();
 
     // Disable copy, allow move
@@ -99,7 +100,7 @@ public:
     bool isActive() const;
 
 private:
-    void open();
+    void open(bool create_if_missing);
 
     Offset base_offset_;
     std::string path_;
