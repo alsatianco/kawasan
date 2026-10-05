@@ -7,6 +7,8 @@
 #include <nlohmann/json.hpp>
 #include <set>
 
+#include "kawasan/broker/coordinator_routing.h"
+#include "kawasan/broker/group_state_manager.h"
 #include "kawasan/common/logger.h"
 #include "kawasan/common/rocksdb_compat.h"
 
@@ -58,6 +60,41 @@ OffsetManager::~OffsetManager() {
         Logger::info("Closing OffsetManager RocksDB");
         db_.reset();
     }
+}
+
+void OffsetManager::replaceCoordinatorPartition(int32_t partition, int32_t partition_count,
+                                                const std::vector<GroupRecord>& records) {
+    if (partition < 0 || partition >= partition_count)
+        throw std::invalid_argument("Invalid coordinator cache partition");
+    rocksdb::WriteBatch batch;
+    std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(rocksdb::ReadOptions()));
+    for (it->SeekToFirst(); it->Valid(); it->Next()) {
+        const auto key = it->key().ToString();
+        std::optional<std::string> group;
+        if (key.starts_with(kGroupPrefix))
+            group = key.substr(std::strlen(kGroupPrefix));
+        else if (const auto parsed = parseOffsetKey(key))
+            group = parsed->group_id;
+        else
+            throw std::runtime_error("Malformed disposable coordinator cache key");
+        if (coordinatorPartitionFor(*group, partition_count) == partition)
+            batch.Delete(key);
+    }
+    if (!it->status().ok())
+        throw std::runtime_error("Coordinator cache scan failed: " + it->status().ToString());
+    for (const auto& record : records) {
+        if (record.tombstone ||
+            coordinatorPartitionFor(record.key.group_id, partition_count) != partition)
+            throw std::invalid_argument("Invalid coordinator cache image");
+        if (record.key.kind == GroupRecordKey::Kind::Offset)
+            batch.Put(makeOffsetKey(record.key.group_id, record.key.topic, record.key.partition),
+                      serializeOffsetMetadata(record.offset));
+    }
+    rocksdb::WriteOptions options;
+    options.sync = true;
+    const auto status = db_->Write(options, &batch);
+    if (!status.ok())
+        throw std::runtime_error("Coordinator cache replacement failed: " + status.ToString());
 }
 
 void OffsetManager::commitOffset(const std::string& group_id, const std::string& topic,

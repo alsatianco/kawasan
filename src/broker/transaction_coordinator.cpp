@@ -1,7 +1,10 @@
 #include "kawasan/broker/transaction_coordinator.h"
 
 #include <algorithm>
+#include <stdexcept>
 #include <utility>
+
+#include "kawasan/broker/coordinator_routing.h"
 
 namespace kawasan::broker {
 
@@ -114,6 +117,23 @@ void TransactionCoordinator::completeAbort(const std::string& transactional_id) 
     // consumer-group offset commits visible.
     s.pending_offsets.clear();
     aborts_total_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void TransactionCoordinator::replaceCoordinatorPartition(
+    int32_t partition, int32_t partition_count, const std::vector<TxnSnapshot>& snapshots) {
+    if (partition < 0 || partition >= partition_count)
+        throw std::invalid_argument("Invalid transaction cache partition");
+    std::unordered_map<std::string, TxnSnapshot> restored;
+    for (const auto& snapshot : snapshots) {
+        if (coordinatorPartitionFor(snapshot.transactional_id, partition_count) != partition ||
+            !restored.emplace(snapshot.transactional_id, snapshot).second)
+            throw std::invalid_argument("Invalid transaction acquisition image");
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::erase_if(txns_, [&](const auto& entry) {
+        return coordinatorPartitionFor(entry.first, partition_count) == partition;
+    });
+    txns_.merge(restored);
 }
 
 void TransactionCoordinator::restore(const TxnSnapshot& snapshot) {

@@ -8,6 +8,17 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-05
 
+- Stage early M10 broker format bootstrap before disposable-cache opening and
+  owned-partition acquisition after the current leadership's safe-prefix barrier.
+  Replace only owned group/offset/pending/transaction caches below HW; preserve
+  static membership, assignments and complete checkpoint metadata. Fence stale
+  epochs immediately and leave malformed committed state unloaded. Verify source
+  recovery after real SIGKILL/cache loss and three-broker restart/ownership changes.
+  Initialize fresh non-controller transaction management before request admission;
+  drain Raft/IO on failed startup. No configuration activates replicated mode:
+  coordinator requests and legacy cleanup/sweep/Prepare redrive remain gated
+  until ISR-committed writes and fenced mutations are ready.
+
 - Stage the M10 coordinator format-v1 contract: Raft-committed declarations,
   fsynced local manifests and explicit fresh authoritative replica initialization.
   Reject legacy/mixed/partial formats, routing/count changes and missing reserved

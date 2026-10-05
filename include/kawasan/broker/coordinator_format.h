@@ -34,12 +34,14 @@ class CoordinatorFormatStorage {
 public:
     CoordinatorFormatStorage(CoordinatorFormat expected, std::string log_dir,
                              std::string metadata_dir);
+    void preflight();
     void admit(const std::optional<CoordinatorFormat>& committed);
     storage::Log* openReplica(storage::LogManager& logs, const std::string& topic,
                               PartitionId partition);
     static void rejectFormattedLegacyRuntime(const std::string& metadata_dir);
 
 private:
+    void validateAdmission(const std::optional<CoordinatorFormat>& committed, bool write_manifest);
     void rejectLegacySources() const;
     void persist() const;
     CoordinatorFormat expected_;

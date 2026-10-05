@@ -24,6 +24,7 @@
 #include "kawasan/broker/coordinator_format.h"
 #include "kawasan/broker/coordinator_routing.h"
 #include "kawasan/broker/fetch_session_manager.h"
+#include "kawasan/broker/group_state_manager.h"
 #include "kawasan/broker/isolation_tracker.h"
 #include "kawasan/broker/leader_election_policy.h"
 #include "kawasan/broker/peer_client.h"
@@ -152,7 +153,13 @@ bool KawasanBroker::authorize(const RequestDispatcher::RequestContext& context, 
                                                host, allow_everyone_if_no_acl_);
 }
 
-KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
+KawasanBroker::KawasanBroker(const Config& config) : KawasanBroker(config, std::nullopt) {}
+
+KawasanBroker::KawasanBroker(const Config& config, CoordinatorAcquisitionOnly staging)
+    : KawasanBroker(config, std::optional<CoordinatorFormat>(std::move(staging.format))) {}
+
+KawasanBroker::KawasanBroker(const Config& config, std::optional<CoordinatorFormat> staging)
+    : staged_coordinator_format_(std::move(staging)), config_(config) {
     const auto compatibility_profile =
         config_.get<std::string>("compatibility.max.api.version.profile", "4.x");
     if (compatibility_profile != "4.x" && compatibility_profile != "3.x") {
@@ -200,7 +207,18 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
 
     // Format primitives are staged until replicated acquisition/appends exist.
     // Reject mixed stores before OffsetManager, LogManager or Raft can mutate them.
-    CoordinatorFormatStorage::rejectFormattedLegacyRuntime(metadata_dir_);
+    if (staged_coordinator_format_) {
+        const auto& format = *staged_coordinator_format_;
+        format.validate();
+        if (format.cluster_id != cluster_id_ ||
+            format.offsets_partitions != config_.get<int32_t>("offsets.topic.num.partitions", 16) ||
+            format.transaction_partitions !=
+                config_.get<int32_t>("transaction.state.topic.num.partitions", 16))
+            throw std::invalid_argument("Coordinator format conflicts with broker configuration");
+        CoordinatorFormatStorage(format, log_dir_, metadata_dir_).preflight();
+    } else {
+        CoordinatorFormatStorage::rejectFormattedLegacyRuntime(metadata_dir_);
+    }
 
     storage::LogConfig configured_log;
     const auto default_segment_bytes = static_cast<int64_t>(configured_log.segment_size);
@@ -497,7 +515,8 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
 
     // Initialize OffsetManager with persistent storage
     const std::string offset_db_path = log_dir_ + "/consumer_offsets";
-    offset_manager_ = std::make_shared<OffsetManager>(offset_db_path);
+    if (!staged_coordinator_format_)
+        offset_manager_ = std::make_shared<OffsetManager>(offset_db_path);
 
     // Phase 2.1: ProducerStateManager (in-memory dedup state).
     producer_state_manager_ = std::make_unique<ProducerStateManager>();
@@ -651,10 +670,10 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
     });
 
     // Load persisted group state from storage
-    group_coordinator_->loadGroupsFromStorage();
-
-    // Start background cleanup thread for expired groups and timed-out members
-    group_coordinator_->startCleanupThread();
+    if (!staged_coordinator_format_) {
+        group_coordinator_->loadGroupsFromStorage();
+        group_coordinator_->startCleanupThread();
+    }
 
     // M2: start the transaction-timeout sweep. Runs after initializeMetadata()
     // has already replayed/re-armed persisted transactions, so it never acts on
@@ -663,7 +682,8 @@ KawasanBroker::KawasanBroker(const Config& config) : config_(config) {
         1000,
         config_.get<int64_t>("transaction.abort.timed.out.transaction.cleanup.interval.ms", 10000));
     txn_sweep_stop_.store(false);
-    txn_sweep_thread_ = std::thread(&KawasanBroker::transactionSweepLoop, this);
+    if (!staged_coordinator_format_)
+        txn_sweep_thread_ = std::thread(&KawasanBroker::transactionSweepLoop, this);
 
     // M3: start the producer-state snapshot writer. Started during construction
     // (like the sweep) so a construct-only broker still owns a joinable thread
@@ -777,16 +797,18 @@ void KawasanBroker::start() {
         Logger::debug("IO context thread stopped");
     });
 
-    // Initialize Raft for metadata management
-    initializeRaft();
-
-    // Load metadata and install commit hooks
-    initializeMetadata();
-
-    // Start services
-    startServices();
-    if (metadata_controller_) {
-        metadata_controller_->updateLocalBroker(localBrokerMetadata());
+    try {
+        initializeRaft();
+        initializeMetadata();
+        startServices();
+        if (metadata_controller_)
+            metadata_controller_->updateLocalBroker(localBrokerMetadata());
+    } catch (...) {
+        // Strict source admission can fail after Raft/IO starts. Drain those
+        // threads before propagating, including a never-serving broker.
+        running_ = true;
+        stop();
+        throw;
     }
 
     running_ = true;
@@ -1029,6 +1051,8 @@ void KawasanBroker::initializeMetadata() {
     BrokerMetadata broker = localBrokerMetadata();
     metadata_controller_ = std::make_unique<MetadataController>(
         metadata_dir_, cluster_id_, broker, log_manager_.get(), raft_node_.get());
+    if (staged_coordinator_format_)
+        metadata_controller_->configureCoordinatorFormat(*staged_coordinator_format_, log_dir_);
     metadata_controller_->start();
     cluster_id_ = metadata_controller_->clusterId();
 
@@ -1060,10 +1084,19 @@ void KawasanBroker::initializeMetadata() {
             // Per-topic config (cleanup.policy, etc.) is already
             // registered by applyCreate during the metadata load path.
             for (const auto& pm : tm.partitions) {
+                if (staged_coordinator_format_ &&
+                    (tm.name == "__consumer_offsets" || tm.name == "__transaction_state") &&
+                    std::find(pm.replicas.begin(), pm.replicas.end(), broker_id_) ==
+                        pm.replicas.end())
+                    continue;
                 // getOrCreateLog opens the existing log dir and loads
                 // its segments via Log::loadSegments(); this is what
                 // restores prior records.
-                (void)log_manager_->getOrCreateLog(tm.name, pm.partition);
+                if (staged_coordinator_format_ &&
+                    (tm.name == "__consumer_offsets" || tm.name == "__transaction_state"))
+                    (void)metadata_controller_->openCoordinatorReplica(tm.name, pm.partition);
+                else
+                    (void)log_manager_->getOrCreateLog(tm.name, pm.partition);
                 // M3: rebuild idempotent-producer state. Load the newest valid
                 // producer-state snapshot (if any) and restore its entries, then
                 // replay only the log TAIL after the snapshot offset. Without a
@@ -1104,7 +1137,8 @@ void KawasanBroker::initializeMetadata() {
     // established yet (ensureInternalTopics below is a no-op until then) and
     // must not gate recovery. This runs before the broker serves traffic, so
     // restored transactions hold their LSO before any client can fetch.
-    if (metadata_controller_ && log_manager_ && !transaction_state_manager_) {
+    if (!staged_coordinator_format_ && metadata_controller_ && log_manager_ &&
+        !transaction_state_manager_) {
         const auto txn_md = metadata_controller_->describeTopics({"__transaction_state"});
         if (!txn_md.empty() && !txn_md.front().partitions.empty()) {
             txn_state_num_partitions_ = static_cast<int32_t>(txn_md.front().partitions.size());
@@ -1199,7 +1233,7 @@ void KawasanBroker::transactionSweepLoop() {
         }
         if (txn_sweep_stop_.load())
             break;
-        if (!transaction_coordinator_)
+        if (!transaction_coordinator_ || !internal_topics_ready_.load())
             continue;
 
         const int64_t now = transaction_coordinator_->nowMs();
@@ -1427,12 +1461,33 @@ void KawasanBroker::ensureInternalTopics() {
         return !md.empty() && !md.front().partitions.empty();
     };
 
-    // If both already exist (created by whichever broker is the controller and
-    // replicated to us via Raft), record the offsets partition count and finish.
-    if (topic_exists("__consumer_offsets") && topic_exists("__transaction_state")) {
-        const auto md = metadata_controller_->describeTopics({"__consumer_offsets"});
-        offsets_topic_num_partitions_ = static_cast<int32_t>(md.front().partitions.size());
+    if (staged_coordinator_format_ && !metadata_controller_->coordinatorFormat()) {
+        if (!raft_node_ || !raft_node_->isLeader())
+            return;
+        const auto result =
+            metadata_controller_->declareCoordinatorFormat(*staged_coordinator_format_);
+        if (result.error_code != ErrorCode::NONE)
+            return;
+    }
+
+    auto initialize_managers = [&] {
+        const auto offsets = metadata_controller_->describeTopics({"__consumer_offsets"});
+        const auto txns = metadata_controller_->describeTopics({"__transaction_state"});
+        offsets_topic_num_partitions_ = static_cast<int32_t>(offsets.front().partitions.size());
+        txn_state_num_partitions_ = static_cast<int32_t>(txns.front().partitions.size());
+        if (!transaction_state_manager_) {
+            transaction_state_manager_ = std::make_unique<TransactionStateManager>(
+                log_manager_.get(), txn_state_num_partitions_);
+            if (!staged_coordinator_format_)
+                replayTransactionStateFromLog();
+        }
+        if (staged_coordinator_format_ && !offset_manager_)
+            offset_manager_ = std::make_shared<OffsetManager>(log_dir_ + "/consumer_offsets");
         internal_topics_ready_.store(true);
+    };
+
+    if (topic_exists("__consumer_offsets") && topic_exists("__transaction_state")) {
+        initialize_managers();
         return;
     }
 
@@ -1482,28 +1537,8 @@ void KawasanBroker::ensureInternalTopics() {
                                            {"segment.bytes", "104857600"},
                                            {"min.compaction.lag.ms", "0"}});
 
-    // Capture the actual offsets partition count (handles a pre-existing topic
-    // with a different count) so offset-commit routing uses the true modulus.
-    const auto offsets_md = metadata_controller_->describeTopics({"__consumer_offsets"});
-    if (!offsets_md.empty() && !offsets_md.front().partitions.empty()) {
-        offsets_topic_num_partitions_ = static_cast<int32_t>(offsets_md.front().partitions.size());
-    }
-    // M1: capture the actual __transaction_state partition count and construct
-    // the state manager so txn-state routing (write + replay) agrees on the
-    // modulus. Route by transactional_id hash % this count.
-    const auto txn_md = metadata_controller_->describeTopics({"__transaction_state"});
-    if (!txn_md.empty() && !txn_md.front().partitions.empty()) {
-        txn_state_num_partitions_ = static_cast<int32_t>(txn_md.front().partitions.size());
-    } else {
-        txn_state_num_partitions_ = txn_partitions;
-    }
-    if (txn_ok && log_manager_ && !transaction_state_manager_) {
-        transaction_state_manager_ = std::make_unique<TransactionStateManager>(
-            log_manager_.get(), txn_state_num_partitions_);
-    }
-    if (offsets_ok && txn_ok) {
-        internal_topics_ready_.store(true);
-    }
+    if (offsets_ok && txn_ok)
+        initialize_managers();
 }
 
 void KawasanBroker::controllerBootstrapLoop() {
@@ -1633,6 +1668,38 @@ void KawasanBroker::registerProtocolHandlers() {
         if (api == supported_api_versions_.end() || api->min_version < codec_min ||
             api->max_version > codec_max) {
             throw std::logic_error("advertised API range exceeds registered codec range");
+        }
+        if (staged_coordinator_format_) {
+            // Staged acquisition must never reach legacy writes, cleanup or
+            // marker completion. Version-specific builders retain wire shape.
+            switch (key) {
+                case protocol::ApiKey::FIND_COORDINATOR:
+                case protocol::ApiKey::OFFSET_COMMIT:
+                case protocol::ApiKey::OFFSET_FETCH:
+                case protocol::ApiKey::JOIN_GROUP:
+                case protocol::ApiKey::SYNC_GROUP:
+                case protocol::ApiKey::HEARTBEAT:
+                case protocol::ApiKey::LEAVE_GROUP:
+                case protocol::ApiKey::DESCRIBE_GROUPS:
+                case protocol::ApiKey::LIST_GROUPS:
+                case protocol::ApiKey::INIT_PRODUCER_ID:
+                case protocol::ApiKey::ADD_PARTITIONS_TO_TXN:
+                case protocol::ApiKey::ADD_OFFSETS_TO_TXN:
+                case protocol::ApiKey::END_TXN:
+                case protocol::ApiKey::TXN_OFFSET_COMMIT:
+                    handler = [this, errors](Context& context) {
+                        RequestDispatcher::HandlerResult result;
+                        result.payload =
+                            errors(context,
+                                   dataPlaneCurrent() ? ErrorCode::COORDINATOR_LOAD_IN_PROGRESS
+                                                      : ErrorCode::NOT_COORDINATOR,
+                                   context.header.apiVersion());
+                        return result;
+                    };
+                    break;
+                default:
+                    break;
+            }
         }
         request_dispatcher_->registerHandler(
             key, api->min_version, api->max_version, std::move(handler),
@@ -2317,6 +2384,14 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
             partition_response.log_start_offset = 0;
             partition_response.log_append_time = -1;
             partition_response.error_code = ErrorCode::NONE;
+
+            if (staged_coordinator_format_ && (topic_data.topic == "__consumer_offsets" ||
+                                               topic_data.topic == "__transaction_state")) {
+                partition_response.error_code = ErrorCode::TOPIC_AUTHORIZATION_FAILED;
+                topic_response.partitions.push_back(partition_response);
+                has_error = true;
+                continue;
+            }
 
             if (!topic_metadata_opt.has_value()) {
                 partition_response.error_code = topic_error;
@@ -3484,6 +3559,8 @@ Buffer KawasanBroker::buildListOffsetsError(const RequestDispatcher::RequestCont
 }
 
 bool KawasanBroker::isCoordinatorFor(const std::string& key, protocol::CoordinatorType type) const {
+    if (type == protocol::CoordinatorType::TRANSACTION && !internal_topics_ready_.load())
+        return false;
     if (cluster_brokers_.empty())
         return true;
     const auto coordinator = resolveCoordinator(key, type);
@@ -4021,7 +4098,10 @@ void KawasanBroker::reconcileReplicas() {
             if (!current || current->leader != pm.leader ||
                 current->leader_epoch != pm.leader_epoch || current->isr != pm.isr)
                 continue;  // Do not apply a metadata snapshot taken before this lock.
-            auto* log = log_manager_->getOrCreateLog(tm.name, pm.partition);
+            auto* log = staged_coordinator_format_ && (tm.name == "__consumer_offsets" ||
+                                                       tm.name == "__transaction_state")
+                            ? metadata_controller_->openCoordinatorReplica(tm.name, pm.partition)
+                            : log_manager_->getOrCreateLog(tm.name, pm.partition);
             if (!log) {
                 continue;
             }
@@ -4045,6 +4125,7 @@ void KawasanBroker::reconcileReplicas() {
             }
         }
     }
+    acquireCoordinatorPartitions();
 }
 
 void KawasanBroker::maintainLeaderIsr() {
@@ -5013,7 +5094,11 @@ Buffer KawasanBroker::handleDeleteRecords(RequestDispatcher::RequestContext& con
             pr.partition = p.partition;
 
             auto* log = log_manager_ ? log_manager_->getLog(t.topic, p.partition) : nullptr;
-            if (!log) {
+            if (staged_coordinator_format_ &&
+                (t.topic == "__consumer_offsets" || t.topic == "__transaction_state")) {
+                pr.error_code = ErrorCode::TOPIC_AUTHORIZATION_FAILED;
+                pr.low_watermark = -1;
+            } else if (!log) {
                 pr.error_code = ErrorCode::UNKNOWN_TOPIC_OR_PARTITION;
                 pr.low_watermark = -1;
             } else {
@@ -5043,6 +5128,13 @@ Buffer KawasanBroker::handleDeleteGroups(RequestDispatcher::RequestContext& cont
     for (const auto& g : request.groups()) {
         protocol::DeleteGroupsResponse::Result r;
         r.group_id = g;
+        if (staged_coordinator_format_) {
+            r.error_code = coordinatorLoadStatus(g, protocol::CoordinatorType::GROUP);
+            if (r.error_code == ErrorCode::NONE)
+                r.error_code = ErrorCode::COORDINATOR_LOAD_IN_PROGRESS;
+            response.addResult(std::move(r));
+            continue;
+        }
         try {
             if (offset_manager_) {
                 offset_manager_->deleteGroup(g);
@@ -5065,6 +5157,11 @@ Buffer KawasanBroker::handleOffsetDelete(RequestDispatcher::RequestContext& cont
 
     protocol::OffsetDeleteResponse response;
     response.setErrorCode(ErrorCode::NONE);
+    if (staged_coordinator_format_) {
+        auto code = coordinatorLoadStatus(request.groupId(), protocol::CoordinatorType::GROUP);
+        response.setErrorCode(code == ErrorCode::NONE ? ErrorCode::COORDINATOR_LOAD_IN_PROGRESS
+                                                      : code);
+    }
     response.setThrottleTimeMs(0);
     // Phase 4.1f: actually drop per-(group, topic, partition) offsets from
     // the OffsetManager. Per-partition errors are reported so callers can
@@ -5076,7 +5173,9 @@ Buffer KawasanBroker::handleOffsetDelete(RequestDispatcher::RequestContext& cont
             protocol::OffsetDeleteResponse::PartitionResult pr;
             pr.partition = p.partition;
             try {
-                if (!offset_manager_) {
+                if (staged_coordinator_format_) {
+                    pr.error_code = ErrorCode::COORDINATOR_LOAD_IN_PROGRESS;
+                } else if (!offset_manager_) {
                     pr.error_code = ErrorCode::COORDINATOR_NOT_AVAILABLE;
                 } else {
                     offset_manager_->deleteOffset(request.groupId(), t.topic, p.partition);
@@ -5205,10 +5304,11 @@ Buffer KawasanBroker::handleListTransactions(RequestDispatcher::RequestContext& 
     req.decode(context.payload, context.header.apiVersion());
     protocol::ListTransactionsResponse resp;
     resp.setThrottleTimeMs(0);
-    resp.setErrorCode(ErrorCode::NONE);
+    resp.setErrorCode(staged_coordinator_format_ ? ErrorCode::COORDINATOR_LOAD_IN_PROGRESS
+                                                 : ErrorCode::NONE);
     // Phase 4.1l: enumerate known transactional IDs from the
     // TransactionCoordinator with optional state/producer_id filters.
-    if (transaction_coordinator_) {
+    if (!staged_coordinator_format_ && transaction_coordinator_) {
         const auto txns =
             transaction_coordinator_->list(req.stateFilters(), req.producerIdFilters());
         for (const auto& t : txns) {
@@ -5239,6 +5339,13 @@ Buffer KawasanBroker::handleDescribeTransactions(RequestDispatcher::RequestConte
         s.transactional_id = tid;
         s.error_code = ErrorCode::NONE;
         s.state = "Empty";
+        if (staged_coordinator_format_) {
+            s.error_code = coordinatorLoadStatus(tid, protocol::CoordinatorType::TRANSACTION);
+            if (s.error_code == ErrorCode::NONE)
+                s.error_code = ErrorCode::COORDINATOR_LOAD_IN_PROGRESS;
+            resp.addState(std::move(s));
+            continue;
+        }
         const auto opt =
             transaction_coordinator_ ? transaction_coordinator_->describe(tid) : std::nullopt;
         if (opt.has_value()) {
@@ -5905,4 +6012,116 @@ Buffer KawasanBroker::handleTxnOffsetCommit(RequestDispatcher::RequestContext& c
                           [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
 }
 
+}  // namespace kawasan::broker
+
+namespace kawasan::broker {
+ErrorCode KawasanBroker::coordinatorLoadStatus(const std::string& key,
+                                               protocol::CoordinatorType type) const {
+    if (!staged_coordinator_format_)
+        return isCoordinatorFor(key, type) ? ErrorCode::NONE : ErrorCode::NOT_COORDINATOR;
+    if (type != protocol::CoordinatorType::GROUP && type != protocol::CoordinatorType::TRANSACTION)
+        return ErrorCode::INVALID_REQUEST;
+    if (!metadata_controller_)
+        return ErrorCode::COORDINATOR_LOAD_IN_PROGRESS;
+    if (!dataPlaneCurrent())
+        return ErrorCode::NOT_COORDINATOR;
+    const std::string topic =
+        type == protocol::CoordinatorType::GROUP ? "__consumer_offsets" : "__transaction_state";
+    const TopicPartition tp{
+        topic, coordinatorPartitionFor(key, staged_coordinator_format_->partitionCount(topic))};
+    const auto metadata = currentPartitionMetadata(tp);
+    if (!metadata)
+        return ErrorCode::COORDINATOR_LOAD_IN_PROGRESS;
+    if (metadata->leader != broker_id_)
+        return ErrorCode::NOT_COORDINATOR;
+    std::lock_guard<std::mutex> lock(coordinator_acquisition_mutex_);
+    const auto found = acquired_coordinator_epochs_.find(tp);
+    if (found == acquired_coordinator_epochs_.end() || found->second != metadata->leader_epoch ||
+        !replica_manager_->readableHighWatermark(tp, metadata->leader_epoch))
+        return ErrorCode::COORDINATOR_LOAD_IN_PROGRESS;
+    // Recheck after taking the acquisition fence: ownership may have changed
+    // while waiting behind replay. Future handlers must retain this fence.
+    return dataPlaneCurrent() && isPartitionLeadership(tp, broker_id_, metadata->leader_epoch)
+               ? ErrorCode::NONE
+               : ErrorCode::NOT_COORDINATOR;
+}
+
+void KawasanBroker::acquireCoordinatorPartitions() {
+    if (!staged_coordinator_format_ || !internal_topics_ready_.load())
+        return;
+    const auto topics =
+        metadata_controller_->describeTopics({"__consumer_offsets", "__transaction_state"});
+    for (const auto& tm : topics) {
+        for (const auto& pm : tm.partitions) {
+            const TopicPartition tp{tm.name, pm.partition};
+            auto write_lock = lockPartitionWrites(tp);
+            std::lock_guard<std::mutex> acquisition_lock(coordinator_acquisition_mutex_);
+            const auto current = currentPartitionMetadata(tp);
+            const bool owner = current && dataPlaneCurrent() && current->leader == broker_id_ &&
+                               current->leader_epoch == pm.leader_epoch;
+            auto loaded = acquired_coordinator_epochs_.find(tp);
+            if (!owner || (loaded != acquired_coordinator_epochs_.end() &&
+                           loaded->second != pm.leader_epoch)) {
+                if (loaded != acquired_coordinator_epochs_.end()) {
+                    acquired_coordinator_epochs_.erase(loaded);
+                    if (tm.name == "__consumer_offsets")
+                        group_coordinator_->replaceCoordinatorPartition(
+                            pm.partition, offsets_topic_num_partitions_, {}, offset_manager_);
+                    else
+                        transaction_coordinator_->replaceCoordinatorPartition(
+                            pm.partition, txn_state_num_partitions_, {});
+                }
+                if (!owner)
+                    continue;
+            }
+            if (acquired_coordinator_epochs_.contains(tp) ||
+                !replica_manager_->readableHighWatermark(tp, pm.leader_epoch))
+                continue;
+            // Empty replacement erases stale entries even if committed replay
+            // subsequently fails. Unrelated partitions are never scanned.
+            try {
+                if (tm.name == "__consumer_offsets") {
+                    group_coordinator_->replaceCoordinatorPartition(
+                        pm.partition, offsets_topic_num_partitions_, {}, offset_manager_);
+                    GroupStateManager source(log_manager_.get(), offsets_topic_num_partitions_);
+                    const auto image = source.loadCommittedPartition(pm.partition);
+                    std::vector<GroupRecord> records;
+                    for (const auto& [key, record] : image) {
+                        (void)key;
+                        records.push_back(record);
+                    }
+                    if (!dataPlaneCurrent() ||
+                        !isPartitionLeadership(tp, broker_id_, pm.leader_epoch))
+                        continue;
+                    group_coordinator_->replaceCoordinatorPartition(
+                        pm.partition, offsets_topic_num_partitions_, records, offset_manager_);
+                } else {
+                    transaction_coordinator_->replaceCoordinatorPartition(
+                        pm.partition, txn_state_num_partitions_, {});
+                    const auto snapshots =
+                        transaction_state_manager_->loadCommittedPartition(pm.partition);
+                    if (!dataPlaneCurrent() ||
+                        !isPartitionLeadership(tp, broker_id_, pm.leader_epoch))
+                        continue;
+                    transaction_coordinator_->replaceCoordinatorPartition(
+                        pm.partition, txn_state_num_partitions_, snapshots);
+                    // Prepare redrive and cross-broker LSO/markers wait for the
+                    // fenced ISR append/WriteTxnMarkers path; never use legacy completion.
+                }
+                if (dataPlaneCurrent() && isPartitionLeadership(tp, broker_id_, pm.leader_epoch)) {
+                    acquired_coordinator_epochs_[tp] = pm.leader_epoch;
+                } else if (tm.name == "__consumer_offsets") {
+                    group_coordinator_->replaceCoordinatorPartition(
+                        pm.partition, offsets_topic_num_partitions_, {}, offset_manager_);
+                } else {
+                    transaction_coordinator_->replaceCoordinatorPartition(
+                        pm.partition, txn_state_num_partitions_, {});
+                }
+            } catch (const std::exception& ex) {
+                Logger::error("Coordinator acquisition {}-{} failed: {}", tm.name, pm.partition,
+                              ex.what());
+            }
+        }
+    }
+}
 }  // namespace kawasan::broker

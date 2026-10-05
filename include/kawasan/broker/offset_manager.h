@@ -23,6 +23,8 @@ namespace kawasan::broker {
 /// - Values are stored as JSON for flexibility and debugability
 ///
 /// See docs/CONSUMER_OFFSET_STORAGE.md for detailed design.
+struct GroupRecord;
+
 class OffsetManager {
 public:
     /// @brief Constructs an OffsetManager with the specified RocksDB path.
@@ -68,6 +70,11 @@ public:
                    partition == other.partition;
         }
     };
+
+    // Acquisition only: replace one routed partition atomically, including
+    // removing stale group metadata. Complete group/pending state is in memory.
+    void replaceCoordinatorPartition(int32_t partition, int32_t partition_count,
+                                     const std::vector<GroupRecord>& records);
 
     //
     // Offset Operations

@@ -59,6 +59,14 @@ struct TlsConfig {
 class KawasanBroker {
 public:
     explicit KawasanBroker(const Config& config);
+    // Internal M10 integration seam. Coordinator requests remain refused until
+    // ISR-committed persistence lands; no configuration enables this mode.
+    struct CoordinatorAcquisitionOnly {
+        CoordinatorFormat format;
+    };
+    KawasanBroker(const Config& config, CoordinatorAcquisitionOnly staging);
+    ErrorCode coordinatorLoadStatus(const std::string& key, protocol::CoordinatorType type) const;
+    void acquireCoordinatorPartitions();
     ~KawasanBroker();
 
     // Non-copyable/movable
@@ -151,6 +159,11 @@ public:
     size_t openLogCount() const { return log_manager_ ? log_manager_->openLogCount() : 0; }
 
 private:
+    friend struct CoordinatorAcquisitionProbe;
+    KawasanBroker(const Config& config, std::optional<CoordinatorFormat> staging);
+    std::optional<CoordinatorFormat> staged_coordinator_format_;
+    mutable std::mutex coordinator_acquisition_mutex_;
+    std::map<TopicPartition, int32_t> acquired_coordinator_epochs_;
     void initializeRaft();
     void initializeMetadata();
     void startServices();

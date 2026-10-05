@@ -2,8 +2,11 @@
 
 Status: accepted design for M10. Strict committed-partition transaction/group
 replay, authoritative log opening, Raft format declarations and local manifests
-are implemented as opt-in primitives. Broker runtime activation, acquisition,
-ISR-committed persistence and failover acceptance remain pending.
+are implemented as opt-in primitives. Early broker bootstrap and owned-partition
+cache acquisition are implemented through an internal acquisition-only C++ seam.
+Public runtime activation, ISR-committed persistence, fenced mutations/marker
+redrive and failover acceptance remain pending. No broker configuration enables
+the new mode; coordinator requests remain refused in acquisition-only staging.
 
 M10 will make committed `__consumer_offsets` and `__transaction_state` log
 records authoritative in clustered mode. Each new owner must rebuild only its

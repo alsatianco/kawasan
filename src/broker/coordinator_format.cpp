@@ -94,7 +94,39 @@ void CoordinatorFormatStorage::rejectLegacySources() const {
     }
 }
 
+void CoordinatorFormatStorage::preflight() {
+    const auto metadata = fs::path(manifest_path_).parent_path() / "topics.json";
+    std::optional<CoordinatorFormat> declaration;
+    if (fs::exists(metadata)) {
+        const auto json = readJson(metadata);
+        if (json.at("cluster_id").get<std::string>() != expected_.cluster_id)
+            reject("cluster ID changed");
+        if (json.contains("coordinator_format"))
+            declaration = CoordinatorFormat::deserialize(json.at("coordinator_format").dump());
+        for (const auto& topic : json.at("topics")) {
+            const auto name = topic.at("name").get<std::string>();
+            if (name != "__consumer_offsets" && name != "__transaction_state")
+                continue;
+            if (!declaration ||
+                topic.at("partitions").size() !=
+                    static_cast<size_t>(expected_.partitionCount(name)) ||
+                topic.at("configs").value("cleanup.policy", "delete") != "compact")
+                reject("legacy or changed coordinator metadata");
+            int32_t expected_partition = 0;
+            for (const auto& partition : topic.at("partitions"))
+                if (partition.at("partition").get<int64_t>() != expected_partition++)
+                    reject("coordinator partition identity changed");
+        }
+    }
+    validateAdmission(declaration, false);
+}
+
 void CoordinatorFormatStorage::admit(const std::optional<CoordinatorFormat>& committed) {
+    validateAdmission(committed, true);
+}
+
+void CoordinatorFormatStorage::validateAdmission(const std::optional<CoordinatorFormat>& committed,
+                                                 bool write_manifest) {
     admitted_ = false;
     if (committed) {
         committed->validate();
@@ -125,8 +157,8 @@ void CoordinatorFormatStorage::admit(const std::optional<CoordinatorFormat>& com
         return;
     }
     rejectLegacySources();
-    if (!committed)
-        return;  // An empty joiner waits; it cannot invent a declaration.
+    if (!committed || !write_manifest)
+        return;  // Preflight and empty joiners cannot invent a durable declaration.
     persist();
     admitted_ = true;
 }

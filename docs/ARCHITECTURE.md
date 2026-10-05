@@ -129,10 +129,10 @@ The orchestration layer. `KawasanBroker` constructs and wires every subsystem be
 | `MetadataController` | Applies topic/config/ISR/leader mutations through Raft and serves cached metadata. Its opt-in M10 format declaration establishes the immutable coordinator storage contract. |
 | `MetadataStore` / `metadata_types.h` | Persistent and in-memory representation of cluster metadata (topics, partitions, brokers). |
 | `GroupCoordinator` | Consumer-group lifecycle: JoinGroup/SyncGroup/Heartbeat/LeaveGroup, rebalance generations, and member tracking. Persists group state and offsets through `OffsetManager`. |
-| `CoordinatorFormatStorage` / `GroupStateManager` | Staged M10 format admission, durable replica reservations and complete group/offset/pending records with committed partition replay. Broker activation and ownership integration remain pending. |
+| `CoordinatorFormatStorage` / `GroupStateManager` | Staged M10 format admission, durable replica reservations and complete group/offset/pending records with committed partition replay and owned cache installation. Public activation waits for ISR-committed persistence. |
 | `OffsetManager` | RocksDB-backed consumer offset and group-metadata store. See [Consumer offset storage](#consumer-offset-storage). |
 | `TransactionCoordinator` | Transactional-producer and exactly-once support (InitProducerId with epoch fencing, AddPartitionsToTxn, two-phase EndTxn, TxnOffsetCommit). |
-| `TransactionStateManager` | Persists transaction snapshots to `__transaction_state` and replays them on startup. Its strict HW-bounded partition replay API is available for M10; acquisition integration is pending. |
+| `TransactionStateManager` | Persists transaction snapshots to `__transaction_state` and replays them on startup. Its strict HW-bounded partition replay API is used by staged M10 acquisition; legacy startup retains loadAll. |
 | `QuotaManager` | Per-client produce/consume byte-rate quotas (`quota.producer.default` / `quota.consumer.default`), returning `throttle_time_ms`. |
 | `ProducerStateManager` | Tracks `(topic, partition, producer_id)` state for idempotent/duplicate detection; exposes entry/eviction metrics. |
 | `FetchSessionManager` | Incremental-fetch session state (KIP-227 style fetch sessions). |
@@ -301,8 +301,9 @@ partition below a captured HW, validates key/identity/routing, applies tombstone
 and fails on malformed committed data rather than returning a partial cache.
 The acquisition caller must fence ownership and truncation around this scan.
 Snapshot decoding bounds both arrays before reservation and rejects unknown
-states/trailing bytes. This API is not yet wired to ownership: legacy startup
-still uses loadAll, and internal coordinator topics remain RF=1.
+states/trailing bytes. Staged acquisition uses this API under partition-write
+and acquisition fences. Legacy startup still uses loadAll, and internal
+coordinator topics remain RF=1.
 
 In a cluster, promotion rebuilds producer sequence state from the retained partition log before the replica becomes writable. A per-partition lock serializes promotion, Produce and replica ingestion/truncation. Followers do not write producer snapshots; control batches do not advance producer sequence state. This recovery scan currently reads the full retained log on promotion. The new leadership also records its inherited log-end offset and defers consumer Fetch/ListOffsets until fresh ISR progress confirms that prefix. Replica Fetch continues during this transition, and ISR expansion requires the inherited prefix rather than the stale checkpoint. Empty and sole-replica leaders are immediately readable; readiness resets on a new leader epoch. This prevents exposing a stale follower/checkpoint HW before safe recovery advances it.
 
@@ -563,5 +564,26 @@ commit through Raft; a local manifest binds the version, cluster ID, routing and
 partition counts and durably reserves assigned fresh replicas before creation.
 Missing reserved sources and partial/legacy/mixed formats fail closed. Complete
 binary group identities, checkpoints, pending transactional offsets and tombstones
-can rebuild one committed partition image below HW. Runtime activation, safe
-acquisition/cache installation and ISR-committed writes are still required.
+rebuild one committed partition image below HW. The internal C++
+`CoordinatorAcquisitionOnly` constructor validates storage before legacy cache
+opening, waits for the committed declaration, then creates its disposable offset
+cache. Assigned sources reopen through durable reservations; unassigned coordinator
+partitions never open. Fresh non-controller bootstrap also initializes transaction
+state management before admitting transaction requests in legacy mode.
+
+`acquireCoordinatorPartitions` runs after replica reconciliation in clustered
+staging. Under partition-write and acquisition locks, it waits for the current
+leadership's readable HW, removes stale owned cache entries, and installs complete
+group identities/static members/assignments, exact offset metadata, group-owned
+producer/epoch-scoped pending offsets and transaction snapshots. It preserves
+stored group update timestamps, rebuilds heartbeat/rebalance deadlines and rechecks leadership/metadata currency before
+recording the acquired epoch. Malformed committed records leave the partition
+unloaded; uncommitted tails are excluded. The diagnostic `coordinatorLoadStatus`
+compares live ownership/epochs even before the next reconciliation poll.
+
+No broker configuration activates staging. Coordinator wire requests remain
+refused, and cleanup, transaction sweep and legacy Prepare completion remain
+inactive until ISR-committed persistence and fenced state mutation are implemented.
+Requests cannot use external Produce/DeleteRecords to modify formatted coordinator
+sources. Cross-broker LSO/marker recovery and RF>1 coordinator acceptance remain
+pending; the default broker continues to reject formatted stores.

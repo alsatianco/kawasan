@@ -158,3 +158,8 @@ set_tests_properties(ClientApiParityTest PROPERTIES TIMEOUT 90)
 add_executable(txn_offset_fencing_test txn_offset_fencing_test.cpp)
 target_link_libraries(txn_offset_fencing_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME TxnOffsetFencingTest COMMAND txn_offset_fencing_test)
+
+add_executable(coordinator_acquisition_test coordinator_acquisition_test.cpp)
+target_link_libraries(coordinator_acquisition_test PRIVATE kawasan GTest::gtest)
+add_test(NAME CoordinatorAcquisitionTest COMMAND coordinator_acquisition_test)
+set_tests_properties(CoordinatorAcquisitionTest PROPERTIES TIMEOUT 150)

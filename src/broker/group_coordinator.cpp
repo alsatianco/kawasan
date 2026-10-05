@@ -4,6 +4,8 @@
 #include <sstream>
 #include <utility>
 
+#include "kawasan/broker/coordinator_routing.h"
+#include "kawasan/broker/group_state_manager.h"
 #include "kawasan/broker/monitoring/metrics_collector.h"
 #include "kawasan/common/logger.h"
 #include "kawasan/storage/log_manager.h"
@@ -37,6 +39,55 @@ GroupCoordinator::GroupCoordinator(std::shared_ptr<OffsetManager> offset_manager
 
 GroupCoordinator::~GroupCoordinator() {
     stopCleanupThread();
+}
+
+void GroupCoordinator::replaceCoordinatorPartition(int32_t partition, int32_t partition_count,
+                                                   const std::vector<GroupRecord>& records,
+                                                   std::shared_ptr<OffsetManager> offsets) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::unordered_map<std::string, GroupState> restored;
+    std::vector<GroupRecord> pending;
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto& r : records) {
+        if (r.tombstone || coordinatorPartitionFor(r.key.group_id, partition_count) != partition)
+            throw std::invalid_argument("Invalid group acquisition image");
+        if (r.key.kind == GroupRecordKey::Kind::PendingOffset) {
+            pending.push_back(r);
+        } else if (r.key.kind == GroupRecordKey::Kind::Group) {
+            auto& g = restored[r.key.group_id];
+            g.generation_id = r.group.generation;
+            g.kind = static_cast<GroupStateKind>(r.group.state);
+            g.protocol_type = r.group.protocol_type;
+            g.protocol_name = r.group.protocol_name;
+            g.leader_id = r.group.leader_id;
+            g.rebalance_timeout_ms = r.group.rebalance_timeout_ms;
+            g.rebalance_started_at = now;
+            g.last_activity = std::chrono::system_clock::time_point(
+                std::chrono::milliseconds(r.group.last_update_timestamp));
+            for (const auto& m : r.group.members) {
+                g.members.emplace(m.member_id,
+                                  MemberState{m.member_id, m.client_id, m.client_host,
+                                              m.group_instance_id, m.metadata, m.assignment, now});
+            }
+        }
+    }
+    // WriteBatch completes before publishing any in-memory image.
+    offsets->replaceCoordinatorPartition(partition, partition_count, records);
+    std::erase_if(groups_, [&](const auto& entry) {
+        return coordinatorPartitionFor(entry.first, partition_count) == partition;
+    });
+    std::erase_if(pending_coordinator_offsets_, [&](const auto& r) {
+        return coordinatorPartitionFor(r.key.group_id, partition_count) == partition;
+    });
+    groups_.merge(restored);
+    pending_coordinator_offsets_.insert(pending_coordinator_offsets_.end(), pending.begin(),
+                                        pending.end());
+    offset_manager_ = std::move(offsets);
+}
+
+std::vector<GroupRecord> GroupCoordinator::pendingCoordinatorOffsets() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return pending_coordinator_offsets_;
 }
 
 GroupCoordinator::JoinGroupResult GroupCoordinator::handleJoinGroup(

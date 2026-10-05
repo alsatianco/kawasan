@@ -36,6 +36,8 @@ class MetricsCollector;
 
 namespace kawasan::broker {
 
+struct GroupRecord;
+
 /// @brief Minimal in-memory group coordinator to support basic consumer groups.
 /// Offsets are now persisted to disk via OffsetManager.
 class GroupCoordinator {
@@ -44,6 +46,10 @@ public:
         std::shared_ptr<OffsetManager> offset_manager, storage::LogManager* log_manager = nullptr,
         std::shared_ptr<monitoring::MetricsCollector> metrics_collector = nullptr);
     ~GroupCoordinator();
+    void replaceCoordinatorPartition(int32_t partition, int32_t partition_count,
+                                     const std::vector<GroupRecord>& records,
+                                     std::shared_ptr<OffsetManager> offsets);
+    std::vector<GroupRecord> pendingCoordinatorOffsets() const;
 
     GroupCoordinator(const GroupCoordinator&) = delete;
     GroupCoordinator& operator=(const GroupCoordinator&) = delete;
@@ -144,6 +150,7 @@ public:
     Metrics getMetrics() const;
 
 private:
+    friend struct CoordinatorAcquisitionProbe;
     struct MemberState {
         std::string member_id;
         // 0A.10: track real client identity instead of the "unknown" placeholder
@@ -284,6 +291,7 @@ private:
         metrics_collector_;  ///< For recording metrics (optional)
     mutable std::mutex mutex_;
     std::unordered_map<std::string, GroupState> groups_;
+    std::vector<GroupRecord> pending_coordinator_offsets_;
     std::atomic<int64_t> member_sequence_{0};
 
     // Group expiration

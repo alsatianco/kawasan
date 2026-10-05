@@ -135,6 +135,8 @@ public:
     /// including Prepare* and the per-partition first_offsets. Does not
     /// touch metric counters.
     void restore(const TxnSnapshot& snapshot);
+    void replaceCoordinatorPartition(int32_t partition, int32_t partition_count,
+                                     const std::vector<TxnSnapshot>& snapshots);
 
     /// @brief Phase EX-6: stage offsets from TxnOffsetCommit. The
     /// offsets are buffered in the in-flight txn snapshot and applied

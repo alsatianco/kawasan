@@ -31,6 +31,10 @@ public:
         return store_.coordinatorFormat();
     }
 
+    storage::Log* openCoordinatorReplica(const std::string& topic, PartitionId partition) {
+        return store_.openCoordinatorReplica(topic, partition);
+    }
+
     /// @brief Loads persisted metadata and installs commit hooks.
     void start();
 

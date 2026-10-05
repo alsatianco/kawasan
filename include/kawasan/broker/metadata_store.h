@@ -32,6 +32,7 @@ public:
     void configureCoordinatorFormat(const CoordinatorFormat& expected, const std::string& log_dir);
     TopicOperationResult applyCoordinatorFormat(const CoordinatorFormat& format);
     std::optional<CoordinatorFormat> coordinatorFormat() const;
+    storage::Log* openCoordinatorReplica(const std::string& topic, PartitionId partition);
 
     /// @brief Loads metadata from disk (creates empty store if missing).
     void load();

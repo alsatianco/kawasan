@@ -239,6 +239,22 @@ std::optional<CoordinatorFormat> MetadataStore::coordinatorFormat() const {
     return coordinator_format_;
 }
 
+storage::Log* MetadataStore::openCoordinatorReplica(const std::string& topic,
+                                                    PartitionId partition) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!format_storage_ || !coordinator_format_ || !log_manager_)
+        throw std::runtime_error("Coordinator replica requires committed format admission");
+    const auto topic_it = topics_.find(topic);
+    if (topic_it == topics_.end())
+        throw std::runtime_error("Unknown coordinator topic");
+    for (const auto& pm : topic_it->second.metadata.partitions) {
+        if (pm.partition == partition && std::find(pm.replicas.begin(), pm.replicas.end(),
+                                                   local_broker_id_) != pm.replicas.end())
+            return format_storage_->openReplica(*log_manager_, topic, partition);
+    }
+    throw std::runtime_error("Coordinator replica is not assigned locally");
+}
+
 TopicOperationResult MetadataStore::applyCoordinatorFormat(const CoordinatorFormat& format) {
     std::lock_guard<std::mutex> lock(mutex_);
     format.validate();
