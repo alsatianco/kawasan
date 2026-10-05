@@ -8,6 +8,12 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-05
 
+- Recover sparse producer sequence ranges, including empty compacted batches,
+  and traverse large batches during broker restart, promotion, transaction-marker
+  recovery and timestamp scans. Wrap sequences without signed overflow; preserve
+  snapshot record counts. Sparse appends and exact retries require the ISR to
+  cover the full assigned offset span before an acks=all response succeeds.
+
 - Validate stored batch offset spans and header/key identity during recovery.
   Propagate RocksDB iterator errors so a corrupt table cannot reopen as an
   empty segment. Reject mismatched segment append offsets before writing.

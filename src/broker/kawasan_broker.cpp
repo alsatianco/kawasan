@@ -1362,7 +1362,7 @@ bool KawasanBroker::logHasControlBatchForProducer(storage::Log* log, int64_t pro
             break;
         Offset next = off;
         for (const auto& batch : batches) {
-            next = std::max(next, batch.baseOffset() + static_cast<Offset>(batch.records().size()));
+            next = std::max(next, batch.baseOffset() + batch.offsetSpan());
             if (batch.isControlBatch() && batch.producerId() == producer_id) {
                 return true;
             }
@@ -1398,13 +1398,11 @@ void KawasanBroker::replayProducerStateFromLog(const std::string& topic, Partiti
         for (const auto& batch : batches) {
             const Offset base = batch.baseOffset();
             const int32_t count = static_cast<int32_t>(batch.records().size());
-            if (base + count > next) {
-                next = base + count;
-            }
-            if (batch.producerId() >= 0 && count > 0 && !batch.isControlBatch()) {
+            next = std::max(next, base + batch.offsetSpan());
+            if (batch.producerId() >= 0 && !batch.isControlBatch()) {
                 producer_state_manager_->recordAppend(topic, partition, batch.producerId(),
                                                       batch.producerEpoch(), batch.baseSequence(),
-                                                      count, base);
+                                                      count, base, batch.lastOffsetDelta());
             }
         }
         if (next <= off) {
@@ -2431,10 +2429,10 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                                      batch.producerEpoch(), batch.baseSequence(),
                                      chk.duplicate_offset);
                         if (acks == -1 && isr_size > 1 && chk.duplicate_offset >= 0) {
-                            pending_acks.push_back(PendingAck{
-                                topic_responses.size(), topic_response.partitions.size(), tp,
-                                chk.duplicate_offset + static_cast<Offset>(batch.records().size()),
-                                partition_it->leader_epoch});
+                            pending_acks.push_back(
+                                PendingAck{topic_responses.size(), topic_response.partitions.size(),
+                                           tp, chk.duplicate_offset + batch.offsetSpan(),
+                                           partition_it->leader_epoch});
                         }
                         topic_response.partitions.push_back(partition_response);
                         continue;
@@ -2459,6 +2457,8 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                 // producer_id to match against the aborted_transactions
                 // list returned by Fetch.
                 const size_t record_count = batch.records().size();
+                const int32_t saved_last_delta = batch.lastOffsetDelta();
+                const Offset saved_span = batch.offsetSpan();
                 const int64_t saved_pid = batch.producerId();
                 const int16_t saved_epoch = batch.producerEpoch();
                 const int32_t saved_base_seq = batch.baseSequence();
@@ -2481,7 +2481,8 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                 if (producer_state_manager_ && saved_pid >= 0) {
                     producer_state_manager_->recordAppend(
                         topic_data.topic, partition_data.partition, saved_pid, saved_epoch,
-                        saved_base_seq, static_cast<int32_t>(record_count), base_offset);
+                        saved_base_seq, static_cast<int32_t>(record_count), base_offset,
+                        saved_last_delta);
                 }
 
                 // Update metrics: track messages produced and bytes
@@ -2508,8 +2509,7 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                 if (acks == -1 && isr_size > 1) {
                     pending_acks.push_back(
                         PendingAck{topic_responses.size(), topic_response.partitions.size(), tp,
-                                   base_offset + static_cast<Offset>(record_count),
-                                   partition_it->leader_epoch});
+                                   base_offset + saved_span, partition_it->leader_epoch});
                 }
             } catch (const StorageException& ex) {
                 Logger::error("Storage error while appending to {}-{}: {}", topic_data.topic,
@@ -3409,8 +3409,7 @@ RequestDispatcher::HandlerResult KawasanBroker::handleListOffsets(
                                     done = true;
                                     break;
                                 }
-                                next = batch.baseOffset() +
-                                       static_cast<Offset>(batch.records().size());
+                                next = std::max(next, batch.baseOffset() + batch.offsetSpan());
                             }
                             if (done)
                                 break;

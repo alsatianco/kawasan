@@ -18,6 +18,11 @@ add_executable(idempotent_replay_test idempotent_replay_test.cpp)
 target_link_libraries(idempotent_replay_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME IdempotentReplayTest COMMAND idempotent_replay_test)
 
+add_executable(sparse_broker_replay_test sparse_broker_replay_test.cpp)
+target_link_libraries(sparse_broker_replay_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME SparseBrokerReplayTest COMMAND sparse_broker_replay_test)
+set_tests_properties(SparseBrokerReplayTest PROPERTIES TIMEOUT 90)
+
 add_executable(production_config_test production_config_test.cpp)
 target_link_libraries(production_config_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME ProductionConfigTest COMMAND production_config_test)

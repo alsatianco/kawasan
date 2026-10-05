@@ -84,4 +84,20 @@ TEST(ProducerStateManagerTest, PartitionResetDropsDivergentStateWithoutAffecting
     EXPECT_EQ(psm.check(kTopic, 1, kPid, kEpoch, 0, 2).duplicate_offset, 200);
 }
 
+TEST(ProducerStateManagerTest, DenseSequenceRangeWrapsWithoutSignedOverflow) {
+    ProducerStateManager psm;
+    psm.recordAppend(kTopic, kPart, kPid, kEpoch, INT32_MAX - 1, 3, 100);
+    EXPECT_EQ(psm.listProducers(kTopic, kPart).at(0).last_sequence, 0);
+    EXPECT_EQ(psm.check(kTopic, kPart, kPid, kEpoch, 1, 1).error, ErrorCode::NONE);
+    EXPECT_EQ(psm.check(kTopic, kPart, kPid, kEpoch, INT32_MAX - 1, 3).duplicate_offset, 100);
+}
+
+TEST(ProducerStateManagerTest, SequenceZeroAfterMaximumIsAcceptedAndDeduplicated) {
+    ProducerStateManager psm;
+    psm.recordAppend(kTopic, kPart, kPid, kEpoch, INT32_MAX, 1, 100);
+    EXPECT_EQ(psm.check(kTopic, kPart, kPid, kEpoch, 0, 1).error, ErrorCode::NONE);
+    psm.recordAppend(kTopic, kPart, kPid, kEpoch, 0, 1, 101);
+    EXPECT_EQ(psm.check(kTopic, kPart, kPid, kEpoch, 0, 1).duplicate_offset, 101);
+}
+
 }  // namespace

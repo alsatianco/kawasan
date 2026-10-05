@@ -235,6 +235,15 @@ leader covering every omitted offset. It opens a new segment at the wire base
 rather than relabeling the batch. Ordinary or uncommitted gaps still require
 reconciliation; replicated append never advances follower HW.
 
+Broker producer replay, transaction-marker recovery and timestamp scans advance
+by the assigned batch span across read chunks. Producer sequence recovery uses
+`baseSequence + lastOffsetDelta` modulo `INT32_MAX + 1`, independently of retained
+record count, including fully compacted batches with only a producer header.
+Control markers do not change data sequences. Snapshots keep their existing
+format and retained count, together with the recovered last sequence. Live
+appends use the same sequence range; acks=all appends and exact retries wait for
+the ISR to cover the whole span.
+
 Recovery validates each stored batch's span and verifies its header base against
 the RocksDB key before deriving LEO. Iterator read errors propagate instead of
 turning a corrupted table into an empty or partial recovered segment. Segment

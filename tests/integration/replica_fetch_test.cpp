@@ -21,11 +21,13 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <iostream>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "../sparse_record_batch.h"
 #include "kawasan/broker/kawasan_broker.h"
 #include "kawasan/broker/metadata_controller.h"
 #include "kawasan/broker/replica_manager.h"
@@ -203,7 +205,8 @@ asio::ip::tcp::socket connect(asio::io_context& io, int32_t port) {
 // the caller can do other work on other connections while it is outstanding.
 void sendAcksAllProduce(asio::ip::tcp::socket& socket, const std::string& topic,
                         const std::string& value, int32_t timeout_ms, int32_t corr,
-                        int64_t producer_id = -1, int32_t sequence = -1) {
+                        int64_t producer_id = -1, int32_t sequence = -1,
+                        int32_t last_offset_delta = -1) {
     kawasan::storage::RecordBatch batch;
     batch.setMagic(2);
     batch.setFirstTimestamp(0);
@@ -213,7 +216,11 @@ void sendAcksAllProduce(asio::ip::tcp::socket& socket, const std::string& topic,
     kawasan::Record record;
     record.timestamp = 0;
     record.value = std::vector<uint8_t>(value.begin(), value.end());
+    if (last_offset_delta >= 0)
+        record.offset_delta = last_offset_delta;
     batch.addRecord(record);
+    if (last_offset_delta >= 0)
+        batch = kawasan::test_support::batchWithWireSpan(batch, last_offset_delta);
 
     kawasan::Buffer payload;
     kawasan::protocol::RequestHeader header(kawasan::protocol::ApiKey::PRODUCE, /*api_version=*/3,
@@ -380,7 +387,10 @@ struct ParkedProduceFixture {
     ~ParkedProduceFixture() {
         admin->close();
         broker.stop();
-        std::filesystem::remove_all(log_dir);
+        if (::testing::Test::HasFailure())
+            std::cerr << "Retained replica fetch data: " << log_dir << '\n';
+        else
+            std::filesystem::remove_all(log_dir);
     }
 };
 
@@ -472,6 +482,25 @@ TEST(ReplicaFetchTest, IdempotentRetryWaitsForReplicationBeforeAcknowledgement) 
     EXPECT_EQ(fetchAs(follower, f.topic, kFollowerId, 2, 62).error, kawasan::ErrorCode::NONE);
     EXPECT_EQ(readProduceError(producer), kawasan::ErrorCode::NONE);
     EXPECT_EQ(f.broker.replicaManager()->getLog(f.tp)->logEndOffset(), 2);
+}
+
+TEST(ReplicaFetchTest, SparseAppendAndRetryWaitForTheEntireAssignedOffsetSpan) {
+    ParkedProduceFixture f("sparse-acks");
+    auto producer = connect(f.io, f.broker.port());
+    auto follower = connect(f.io, f.broker.port());
+    sendAcksAllProduce(producer, f.topic, "retained", 1000, 70, 99, 0, 9);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    ASSERT_EQ(f.broker.replicaManager()->getLog(f.tp)->logEndOffset(), 11);
+    ASSERT_EQ(fetchAs(follower, f.topic, kFollowerId, 2, 71).error, kawasan::ErrorCode::NONE);
+    EXPECT_EQ(readProduceError(producer), kawasan::ErrorCode::REQUEST_TIMED_OUT)
+        << "HW=2 covers the retained count but not the span ending at 11";
+    sendAcksAllProduce(producer, f.topic, "retained", 1000, 72, 99, 0, 9);
+    EXPECT_EQ(readProduceError(producer), kawasan::ErrorCode::REQUEST_TIMED_OUT)
+        << "An exact retry must wait for the same full span";
+    sendAcksAllProduce(producer, f.topic, "retained", 5000, 73, 99, 0, 9);
+    ASSERT_EQ(fetchAs(follower, f.topic, kFollowerId, 11, 74).error, kawasan::ErrorCode::NONE);
+    EXPECT_EQ(readProduceError(producer), kawasan::ErrorCode::NONE);
+    EXPECT_EQ(f.broker.replicaManager()->getLog(f.tp)->logEndOffset(), 11);
 }
 
 // A follower with a stale task must not resurrect a topic that was deleted.

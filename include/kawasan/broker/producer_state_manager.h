@@ -67,10 +67,12 @@ public:
     CheckResult check(const std::string& topic, PartitionId partition, int64_t producer_id,
                       int16_t producer_epoch, int32_t base_sequence, int32_t record_count) const;
 
-    /// @brief Records that a batch was successfully appended.
+    /// @brief Records that a batch was successfully appended. Sparse batches
+    /// supply last_offset_delta to retain their original sequence range while
+    /// record_count remains the number of retained records in snapshots.
     void recordAppend(const std::string& topic, PartitionId partition, int64_t producer_id,
                       int16_t producer_epoch, int32_t base_sequence, int32_t record_count,
-                      Offset base_offset);
+                      Offset base_offset, int32_t last_offset_delta = -1);
 
     /// @brief Discard a partition's cached state before rebuilding its retained log.
     void clearPartition(const std::string& topic, PartitionId partition);
@@ -124,8 +126,8 @@ private:
     struct State {
         int16_t last_epoch = -1;
         // last_sequence is the *last* sequence in the most recent batch,
-        // i.e. base_sequence + record_count - 1. This is what determines
-        // "next expected" = last_sequence + 1.
+        // i.e. (base_sequence + last_offset_delta) modulo (INT32_MAX+1).
+        // Dense batches use record_count - 1 as their last offset delta.
         int32_t last_sequence = -1;
         int32_t last_base_sequence = -1;
         int32_t last_record_count = 0;

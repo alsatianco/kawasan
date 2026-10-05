@@ -59,6 +59,10 @@ ProducerStateManager::CheckResult ProducerStateManager::check(
         result.duplicate_offset = s.last_base_offset;
         return result;
     }
+    const int32_t expected_next = incrementSequence(s.last_sequence);
+    if (base_sequence == expected_next) {
+        return result;  // Includes sequence zero after INT32_MAX.
+    }
     if (base_sequence <= s.last_sequence) {
         // Older sequence range — also a duplicate (client retried an
         // even-older batch). We don't have its offset; report the
@@ -68,7 +72,6 @@ ProducerStateManager::CheckResult ProducerStateManager::check(
         return result;
     }
 
-    const int32_t expected_next = incrementSequence(s.last_sequence);
     if (base_sequence != expected_next) {
         // Producer skipped sequences — refuse.
         result.error = ErrorCode::OUT_OF_ORDER_SEQUENCE_NUMBER;
@@ -82,8 +85,8 @@ ProducerStateManager::CheckResult ProducerStateManager::check(
 void ProducerStateManager::recordAppend(const std::string& topic, PartitionId partition,
                                         int64_t producer_id, int16_t producer_epoch,
                                         int32_t base_sequence, int32_t record_count,
-                                        Offset base_offset) {
-    if (producer_id < 0 || record_count <= 0)
+                                        Offset base_offset, int32_t last_offset_delta) {
+    if (producer_id < 0 || record_count < 0 || (record_count == 0 && last_offset_delta < 0))
         return;
     std::lock_guard<std::mutex> lock(mutex_);
     Key key{topic, partition, producer_id};
@@ -91,7 +94,9 @@ void ProducerStateManager::recordAppend(const std::string& topic, PartitionId pa
     s.last_epoch = producer_epoch;
     s.last_base_sequence = base_sequence;
     s.last_record_count = record_count;
-    s.last_sequence = base_sequence + (record_count - 1);
+    const int64_t sequence_delta = last_offset_delta >= 0 ? last_offset_delta : record_count - 1;
+    s.last_sequence = static_cast<int32_t>((static_cast<int64_t>(base_sequence) + sequence_delta) %
+                                           (static_cast<int64_t>(INT32_MAX) + 1));
     s.last_base_offset = base_offset;
 }
 

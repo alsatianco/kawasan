@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include "../sparse_broker_test_client.h"
 #include "kawasan/broker/kawasan_broker.h"
 #include "kawasan/broker/metadata_controller.h"
 #include "kawasan/broker/replica_manager.h"
@@ -146,6 +147,13 @@ TEST_F(CompactedReplicationTest, LaggingFollowerCrossesCommittedCompactionGaps) 
         }
         return brokers_[0]->replicaManager()->isLeader(tp);
     }));
+    // ISR expiry requires an observed fetch. Merely registering a follower
+    // does not prove it has reached the leader; stopping before its first fetch
+    // leaves it unseen, which computeIsrUpdate deliberately keeps in the ISR.
+    ASSERT_TRUE(waitUntil([&] {
+        return brokers_[0]->replicaManager()->getFollowerLag(tp, 1).has_value() &&
+               brokers_[0]->replicaManager()->getFollowerLag(tp, 2).has_value();
+    }));
     brokers_[2]->replicaManager()->stop();
     ASSERT_TRUE(waitUntil([&] {
         const auto metadata = brokers_[0]->metadataController()->describeTopics({topic});
@@ -176,5 +184,49 @@ TEST_F(CompactedReplicationTest, LaggingFollowerCrossesCommittedCompactionGaps) 
     ASSERT_EQ(mirrored.size(), 1u);
     EXPECT_EQ(mirrored[0].baseOffset(), 2);
     EXPECT_EQ(mirrored[0].records()[0].value, retained[0].records()[0].value);
+}
+
+TEST_F(CompactedReplicationTest, PromotionReplaysSparseSequencesAndLaterProducer) {
+    using namespace kawasan::test_support;
+    constexpr const char* topic = "sparse-promotion";
+    const kawasan::TopicPartition tp{topic, 0};
+    kawasan::broker::TopicSpecification spec;
+    spec.name = topic;
+    spec.num_partitions = 1;
+    spec.replication_factor = 3;
+    spec.assignments = {{0, 1, 2}};
+    spec.configs = {{"cleanup.policy", "compact"}};
+    ASSERT_EQ(controller()->createTopic(spec).error_code, kawasan::ErrorCode::NONE);
+    ASSERT_TRUE(waitUntil([&] {
+        for (auto& broker : brokers_)
+            if (!broker->logManager()->getLog(topic, 0))
+                return false;
+        return brokers_[0]->replicaManager()->isLeader(tp);
+    }));
+    auto* leader = brokers_[0]->logManager()->getLog(topic, 0);
+    {
+        auto write_lock = brokers_[0]->lockPartitionWrites(tp);
+        ASSERT_EQ(leader->appendReplicatedBatch(sparseProducerBatch(8 * 1024 * 1024)),
+                  kawasan::storage::Log::ReplicaAppendResult::kAppended);
+        leader->appendBatch(producerBatch(100, 0), false);
+        leader->appendBatch(kawasan::storage::RecordBatch::makeControlBatch(100, 0, 11, true, 0),
+                            false);
+    }
+    ASSERT_TRUE(waitUntil([&] {
+        for (auto& broker : brokers_)
+            if (broker->logManager()->getLog(topic, 0)->highWatermark() != 12)
+                return false;
+        return true;
+    }));
+    ASSERT_EQ(controller()->updatePartitionLeader(topic, 0, 1).error_code,
+              kawasan::ErrorCode::NONE);
+    ASSERT_TRUE(waitUntil([&] { return brokers_[1]->replicaManager()->isLeader(tp); }));
+    const auto retry = brokerProduce(brokers_[1]->port(), topic, producerBatch(100, 0));
+    EXPECT_EQ(retry.error_code, kawasan::ErrorCode::NONE);
+    EXPECT_EQ(retry.base_offset, 10);
+    EXPECT_EQ(brokers_[1]->logManager()->getLog(topic, 0)->logEndOffset(), 12);
+    const auto next = brokerProduce(brokers_[1]->port(), topic, producerBatch(99, 10));
+    EXPECT_EQ(next.error_code, kawasan::ErrorCode::NONE);
+    EXPECT_EQ(next.base_offset, 12);
 }
 }  // namespace
