@@ -340,7 +340,6 @@ TEST_F(StreamsComprehensiveTest, ParallelProcessingSimulation) {
 
     std::atomic<int64_t> totalProcessed{0};
     std::map<std::string, std::atomic<int64_t>> keyCounts;
-    std::mutex keyMutex;
 
     // Initialize key counters
     for (int i = 0; i < 10; ++i) {
