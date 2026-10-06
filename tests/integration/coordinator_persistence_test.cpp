@@ -13,6 +13,7 @@
 #include "kawasan/broker/kawasan_broker.h"
 #include "kawasan/broker/transaction_state_manager.h"
 #include "kawasan/common/logger.h"
+#include "kawasan/protocol/api_versions.h"
 
 using namespace kawasan;
 using namespace kawasan::broker;
@@ -21,6 +22,50 @@ namespace fs = std::filesystem;
 namespace asio = boost::asio;
 
 namespace kawasan::broker {
+struct CoordinatorExecutorProbe {
+    static Buffer error(const RequestDispatcher::RequestContext& context, ErrorCode code, int16_t) {
+        Buffer payload;
+        payload.writeInt32(context.header.correlationId());
+        payload.writeInt16(static_cast<int16_t>(code));
+        return payload;
+    }
+    static RequestDispatcher::HandlerFunc handler(
+        KawasanBroker& b, const std::string& id, RequestDispatcher::HandlerFunc work,
+        bool read_only = false, protocol::CoordinatorType type = protocol::CoordinatorType::GROUP) {
+        return [&b, id, work, read_only, type](auto& context) {
+            return b.deferCoordinatorRequest(context, id, type, work, error, read_only);
+        };
+    }
+    static void wire(KawasanBroker& b, const std::string& id, RequestDispatcher::HandlerFunc work) {
+        // Test-only override exercises the staged seam over Heartbeat v0 bytes.
+        // Production registration still refuses all staged coordinator requests.
+        b.request_dispatcher_->handlers_.at(static_cast<int16_t>(protocol::ApiKey::HEARTBEAT))
+            .front()
+            .handler = handler(b, id, std::move(work));
+    }
+    static RequestDispatcher::DispatchResult dispatch(
+        KawasanBroker& b, const std::string& id, RequestDispatcher::HandlerFunc work,
+        std::function<void(RequestDispatcher::DispatchResult)> sink, bool read_only = false,
+        protocol::CoordinatorType type = protocol::CoordinatorType::GROUP) {
+        RequestDispatcher dispatcher(nullptr);
+        dispatcher.registerHandler(protocol::ApiKey::HEARTBEAT, 0, 0,
+                                   handler(b, id, std::move(work), read_only, type), error);
+        RequestDispatcher::RequestContext context;
+        context.header = {protocol::ApiKey::HEARTBEAT, 0, 71, "executor-test"};
+        context.deferred_sink = std::move(sink);
+        return dispatcher.dispatch(std::move(context));
+    }
+    static std::unique_lock<std::mutex> holdAcquisition(KawasanBroker& b) {
+        return std::unique_lock<std::mutex>(b.coordinator_acquisition_mutex_);
+    }
+    static ErrorCode fencedStatus(KawasanBroker& b, const TopicPartition& tp, int32_t epoch) {
+        auto status = ErrorCode::NONE;
+        b.withCoordinatorRequestFence(tp, epoch, [&](auto error) { status = error; });
+        return status;
+    }
+    static int64_t allocate(KawasanBroker& b) { return b.allocateNextProducerId(); }
+    static bool stopping(KawasanBroker& b) { return b.coordinator_executor_->stopping(); }
+};
 struct CoordinatorPersistenceProbe {
     static OffsetManager& offsets(KawasanBroker& b) { return *b.offset_manager_; }
     static std::shared_ptr<OffsetManager> retainOffsets(KawasanBroker& b) {
@@ -121,6 +166,7 @@ protected:
         c.setBool("monitoring.enabled", false);
         c.setInt("monitoring.port", 0);
         c.setInt("port", 0);
+        c.setInt("network.io_threads", 1);
         c.setInt("raft.port", 0);
         c.setString("log.durability", "async");
         c.setInt("replica.lag.time.max.ms", 60000);
@@ -1223,5 +1269,327 @@ TEST_F(CoordinatorPersistenceTest, ShutdownCancelsIsrWaitBeforeClosingStorage) {
     stopped.get();
     EXPECT_EQ(retained_offsets->fetchOffset(id, "data", 0), 10);
     EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), prior);
+}
+
+RequestDispatcher::HandlerResult heartbeatResult(const RequestDispatcher::RequestContext& context,
+                                                 ErrorCode status) {
+    RequestDispatcher::HandlerResult result;
+    result.payload = CoordinatorExecutorProbe::error(context, status, 0);
+    return result;
+}
+ErrorCode publishStatus(RequestDispatcher::DispatchResult& result) {
+    ErrorCode status = ErrorCode::NONE;
+    if (result.publication_guard)
+        result.publication_guard([&](auto code) { status = code; });
+    if (status == ErrorCode::NONE) {
+        Buffer frame(result.frame);
+        (void)frame.readInt32();
+        (void)frame.readInt32();
+        status = static_cast<ErrorCode>(frame.readInt16());
+    }
+    return status;
+}
+Buffer heartbeatWire(const std::string& id) {
+    Buffer payload;
+    protocol::RequestHeader(protocol::ApiKey::HEARTBEAT, 0, 71, "executor-test").encode(payload);
+    heartbeatRequest(id).encode(payload, 0);
+    return payload;
+}
+
+TEST_F(CoordinatorPersistenceTest, DeferredWireIsrWaitLeavesSingleIoThreadAndReplicaFetchLive) {
+    startCluster();
+    const auto id = key(1);
+    auto& b = *brokers[1];
+    ASSERT_TRUE(waitUntil([&] {
+        return b.coordinatorLoadStatus(id, protocol::CoordinatorType::GROUP) == ErrorCode::NONE;
+    }));
+    ASSERT_EQ(put(b, id, {offsetRecord(id, 10)}), ErrorCode::NONE);
+    brokers[0]->replicaManager()->stop();
+    brokers[2]->replicaManager()->stop();
+    CoordinatorExecutorProbe::wire(b, id, [&](auto& context) {
+        return heartbeatResult(context, put(b, id, {offsetRecord(id, 11)}, 30s));
+    });
+    auto pending = std::async(std::launch::async, [&] {
+        auto request = heartbeatWire(id);
+        return test_support::brokerRequest(b.port(), request);
+    });
+    ASSERT_TRUE(waitUntil(
+        [&] { return b.logManager()->getLog("__consumer_offsets", 1)->logEndOffset() == 2; }));
+    EXPECT_EQ(pending.wait_for(50ms), std::future_status::timeout);
+    auto progress = std::async(std::launch::async, [&] {
+        Buffer payload;
+        protocol::RequestHeader(protocol::ApiKey::API_VERSIONS, 1, 72, "io-progress")
+            .encode(payload);
+        protocol::ApiVersionsRequest{}.encode(payload, 1);
+        return test_support::brokerRequest(b.port(), payload);
+    });
+    EXPECT_EQ(progress.wait_for(2s), std::future_status::ready);
+    auto versions = progress.get();
+    EXPECT_EQ(versions.readInt32(), 72);
+    EXPECT_EQ(versions.readInt16(), 0);
+    brokers[0]->replicaManager()->start();
+    brokers[2]->replicaManager()->start();
+    ASSERT_EQ(pending.wait_for(10s), std::future_status::ready);
+    auto response = pending.get();
+    EXPECT_EQ(response.readInt32(), 71);
+    EXPECT_EQ(static_cast<ErrorCode>(response.readInt16()), ErrorCode::NONE);
+    EXPECT_EQ(CoordinatorPersistenceProbe::offsets(b).fetchOffset(id, "data", 0), 11);
+}
+
+TEST_F(CoordinatorPersistenceTest, DeferredShutdownRejectsQueueAndDrainsWorkerAndResponseTickets) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    ASSERT_TRUE(waitUntil([&] {
+        return b.coordinatorLoadStatus(id, protocol::CoordinatorType::GROUP) == ErrorCode::NONE;
+    }));
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    std::atomic<int> entered{0}, rejected{0};
+    auto work = [&](auto& context) {
+        ++entered;
+        released.wait();
+        return heartbeatResult(context, ErrorCode::NONE);
+    };
+    auto sink = [&](auto result) {
+        if (publishStatus(result) == ErrorCode::NOT_COORDINATOR)
+            ++rejected;
+    };
+    EXPECT_TRUE(CoordinatorExecutorProbe::dispatch(b, id, work, sink).deferred);
+    EXPECT_TRUE(CoordinatorExecutorProbe::dispatch(b, id, work, sink).deferred);
+    ASSERT_TRUE(waitUntil([&] { return entered.load() == 2; }));
+    EXPECT_TRUE(CoordinatorExecutorProbe::dispatch(b, id, work, sink).deferred);
+    auto stopped = std::async(std::launch::async, [&] { b.stop(); });
+    ASSERT_TRUE(waitUntil([&] { return CoordinatorExecutorProbe::stopping(b); }));
+    EXPECT_EQ(stopped.wait_for(50ms), std::future_status::timeout);
+    release.set_value();
+    EXPECT_EQ(stopped.wait_for(5s), std::future_status::ready);
+    stopped.get();
+    EXPECT_EQ(entered.load(), 2);
+    EXPECT_EQ(rejected.load(), 3);
+}
+
+TEST_F(CoordinatorPersistenceTest, DeferredShutdownWaitsForRetainedPublicationAndRefusesSuccess) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    ASSERT_TRUE(waitUntil([&] {
+        return b.coordinatorLoadStatus(id, protocol::CoordinatorType::GROUP) == ErrorCode::NONE;
+    }));
+    std::promise<RequestDispatcher::DispatchResult> delivered;
+    EXPECT_TRUE(
+        CoordinatorExecutorProbe::dispatch(
+            b, id,
+            [&](auto& context) { return heartbeatResult(context, put(b, id, {offsetRecord(id)})); },
+            [&](auto result) { delivered.set_value(std::move(result)); })
+            .deferred);
+    auto ready = delivered.get_future();
+    ASSERT_EQ(ready.wait_for(2s), std::future_status::ready);
+    auto result = ready.get();
+    EXPECT_EQ(CoordinatorPersistenceProbe::offsets(b).fetchOffset(id, "data", 0), 42);
+    auto stopped = std::async(std::launch::async, [&] { b.stop(); });
+    ASSERT_TRUE(waitUntil([&] { return CoordinatorExecutorProbe::stopping(b); }));
+    EXPECT_EQ(stopped.wait_for(50ms), std::future_status::timeout);
+    EXPECT_NE(b.logManager()->getLog("__consumer_offsets", 0), nullptr);
+    EXPECT_EQ(publishStatus(result), ErrorCode::NOT_COORDINATOR);
+    result = {};
+    EXPECT_EQ(stopped.wait_for(5s), std::future_status::ready);
+    stopped.get();
+}
+
+TEST_F(CoordinatorPersistenceTest, DeferredWireOwnerLossAfterMutationBeforeDeliveryRefusesSuccess) {
+    startCluster();
+    const auto id = key(1);
+    auto& b = *brokers[1];
+    ASSERT_TRUE(waitUntil([&] {
+        return b.coordinatorLoadStatus(id, protocol::CoordinatorType::GROUP) == ErrorCode::NONE;
+    }));
+    std::promise<ErrorCode> committed;
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    CoordinatorExecutorProbe::wire(b, id, [&](auto& context) {
+        const auto status = put(b, id, {offsetRecord(id)});
+        committed.set_value(status);
+        released.wait();
+        return heartbeatResult(context, status);
+    });
+    auto pending = std::async(std::launch::async, [&] {
+        auto request = heartbeatWire(id);
+        return test_support::brokerRequest(b.port(), request);
+    });
+    auto durable = committed.get_future();
+    ASSERT_EQ(durable.wait_for(5s), std::future_status::ready);
+    EXPECT_EQ(durable.get(), ErrorCode::NONE);
+    KawasanBroker* controller = nullptr;
+    ASSERT_TRUE(waitUntil([&] {
+        for (auto& broker : brokers)
+            if (broker->raftNode()->isLeader())
+                controller = broker.get();
+        return controller != nullptr;
+    }));
+    ASSERT_EQ(controller->metadataController()
+                  ->updatePartitionLeader("__consumer_offsets", 1, 0)
+                  .error_code,
+              ErrorCode::NONE);
+    ASSERT_TRUE(waitUntil([&] {
+        return b.metadataController()
+                   ->describeTopics({"__consumer_offsets"})
+                   .front()
+                   .partitions[1]
+                   .leader == 0;
+    }));
+    release.set_value();
+    ASSERT_EQ(pending.wait_for(5s), std::future_status::ready);
+    auto response = pending.get();
+    EXPECT_EQ(response.readInt32(), 71);
+    EXPECT_EQ(static_cast<ErrorCode>(response.readInt16()), ErrorCode::NOT_COORDINATOR);
+}
+
+TEST_F(CoordinatorPersistenceTest, DeferredReadAdmissionAndWorkerExceptionsUseFencedResponses) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    ASSERT_TRUE(waitUntil([&] {
+        return b.coordinatorLoadStatus(id, protocol::CoordinatorType::GROUP) == ErrorCode::NONE;
+    }));
+    ASSERT_EQ(put(b, id, {offsetRecord(id)}), ErrorCode::NONE);
+    std::promise<ErrorCode> delivered;
+    ASSERT_TRUE(CoordinatorExecutorProbe::dispatch(
+                    b, id,
+                    [&](auto& context) {
+                        EXPECT_EQ(
+                            CoordinatorPersistenceProbe::offsets(b).fetchOffset(id, "data", 0), 42);
+                        return heartbeatResult(context, ErrorCode::NONE);
+                    },
+                    [&](auto result) { delivered.set_value(publishStatus(result)); }, true)
+                    .deferred);
+    EXPECT_EQ(delivered.get_future().get(), ErrorCode::NONE);
+    std::promise<ErrorCode> failed;
+    ASSERT_TRUE(CoordinatorExecutorProbe::dispatch(
+                    b, id,
+                    [](auto&) -> RequestDispatcher::HandlerResult {
+                        throw std::runtime_error("worker fixture exception");
+                    },
+                    [&](auto result) { failed.set_value(publishStatus(result)); })
+                    .deferred);
+    EXPECT_EQ(failed.get_future().get(), ErrorCode::KAFKA_STORAGE_ERROR);
+}
+
+TEST_F(CoordinatorPersistenceTest, DeferredMutationCannotUseReacquiredEpochFromOlderAdmission) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    ASSERT_EQ(put(b, id, {offsetRecord(id, 10)}), ErrorCode::NONE);
+    std::promise<void> entered, release;
+    auto released = release.get_future().share();
+    std::promise<ErrorCode> mutated, delivered;
+    ASSERT_TRUE(CoordinatorExecutorProbe::dispatch(
+                    b, id,
+                    [&](auto& context) {
+                        entered.set_value();
+                        released.wait();
+                        const auto status = put(b, id, {offsetRecord(id, 11)});
+                        mutated.set_value(status);
+                        return heartbeatResult(context, status);
+                    },
+                    [&](auto result) { delivered.set_value(publishStatus(result)); })
+                    .deferred);
+    ASSERT_EQ(entered.get_future().wait_for(2s), std::future_status::ready);
+    EXPECT_EQ(b.metadataController()->updatePartitionLeader("__consumer_offsets", 0, 0).error_code,
+              ErrorCode::NONE);
+    b.reconcileReplicas();
+    EXPECT_EQ(b.coordinatorLoadStatus(id, protocol::CoordinatorType::GROUP), ErrorCode::NONE);
+    release.set_value();
+    EXPECT_EQ(mutated.get_future().get(), ErrorCode::NOT_COORDINATOR);
+    EXPECT_EQ(delivered.get_future().get(), ErrorCode::NOT_COORDINATOR);
+    EXPECT_EQ(CoordinatorPersistenceProbe::offsets(b).fetchOffset(id, "data", 0), 10);
+    EXPECT_EQ(b.logManager()->getLog("__consumer_offsets", 0)->logEndOffset(), 1);
+}
+
+TEST_F(CoordinatorPersistenceTest, DeferredShutdownCancelsActiveIsrWorkerBeforeStorageCloses) {
+    startCluster();
+    const auto id = key(1);
+    auto& b = *brokers[1];
+    ASSERT_TRUE(waitUntil([&] {
+        return b.coordinatorLoadStatus(id, protocol::CoordinatorType::GROUP) == ErrorCode::NONE;
+    }));
+    ASSERT_EQ(put(b, id, {offsetRecord(id, 10)}), ErrorCode::NONE);
+    const auto retained = CoordinatorPersistenceProbe::retainOffsets(b);
+    brokers[0]->replicaManager()->stop();
+    brokers[2]->replicaManager()->stop();
+    std::promise<ErrorCode> delivered;
+    ASSERT_TRUE(CoordinatorExecutorProbe::dispatch(
+                    b, id,
+                    [&](auto& context) {
+                        return heartbeatResult(context, put(b, id, {offsetRecord(id, 11)}, 30s));
+                    },
+                    [&](auto result) { delivered.set_value(publishStatus(result)); })
+                    .deferred);
+    ASSERT_TRUE(waitUntil(
+        [&] { return b.logManager()->getLog("__consumer_offsets", 1)->logEndOffset() == 2; }));
+    auto stopped = std::async(std::launch::async, [&] { b.stop(); });
+    auto response = delivered.get_future();
+    EXPECT_EQ(response.wait_for(2s), std::future_status::ready);
+    EXPECT_EQ(response.get(), ErrorCode::NOT_COORDINATOR);
+    EXPECT_EQ(stopped.wait_for(5s), std::future_status::ready);
+    stopped.get();
+    EXPECT_EQ(retained->fetchOffset(id, "data", 0), 10);
+}
+
+TEST_F(CoordinatorPersistenceTest, DeferredProducerIdentityAndTransactionReadUseOwnedSource) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    std::promise<ErrorCode> delivered;
+    std::optional<TransactionCoordinator::TxnSnapshot> created;
+    ASSERT_TRUE(CoordinatorExecutorProbe::dispatch(
+                    b, id,
+                    [&](auto& context) {
+                        auto identity = transaction(id);
+                        identity.producer_id = CoordinatorExecutorProbe::allocate(b);
+                        const auto status = init(b, identity);
+                        if (status == ErrorCode::NONE)
+                            created = identity;
+                        return heartbeatResult(context, status);
+                    },
+                    [&](auto result) { delivered.set_value(publishStatus(result)); }, false,
+                    protocol::CoordinatorType::TRANSACTION)
+                    .deferred);
+    EXPECT_EQ(delivered.get_future().get(), ErrorCode::NONE);
+    ASSERT_TRUE(created);
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), created);
+    std::promise<ErrorCode> read;
+    ASSERT_TRUE(CoordinatorExecutorProbe::dispatch(
+                    b, id,
+                    [&](auto& context) {
+                        EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id),
+                                  created);
+                        return heartbeatResult(context, ErrorCode::NONE);
+                    },
+                    [&](auto result) { read.set_value(publishStatus(result)); }, true,
+                    protocol::CoordinatorType::TRANSACTION)
+                    .deferred);
+    EXPECT_EQ(read.get_future().get(), ErrorCode::NONE);
+}
+
+TEST_F(CoordinatorPersistenceTest, OwnershipRefusalTakesPriorityOverBusyAcquisition) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const TopicPartition tp{"__consumer_offsets", 0};
+    const auto epoch =
+        b.metadataController()->describeTopics({tp.topic}).front().partitions[0].leader_epoch;
+    ASSERT_EQ(b.metadataController()->updatePartitionLeader(tp.topic, tp.partition, -1).error_code,
+              ErrorCode::NONE);
+    auto lock = CoordinatorExecutorProbe::holdAcquisition(b);
+    auto response = std::async(
+        std::launch::async, [&] { return CoordinatorExecutorProbe::fencedStatus(b, tp, epoch); });
+    EXPECT_EQ(response.wait_for(2s), std::future_status::ready);
+    EXPECT_EQ(response.get(), ErrorCode::NOT_COORDINATOR);
 }
 }  // namespace

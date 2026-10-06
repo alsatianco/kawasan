@@ -8,6 +8,18 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-06
 
+- Add a bounded staged coordinator executor with shutdown queue refusal, ISR
+  cancellation and request tickets retained through response write/cancellation.
+  Fence keyed group/transaction admission, cache reads and response write
+  initiation against the original ownership epoch; reject old requests after
+  reacquisition. Snapshot deferred connection identities. Keep coordinator
+  handler/background and public-format activation gated.
+- Make deferred dispatcher completion independent of dispatcher lifetime and
+  deliver it at most once. Snapshot connection principals for parked Fetch and
+  Produce so later authorization cannot use a released connection. Serialize TCP sessions on strands, seal deferred
+  posting per server generation and drain cancelled reads/writes and posted
+  delivery on shutdown. Retained completions cannot access a destroyed server.
+
 - Add detached staged group-state proposals for JoinGroup, SyncGroup, Heartbeat,
   LeaveGroup and member/rebalance timeouts. Persist the complete touched group
   before installing its exact heartbeat/deadline/counter changes; preserve other

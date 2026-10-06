@@ -705,6 +705,8 @@ KawasanBroker::KawasanBroker(const Config& config, std::optional<CoordinatorForm
 
     request_metrics_ = std::make_shared<metrics::RequestMetrics>();
     request_dispatcher_ = std::make_shared<RequestDispatcher>(request_metrics_);
+    if (staged_coordinator_persistence_)
+        coordinator_executor_ = std::make_unique<CoordinatorExecutor>();
     supported_api_versions_ = {
         {protocol::ApiKey::API_VERSIONS, 0, 4},
         {protocol::ApiKey::LIST_OFFSETS, 0, kListOffsetsMaxVersion},
@@ -859,7 +861,19 @@ void KawasanBroker::stop() {
     // to finish while storage, metadata and replica progress are still alive.
     // The writer observes the stop flag and cancels an uncommitted ISR wait.
     if (staged_coordinator_persistence_) {
+        // Seal the queue first, then cancel active ISR waits. Workers complete
+        // queued requests with refusal while dispatcher/transport are alive.
+        if (coordinator_executor_)
+            coordinator_executor_->seal();
         coordinator_mutations_stopping_.store(true);
+        if (coordinator_executor_) {
+            coordinator_executor_->join();
+            // Cancel slow writes and drain posted publication callbacks before
+            // their tickets release the broker's metadata/cache lifetime.
+            if (tcp_server_)
+                tcp_server_->stop();
+            coordinator_executor_->drainResponses();
+        }
         std::unique_lock<std::shared_mutex> drain(coordinator_mutation_lifecycle_mutex_);
     }
     // M2: the transaction-timeout sweep is started during construction (next
@@ -2646,6 +2660,7 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
     // produce is resolved from the purgatory after this call returns.
     struct ProduceState {
         RequestDispatcher::RequestContext context;
+        std::optional<RequestDispatcher::ConnectionContext> connection;
         std::vector<protocol::ProduceTopicResponse> topics;
         std::vector<PendingAck> pending;
         bool has_error = false;
@@ -2653,7 +2668,9 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
     auto state = std::make_shared<ProduceState>();
     state->context.header = context.header;
     state->context.peer_identity = context.peer_identity;
-    state->context.connection = context.connection;
+    if (context.connection)
+        state->connection = *context.connection;
+    state->context.connection = state->connection ? &*state->connection : nullptr;
     state->topics = std::move(topic_responses);
     state->pending = std::move(pending_acks);
     state->has_error = has_error;
@@ -2796,12 +2813,15 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
     struct FetchState {
         protocol::FetchRequest request;
         RequestDispatcher::RequestContext context;
+        std::optional<RequestDispatcher::ConnectionContext> connection;
     };
     auto state = std::make_shared<FetchState>();
     state->request.decode(context.payload, context.header.apiVersion());
     state->context.header = context.header;
     state->context.peer_identity = context.peer_identity;
-    state->context.connection = context.connection;
+    if (context.connection)
+        state->connection = *context.connection;
+    state->context.connection = state->connection ? &*state->connection : nullptr;
     const auto& request = state->request;
 
     const int32_t max_wait_ms = std::max<int32_t>(0, request.maxWaitMs());

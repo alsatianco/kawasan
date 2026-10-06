@@ -7,6 +7,7 @@ add_library(kawasan_broker OBJECT
     request_dispatcher.cpp
     request_metrics.cpp
     coordinator_format.cpp
+    coordinator_executor.cpp
     coordinator_persistence.cpp
     metadata_store.cpp
     metadata_controller.cpp

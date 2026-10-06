@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "kawasan/broker/coordinator_executor.h"
 #include "kawasan/broker/delayed_operation_purgatory.h"
 #include "kawasan/broker/group_coordinator.h"
 #include "kawasan/broker/group_state_manager.h"
@@ -194,8 +195,26 @@ public:
 private:
     friend struct CoordinatorAcquisitionProbe;
     friend struct CoordinatorPersistenceProbe;
+    friend struct CoordinatorExecutorProbe;
     KawasanBroker(const Config& config, std::optional<CoordinatorFormat> staging,
                   bool persistence = false);
+    // Internal deferred seam; no registration/public mode calls this yet.
+    // Work must use committed mutations. read_only callbacks access caches only
+    // under the ownership fence, without calling metadata or reentering mutations.
+    // Error builders also run inside the publication fence and must not call metadata.
+    RequestDispatcher::HandlerResult deferCoordinatorRequest(
+        RequestDispatcher::RequestContext context, const std::string& key,
+        protocol::CoordinatorType type, RequestDispatcher::HandlerFunc work,
+        RequestDispatcher::ErrorBuilder errors, bool read_only = false);
+    void withCoordinatorRequestFence(const TopicPartition& tp, int32_t epoch,
+                                     const std::function<void(ErrorCode)>& publish);
+    struct RequestOwnership {
+        KawasanBroker* broker;
+        TopicPartition tp;
+        int32_t epoch;
+    };
+    static thread_local std::optional<RequestOwnership> coordinator_request_owner_;
+    std::unique_ptr<CoordinatorExecutor> coordinator_executor_;
     std::optional<CoordinatorFormat> staged_coordinator_format_;
     bool staged_coordinator_persistence_ = false;
     mutable std::mutex coordinator_acquisition_mutex_;

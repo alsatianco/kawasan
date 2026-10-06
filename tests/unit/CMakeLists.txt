@@ -232,3 +232,8 @@ add_test(NAME CoordinatorFormatTest COMMAND coordinator_format_test)
 add_executable(group_state_manager_test group_state_manager_test.cpp)
 target_link_libraries(group_state_manager_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME GroupStateManagerTest COMMAND group_state_manager_test)
+
+add_executable(coordinator_executor_test coordinator_executor_test.cpp)
+target_link_libraries(coordinator_executor_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME CoordinatorExecutorTest COMMAND coordinator_executor_test)
+set_tests_properties(CoordinatorExecutorTest PROPERTIES TIMEOUT 20)

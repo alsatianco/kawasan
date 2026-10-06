@@ -635,12 +635,39 @@ stopping replication or closing logs. Queued mutations recheck the shutdown gate
 after obtaining their partition lock. Proposal callbacks must finish and cannot
 reenter mutation or broker shutdown.
 
+The staged `CoordinatorExecutor` has two workers and a bounded 1,024-entry queue.
+`deferCoordinatorRequest` captures one group/transaction source and its ownership
+epoch. Admission and worker execution check currency, acquired state, readable HW
+and source barriers. Read callbacks run under the ownership fence; mutation
+callbacks use the committed writer and retain their original admission epoch even
+if the same broker reacquires the source. Authenticated connection state is copied
+before deferral; existing parked Fetch/Produce also own principal snapshots for
+later authorization after connection teardown. Known ownership loss takes
+priority over busy acquisition. Read callbacks and error builders must not
+reenter metadata.
+
+A shared request ticket spans queueing, worker execution, posted delivery and the
+last socket write/cancellation. At delivery, a synchronous publication guard
+rechecks the original owner/epoch and initiates the write under the metadata
+fence. Busy acquisition/mutation locks return a retryable load error instead of
+blocking a socket thread behind an ISR wait. Shutdown seals queue admission,
+cancels ISR waits, rejects queued work, joins workers, cancels/drains TCP operations
+and drains response tickets before replica/metadata/storage teardown. External
+integration sinks must discard their responses or finish delivery to release
+tickets. Dispatcher completion owns framing/metrics inputs without a dispatcher
+pointer and delivers at most once. TCP sinks retain only a weak session plus a
+sealed per-generation posting gate; session strands serialize socket access and
+shutdown drains IO naturally instead of abandoning posted callbacks.
+
 No broker configuration activates staging. Coordinator wire requests, cleanup,
 transaction sweep and legacy Prepare completion remain gated until all handlers
-and background jobs use the new mutation functions. Serving integration still
-needs deferred execution off socket IO threads, worker/response lifecycle draining,
-read/producer/response fencing and migration of offset/transaction handlers and
-background jobs. The group proposal primitive does not itself activate handlers.
+and background jobs use the new mutation functions. Test-only Heartbeat overrides
+exercise deferred staged offset writes on real sockets; they do not enable the
+normal protocol handlers. Serving integration still needs complete handler/job
+migration, multi-key request aggregation, pending-offset routing and negotiated
+session-timeout recovery. Keyed producer identity creation and reads can use this
+executor; unkeyed producer admission remains part of that migration. The group
+proposal and executor primitives do not themselves activate handlers.
 InitProducerId now propagates counter-write and directory-fsync failures before acknowledging an ID or creating a transaction;
 the successful counter format and sequential single-node IDs stay compatible.
 Requests cannot use external Produce/DeleteRecords to modify formatted sources.

@@ -11,6 +11,150 @@
 
 namespace kawasan::broker {
 
+thread_local std::optional<KawasanBroker::RequestOwnership>
+    KawasanBroker::coordinator_request_owner_;
+
+// Lock order matches acquisition: mutation -> acquisition -> metadata. Try the
+// first two locks because response publication runs on a socket IO thread.
+void KawasanBroker::withCoordinatorRequestFence(const TopicPartition& tp, int32_t epoch,
+                                                const std::function<void(ErrorCode)>& publish) {
+    if (coordinator_mutations_stopping_.load() || !running_.load() || !dataPlaneCurrent()) {
+        publish(ErrorCode::NOT_COORDINATOR);
+        return;
+    }
+    // Known owner/epoch loss takes priority over a busy acquisition lock. The
+    // atomic metadata fence below still rechecks changes after this snapshot.
+    const auto metadata = currentPartitionMetadata(tp);
+    if (!metadata) {
+        publish(ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+        return;
+    }
+    if (metadata->leader != broker_id_ || metadata->leader_epoch != epoch) {
+        publish(ErrorCode::NOT_COORDINATOR);
+        return;
+    }
+    auto mutex = coordinatorMutationMutex(tp);
+    std::unique_lock<std::mutex> mutation(*mutex, std::try_to_lock);
+    std::unique_lock<std::mutex> acquisition(coordinator_acquisition_mutex_, std::try_to_lock);
+    if (!mutation.owns_lock() || !acquisition.owns_lock()) {
+        publish(ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+        return;
+    }
+    bool called = false;
+    const auto status =
+        metadata_controller_->withPartitionLeadership(tp, broker_id_, epoch, [&](const auto&) {
+            const auto loaded = acquired_coordinator_epochs_.find(tp);
+            auto error = ErrorCode::NONE;
+            if (coordinator_mutations_stopping_.load() || !dataPlaneCurrent())
+                error = ErrorCode::NOT_COORDINATOR;
+            else if (loaded == acquired_coordinator_epochs_.end() || loaded->second != epoch ||
+                     !replica_manager_->readableHighWatermark(tp, epoch) ||
+                     failed_coordinator_appends_.contains(tp) ||
+                     coordinator_commit_barriers_.contains(tp))
+                error = ErrorCode::COORDINATOR_LOAD_IN_PROGRESS;
+            called = true;
+            publish(error);  // Includes actual transport write initiation.
+            return error;
+        });
+    if (!called)
+        publish(status);
+}
+
+RequestDispatcher::HandlerResult KawasanBroker::deferCoordinatorRequest(
+    RequestDispatcher::RequestContext context, const std::string& key,
+    protocol::CoordinatorType type, RequestDispatcher::HandlerFunc work,
+    RequestDispatcher::ErrorBuilder errors, bool read_only) {
+    if (!errors)
+        throw std::invalid_argument("deferred coordinator request needs an error builder");
+    auto error_context = context;
+    error_context.connection = nullptr;
+    error_context.complete = {};
+    error_context.deferred_sink = {};
+    auto error_payload = [errors, error_context](ErrorCode error) {
+        return errors(error_context, error, error_context.header.apiVersion());
+    };
+    auto refusal = [&](ErrorCode error) {
+        RequestDispatcher::HandlerResult result;
+        result.payload = error_payload(error);
+        return result;
+    };
+    if (!coordinator_executor_ || !context.complete || !work || key.empty() ||
+        (type != protocol::CoordinatorType::GROUP &&
+         type != protocol::CoordinatorType::TRANSACTION))
+        return refusal(ErrorCode::INVALID_REQUEST);
+    const std::string topic =
+        type == protocol::CoordinatorType::GROUP ? "__consumer_offsets" : "__transaction_state";
+    const TopicPartition tp{
+        topic, coordinatorPartitionFor(key, staged_coordinator_format_->partitionCount(topic))};
+    const auto metadata = currentPartitionMetadata(tp);
+    if (!metadata)
+        return refusal(ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+    const auto epoch = metadata->leader_epoch;
+    ErrorCode admission = ErrorCode::NOT_COORDINATOR;
+    withCoordinatorRequestFence(tp, epoch, [&](auto status) { admission = status; });
+    if (admission != ErrorCode::NONE)
+        return refusal(admission);
+    auto complete = context.complete;
+    // A deferred transport sink is weak; snapshot the authenticated identity so
+    // an idle disconnect cannot leave a worker with a dangling connection pointer.
+    auto connection =
+        context.connection
+            ? std::make_shared<RequestDispatcher::ConnectionContext>(*context.connection)
+            : nullptr;
+    context.connection = connection.get();
+    context.complete = {};
+    context.deferred_sink = {};
+    const bool queued = coordinator_executor_->submit(
+        [this, context = std::move(context), connection, complete, work = std::move(work),
+         error_payload, tp, epoch, read_only](bool admitted, auto ticket) mutable {
+            (void)connection;
+            RequestDispatcher::HandlerResult result;
+            ErrorCode status = ErrorCode::NOT_COORDINATOR;
+            const auto previous = coordinator_request_owner_;
+            coordinator_request_owner_ = RequestOwnership{this, tp, epoch};
+            try {
+                if (admitted) {
+                    withCoordinatorRequestFence(tp, epoch, [&](auto error) {
+                        status = error;
+                        if (read_only && status == ErrorCode::NONE)
+                            result = work(context);
+                    });
+                    if (!read_only && status == ErrorCode::NONE)
+                        result = work(context);  // Mutations retain the admitted epoch below.
+                    if (result.deferred)
+                        status = ErrorCode::INVALID_REQUEST;  // No nested deferrals.
+                }
+            } catch (const ProtocolException&) {
+                status = ErrorCode::INVALID_REQUEST;
+            } catch (const KawasanException& ex) {
+                status = ex.code();
+            } catch (const std::exception& ex) {
+                Logger::error("Deferred coordinator handler failed: {}", ex.what());
+                status = ErrorCode::KAFKA_STORAGE_ERROR;
+            } catch (...) {
+                status = ErrorCode::KAFKA_STORAGE_ERROR;
+            }
+            coordinator_request_owner_ = previous;
+            if (status != ErrorCode::NONE)
+                result.payload = error_payload(status);
+            result.deferred = false;
+            result.lifetime = std::move(ticket);
+            result.publication_error = error_payload;
+            result.publication_guard = [this, tp, epoch,
+                                        ticket = result.lifetime](const auto& publish) {
+                (void)ticket;
+                withCoordinatorRequestFence(tp, epoch, publish);
+            };
+            complete(std::move(result));
+        });
+    if (!queued)
+        return refusal(coordinator_executor_->stopping() ? ErrorCode::NOT_COORDINATOR
+                                                         : ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+    RequestDispatcher::HandlerResult parked;
+    parked.deferred = true;
+    return parked;
+}
+
 std::shared_ptr<std::mutex> KawasanBroker::coordinatorMutationMutex(const TopicPartition& tp) {
     std::lock_guard<std::mutex> lock(coordinator_mutation_map_mutex_);
     auto& mutex = coordinator_mutation_mutexes_[tp];
@@ -158,6 +302,12 @@ ErrorCode KawasanBroker::mutateCoordinatorGroupImpl(
     const auto metadata = currentPartitionMetadata(tp);
     if (!metadata)
         return ErrorCode::NOT_COORDINATOR;
+    if (coordinator_request_owner_ && coordinator_request_owner_->broker == this) {
+        if (coordinator_request_owner_->tp != tp)
+            return ErrorCode::INVALID_REQUEST;
+        if (coordinator_request_owner_->epoch != metadata->leader_epoch)
+            return ErrorCode::NOT_COORDINATOR;
+    }
     try {
         GroupStateManager source(log_manager_.get(), offsets_topic_num_partitions_);
         auto image = source.loadCommittedPartition(tp.partition);
@@ -281,6 +431,12 @@ ErrorCode KawasanBroker::mutateCoordinatorTransaction(
     const auto metadata = currentPartitionMetadata(tp);
     if (!metadata)
         return ErrorCode::NOT_COORDINATOR;
+    if (coordinator_request_owner_ && coordinator_request_owner_->broker == this) {
+        if (coordinator_request_owner_->tp != tp)
+            return ErrorCode::INVALID_REQUEST;
+        if (coordinator_request_owner_->epoch != metadata->leader_epoch)
+            return ErrorCode::NOT_COORDINATOR;
+    }
     auto proposed = transaction_coordinator_->describe(transactional_id);
     if (expected != proposed) {
         if (expected && proposed && expected->producer_id != proposed->producer_id)

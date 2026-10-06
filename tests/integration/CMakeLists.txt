@@ -168,3 +168,8 @@ add_executable(coordinator_persistence_test coordinator_persistence_test.cpp)
 target_link_libraries(coordinator_persistence_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME CoordinatorPersistenceTest COMMAND coordinator_persistence_test)
 set_tests_properties(CoordinatorPersistenceTest PROPERTIES TIMEOUT 180)
+
+add_executable(deferred_response_test deferred_response_test.cpp)
+target_link_libraries(deferred_response_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME DeferredResponseTest COMMAND deferred_response_test)
+set_tests_properties(DeferredResponseTest PROPERTIES TIMEOUT 30)

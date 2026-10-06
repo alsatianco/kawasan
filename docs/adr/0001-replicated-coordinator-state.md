@@ -102,3 +102,12 @@ record. Failed proposals leave the live group unchanged. A timeout can persist
 PreparingRebalance with surviving members and no elected leader; other phases
 retain the member-leader validation. This checkpoint does not enable coordinator
 wire handlers, background jobs or a public format configuration.
+
+The staged executor checkpoint carries an admitted source/ownership epoch from
+queueing through response write initiation. Shutdown rejects queued work, cancels
+ISR waits, joins workers and drains TCP delivery/write tickets while source and
+metadata lifetimes still exist. Read callbacks use the ownership fence and
+committed mutations refuse older admissions after reacquisition. Dispatcher
+completion and retained TCP sinks no longer depend on destroyed owners. These
+are internal, single-source seams; normal coordinator handlers/background jobs,
+multi-key aggregation, pending-offset routing and public activation remain gated.

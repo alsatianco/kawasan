@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <boost/asio/bind_executor.hpp>
 #include <boost/asio/error.hpp>
 #include <boost/asio/ip/address_v4.hpp>
 #include <boost/asio/ip/address_v6.hpp>
@@ -14,6 +15,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstring>
+#include <future>
 #include <optional>
 #include <stdexcept>
 
@@ -81,19 +83,35 @@ public:
     TcpSession(boost::asio::ip::tcp::socket socket, TcpServer& server, size_t max_frame_size)
         : socket_(std::move(socket)),
           server_(server),
-          max_frame_size_(std::max<size_t>(1, max_frame_size)),
-          last_activity_(std::chrono::steady_clock::now()) {}
+          strand_(boost::asio::make_strand(server.io_context_)),
+          max_frame_size_(std::max<size_t>(1, max_frame_size)) {
+        updateActivity();
+    }
 
-    ~TcpSession() { stop(); }
+    ~TcpSession() = default;
+
+    void requestStop(
+        monitoring::ConnectionCloseReason reason = monitoring::ConnectionCloseReason::kNormal) {
+        boost::asio::post(strand_, [self = shared_from_this(), reason] { self->stop(reason); });
+    }
+
+    void startOnStrand() {
+        boost::asio::post(strand_, [self = shared_from_this()] { self->start(); });
+    }
 
     void start() {
+        if (stopped_)
+            return;
         peer_identity_ = describePeer();
         Logger::info("Accepted client connection from {}", peer_identity_);
         updateActivity();
         readFrameSize();
     }
 
-    std::chrono::steady_clock::time_point getLastActivity() const { return last_activity_; }
+    std::chrono::steady_clock::time_point getLastActivity() const {
+        return std::chrono::steady_clock::time_point(
+            std::chrono::steady_clock::duration(last_activity_.load()));
+    }
 
     void stop(
         monitoring::ConnectionCloseReason reason = monitoring::ConnectionCloseReason::kNormal) {
@@ -110,13 +128,20 @@ public:
     }
 
 private:
-    void updateActivity() { last_activity_ = std::chrono::steady_clock::now(); }
+    void updateActivity() {
+        last_activity_.store(std::chrono::steady_clock::now().time_since_epoch().count());
+    }
 
     void readFrameSize() {
+        if (stopped_)
+            return;
         auto self = shared_from_this();
         boost::asio::async_read(
             socket_, boost::asio::buffer(size_buffer_),
-            [self](const boost::system::error_code& ec, std::size_t bytes_transferred) {
+            boost::asio::bind_executor(strand_, [self](const boost::system::error_code& ec,
+                                                       std::size_t bytes_transferred) {
+                if (self->stopped_)
+                    return;
                 if (ec) {
                     self->handleError("reading frame size", ec);
                     return;
@@ -140,14 +165,17 @@ private:
 
                 self->frame_buffer_.assign(frame_length, 0);
                 self->readFramePayload();
-            });
+            }));
     }
 
     void readFramePayload() {
         auto self = shared_from_this();
         boost::asio::async_read(
             socket_, boost::asio::buffer(frame_buffer_),
-            [self](const boost::system::error_code& ec, std::size_t bytes_transferred) {
+            boost::asio::bind_executor(strand_, [self](const boost::system::error_code& ec,
+                                                       std::size_t bytes_transferred) {
+                if (self->stopped_)
+                    return;
                 if (ec) {
                     self->handleError("reading frame payload", ec);
                     return;
@@ -161,7 +189,7 @@ private:
                 self->updateActivity();
                 self->server_.recordBytesIn(bytes_transferred);
                 self->processRequest();
-            });
+            }));
     }
 
     void processRequest() {
@@ -187,8 +215,8 @@ private:
         }
 
         Logger::debug("Client {} request api_key={} version={} correlation_id={} client_id={}",
-                     peer_identity_, static_cast<int16_t>(header.apiKey()), header.apiVersion(),
-                     header.correlationId(), header.clientId());
+                      peer_identity_, static_cast<int16_t>(header.apiKey()), header.apiVersion(),
+                      header.correlationId(), header.clientId());
 
         RequestDispatcher::RequestContext context;
         context.header = header;
@@ -197,15 +225,17 @@ private:
         context.peer_identity = peer_identity_;
         context.connection = &conn_state_;
 
-        context.deferred_sink = [self = shared_from_this()](
+        context.deferred_sink = [weak = weak_from_this(), gate = server_.delivery_gate_](
                                     RequestDispatcher::DispatchResult result) {
-            // May be invoked from any thread; hop onto the socket's executor.
-            // No read is armed while a response is deferred, so this write is
-            // the only operation on the socket.
-            boost::asio::post(self->socket_.get_executor(),
-                              [self, result = std::move(result)]() mutable {
-                                  self->deliver(std::move(result));
-                              });
+            // A retained completion never owns a socket/executor. Stop seals
+            // posting before draining IO, and old generations stay sealed.
+            std::lock_guard<std::mutex> lock(gate->mutex);
+            if (!gate->accepting)
+                return;
+            if (auto self = weak.lock())
+                boost::asio::post(self->strand_, [self, result = std::move(result)]() mutable {
+                    self->deliver(std::move(result));
+                });
         };
 
         auto dispatch_result = server_.dispatchRequest(std::move(context));
@@ -219,6 +249,25 @@ private:
         if (stopped_) {
             return;
         }
+        if (dispatch_result.publication_guard) {
+            auto guard = std::move(dispatch_result.publication_guard);
+            guard([&](ErrorCode status) {
+                if (status != ErrorCode::NONE) {
+                    if (!dispatch_result.publication_error) {
+                        stop();
+                        return;
+                    }
+                    dispatch_result.frame = dispatch_result.publication_error(status);
+                    dispatch_result.suppress_response = false;
+                }
+                deliverImpl(std::move(dispatch_result));
+            });
+            return;
+        }
+        deliverImpl(std::move(dispatch_result));
+    }
+
+    void deliverImpl(RequestDispatcher::DispatchResult dispatch_result) {
         const bool close_after_write = dispatch_result.close_connection;
 
         if (close_after_write) {
@@ -241,22 +290,27 @@ private:
         auto self = shared_from_this();
         boost::asio::async_write(
             socket_, boost::asio::buffer(*response),
-            [self, response, close_after_write](const boost::system::error_code& ec,
-                                                std::size_t bytes_transferred) {
-                if (ec) {
-                    self->handleError("writing response", ec);
-                    return;
-                }
-                self->updateActivity();
-                self->server_.recordBytesOut(bytes_transferred);
-                if (close_after_write) {
-                    Logger::info("Connection {} closed after sending response (as requested)",
-                                 self->peer_identity_);
-                    self->stop();
-                    return;
-                }
-                self->readFrameSize();
-            });
+            boost::asio::bind_executor(
+                strand_,
+                [self, response, close_after_write, lifetime = std::move(dispatch_result.lifetime)](
+                    const boost::system::error_code& ec, std::size_t bytes_transferred) {
+                    (void)lifetime;
+                    if (self->stopped_)
+                        return;
+                    if (ec) {
+                        self->handleError("writing response", ec);
+                        return;
+                    }
+                    self->updateActivity();
+                    self->server_.recordBytesOut(bytes_transferred);
+                    if (close_after_write) {
+                        Logger::info("Connection {} closed after sending response (as requested)",
+                                     self->peer_identity_);
+                        self->stop();
+                        return;
+                    }
+                    self->readFrameSize();
+                }));
     }
 
     void handleError(const std::string& context, const boost::system::error_code& ec) {
@@ -302,12 +356,13 @@ private:
 
     boost::asio::ip::tcp::socket socket_;
     TcpServer& server_;
+    boost::asio::strand<boost::asio::io_context::executor_type> strand_;
     size_t max_frame_size_;
     std::atomic<bool> stopped_{false};
     std::array<uint8_t, 4> size_buffer_{};
     std::vector<uint8_t> frame_buffer_;
     std::string peer_identity_;
-    std::chrono::steady_clock::time_point last_activity_;
+    std::atomic<std::chrono::steady_clock::rep> last_activity_{0};
     // Per-connection state (authenticated principal, etc.). Lives for the
     // lifetime of this session and is handed to each request via the context.
     RequestDispatcher::ConnectionContext conn_state_;
@@ -433,6 +488,8 @@ void TcpServer::start() {
         return;
     }
 
+    io_context_.restart();
+    delivery_gate_ = std::make_shared<DeliveryGate>();
     auto endpoints = resolveEndpoints();
     if (endpoints.empty()) {
         throw std::runtime_error("No endpoints resolved for TCP server");
@@ -479,79 +536,69 @@ void TcpServer::start() {
             throw std::runtime_error("Listener endpoints bound to different ports");
         }
 
-        auto* raw_acceptor = acceptor.get();
         Logger::info("TCP listener bound to {}:{}", endpoint.address().to_string(),
                      endpoint.port());
         acceptors_.push_back(std::move(acceptor));
-        doAccept(raw_acceptor);
     }
 
     configured_port_ = bound_port.value_or(endpoints.front().port());
     io_context_.restart();
     work_guard_ = std::make_unique<WorkGuard>(boost::asio::make_work_guard(io_context_));
 
+    running_ = true;
+    for (auto& acceptor : acceptors_)
+        doAccept(acceptor.get());
+    startIdleCheckTimer();
     workers_.reserve(io_threads_);
     for (size_t i = 0; i < io_threads_; ++i) {
         workers_.emplace_back([this]() {
-            try {
-                io_context_.run();
-            } catch (const std::exception& ex) {
-                Logger::error("I/O worker exception: {}", ex.what());
+            for (;;) {
+                try {
+                    io_context_.run();
+                    break;
+                } catch (const std::exception& ex) {
+                    Logger::error("I/O worker exception: {}", ex.what());
+                } catch (...) {
+                    Logger::error("I/O worker failed with an unknown exception");
+                }
             }
         });
     }
-
-    // Start idle connection checker
-    startIdleCheckTimer();
-
-    running_ = true;
 }
 
 void TcpServer::stop() {
     std::unique_lock<std::mutex> lock(state_mutex_);
-    if (!running_) {
+    if (!running_)
         return;
-    }
     running_ = false;
-
-    // Cancel idle check timer
-    if (idle_check_timer_) {
-        idle_check_timer_->cancel();
-        idle_check_timer_.reset();
-    }
-
-    boost::system::error_code ec;
-    for (auto& acceptor : acceptors_) {
-        if (acceptor) {
-            acceptor->close(ec);
-        }
-    }
-
-    if (work_guard_) {
-        work_guard_->reset();
-    }
-    lock.unlock();
-
-    std::vector<std::shared_ptr<TcpSession>> pending_sessions;
     {
-        std::lock_guard<std::mutex> sessions_lock(sessions_mutex_);
-        for (auto& [_, session] : sessions_) {
-            pending_sessions.push_back(session);
+        std::lock_guard<std::mutex> gate_lock(delivery_gate_->mutex);
+        delivery_gate_->accepting = false;
+    }
+    // Cancel each socket on its own strand. Let run() drain composed operations
+    // and posted deliveries; io_context::stop would leave dangling sessions.
+    boost::asio::post(control_, [this] {
+        if (idle_check_timer_)
+            idle_check_timer_->cancel();
+        boost::system::error_code ec;
+        for (auto& acceptor : acceptors_)
+            acceptor->close(ec);
+        std::vector<std::shared_ptr<TcpSession>> sessions;
+        {
+            std::lock_guard<std::mutex> sessions_lock(sessions_mutex_);
+            for (auto& [_, session] : sessions_)
+                sessions.push_back(session);
         }
-        sessions_.clear();
-    }
-
-    for (auto& session : pending_sessions) {
-        session->stop();
-    }
-
-    io_context_.stop();
-    for (auto& worker : workers_) {
-        if (worker.joinable()) {
+        for (auto& session : sessions)
+            session->requestStop();
+        work_guard_->reset();
+    });
+    // Serialize stop/start until all handlers that reference this server drain.
+    for (auto& worker : workers_)
+        if (worker.joinable())
             worker.join();
-        }
-    }
     workers_.clear();
+    idle_check_timer_.reset();
     acceptors_.clear();
     work_guard_.reset();
 }
@@ -564,19 +611,15 @@ void TcpServer::stopGracefully(std::chrono::seconds drain_timeout) {
         return;
     }
 
-    // Stop accepting new connections
-    boost::system::error_code ec;
-    for (auto& acceptor : acceptors_) {
-        if (acceptor) {
+    auto closed = std::make_shared<std::promise<void>>();
+    auto ready = closed->get_future();
+    boost::asio::post(control_, [this, closed] {
+        boost::system::error_code ec;
+        for (auto& acceptor : acceptors_)
             acceptor->close(ec);
-            if (ec) {
-                Logger::warn("Error closing acceptor during graceful shutdown: {}", ec.message());
-            }
-        }
-    }
-    acceptors_.clear();
-    Logger::info("Stopped accepting new connections");
-
+        closed->set_value();
+    });
+    ready.wait();
     lock.unlock();
 
     // Wait for existing connections to finish (with timeout)
@@ -618,27 +661,29 @@ uint16_t TcpServer::listeningPort() const {
 }
 
 void TcpServer::doAccept(tcp::acceptor* acceptor) {
-    if (!acceptor) {
+    if (!acceptor || !acceptor->is_open()) {
         return;
     }
 
-    acceptor->async_accept(
-        [this, acceptor](const boost::system::error_code& ec, tcp::socket socket) {
+    acceptor->async_accept(boost::asio::bind_executor(
+        control_, [this, acceptor](const boost::system::error_code& ec, tcp::socket socket) {
             if (ec) {
-                if (running_) {
+                if (running_ && acceptor->is_open()) {
                     Logger::error("Accept error: {}", ec.message());
                     doAccept(acceptor);
                 }
                 return;
             }
 
+            if (!running_)
+                return;
             applySocketTuning(socket, socket_tuning_);
             auto session =
                 std::make_shared<TcpSession>(std::move(socket), *this, max_frame_size_bytes_);
             trackSession(session);
-            session->start();
+            session->startOnStrand();
             doAccept(acceptor);
-        });
+        }));
 }
 
 RequestDispatcher::DispatchResult TcpServer::dispatchRequest(
@@ -681,20 +726,21 @@ void TcpServer::startIdleCheckTimer() {
     idle_check_timer_ = std::make_unique<boost::asio::steady_timer>(io_context_);
     idle_check_timer_->expires_after(check_interval);
 
-    idle_check_timer_->async_wait([this](const boost::system::error_code& ec) {
-        if (ec) {
-            if (ec != boost::asio::error::operation_aborted) {
-                Logger::warn("Idle check timer error: {}", ec.message());
+    idle_check_timer_->async_wait(
+        boost::asio::bind_executor(control_, [this](const boost::system::error_code& ec) {
+            if (ec) {
+                if (ec != boost::asio::error::operation_aborted) {
+                    Logger::warn("Idle check timer error: {}", ec.message());
+                }
+                return;
             }
-            return;
-        }
 
-        checkIdleSessions();
+            checkIdleSessions();
 
-        if (running_) {
-            startIdleCheckTimer();  // Reschedule
-        }
-    });
+            if (running_) {
+                startIdleCheckTimer();  // Reschedule
+            }
+        }));
 }
 
 void TcpServer::checkIdleSessions() {
@@ -718,7 +764,7 @@ void TcpServer::checkIdleSessions() {
                      idle_timeout_.count());
 
         for (auto& session : idle_sessions) {
-            session->stop(monitoring::ConnectionCloseReason::kIdleTimeout);
+            session->requestStop(monitoring::ConnectionCloseReason::kIdleTimeout);
         }
     }
 }

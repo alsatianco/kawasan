@@ -5,6 +5,7 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/asio/steady_timer.hpp>
+#include <boost/asio/strand.hpp>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -71,6 +72,11 @@ public:
 
 private:
     class TcpSession;
+    struct DeliveryGate {
+        std::mutex mutex;
+        bool accepting = true;
+    };
+    std::shared_ptr<DeliveryGate> delivery_gate_;
 
     using tcp = boost::asio::ip::tcp;
     using WorkGuard = boost::asio::executor_work_guard<boost::asio::io_context::executor_type>;
@@ -108,6 +114,8 @@ private:
 
     mutable std::mutex state_mutex_;
     boost::asio::io_context io_context_;
+    boost::asio::strand<boost::asio::io_context::executor_type> control_{
+        io_context_.get_executor()};
     std::vector<std::unique_ptr<tcp::acceptor>> acceptors_;
     std::unique_ptr<WorkGuard> work_guard_;
     std::vector<std::thread> workers_;
