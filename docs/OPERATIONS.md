@@ -830,7 +830,7 @@ python3 scripts/tests/consistency_checker.py --verify-only /tmp/kawasan-chaos-45
 python3 scripts/tests/check_seeded_hw_bug.py --artifacts /tmp/kawasan-chaos-hw-proof
 ```
 
-Use a new artifact directory for every run. Evidence includes an immutable executable copy used for every restart, the seed, commit and binary/checker/nemesis hashes, ordered scan, summary, fault/heal events, broker logs and RocksDB data on success and failure. The HW proof copies build inputs into its artifact directory and leaves the master worktree intact; compiler/startup failures do not count as detection. Default broker ports are 9092/9192/9292; `--port-base` allocates a separate block, with Raft and monitoring at +1/+2. `--broker-bin` selects a candidate binary. Keep the machine awake for timing-sensitive local runs.
+Use a new artifact directory for every run. Evidence includes an immutable executable copy used for every restart, the seed, commit and binary/checker/nemesis hashes, ordered scan, summary, fault/heal events, broker logs and RocksDB data on success and failure. The HW proof copies build inputs into its artifact directory and leaves the main worktree intact; compiler/startup failures do not count as detection. Default broker ports are 9092/9192/9292; `--port-base` allocates a separate block, with Raft and monitoring at +1/+2. `--broker-bin` selects a candidate binary. Keep the machine awake for timing-sensitive local runs.
 
 The nemesis permits one fault at a time only when the remaining live ISR meets minISR and the remaining brokers retain a Raft majority. It resumes/restarts the victim and waits for readiness plus the full ISR before choosing another fault. Incomplete role/action coverage, failed healing, missing samples and undrained delivery callbacks fail the run.
 
@@ -842,7 +842,7 @@ The local cluster harness supports `kill9 <id>`, `pause <id>`, `resume <id>`, an
 
 ### Unit and integration tests
 
-The C++ unit/integration suites are run via CTest (see [../README.md](../README.md) and [../CLAUDE.md](../CLAUDE.md)):
+The C++ unit/integration suites are run via CTest (see [../README.md](../README.md) and [Contributing](./CONTRIBUTING.md)):
 
 ```bash
 ctest --test-dir build --output-on-failure

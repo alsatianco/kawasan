@@ -2,7 +2,7 @@ name: compat-smoke
 
 on:
   pull_request:
-    branches: [main, master]
+    branches: [main]
   workflow_dispatch:
 
 jobs:

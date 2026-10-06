@@ -81,3 +81,35 @@ OPTIONS-*
 # Core dumps
 core
 core.*
+
+# Internal AI instructions, settings, plans, and session reports
+/AI-TEMP/
+/AI-temp/
+/.claude/
+CLAUDE.md
+AGENTS.md
+/docs/improv/
+/docs/superpowers/
+/docs/history/
+/plan.md
+/todo.md
+/docs/06-gap-analysis.md
+/docs/07-autonomous-run-summary.md
+/docs/plan_for_deploy.md
+/docs/FIX_SUMMARY.md
+/docs/IMPLEMENTATION_SUMMARY.md
+/docs/PROJECT_STATUS.md
+/docs/PROJECT_STATUS2.md
+/docs/TLS_RAFT_IMPLEMENTATION_NOTE.md
+/KAFKA_UI_COMPATIBILITY_FIX.md
+/docs/CONSUMER_LOOP_FIX.md
+/docs/CONSUMER_OFFSET_COMMIT_FIX.md
+/docs/CONSUMER_OFFSET_FIX.md
+/docs/MULTI_CONSUMER_FIX.md
+/docs/ROCKSDB_KEY_FIX.md
+/.codex/
+/.cursor/
+/.gemini/
+GEMINI.md
+/.github/copilot-instructions.md
+/.github/instructions/

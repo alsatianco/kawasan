@@ -31,7 +31,7 @@ The config loader (`src/common/config.cpp`) auto-detects the file format from th
 | `{` or `[` | JSON object | `config/broker.dev.properties`, `config/broker.dev.json`, `config/broker.production.properties` |
 | anything else | Kafka-style `key=value` properties | `config/broker-0.properties`, `config/broker-1.properties`, `config/broker-2.properties` |
 
-Both formats are first-class — there is no "JSON-only" mode. The `.properties` extension on the JSON files is historical; the loader ignores the extension and dispatches purely on content. See [../CLAUDE.md](../CLAUDE.md) for this gotcha.
+Both formats are first-class — there is no "JSON-only" mode. The `.properties` extension on the JSON files is historical; the loader ignores the extension and dispatches purely on content.
 
 Properties parsing rules: keys/values are split on the first `=` (falling back to the first `:`); leading/trailing whitespace is trimmed; lines beginning with `#` or `!` are comments; malformed lines (no separator) are skipped silently. Property values are coerced to a typed JSON value so that `getInt`/`getBool`/`getString` behave identically regardless of source format — `true`/`false` become booleans, all-digit strings (optional leading `-`) become integers, everything else stays a string.
 
@@ -165,7 +165,7 @@ Single-node is the primary, hardened mode. Multi-broker Raft replication exists 
 | `default.replication.factor` | int | `1` | Honored (clamped) | Default RF for new topics. Values above the **cluster size** (1 + number of commas in `raft.peers`, so 1 for single-node) are clamped to it with a warning; `< 1` is corrected to 1. In a 3-broker cluster RF=3 is honored (M5 follower replication). With `deployment.mode=production`, RF > cluster size is **rejected at startup** instead of silently clamped (see Deployment mode). |
 | `raft.port` | int | `9093` | Honored | Inter-broker Raft listener port. |
 | `raft.peers` | string | `""` (single-node) | Honored | Comma-separated `id:host:port` list, e.g. `0:host0:9093,1:host1:9093`. Empty = single-node. If non-empty, **this broker's `broker.id` must appear in the list** or startup fails. |
-| `raft.ssl.enabled` | bool | `false` | Parsed, **not enforced** | When `true`, the cert/key/ca paths below are read and validated, but `src/raft/raft_transport.{cpp,h}` contains no TLS code — inter-broker Raft traffic stays PLAINTEXT regardless. See [../CLAUDE.md](../CLAUDE.md). |
+| `raft.ssl.enabled` | bool | `false` | Parsed, **not enforced** | When `true`, the cert/key/ca paths below are read and validated, but `src/raft/raft_transport.{cpp,h}` contains no TLS code — inter-broker Raft traffic stays PLAINTEXT regardless. |
 | `raft.ssl.cert.file` | string | `""` | Parsed, not enforced | PEM server certificate (required by `isValid()` when `raft.ssl.enabled=true`). |
 | `raft.ssl.key.file` | string | `""` | Parsed, not enforced | PEM private key. |
 | `raft.ssl.key.password` | string | `""` | Parsed, not enforced | Private-key password. |

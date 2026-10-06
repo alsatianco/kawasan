@@ -75,4 +75,4 @@ For **single-node** deployments it is the intended, supported mode: durable stor
 
 ## How do I build it or contribute?
 
-Build with CMake: `cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo`, then `cmake --build build`, and run the suite with `ctest --test-dir build --output-on-failure`. Full prerequisites and platform notes are in [../README.md](../README.md) and [../CLAUDE.md](../CLAUDE.md); contribution workflow and conventions are in [Contributing](./CONTRIBUTING.md).
+Build with CMake: `cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo`, then `cmake --build build`, and run the suite with `ctest --test-dir build --output-on-failure`. Full prerequisites and platform notes are in [../README.md](../README.md); contribution workflow and conventions are in [Contributing](./CONTRIBUTING.md).

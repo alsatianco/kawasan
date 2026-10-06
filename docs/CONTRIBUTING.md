@@ -1,6 +1,6 @@
 # Contributing to Kawasan
 
-This guide covers how to set up a development environment, the coding and commit conventions, the pull-request workflow, and how to run the test suites. For the canonical build/configure/run commands see [../CLAUDE.md](../CLAUDE.md) and [../README.md](../README.md); this document summarizes and links rather than duplicating them.
+This guide covers how to set up a development environment, the coding and commit conventions, the pull-request workflow, and how to run the test suites. For the canonical build/configure/run commands see [../README.md](../README.md); this document summarizes and links rather than duplicating them.
 
 ## Contents
 
@@ -23,15 +23,15 @@ Prerequisites:
 | Dependencies | vcpkg (`vcpkg.json`) or system packages: Boost, RocksDB, spdlog, nlohmann/json, GTest, OpenSSL, zlib, snappy, lz4, zstd |
 | Git | any recent |
 
-Configure, build, run a broker, and run tests using the commands in [../CLAUDE.md](../CLAUDE.md) (Build Commands and CMake Options). In short: `cmake -S . -B build`, `cmake --build build -j`, then `ctest --test-dir build`. The toolchain enforces `-std=c++20 -Wall -Wextra -Wpedantic -Werror`, so a clean build must be warning-free.
+Configure, build, run a broker, and run tests using the commands in the [README build guide](../README.md#building-linux--macos). In short: `cmake -S . -B build`, `cmake --build build -j`, then `ctest --test-dir build`. The toolchain enforces `-std=c++20 -Wall -Wextra -Wpedantic -Werror`, so a clean build must be warning-free.
 
-Relevant CMake options (full table in [../CLAUDE.md](../CLAUDE.md)): `KAWASAN_BUILD_TESTS`, `KAWASAN_BUILD_TOOLS`, `KAWASAN_BUILD_EXAMPLES`, `KAWASAN_ENABLE_ASAN`, `KAWASAN_ENABLE_TSAN`, and `KAWASAN_BUILD_FUZZ` (libFuzzer harnesses, requires Clang).
+Relevant CMake options (defined in [../CMakeLists.txt](../CMakeLists.txt)): `KAWASAN_BUILD_TESTS`, `KAWASAN_BUILD_TOOLS`, `KAWASAN_BUILD_EXAMPLES`, `KAWASAN_ENABLE_ASAN`, `KAWASAN_ENABLE_TSAN`, and `KAWASAN_BUILD_FUZZ` (libFuzzer harnesses, requires Clang).
 
 Configuration files live under `config/`. The loader (`src/common/config.cpp`) auto-detects and accepts **both** JSON objects (e.g. `config/broker.dev.properties`) and Kafka-style `key=value` text (e.g. `config/broker-0.properties`); both support `${VAR}` / `${VAR:default}` environment-variable substitution. See [./CONFIGURATION.md](./CONFIGURATION.md) for the full key reference.
 
 ## Coding style and naming
 
-Format every file before committing with `clang-format -i <file>` (Google-based `.clang-format`, 4-space indent, 100-column limit, `Attach` braces). `.clang-tidy` enforces the naming rules below; the full rule set is in [../CLAUDE.md](../CLAUDE.md).
+Format every file before committing with `clang-format -i <file>` (Google-based `.clang-format`, 4-space indent, 100-column limit, `Attach` braces). `.clang-tidy` enforces the naming rules below; the full rule set is in [../.clang-tidy](../.clang-tidy).
 
 | Element | Convention | Example |
 |---------|-----------|---------|
@@ -77,7 +77,7 @@ Keep the subject in the imperative mood and reference issue numbers in the body 
 
 ## Pull-request workflow
 
-1. **Branch** off the default branch with a descriptive name:
+1. **Branch** off `main` with a descriptive name:
    - `feature/<short-description>` — new functionality
    - `fix/<issue-or-description>` — bug fixes
    - `docs/<what-changed>` — documentation

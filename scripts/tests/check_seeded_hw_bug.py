@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build a disposable broker with an HW bug; require the live checker to catch I1.
 
-Copies only build inputs. The master worktree, branch, user changes and normal
+Copies only build inputs. The main worktree, branch, user changes and normal
 build directory remain intact. A compiler/client/startup failure is NOT proof.
 """
 import argparse
