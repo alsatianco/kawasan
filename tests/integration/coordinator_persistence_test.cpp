@@ -1356,12 +1356,23 @@ TEST_F(CoordinatorPersistenceTest, DeferredShutdownRejectsQueueAndDrainsWorkerAn
         if (publishStatus(result) == ErrorCode::NOT_COORDINATOR)
             ++rejected;
     };
+    auto waitForWorkers = [&](int count) {
+        const bool ready = waitUntil([&] { return entered.load() == count; });
+        if (!ready) {
+            release.set_value();
+            b.stop();  // Drain callbacks while their captured fixture state is alive.
+        }
+        return ready;
+    };
+    // Admission and worker fencing use try-locks on the same partition. Wait
+    // for each worker to leave the fence before admitting the next request.
     EXPECT_TRUE(CoordinatorExecutorProbe::dispatch(b, id, work, sink).deferred);
+    ASSERT_TRUE(waitForWorkers(1));
     EXPECT_TRUE(CoordinatorExecutorProbe::dispatch(b, id, work, sink).deferred);
-    ASSERT_TRUE(waitUntil([&] { return entered.load() == 2; }));
+    ASSERT_TRUE(waitForWorkers(2));
     EXPECT_TRUE(CoordinatorExecutorProbe::dispatch(b, id, work, sink).deferred);
     auto stopped = std::async(std::launch::async, [&] { b.stop(); });
-    ASSERT_TRUE(waitUntil([&] { return CoordinatorExecutorProbe::stopping(b); }));
+    EXPECT_TRUE(waitUntil([&] { return CoordinatorExecutorProbe::stopping(b); }));
     EXPECT_EQ(stopped.wait_for(50ms), std::future_status::timeout);
     release.set_value();
     EXPECT_EQ(stopped.wait_for(5s), std::future_status::ready);
