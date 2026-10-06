@@ -8,6 +8,13 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-06
 
+- Add detached staged group-state proposals for JoinGroup, SyncGroup, Heartbeat,
+  LeaveGroup and member/rebalance timeouts. Persist the complete touched group
+  before installing its exact heartbeat/deadline/counter changes; preserve other
+  groups and offset/pending keys. Commit state-changing protocol errors separately
+  from storage status. Accept a leaderless PreparingRebalance record after a
+  rebalance timeout, while retaining leader validation in other phases.
+  Coordinator wire/background and public-format activation remain gated.
 - Preserve live group heartbeat/rebalance clocks, activity and cumulative
   counters when publishing staged committed mutations; ownership acquisition
   still rebuilds steady-clock deadlines. Seal coordinator mutation admission

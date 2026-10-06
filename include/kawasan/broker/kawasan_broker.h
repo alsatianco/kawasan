@@ -80,6 +80,13 @@ public:
     // counters; acquisition rebuilds them. Shutdown drains admitted proposals.
     ErrorCode mutateCoordinatorGroup(const std::string& group_id, const GroupMutation& mutation,
                                      std::chrono::milliseconds timeout = std::chrono::seconds(5));
+    using GroupStateMutation = std::function<void(GroupCoordinator::GroupProposal&)>;
+    // Returns persistence/admission status; capture the protocol result in the
+    // callback and return it only after success. Some protocol errors themselves
+    // change state (e.g. SyncGroup rejecting obsolete assignments).
+    ErrorCode mutateCoordinatorGroupState(
+        const std::string& group_id, const GroupStateMutation& mutation,
+        std::chrono::milliseconds timeout = std::chrono::seconds(5));
     ErrorCode deleteCoordinatorGroup(const std::string& group_id,
                                      std::chrono::milliseconds timeout = std::chrono::seconds(5));
     using TransactionMutation =
@@ -206,6 +213,10 @@ private:
     std::mutex coordinator_mutation_map_mutex_;
     std::map<TopicPartition, std::shared_ptr<std::mutex>> coordinator_mutation_mutexes_;
     std::shared_ptr<std::mutex> coordinatorMutationMutex(const TopicPartition& tp);
+    ErrorCode mutateCoordinatorGroupImpl(
+        const std::string& group_id, const GroupMutation& mutation,
+        std::chrono::milliseconds timeout,
+        const std::unique_ptr<GroupCoordinator::GroupProposal>* proposal = nullptr);
     ErrorCode commitCoordinatorRecords(const TopicPartition& tp, int32_t epoch,
                                        const std::vector<Record>& records,
                                        const std::function<void()>& publish,

@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "kawasan/broker/group_state_manager.h"
 #include "kawasan/broker/offset_manager.h"
 #include "kawasan/common/error.h"
 #include "kawasan/protocol/describe_groups_request.h"
@@ -36,12 +37,11 @@ class MetricsCollector;
 
 namespace kawasan::broker {
 
-struct GroupRecord;
-
 /// @brief Minimal in-memory group coordinator to support basic consumer groups.
 /// Offsets are now persisted to disk via OffsetManager.
 class GroupCoordinator {
 public:
+    class GroupProposal;
     explicit GroupCoordinator(
         std::shared_ptr<OffsetManager> offset_manager, storage::LogManager* log_manager = nullptr,
         std::shared_ptr<monitoring::MetricsCollector> metrics_collector = nullptr);
@@ -53,8 +53,14 @@ public:
     // for surviving identities. Acquisition deliberately rebuilds those clocks.
     void publishCoordinatorPartition(int32_t partition, int32_t partition_count,
                                      const std::vector<GroupRecord>& records,
-                                     std::shared_ptr<OffsetManager> offsets);
+                                     std::shared_ptr<OffsetManager> offsets,
+                                     const GroupProposal* proposal = nullptr);
     std::vector<GroupRecord> pendingCoordinatorOffsets() const;
+    // Detached state-machine execution: durable fields come from the source,
+    // live clocks/counters from this owner. Only committed publication installs
+    // the touched group's runtime changes. Caller serializes this partition.
+    std::unique_ptr<GroupProposal> proposeGroup(const std::string& group_id,
+                                                const std::optional<GroupRecord>& committed);
 
     GroupCoordinator(const GroupCoordinator&) = delete;
     GroupCoordinator& operator=(const GroupCoordinator&) = delete;
@@ -158,7 +164,8 @@ private:
     friend struct CoordinatorAcquisitionProbe;
     void installCoordinatorPartition(int32_t partition, int32_t partition_count,
                                      const std::vector<GroupRecord>& records,
-                                     std::shared_ptr<OffsetManager> offsets, bool preserve_runtime);
+                                     std::shared_ptr<OffsetManager> offsets, bool preserve_runtime,
+                                     const GroupProposal* proposal = nullptr);
     struct MemberState {
         std::string member_id;
         // 0A.10: track real client identity instead of the "unknown" placeholder
@@ -278,6 +285,10 @@ private:
         // Note: committed_offsets removed - now stored in OffsetManager
     };
 
+    explicit GroupCoordinator(bool proposal_only);
+    static GroupState restoreGroup(const GroupRecord& record, const GroupState* previous);
+    static GroupRecord snapshotGroup(const std::string& group_id, const GroupState& group);
+
     GroupState* findGroup(const std::string& group_id);
     const GroupState* findGroup(const std::string& group_id) const;
 
@@ -300,7 +311,11 @@ private:
     mutable std::mutex mutex_;
     std::unordered_map<std::string, GroupState> groups_;
     std::vector<GroupRecord> pending_coordinator_offsets_;
-    std::atomic<int64_t> member_sequence_{0};
+    // IDs may be reserved by failed proposals; sharing the allocator prevents
+    // concurrent proposals for different partitions from reusing an ID.
+    std::shared_ptr<std::atomic<int64_t>> member_sequence_ =
+        std::make_shared<std::atomic<int64_t>>(0);
+    bool proposal_only_ = false;
 
     // Group expiration
     int64_t group_retention_ms_;  ///< Group retention period (default: 7 days)
@@ -312,6 +327,34 @@ private:
 
     // Phase EX-1 metrics.
     std::atomic<int64_t> member_timeout_total_{0};
+};
+
+// Restricted facade: proposals can only run membership/timeout transitions for
+// their selected group. They have no storage, cleanup thread or live cache access.
+class GroupCoordinator::GroupProposal {
+public:
+    GroupProposal(const GroupProposal&) = delete;
+    GroupProposal& operator=(const GroupProposal&) = delete;
+    GroupProposal(GroupProposal&&) = delete;
+    GroupProposal& operator=(GroupProposal&&) = delete;
+    JoinGroupResult handleJoinGroup(const protocol::JoinGroupRequest& request,
+                                    const std::string& client_id = {},
+                                    const std::string& client_host = {});
+    SyncGroupResult handleSyncGroup(const protocol::SyncGroupRequest& request);
+    ErrorCode handleHeartbeat(const protocol::HeartbeatRequest& request);
+    ErrorCode handleLeaveGroup(const std::string& member_id);
+    void checkTimeouts();
+    std::optional<GroupRecord> record() const;
+
+private:
+    friend class GroupCoordinator;
+    GroupProposal(const GroupCoordinator* owner, std::string group_id,
+                  std::unique_ptr<GroupCoordinator> draft);
+    void requireGroup(const std::string& group_id) const;
+    const GroupCoordinator* owner_;
+    std::string group_id_;
+    std::unique_ptr<GroupCoordinator> draft_;
+    mutable bool published_ = false;
 };
 
 }  // namespace kawasan::broker

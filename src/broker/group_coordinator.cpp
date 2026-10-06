@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 
 #include "kawasan/broker/coordinator_routing.h"
@@ -49,60 +50,50 @@ void GroupCoordinator::replaceCoordinatorPartition(int32_t partition, int32_t pa
 
 void GroupCoordinator::publishCoordinatorPartition(int32_t partition, int32_t partition_count,
                                                    const std::vector<GroupRecord>& records,
-                                                   std::shared_ptr<OffsetManager> offsets) {
-    installCoordinatorPartition(partition, partition_count, records, std::move(offsets), true);
+                                                   std::shared_ptr<OffsetManager> offsets,
+                                                   const GroupProposal* proposal) {
+    installCoordinatorPartition(partition, partition_count, records, std::move(offsets), true,
+                                proposal);
 }
 
 void GroupCoordinator::installCoordinatorPartition(int32_t partition, int32_t partition_count,
                                                    const std::vector<GroupRecord>& records,
                                                    std::shared_ptr<OffsetManager> offsets,
-                                                   bool preserve_runtime) {
+                                                   bool preserve_runtime,
+                                                   const GroupProposal* proposal) {
     std::lock_guard<std::mutex> lock(mutex_);
     std::unordered_map<std::string, GroupState> restored;
     std::vector<GroupRecord> pending;
-    const auto now = std::chrono::steady_clock::now();
     for (const auto& r : records) {
         if (r.tombstone || coordinatorPartitionFor(r.key.group_id, partition_count) != partition)
             throw std::invalid_argument("Invalid group acquisition image");
         if (r.key.kind == GroupRecordKey::Kind::PendingOffset) {
             pending.push_back(r);
         } else if (r.key.kind == GroupRecordKey::Kind::Group) {
-            auto& g = restored[r.key.group_id];
-            g.generation_id = r.group.generation;
-            g.kind = static_cast<GroupStateKind>(r.group.state);
-            g.protocol_type = r.group.protocol_type;
-            g.protocol_name = r.group.protocol_name;
-            g.leader_id = r.group.leader_id;
-            g.rebalance_timeout_ms = r.group.rebalance_timeout_ms;
-            g.rebalance_started_at = now;
-            g.last_activity = std::chrono::system_clock::time_point(
-                std::chrono::milliseconds(r.group.last_update_timestamp));
-            for (const auto& m : r.group.members) {
-                g.members.emplace(m.member_id,
-                                  MemberState{m.member_id, m.client_id, m.client_host,
-                                              m.group_instance_id, m.metadata, m.assignment, now});
-            }
-            if (preserve_runtime) {
-                const auto previous = groups_.find(r.key.group_id);
-                if (previous != groups_.end()) {
-                    const auto& live = previous->second;
-                    g.last_activity = std::max(g.last_activity, live.last_activity);
-                    const auto generation_delta =
-                        std::max<int64_t>(0, int64_t{g.generation_id} - live.generation_id);
-                    g.rebalances_total.store(live.rebalances_total.load() + generation_delta);
-                    // An offset/pending mutation must never extend a stalled
-                    // rebalance's deadline. A new generation/phase gets a new
-                    // deadline; unchanged phases keep the original start.
-                    if (g.generation_id == live.generation_id && g.kind == live.kind)
-                        g.rebalance_started_at = live.rebalance_started_at;
-                    for (auto& [id, member] : g.members) {
-                        const auto old_member = live.members.find(id);
-                        if (old_member != live.members.end() &&
-                            old_member->second.group_instance_id == member.group_instance_id)
-                            member.last_heartbeat = old_member->second.last_heartbeat;
-                    }
-                }
-            }
+            const auto previous = groups_.find(r.key.group_id);
+            const auto* live =
+                preserve_runtime && previous != groups_.end() ? &previous->second : nullptr;
+            restored.emplace(r.key.group_id, restoreGroup(r, live));
+        }
+    }
+    if (proposal) {
+        if (!preserve_runtime || proposal->owner_ != this || proposal->published_ ||
+            coordinatorPartitionFor(proposal->group_id_, partition_count) != partition)
+            throw std::invalid_argument("Invalid group runtime proposal");
+        std::lock_guard<std::mutex> draft_lock(proposal->draft_->mutex_);
+        const auto draft = proposal->draft_->groups_.find(proposal->group_id_);
+        const auto proposed = restored.find(proposal->group_id_);
+        if (draft != proposal->draft_->groups_.end()) {
+            if (proposed == restored.end() ||
+                snapshotGroup(proposal->group_id_, draft->second).group !=
+                    snapshotGroup(proposal->group_id_, proposed->second).group)
+                throw std::invalid_argument("Group runtime proposal differs from committed image");
+            // Exact touched-group clocks and counters, including runtime-only
+            // transitions on protocol errors. Unrelated groups retain their own
+            // live clocks through restoreGroup above.
+            proposed->second = draft->second;
+        } else if (proposed != restored.end()) {
+            throw std::invalid_argument("Missing group runtime proposal");
         }
     }
     // WriteBatch completes before publishing any in-memory image.
@@ -117,6 +108,147 @@ void GroupCoordinator::installCoordinatorPartition(int32_t partition, int32_t pa
     pending_coordinator_offsets_.insert(pending_coordinator_offsets_.end(), pending.begin(),
                                         pending.end());
     offset_manager_ = std::move(offsets);
+    if (proposal) {
+        member_timeout_ms_ = std::max(member_timeout_ms_, proposal->draft_->member_timeout_ms_);
+        member_timeout_total_.fetch_add(proposal->draft_->member_timeout_total_.load(),
+                                        std::memory_order_relaxed);
+        proposal->published_ = true;
+    }
+}
+
+GroupCoordinator::GroupCoordinator(bool proposal_only)
+    : log_manager_(nullptr),
+      proposal_only_(proposal_only),
+      group_retention_ms_(kDefaultGroupRetentionMs),
+      member_timeout_ms_(kDefaultMemberTimeoutMs) {}
+
+GroupCoordinator::GroupState GroupCoordinator::restoreGroup(const GroupRecord& r,
+                                                            const GroupState* live) {
+    GroupState g;
+    const auto now = std::chrono::steady_clock::now();
+    g.generation_id = r.group.generation;
+    g.kind = static_cast<GroupStateKind>(r.group.state);
+    g.protocol_type = r.group.protocol_type;
+    g.protocol_name = r.group.protocol_name;
+    g.leader_id = r.group.leader_id;
+    g.rebalance_timeout_ms = r.group.rebalance_timeout_ms;
+    g.rebalance_started_at = now;
+    g.last_activity = std::chrono::system_clock::time_point(
+        std::chrono::milliseconds(r.group.last_update_timestamp));
+    for (const auto& m : r.group.members) {
+        g.members.emplace(m.member_id,
+                          MemberState{m.member_id, m.client_id, m.client_host, m.group_instance_id,
+                                      m.metadata, m.assignment, now});
+    }
+    if (live) {
+        g.last_activity = std::max(g.last_activity, live->last_activity);
+        const auto generation_delta =
+            std::max<int64_t>(0, int64_t{g.generation_id} - live->generation_id);
+        g.rebalances_total.store(live->rebalances_total.load() + generation_delta);
+        if (g.generation_id == live->generation_id && g.kind == live->kind)
+            g.rebalance_started_at = live->rebalance_started_at;
+        for (auto& [id, member] : g.members) {
+            const auto old_member = live->members.find(id);
+            if (old_member != live->members.end() &&
+                old_member->second.group_instance_id == member.group_instance_id)
+                member.last_heartbeat = old_member->second.last_heartbeat;
+        }
+    }
+    return g;
+}
+
+GroupRecord GroupCoordinator::snapshotGroup(const std::string& group_id, const GroupState& g) {
+    GroupRecord record;
+    record.key.group_id = group_id;
+    auto& s = record.group;
+    s.generation = g.generation_id;
+    s.state = static_cast<int8_t>(g.kind);
+    s.protocol_type = g.protocol_type;
+    s.protocol_name = g.protocol_name;
+    s.leader_id = g.leader_id;
+    s.rebalance_timeout_ms = g.rebalance_timeout_ms;
+    s.last_update_timestamp =
+        std::chrono::duration_cast<std::chrono::milliseconds>(g.last_activity.time_since_epoch())
+            .count();
+    for (const auto& [id, m] : g.members) {
+        (void)id;
+        s.members.push_back({m.member_id, m.client_id, m.client_host, m.group_instance_id,
+                             m.metadata, m.assignment});
+    }
+    std::sort(s.members.begin(), s.members.end(),
+              [](const auto& a, const auto& b) { return a.member_id < b.member_id; });
+    return record;
+}
+
+std::unique_ptr<GroupCoordinator::GroupProposal> GroupCoordinator::proposeGroup(
+    const std::string& group_id, const std::optional<GroupRecord>& committed) {
+    if (group_id.empty() ||
+        (committed && (committed->tombstone || committed->key.kind != GroupRecordKey::Kind::Group ||
+                       committed->key.group_id != group_id)))
+        throw std::invalid_argument("Invalid committed group proposal source");
+    auto draft = std::unique_ptr<GroupCoordinator>(new GroupCoordinator(true));
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        draft->member_sequence_ = member_sequence_;
+        draft->member_timeout_ms_ = member_timeout_ms_;
+        draft->group_retention_ms_ = group_retention_ms_;
+        if (committed) {
+            const auto previous = groups_.find(group_id);
+            draft->groups_.emplace(
+                group_id,
+                restoreGroup(*committed, previous != groups_.end() ? &previous->second : nullptr));
+        }
+    }
+    return std::unique_ptr<GroupProposal>(new GroupProposal(this, group_id, std::move(draft)));
+}
+
+GroupCoordinator::GroupProposal::GroupProposal(const GroupCoordinator* owner, std::string group_id,
+                                               std::unique_ptr<GroupCoordinator> draft)
+    : owner_(owner), group_id_(std::move(group_id)), draft_(std::move(draft)) {}
+
+void GroupCoordinator::GroupProposal::requireGroup(const std::string& group_id) const {
+    if (published_)
+        throw std::logic_error("Group proposal is already published");
+    if (group_id != group_id_)
+        throw std::invalid_argument("Group proposal cannot mutate another group");
+}
+
+GroupCoordinator::JoinGroupResult GroupCoordinator::GroupProposal::handleJoinGroup(
+    const protocol::JoinGroupRequest& request, const std::string& client_id,
+    const std::string& client_host) {
+    requireGroup(request.groupId());
+    return draft_->handleJoinGroup(request, client_id, client_host);
+}
+
+GroupCoordinator::SyncGroupResult GroupCoordinator::GroupProposal::handleSyncGroup(
+    const protocol::SyncGroupRequest& request) {
+    requireGroup(request.groupId());
+    return draft_->handleSyncGroup(request);
+}
+
+ErrorCode GroupCoordinator::GroupProposal::handleHeartbeat(
+    const protocol::HeartbeatRequest& request) {
+    requireGroup(request.groupId());
+    return draft_->handleHeartbeat(request);
+}
+
+ErrorCode GroupCoordinator::GroupProposal::handleLeaveGroup(const std::string& member_id) {
+    requireGroup(group_id_);
+    return draft_->handleLeaveGroup(group_id_, member_id);
+}
+
+void GroupCoordinator::GroupProposal::checkTimeouts() {
+    requireGroup(group_id_);
+    draft_->checkMemberTimeouts();
+    draft_->checkRebalanceTimeouts();
+}
+
+std::optional<GroupRecord> GroupCoordinator::GroupProposal::record() const {
+    std::lock_guard<std::mutex> lock(draft_->mutex_);
+    const auto group = draft_->groups_.find(group_id_);
+    if (group == draft_->groups_.end())
+        return std::nullopt;
+    return snapshotGroup(group_id_, group->second);
 }
 
 std::vector<GroupRecord> GroupCoordinator::pendingCoordinatorOffsets() const {
@@ -183,7 +315,7 @@ GroupCoordinator::JoinGroupResult GroupCoordinator::handleJoinGroup(
     // still work.
     if (member_id.empty() && request.sessionTimeoutMs() >= 0 /* always true */) {
         std::ostringstream oss;
-        oss << request.groupId() << "-member-" << ++member_sequence_;
+        oss << request.groupId() << "-member-" << ++*member_sequence_;
         member_id = oss.str();
 
         // For v4+ clients we signal MEMBER_ID_REQUIRED and let the client
@@ -860,6 +992,8 @@ void GroupCoordinator::loadGroupsFromStorage() {
 }
 
 void GroupCoordinator::persistGroupState(const std::string& group_id, const GroupState& group) {
+    if (proposal_only_)
+        return;
     // Convert GroupState to GroupMetadata
     OffsetManager::GroupMetadata metadata;
 

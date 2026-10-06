@@ -5,9 +5,10 @@ replay, authoritative log opening, Raft format declarations and local manifests
 are implemented as opt-in primitives. Early broker bootstrap and owned-partition
 cache acquisition are implemented through an internal acquisition-only C++ seam.
 A separate persistence seam supplies fsynced ISR-committed mutations, fenced
-cache publication and shutdown draining. Public runtime activation,
-handler/background migration, marker redrive and failover acceptance remain
-pending. No broker configuration enables either seam; coordinator requests
+cache publication and shutdown draining. Detached group-state proposals now reuse
+the membership/timeout state machine without exposing changes before commitment.
+Public runtime activation, handler/background migration, marker redrive and
+failover acceptance remain pending. No broker configuration enables either seam; coordinator requests
 remain refused in staging.
 
 M10 will make committed `__consumer_offsets` and `__transaction_state` log
@@ -93,3 +94,11 @@ append/publication and compares transaction snapshots under a separate mutation
 lock. Public handler/background migration and remote-marker completion remain
 M10 work; these primitives do not activate replicated coordinator mode. The
 current broker refuses formatted stores before opening its legacy offset cache.
+
+The staged group-state proposal checkpoint separates protocol results from durable
+mutation status. It carries the touched group's heartbeat/rebalance clocks and
+counter changes through ISR commitment and publishes them with its complete
+record. Failed proposals leave the live group unchanged. A timeout can persist
+PreparingRebalance with surviving members and no elected leader; other phases
+retain the member-leader validation. This checkpoint does not enable coordinator
+wire handlers, background jobs or a public format configuration.

@@ -72,8 +72,12 @@ void validateGroup(const GroupSnapshot& group) {
                                          !instances.insert(*member.group_instance_id).second))
             reject("duplicate or missing static member identity");
     }
+    // Rebalance timeout evicts the leader and leaves surviving members in
+    // PreparingRebalance until one rejoins and takes leadership. This is a
+    // durable transitional state; other phases still require a member leader.
+    const bool awaiting_leader = group.state == 1 && group.leader_id.empty();
     if ((group.members.empty() && !group.leader_id.empty()) ||
-        (!group.members.empty() && !members.contains(group.leader_id)))
+        (!group.members.empty() && !members.contains(group.leader_id) && !awaiting_leader))
         reject("missing group leader identity");
 }
 void validateOffset(const OffsetManager::OffsetMetadata& offset) {

@@ -87,6 +87,25 @@ TEST_F(GroupStateManagerTest, CompleteIdentityOffsetsPendingEpochAndTombstonesRo
     }
 }
 
+TEST_F(GroupStateManagerTest,
+       PreparingRebalanceCanAwaitLeaderElectionButRejectsMissingLeadersOtherwise) {
+    auto preparing = group();
+    preparing.group.state = 1;
+    preparing.group.leader_id.clear();
+    auto wire = GroupStateManager::encode(preparing);
+    EXPECT_EQ(GroupStateManager::decode(wire).group, preparing.group);
+    for (int8_t state : {int8_t{0}, int8_t{2}, int8_t{3}, int8_t{4}}) {
+        auto invalid = preparing;
+        invalid.group.state = state;
+        EXPECT_THROW(GroupStateManager::encode(invalid), std::exception);
+        auto malformed = wire;
+        (*malformed.value)[5] = state;
+        EXPECT_THROW(GroupStateManager::decode(malformed), std::exception);
+    }
+    preparing.group.leader_id = "missing";
+    EXPECT_THROW(GroupStateManager::encode(preparing), std::exception);
+}
+
 TEST_F(GroupStateManagerTest, CommittedReplayReconstructsIdentityAndPendingCheckpointsAfterReopen) {
     const auto p = coordinatorPartitionFor(group().key.group_id, 2);
     {

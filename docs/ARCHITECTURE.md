@@ -602,6 +602,26 @@ until source reopen; an ambiguous acknowledged-prefix wait blocks reacquisition
 in that epoch until HW covers the attempted span. Failed requests may subsequently
 become committed: callers must treat them as ambiguous, not as rolled-back writes.
 
+`mutateCoordinatorGroupState` executes membership and member/rebalance-timeout
+transitions through a restricted `GroupCoordinator::GroupProposal`. Each detached
+draft takes durable fields from the committed source and surviving runtime clocks
+from the owner; it has no storage or background thread. Existing state-machine
+methods run against the draft, with legacy persistence suppressed. Its canonical
+group record commits through the same ISR writer; publication installs its exact
+touched-group runtime state under the cache lock, after validating it against the
+committed image. Unrelated groups, offsets and pending records remain intact.
+Member-ID reservations use a shared allocator and may be consumed by failed
+proposals, so a later proposal cannot reuse an issued reservation.
+
+Persistence status is separate from the captured protocol result: an incomplete
+SyncGroup assignment can return ILLEGAL_GENERATION while its generation bump
+commits, and a heartbeat can refresh its clock while returning
+REBALANCE_IN_PROGRESS. Failed persistence never publishes those draft changes or
+counts draft timeouts. Format-v1 permits an empty leader only in
+PreparingRebalance with surviving members, allowing timeout eviction to persist
+until the next join elects a leader. Acquisition still rebuilds clocks from this
+transitional record.
+
 Mutation publication preserves existing members' heartbeat clocks, unchanged
 rebalance deadlines, the most recent live activity and cumulative rebalance
 counters across the partition image installation. A replacement static identity
@@ -618,9 +638,10 @@ reenter mutation or broker shutdown.
 No broker configuration activates staging. Coordinator wire requests, cleanup,
 transaction sweep and legacy Prepare completion remain gated until all handlers
 and background jobs use the new mutation functions. Serving integration still
-needs to propose live group changes without publishing before commit and dispatch
-ISR waits off socket IO threads. InitProducerId now propagates counter-write and
-directory-fsync failures before acknowledging an ID or creating a transaction;
+needs deferred execution off socket IO threads, worker/response lifecycle draining,
+read/producer/response fencing and migration of offset/transaction handlers and
+background jobs. The group proposal primitive does not itself activate handlers.
+InitProducerId now propagates counter-write and directory-fsync failures before acknowledging an ID or creating a transaction;
 the successful counter format and sequential single-node IDs stay compatible.
 Requests cannot use external Produce/DeleteRecords to modify formatted sources.
 The native staged writer proves group/offset/pending and transaction continuity

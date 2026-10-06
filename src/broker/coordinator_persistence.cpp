@@ -133,6 +133,12 @@ ErrorCode KawasanBroker::commitCoordinatorRecords(const TopicPartition& tp, int3
 ErrorCode KawasanBroker::mutateCoordinatorGroup(const std::string& group_id,
                                                 const GroupMutation& mutation,
                                                 std::chrono::milliseconds timeout) {
+    return mutateCoordinatorGroupImpl(group_id, mutation, timeout);
+}
+
+ErrorCode KawasanBroker::mutateCoordinatorGroupImpl(
+    const std::string& group_id, const GroupMutation& mutation, std::chrono::milliseconds timeout,
+    const std::unique_ptr<GroupCoordinator::GroupProposal>* proposal) {
     if (!staged_coordinator_persistence_ || group_id.empty() || !mutation || timeout.count() < 0)
         return ErrorCode::INVALID_REQUEST;
     if (coordinator_mutations_stopping_.load())
@@ -186,13 +192,45 @@ ErrorCode KawasanBroker::mutateCoordinatorGroup(const std::string& group_id,
             tp, metadata->leader_epoch, records,
             [&] {
                 group_coordinator_->publishCoordinatorPartition(
-                    tp.partition, offsets_topic_num_partitions_, proposed, offset_manager_);
+                    tp.partition, offsets_topic_num_partitions_, proposed, offset_manager_,
+                    proposal ? proposal->get() : nullptr);
             },
             timeout);
     } catch (const std::exception& ex) {
         Logger::error("Coordinator group proposal '{}' failed: {}", group_id, ex.what());
         return ErrorCode::KAFKA_STORAGE_ERROR;
     }
+}
+
+ErrorCode KawasanBroker::mutateCoordinatorGroupState(const std::string& group_id,
+                                                     const GroupStateMutation& mutation,
+                                                     std::chrono::milliseconds timeout) {
+    if (!mutation)
+        return ErrorCode::INVALID_REQUEST;
+    std::unique_ptr<GroupCoordinator::GroupProposal> proposal;
+    return mutateCoordinatorGroupImpl(
+        group_id,
+        [&](const auto& current, auto& changes) {
+            std::optional<GroupRecord> committed;
+            for (const auto& record : current)
+                if (record.key.kind == GroupRecordKey::Kind::Group)
+                    committed = record;
+            proposal = group_coordinator_->proposeGroup(group_id, committed);
+            mutation(*proposal);
+            if (const auto record = proposal->record()) {
+                changes.push_back(*record);
+            } else {
+                // An unknown-group protocol error must not invent group state.
+                // An exact identity tombstone leaves any offsets/pending keys
+                // intact and still fences admission through durable publication.
+                GroupRecord tombstone;
+                tombstone.key.group_id = group_id;
+                tombstone.tombstone = true;
+                changes.push_back(std::move(tombstone));
+            }
+            return ErrorCode::NONE;
+        },
+        timeout, &proposal);
 }
 
 ErrorCode KawasanBroker::deleteCoordinatorGroup(const std::string& group_id,

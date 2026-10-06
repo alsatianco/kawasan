@@ -221,6 +221,431 @@ ErrorCode init(KawasanBroker& b, const TransactionCoordinator::TxnSnapshot& s) {
     });
 }
 
+protocol::JoinGroupRequest joinRequest(const std::string& group, const std::string& member = {}) {
+    protocol::JoinGroupRequest request;
+    request.setGroupId(group);
+    request.setMemberId(member);
+    request.setProtocolType("consumer");
+    request.setGroupProtocols({{"range", {255}}});
+    request.setRebalanceTimeoutMs(60000);
+    return request;
+}
+protocol::HeartbeatRequest heartbeatRequest(const std::string& group, int generation = 7) {
+    protocol::HeartbeatRequest request;
+    request.setGroupId(group);
+    request.setGenerationId(generation);
+    request.setMemberId("member");
+    return request;
+}
+GroupSnapshot committedGroup(KawasanBroker& b, const std::string& id) {
+    auto image =
+        GroupStateManager(b.logManager(), 3).loadCommittedPartition(coordinatorPartitionFor(id, 3));
+    GroupRecordKey key;
+    key.group_id = id;
+    return image.at(key).group;
+}
+
+TEST_F(CoordinatorPersistenceTest, GroupStateProposalsCommitMembershipAndTouchedRuntimeTogether) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    ASSERT_EQ(put(b, id, {groupRecord(id), offsetRecord(id)}), ErrorCode::NONE);
+    auto& groups = CoordinatorPersistenceProbe::groups(b);
+    CoordinatorAcquisitionProbe::ageRuntime(groups, id);
+    const auto before = CoordinatorAcquisitionProbe::runtime(groups, id);
+    GroupCoordinator::JoinGroupResult joined;
+    std::optional<GroupRecord> proposed;
+    auto join = joinRequest(id, "second");
+    join.setGroupInstanceId("second-instance");
+    join.setSessionTimeoutMs(120000);
+    ASSERT_EQ(b.mutateCoordinatorGroupState(
+                  id,
+                  [&](auto& draft) {
+                      joined = draft.handleJoinGroup(join, "second-client", "second-host");
+                      EXPECT_EQ(groups.getMemberTimeoutMs(), 30000);
+                      proposed = draft.record();
+                      EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, id), before);
+                      EXPECT_EQ(groups.describeGroups({id})[0].members.size(), 1);
+                  }),
+              ErrorCode::NONE);
+    ASSERT_EQ(joined.error, ErrorCode::NONE);
+    EXPECT_EQ(joined.generation_id, 8);
+    EXPECT_EQ(groups.getMemberTimeoutMs(), 120000);
+    ASSERT_TRUE(proposed);
+    EXPECT_EQ(committedGroup(b, id), proposed->group);
+    EXPECT_EQ(groups.describeGroups({id})[0].members.size(), 2);
+    const auto joined_runtime = CoordinatorAcquisitionProbe::runtime(groups, id);
+    EXPECT_EQ(joined_runtime.heartbeat, before.heartbeat);  // Only the second member joined.
+    EXPECT_GT(joined_runtime.rebalance, before.rebalance);
+    EXPECT_EQ(joined_runtime.rebalances, 12);  // Count once, including the draft's transition.
+    EXPECT_EQ(CoordinatorPersistenceProbe::offsets(b).fetchOffset(id, "data", 0), 42);
+
+    protocol::SyncGroupRequest sync;
+    sync.setGroupId(id);
+    sync.setMemberId("member");
+    sync.setGenerationId(8);
+    sync.setAssignments({{"member", {1, 2}}, {"second", {3, 4}}});
+    GroupCoordinator::SyncGroupResult synced;
+    ASSERT_EQ(b.mutateCoordinatorGroupState(
+                  id,
+                  [&](auto& draft) {
+                      synced = draft.handleSyncGroup(sync);
+                      proposed = draft.record();
+                      EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, id), joined_runtime);
+                  }),
+              ErrorCode::NONE);
+    EXPECT_EQ(synced.error, ErrorCode::NONE);
+    EXPECT_EQ(synced.assignment, (std::vector<uint8_t>{1, 2}));
+    EXPECT_EQ(committedGroup(b, id), proposed->group);
+    auto synced_runtime = CoordinatorAcquisitionProbe::runtime(groups, id);
+    EXPECT_GT(synced_runtime.heartbeat, joined_runtime.heartbeat);
+    EXPECT_EQ(synced_runtime.rebalances, 12);
+
+    CoordinatorAcquisitionProbe::ageRuntime(groups, id);
+    auto aged = CoordinatorAcquisitionProbe::runtime(groups, id);
+    ErrorCode heartbeat = ErrorCode::INVALID_REQUEST;
+    ASSERT_EQ(b.mutateCoordinatorGroupState(
+                  id,
+                  [&](auto& draft) {
+                      heartbeat = draft.handleHeartbeat(heartbeatRequest(id, 8));
+                      proposed = draft.record();
+                      EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, id), aged);
+                  }),
+              ErrorCode::NONE);
+    EXPECT_EQ(heartbeat, ErrorCode::NONE);
+    EXPECT_EQ(committedGroup(b, id), proposed->group);
+    const auto refreshed = CoordinatorAcquisitionProbe::runtime(groups, id);
+    EXPECT_GT(refreshed.heartbeat, aged.heartbeat);
+    EXPECT_EQ(refreshed.rebalance, aged.rebalance);
+    EXPECT_EQ(refreshed.rebalances, aged.rebalances);
+    // An unrelated offset publication must retain the committed heartbeat.
+    ASSERT_EQ(put(b, id, {offsetRecord(id, 99)}), ErrorCode::NONE);
+    EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, id), refreshed);
+    ErrorCode left = ErrorCode::INVALID_REQUEST;
+    ASSERT_EQ(b.mutateCoordinatorGroupState(
+                  id,
+                  [&](auto& draft) {
+                      left = draft.handleLeaveGroup("second");
+                      proposed = draft.record();
+                      EXPECT_EQ(groups.describeGroups({id})[0].members.size(), 2);
+                  }),
+              ErrorCode::NONE);
+    EXPECT_EQ(left, ErrorCode::NONE);
+    EXPECT_EQ(committedGroup(b, id), proposed->group);
+    EXPECT_EQ(groups.describeGroups({id})[0].members.size(), 1);
+    EXPECT_EQ(groups.describeGroups({id})[0].group_state, "PreparingRebalance");
+    EXPECT_EQ(CoordinatorPersistenceProbe::offsets(b).fetchOffset(id, "data", 0), 99);
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, FirstGroupProposalCountsInitialRebalanceAndKeepsStaticIdentity) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    auto request = joinRequest(id);
+    request.setGroupInstanceId("static");
+    GroupCoordinator::JoinGroupResult result;
+    ASSERT_EQ(b.mutateCoordinatorGroupState(
+                  id,
+                  [&](auto& draft) {
+                      result = draft.handleJoinGroup(request, "client", "host");
+                      EXPECT_TRUE(CoordinatorPersistenceProbe::groups(b).listGroups().empty());
+                  }),
+              ErrorCode::NONE);
+    ASSERT_EQ(result.error, ErrorCode::NONE);
+    auto record = committedGroup(b, id);
+    ASSERT_EQ(record.members.size(), 1);
+    EXPECT_EQ(record.members[0].group_instance_id, "static");
+    EXPECT_EQ(record.members[0].member_id, result.member_id);
+    EXPECT_EQ(CoordinatorPersistenceProbe::groups(b).getMetrics().groups[0].rebalances_total, 1);
+    const auto first_id = result.member_id;
+    ASSERT_EQ(b.mutateCoordinatorGroupState(
+                  id, [&](auto& draft) { result = draft.handleJoinGroup(request); }),
+              ErrorCode::NONE);
+    EXPECT_EQ(result.member_id, first_id);
+    EXPECT_EQ(committedGroup(b, id).members.size(), 1);
+    EXPECT_EQ(CoordinatorPersistenceProbe::groups(b).getMetrics().groups[0].rebalances_total, 1);
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, GroupProposalCheckpointFailureLeavesLiveRuntimeUntouched) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    ASSERT_EQ(put(b, id, {groupRecord(id)}), ErrorCode::NONE);
+    auto& groups = CoordinatorPersistenceProbe::groups(b);
+    CoordinatorAcquisitionProbe::ageRuntime(groups, id);
+    const auto before = CoordinatorAcquisitionProbe::runtime(groups, id);
+    const auto blocked = dir / "0/__consumer_offsets-0/checkpoint.meta.tmp";
+    fs::create_directory(blocked);
+    bool invoked = false;
+    EXPECT_EQ(b.mutateCoordinatorGroupState(
+                  id,
+                  [&](auto& draft) {
+                      invoked = true;
+                      EXPECT_EQ(draft.handleHeartbeat(heartbeatRequest(id)), ErrorCode::NONE);
+                  }),
+              ErrorCode::KAFKA_STORAGE_ERROR);
+    EXPECT_TRUE(invoked);
+    EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, id), before);
+    EXPECT_EQ(groups.describeGroups({id})[0].members.size(), 1);
+    fs::remove(blocked);
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, RejectedGroupProposalCannotChangeOtherGroupsOrPublishDraft) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    ASSERT_EQ(put(b, id, {groupRecord(id)}), ErrorCode::NONE);
+    auto& groups = CoordinatorPersistenceProbe::groups(b);
+    CoordinatorAcquisitionProbe::ageRuntime(groups, id);
+    const auto before = CoordinatorAcquisitionProbe::runtime(groups, id);
+    const auto leo = b.logManager()->getLog("__consumer_offsets", 0)->logEndOffset();
+    EXPECT_EQ(b.mutateCoordinatorGroupState(
+                  id,
+                  [&](auto& draft) {
+                      EXPECT_EQ(draft.handleHeartbeat(heartbeatRequest(id)), ErrorCode::NONE);
+                      draft.handleJoinGroup(joinRequest(key(1)));
+                  }),
+              ErrorCode::KAFKA_STORAGE_ERROR);
+    EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, id), before);
+    EXPECT_EQ(b.logManager()->getLog("__consumer_offsets", 0)->logEndOffset(), leo);
+    EXPECT_EQ(groups.listGroups().size(), 1);
+    EXPECT_EQ(b.mutateCoordinatorGroupState(id,
+                                            [&](auto& draft) {
+                                                draft.handleLeaveGroup("member");
+                                                throw std::runtime_error("rejected after drafting");
+                                            }),
+              ErrorCode::KAFKA_STORAGE_ERROR);
+    EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, id), before);
+    EXPECT_EQ(b.logManager()->getLog("__consumer_offsets", 0)->logEndOffset(), leo);
+    EXPECT_EQ(b.mutateCoordinatorGroupState(id, {}), ErrorCode::INVALID_REQUEST);
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, GroupProtocolErrorsCanCommitTheirStateTransitions) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    auto record = groupRecord(id);
+    record.group.state = 2;
+    auto second = record.group.members[0];
+    second.member_id = "second";
+    second.group_instance_id = "second-instance";
+    record.group.members.push_back(second);
+    ASSERT_EQ(put(b, id, {record}), ErrorCode::NONE);
+    auto& groups = CoordinatorPersistenceProbe::groups(b);
+    CoordinatorAcquisitionProbe::ageRuntime(groups, id);
+    const auto before = CoordinatorAcquisitionProbe::runtime(groups, id);
+    protocol::SyncGroupRequest sync;
+    sync.setGroupId(id);
+    sync.setGenerationId(7);
+    sync.setMemberId("member");
+    sync.setAssignments({{"member", {1}}});  // Assignment computed before second joined.
+    GroupCoordinator::SyncGroupResult result;
+    ASSERT_EQ(b.mutateCoordinatorGroupState(
+                  id,
+                  [&](auto& draft) {
+                      result = draft.handleSyncGroup(sync);
+                      EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, id), before);
+                  }),
+              ErrorCode::NONE);
+    EXPECT_EQ(result.error, ErrorCode::ILLEGAL_GENERATION);
+    EXPECT_EQ(committedGroup(b, id).generation, 8);
+    EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, id).rebalances, 12);
+    CoordinatorAcquisitionProbe::ageRuntime(groups, id);
+    const auto aged = CoordinatorAcquisitionProbe::runtime(groups, id);
+    ErrorCode heartbeat = ErrorCode::NONE;
+    ASSERT_EQ(b.mutateCoordinatorGroupState(
+                  id,
+                  [&](auto& draft) {
+                      heartbeat = draft.handleHeartbeat(heartbeatRequest(id, 8));
+                      EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, id), aged);
+                  }),
+              ErrorCode::NONE);
+    EXPECT_EQ(heartbeat, ErrorCode::REBALANCE_IN_PROGRESS);
+    EXPECT_GT(CoordinatorAcquisitionProbe::runtime(groups, id).heartbeat, aged.heartbeat);
+    EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, id).rebalance, aged.rebalance);
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, GroupTimeoutProposalPublishesEvictionMetricsOnlyOnCommit) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    ASSERT_EQ(put(b, id, {groupRecord(id)}), ErrorCode::NONE);
+    auto& groups = CoordinatorPersistenceProbe::groups(b);
+    groups.setMemberTimeoutMs(1);
+    CoordinatorAcquisitionProbe::ageRuntime(groups, id);
+    const auto before = CoordinatorAcquisitionProbe::runtime(groups, id);
+    const auto metrics_before = groups.getMetrics().member_timeout_total;
+    EXPECT_EQ(b.mutateCoordinatorGroupState(
+                  id,
+                  [&](auto& draft) {
+                      draft.checkTimeouts();
+                      EXPECT_TRUE(draft.record()->group.members.empty());
+                      EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, id), before);
+                      EXPECT_EQ(groups.getMetrics().member_timeout_total, metrics_before);
+                      throw std::runtime_error("cancel eviction");
+                  }),
+              ErrorCode::KAFKA_STORAGE_ERROR);
+    EXPECT_EQ(groups.getMetrics().member_timeout_total, metrics_before);
+    EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, id), before);
+    ASSERT_EQ(b.mutateCoordinatorGroupState(id, [&](auto& draft) { draft.checkTimeouts(); }),
+              ErrorCode::NONE);
+    EXPECT_TRUE(committedGroup(b, id).members.empty());
+    EXPECT_EQ(groups.getMetrics().member_timeout_total, metrics_before + 1);
+    // Replaying the committed image rebuilds deadlines without recounting timeouts.
+    CoordinatorPersistenceProbe::reacquireGroupCache(b, 0);
+    EXPECT_EQ(groups.getMetrics().member_timeout_total, metrics_before + 1);
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, RebalanceTimeoutProposalCommitsLeaderlessPreparingState) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    auto initial = groupRecord(id);
+    initial.group.state = 2;
+    initial.group.rebalance_timeout_ms = 1000;
+    auto second = initial.group.members[0];
+    second.member_id = "second";
+    second.group_instance_id = "second-instance";
+    initial.group.members.push_back(second);
+    ASSERT_EQ(put(b, id, {initial}), ErrorCode::NONE);
+    auto& groups = CoordinatorPersistenceProbe::groups(b);
+    CoordinatorAcquisitionProbe::ageRuntime(groups, id);
+    const auto before = CoordinatorAcquisitionProbe::runtime(groups, id);
+    ASSERT_EQ(b.mutateCoordinatorGroupState(
+                  id,
+                  [&](auto& draft) {
+                      draft.checkTimeouts();
+                      EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, id), before);
+                  }),
+              ErrorCode::NONE);
+    const auto committed = committedGroup(b, id);
+    EXPECT_EQ(committed.state, 1);  // PreparingRebalance, awaiting a new leader's rejoin.
+    EXPECT_TRUE(committed.leader_id.empty());
+    ASSERT_EQ(committed.members.size(), 1);
+    EXPECT_EQ(committed.members[0].member_id, "second");
+    EXPECT_EQ(committed.generation, 8);
+    EXPECT_EQ(groups.getMetrics().groups[0].rebalances_total, 12);
+    EXPECT_EQ(groups.getMetrics().member_timeout_total, 0);
+    // Acquisition must accept the durable transitional image as well.
+    CoordinatorPersistenceProbe::reacquireGroupCache(b, 0);
+    EXPECT_EQ(groups.describeGroups({id})[0].group_state, "PreparingRebalance");
+    GroupCoordinator::JoinGroupResult joined;
+    ASSERT_EQ(
+        b.mutateCoordinatorGroupState(
+            id, [&](auto& draft) { joined = draft.handleJoinGroup(joinRequest(id, "second")); }),
+        ErrorCode::NONE);
+    EXPECT_EQ(joined.error, ErrorCode::NONE);
+    EXPECT_EQ(joined.leader_id, "second");
+    EXPECT_EQ(joined.generation_id, 8);
+    EXPECT_EQ(committedGroup(b, id).state, 2);
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, UnknownGroupProposalPreservesExactOffsetAndPendingKeys) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    auto pending = offsetRecord(id, 43);
+    pending.key.kind = GroupRecordKey::Kind::PendingOffset;
+    pending.key.transactional_id = "txn";
+    pending.key.producer_id = 75;
+    pending.key.producer_epoch = 2;
+    ASSERT_EQ(put(b, id, {offsetRecord(id), pending}), ErrorCode::NONE);
+    ErrorCode result = ErrorCode::NONE;
+    ASSERT_EQ(b.mutateCoordinatorGroupState(id,
+                                            [&](auto& draft) {
+                                                EXPECT_FALSE(draft.record());
+                                                result =
+                                                    draft.handleHeartbeat(heartbeatRequest(id));
+                                                EXPECT_FALSE(draft.record());
+                                            }),
+              ErrorCode::NONE);
+    EXPECT_EQ(result, ErrorCode::ILLEGAL_GENERATION);
+    EXPECT_TRUE(CoordinatorPersistenceProbe::groups(b).getMetrics().groups.empty());
+    EXPECT_EQ(CoordinatorPersistenceProbe::offsets(b).fetchOffset(id, "data", 0), 42);
+    EXPECT_EQ(CoordinatorPersistenceProbe::groups(b).pendingCoordinatorOffsets().size(), 1);
+    const auto image = GroupStateManager(b.logManager(), 3).loadCommittedPartition(0);
+    EXPECT_EQ(image.size(), 2);
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, ThreeBrokerGroupDraftWaitsForIsrAndFencesOwnerChange) {
+    startCluster();
+    const auto id = key(1);
+    auto& b = *brokers[1];
+    ASSERT_TRUE(waitUntil([&] {
+        return b.coordinatorLoadStatus(id, protocol::CoordinatorType::GROUP) == ErrorCode::NONE;
+    }));
+    ASSERT_EQ(put(b, id, {groupRecord(id)}), ErrorCode::NONE);
+    auto& groups = CoordinatorPersistenceProbe::groups(b);
+    CoordinatorAcquisitionProbe::ageRuntime(groups, id);
+    const auto before = CoordinatorAcquisitionProbe::runtime(groups, id);
+    // Retain metadata quorum but freeze acquisition and data replication.
+    for (auto& broker : brokers)
+        broker->replicaManager()->stop();
+    ErrorCode heartbeat = ErrorCode::INVALID_REQUEST;
+    auto pending = std::async(std::launch::async, [&] {
+        return b.mutateCoordinatorGroupState(
+            id, [&](auto& draft) { heartbeat = draft.handleHeartbeat(heartbeatRequest(id)); });
+    });
+    ASSERT_TRUE(waitUntil(
+        [&] { return b.logManager()->getLog("__consumer_offsets", 1)->logEndOffset() == 2; }));
+    EXPECT_EQ(pending.wait_for(20ms), std::future_status::timeout);
+    EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, id), before);
+    brokers[0]->replicaManager()->start();
+    brokers[2]->replicaManager()->start();
+    ASSERT_EQ(pending.get(), ErrorCode::NONE);
+    EXPECT_EQ(heartbeat, ErrorCode::NONE);
+    EXPECT_GT(CoordinatorAcquisitionProbe::runtime(groups, id).heartbeat, before.heartbeat);
+    EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, id).rebalance, before.rebalance);
+
+    brokers[0]->replicaManager()->stop();
+    brokers[2]->replicaManager()->stop();
+    const auto committed = CoordinatorAcquisitionProbe::runtime(groups, id);
+    pending = std::async(std::launch::async, [&] {
+        return b.mutateCoordinatorGroupState(id, [&](auto& draft) {
+            EXPECT_EQ(draft.handleJoinGroup(joinRequest(id, "second")).error, ErrorCode::NONE);
+        });
+    });
+    ASSERT_TRUE(waitUntil(
+        [&] { return b.logManager()->getLog("__consumer_offsets", 1)->logEndOffset() == 3; }));
+    EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, id), committed);
+    KawasanBroker* controller = nullptr;
+    ASSERT_TRUE(waitUntil([&] {
+        for (auto& broker : brokers)
+            if (broker->raftNode()->isLeader()) {
+                controller = broker.get();
+                return true;
+            }
+        return false;
+    }));
+    ASSERT_EQ(controller->metadataController()
+                  ->updatePartitionLeader("__consumer_offsets", 1, 0)
+                  .error_code,
+              ErrorCode::NONE);
+    EXPECT_EQ(pending.get(), ErrorCode::NOT_COORDINATOR);
+    EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, id), committed);
+    EXPECT_EQ(groups.describeGroups({id})[0].members.size(), 1);
+    bool invoked = false;
+    EXPECT_EQ(b.mutateCoordinatorGroupState(id, [&](auto&) { invoked = true; }),
+              ErrorCode::NOT_COORDINATOR);
+    EXPECT_FALSE(invoked);
+}
+
 TEST_F(CoordinatorPersistenceTest, PublicationPreservesLiveGroupsSharingThePartition) {
     KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
     b.start();
