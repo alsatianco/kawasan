@@ -1,5 +1,7 @@
 #include "kawasan/broker/kawasan_broker.h"
 
+#include <fcntl.h>
+#include <unistd.h>
 #include <zlib.h>
 
 #include <algorithm>
@@ -852,6 +854,14 @@ void KawasanBroker::start() {
 }
 
 void KawasanBroker::stop() {
+    // Staged C++ callers can be inside proposals or ISR waits independently
+    // of the TCP server. Seal admission and wait for their source/cache access
+    // to finish while storage, metadata and replica progress are still alive.
+    // The writer observes the stop flag and cancels an uncommitted ISR wait.
+    if (staged_coordinator_persistence_) {
+        coordinator_mutations_stopping_.store(true);
+        std::unique_lock<std::shared_mutex> drain(coordinator_mutation_lifecycle_mutex_);
+    }
     // M2: the transaction-timeout sweep is started during construction (next
     // to the group cleanup thread), i.e. BEFORE running_ becomes true. Join it
     // unconditionally here — before the running_ guard — so a broker that was
@@ -4634,13 +4644,26 @@ int64_t KawasanBroker::allocateNextProducerId() {
     }
     const int64_t allocated = current;
     const int64_t next = current + 1;
-    next_producer_id_.store(next);
-    std::filesystem::create_directories(metadata_dir_);
     // Crash-atomic and durable: re-issuing an id after a crash would make the
     // new producer's first batches look like duplicates of the old one's.
-    if (!writeFileAtomically(counter_path, std::to_string(next))) {
-        Logger::error("Failed to persist producer_id counter to {}", counter_path);
+    try {
+        std::filesystem::create_directories(metadata_dir_);
+        if (!writeFileAtomically(counter_path, std::to_string(next)))
+            throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR,
+                                   "Failed to persist producer_id counter to " + counter_path);
+        const int dir_fd = ::open(metadata_dir_.c_str(), O_RDONLY);
+        if (dir_fd < 0)
+            throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR,
+                                   "Failed to open producer_id counter directory");
+        const bool synced = ::fsync(dir_fd) == 0;
+        const bool closed = ::close(dir_fd) == 0;
+        if (!synced || !closed)
+            throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR,
+                                   "Failed to fsync producer_id counter directory");
+    } catch (const std::filesystem::filesystem_error& ex) {
+        throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR, ex.what());
     }
+    next_producer_id_.store(next);
     // In a cluster every broker issues ids from its own range (see
     // clusterProducerId); single-node ids stay plain sequential.
     return cluster_brokers_.empty() ? allocated : clusterProducerId(broker_id_, allocated);

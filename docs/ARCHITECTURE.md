@@ -602,11 +602,26 @@ until source reopen; an ambiguous acknowledged-prefix wait blocks reacquisition
 in that epoch until HW covers the attempted span. Failed requests may subsequently
 become committed: callers must treat them as ambiguous, not as rolled-back writes.
 
+Mutation publication preserves existing members' heartbeat clocks, unchanged
+rebalance deadlines, the most recent live activity and cumulative rebalance
+counters across the partition image installation. A replacement static identity
+gets a fresh heartbeat clock; a changed generation/phase gets a new rebalance
+deadline. Acquisition retains its separate semantics: rebuild steady-clock
+deadlines and load the persisted activity timestamp verbatim.
+
+A broker lifecycle lease covers each admitted mutation's source/cache access.
+Shutdown seals admission and cancels ISR waits, then drains all leases before
+stopping replication or closing logs. Queued mutations recheck the shutdown gate
+after obtaining their partition lock. Proposal callbacks must finish and cannot
+reenter mutation or broker shutdown.
+
 No broker configuration activates staging. Coordinator wire requests, cleanup,
 transaction sweep and legacy Prepare completion remain gated until all handlers
-and background jobs use the new mutation functions. These functions currently
-install complete cache images; serving integration must preserve live heartbeat/
-rebalance clocks and metrics when publishing unrelated keys in the same partition.
+and background jobs use the new mutation functions. Serving integration still
+needs to propose live group changes without publishing before commit and dispatch
+ISR waits off socket IO threads. InitProducerId now propagates counter-write and
+directory-fsync failures before acknowledging an ID or creating a transaction;
+the successful counter format and sequential single-node IDs stay compatible.
 Requests cannot use external Produce/DeleteRecords to modify formatted sources.
 The native staged writer proves group/offset/pending and transaction continuity
 after an RF=3 owner stops, plus real RF=1 SIGKILL recovery after staged mutation

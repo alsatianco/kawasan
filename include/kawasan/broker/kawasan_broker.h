@@ -9,6 +9,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -75,8 +76,8 @@ public:
     using GroupMutation =
         std::function<ErrorCode(const std::vector<GroupRecord>&, std::vector<GroupRecord>&)>;
     // Proposal callbacks run under the mutation fence and must not reenter a
-    // coordinator mutation. Success currently replaces the whole cache image;
-    // serving integration must preserve clocks/counters for unaffected keys.
+    // coordinator mutation or stop(). Publication preserves live clocks and
+    // counters; acquisition rebuilds them. Shutdown drains admitted proposals.
     ErrorCode mutateCoordinatorGroup(const std::string& group_id, const GroupMutation& mutation,
                                      std::chrono::milliseconds timeout = std::chrono::seconds(5));
     ErrorCode deleteCoordinatorGroup(const std::string& group_id,
@@ -198,6 +199,10 @@ private:
     // An append/fsync exception may have written bytes without advancing LEO.
     // Reopening the source is required; never retry over an unknown WAL result.
     std::set<TopicPartition> failed_coordinator_appends_;
+    // A shared lease covers proposal/source reads through publication. Stop
+    // seals admission, cancels ISR waits and drains leases before closing logs.
+    std::shared_mutex coordinator_mutation_lifecycle_mutex_;
+    std::atomic<bool> coordinator_mutations_stopping_{false};
     std::mutex coordinator_mutation_map_mutex_;
     std::map<TopicPartition, std::shared_ptr<std::mutex>> coordinator_mutation_mutexes_;
     std::shared_ptr<std::mutex> coordinatorMutationMutex(const TopicPartition& tp);

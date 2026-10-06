@@ -44,6 +44,19 @@ GroupCoordinator::~GroupCoordinator() {
 void GroupCoordinator::replaceCoordinatorPartition(int32_t partition, int32_t partition_count,
                                                    const std::vector<GroupRecord>& records,
                                                    std::shared_ptr<OffsetManager> offsets) {
+    installCoordinatorPartition(partition, partition_count, records, std::move(offsets), false);
+}
+
+void GroupCoordinator::publishCoordinatorPartition(int32_t partition, int32_t partition_count,
+                                                   const std::vector<GroupRecord>& records,
+                                                   std::shared_ptr<OffsetManager> offsets) {
+    installCoordinatorPartition(partition, partition_count, records, std::move(offsets), true);
+}
+
+void GroupCoordinator::installCoordinatorPartition(int32_t partition, int32_t partition_count,
+                                                   const std::vector<GroupRecord>& records,
+                                                   std::shared_ptr<OffsetManager> offsets,
+                                                   bool preserve_runtime) {
     std::lock_guard<std::mutex> lock(mutex_);
     std::unordered_map<std::string, GroupState> restored;
     std::vector<GroupRecord> pending;
@@ -68,6 +81,27 @@ void GroupCoordinator::replaceCoordinatorPartition(int32_t partition, int32_t pa
                 g.members.emplace(m.member_id,
                                   MemberState{m.member_id, m.client_id, m.client_host,
                                               m.group_instance_id, m.metadata, m.assignment, now});
+            }
+            if (preserve_runtime) {
+                const auto previous = groups_.find(r.key.group_id);
+                if (previous != groups_.end()) {
+                    const auto& live = previous->second;
+                    g.last_activity = std::max(g.last_activity, live.last_activity);
+                    const auto generation_delta =
+                        std::max<int64_t>(0, int64_t{g.generation_id} - live.generation_id);
+                    g.rebalances_total.store(live.rebalances_total.load() + generation_delta);
+                    // An offset/pending mutation must never extend a stalled
+                    // rebalance's deadline. A new generation/phase gets a new
+                    // deadline; unchanged phases keep the original start.
+                    if (g.generation_id == live.generation_id && g.kind == live.kind)
+                        g.rebalance_started_at = live.rebalance_started_at;
+                    for (auto& [id, member] : g.members) {
+                        const auto old_member = live.members.find(id);
+                        if (old_member != live.members.end() &&
+                            old_member->second.group_instance_id == member.group_instance_id)
+                            member.last_heartbeat = old_member->second.last_heartbeat;
+                    }
+                }
             }
         }
     }

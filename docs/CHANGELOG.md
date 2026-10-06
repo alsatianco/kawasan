@@ -8,6 +8,14 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-06
 
+- Preserve live group heartbeat/rebalance clocks, activity and cumulative
+  counters when publishing staged committed mutations; ownership acquisition
+  still rebuilds steady-clock deadlines. Seal coordinator mutation admission
+  during shutdown, cancel ISR waits and drain proposals before closing storage.
+- Return `KAFKA_STORAGE_ERROR` from InitProducerId when counter persistence fails,
+  without acknowledging a producer ID or creating a transactional identity.
+  Advance the in-memory counter only after atomic file replacement and directory
+  fsync succeed. Successful single-node IDs and counter bytes remain compatible.
 - Add an internal M10 persistence seam with RF=min(3, configured cluster size),
   fsynced ISR appends before cache publication, atomic metadata ownership guards,
   complete group/offset/pending mutations and exact-key deletion batches. Compare

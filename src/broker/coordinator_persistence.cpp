@@ -46,7 +46,7 @@ ErrorCode KawasanBroker::commitCoordinatorRecords(const TopicPartition& tp, int3
             failed_coordinator_appends_.insert(tp);
     };
     auto fence = [&](const PartitionMetadata& metadata, bool appended) {
-        if (!running_.load() || !dataPlaneCurrent())
+        if (coordinator_mutations_stopping_.load() || !running_.load() || !dataPlaneCurrent())
             return ErrorCode::NOT_COORDINATOR;
         if (metadata.replicas.size() != std::min<size_t>(3, cluster_brokers_.size() + 1))
             return ErrorCode::INVALID_REQUEST;  // Never reuse staged RF=1 as replicated state.
@@ -106,10 +106,12 @@ ErrorCode KawasanBroker::commitCoordinatorRecords(const TopicPartition& tp, int3
                         // Strict checkpoint errors must abort publication, even
                         // after replication succeeds. The source remains authoritative.
                         log->flushCheckpoint(/*strict=*/true);
-                        if (!dataPlaneCurrent())
+                        if (coordinator_mutations_stopping_.load() || !dataPlaneCurrent())
                             return ErrorCode::NOT_COORDINATOR;
                         publish();
-                        return dataPlaneCurrent() ? ErrorCode::NONE : ErrorCode::NOT_COORDINATOR;
+                        return !coordinator_mutations_stopping_.load() && dataPlaneCurrent()
+                                   ? ErrorCode::NONE
+                                   : ErrorCode::NOT_COORDINATOR;
                     });
             }
             if (error != ErrorCode::REQUEST_TIMED_OUT ||
@@ -133,10 +135,17 @@ ErrorCode KawasanBroker::mutateCoordinatorGroup(const std::string& group_id,
                                                 std::chrono::milliseconds timeout) {
     if (!staged_coordinator_persistence_ || group_id.empty() || !mutation || timeout.count() < 0)
         return ErrorCode::INVALID_REQUEST;
+    if (coordinator_mutations_stopping_.load())
+        return ErrorCode::NOT_COORDINATOR;
+    std::shared_lock<std::shared_mutex> lifecycle_lock(coordinator_mutation_lifecycle_mutex_);
+    if (coordinator_mutations_stopping_.load())
+        return ErrorCode::NOT_COORDINATOR;
     const TopicPartition tp{"__consumer_offsets",
                             coordinatorPartitionFor(group_id, offsets_topic_num_partitions_)};
     auto mutex = coordinatorMutationMutex(tp);
     std::lock_guard<std::mutex> mutation_lock(*mutex);
+    if (coordinator_mutations_stopping_.load())
+        return ErrorCode::NOT_COORDINATOR;
     const auto status = coordinatorLoadStatus(group_id, protocol::CoordinatorType::GROUP);
     if (status != ErrorCode::NONE)
         return status;
@@ -176,7 +185,7 @@ ErrorCode KawasanBroker::mutateCoordinatorGroup(const std::string& group_id,
         return commitCoordinatorRecords(
             tp, metadata->leader_epoch, records,
             [&] {
-                group_coordinator_->replaceCoordinatorPartition(
+                group_coordinator_->publishCoordinatorPartition(
                     tp.partition, offsets_topic_num_partitions_, proposed, offset_manager_);
             },
             timeout);
@@ -216,10 +225,17 @@ ErrorCode KawasanBroker::mutateCoordinatorTransaction(
     if (!staged_coordinator_persistence_ || transactional_id.empty() || !mutation ||
         timeout.count() < 0)
         return ErrorCode::INVALID_REQUEST;
+    if (coordinator_mutations_stopping_.load())
+        return ErrorCode::NOT_COORDINATOR;
+    std::shared_lock<std::shared_mutex> lifecycle_lock(coordinator_mutation_lifecycle_mutex_);
+    if (coordinator_mutations_stopping_.load())
+        return ErrorCode::NOT_COORDINATOR;
     const TopicPartition tp{"__transaction_state",
                             coordinatorPartitionFor(transactional_id, txn_state_num_partitions_)};
     auto mutex = coordinatorMutationMutex(tp);
     std::lock_guard<std::mutex> mutation_lock(*mutex);
+    if (coordinator_mutations_stopping_.load())
+        return ErrorCode::NOT_COORDINATOR;
     const auto status =
         coordinatorLoadStatus(transactional_id, protocol::CoordinatorType::TRANSACTION);
     if (status != ErrorCode::NONE)

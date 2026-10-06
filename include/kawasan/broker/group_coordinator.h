@@ -49,6 +49,11 @@ public:
     void replaceCoordinatorPartition(int32_t partition, int32_t partition_count,
                                      const std::vector<GroupRecord>& records,
                                      std::shared_ptr<OffsetManager> offsets);
+    // Same committed image installation, but retain live clocks and counters
+    // for surviving identities. Acquisition deliberately rebuilds those clocks.
+    void publishCoordinatorPartition(int32_t partition, int32_t partition_count,
+                                     const std::vector<GroupRecord>& records,
+                                     std::shared_ptr<OffsetManager> offsets);
     std::vector<GroupRecord> pendingCoordinatorOffsets() const;
 
     GroupCoordinator(const GroupCoordinator&) = delete;
@@ -151,6 +156,9 @@ public:
 
 private:
     friend struct CoordinatorAcquisitionProbe;
+    void installCoordinatorPartition(int32_t partition, int32_t partition_count,
+                                     const std::vector<GroupRecord>& records,
+                                     std::shared_ptr<OffsetManager> offsets, bool preserve_runtime);
     struct MemberState {
         std::string member_id;
         // 0A.10: track real client identity instead of the "unknown" placeholder

@@ -23,10 +23,47 @@ namespace asio = boost::asio;
 namespace kawasan::broker {
 struct CoordinatorPersistenceProbe {
     static OffsetManager& offsets(KawasanBroker& b) { return *b.offset_manager_; }
+    static std::shared_ptr<OffsetManager> retainOffsets(KawasanBroker& b) {
+        return b.offset_manager_;
+    }
     static TransactionCoordinator& transactions(KawasanBroker& b) {
         return *b.transaction_coordinator_;
     }
     static GroupCoordinator& groups(KawasanBroker& b) { return *b.group_coordinator_; }
+    static void reacquireGroupCache(KawasanBroker& b, int32_t partition) {
+        const auto image = GroupStateManager(b.log_manager_.get(), b.offsets_topic_num_partitions_)
+                               .loadCommittedPartition(partition);
+        std::vector<GroupRecord> records;
+        for (const auto& [key, record] : image) {
+            (void)key;
+            records.push_back(record);
+        }
+        b.group_coordinator_->replaceCoordinatorPartition(
+            partition, b.offsets_topic_num_partitions_, records, b.offset_manager_);
+    }
+};
+struct CoordinatorAcquisitionProbe {
+    struct Runtime {
+        std::chrono::steady_clock::time_point heartbeat;
+        std::chrono::steady_clock::time_point rebalance;
+        std::chrono::system_clock::time_point activity;
+        int64_t rebalances;
+        bool operator==(const Runtime&) const = default;
+    };
+    static Runtime runtime(GroupCoordinator& coordinator, const std::string& id) {
+        std::lock_guard<std::mutex> lock(coordinator.mutex_);
+        const auto& group = coordinator.groups_.at(id);
+        return {group.members.at("member").last_heartbeat, group.rebalance_started_at,
+                group.last_activity, group.rebalances_total.load()};
+    }
+    static void ageRuntime(GroupCoordinator& coordinator, const std::string& id) {
+        std::lock_guard<std::mutex> lock(coordinator.mutex_);
+        auto& group = coordinator.groups_.at(id);
+        group.members.at("member").last_heartbeat -= 10s;
+        group.rebalance_started_at -= 20s;
+        group.last_activity = std::chrono::system_clock::now();
+        group.rebalances_total.store(11);
+    }
 };
 }  // namespace kawasan::broker
 
@@ -182,6 +219,119 @@ ErrorCode init(KawasanBroker& b, const TransactionCoordinator::TxnSnapshot& s) {
         proposal = s;
         return ErrorCode::NONE;
     });
+}
+
+TEST_F(CoordinatorPersistenceTest, PublicationPreservesLiveGroupsSharingThePartition) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    std::string other;
+    for (int n = 0;; ++n) {
+        other = "other:" + std::to_string(n);
+        if (coordinatorPartitionFor(other, 3) == 0)
+            break;
+    }
+    ASSERT_EQ(coordinatorPartitionFor(other, 3), 0);
+    ASSERT_EQ(put(b, id, {groupRecord(id)}), ErrorCode::NONE);
+    ASSERT_EQ(put(b, other, {groupRecord(other)}), ErrorCode::NONE);
+    auto& groups = CoordinatorPersistenceProbe::groups(b);
+    CoordinatorAcquisitionProbe::ageRuntime(groups, id);
+    CoordinatorAcquisitionProbe::ageRuntime(groups, other);
+    const auto before = CoordinatorAcquisitionProbe::runtime(groups, id);
+    const auto other_before = CoordinatorAcquisitionProbe::runtime(groups, other);
+    ASSERT_EQ(put(b, other, {offsetRecord(other)}), ErrorCode::NONE);
+    EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, id), before);
+    EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, other), other_before);
+    ASSERT_EQ(put(b, id, {offsetRecord(id)}), ErrorCode::NONE);
+    EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, id), before);
+    EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, other), other_before);
+    ASSERT_EQ(b.deleteCoordinatorGroup(other), ErrorCode::NONE);
+    EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(groups, id), before);
+    // A changed generation starts a fresh rebalance, while surviving member
+    // identities retain their actual last heartbeat and cumulative counter.
+    auto changed = groupRecord(id);
+    ++changed.group.generation;
+    ASSERT_EQ(put(b, id, {changed}), ErrorCode::NONE);
+    const auto newer = CoordinatorAcquisitionProbe::runtime(groups, id);
+    EXPECT_EQ(newer.heartbeat, before.heartbeat);
+    EXPECT_EQ(newer.activity, before.activity);
+    EXPECT_GT(newer.rebalance, before.rebalance);
+    EXPECT_EQ(newer.rebalances, before.rebalances + 1);
+    changed.group.members.front().group_instance_id = "replacement-instance";
+    ASSERT_EQ(put(b, id, {changed}), ErrorCode::NONE);
+    const auto replaced = CoordinatorAcquisitionProbe::runtime(groups, id);
+    EXPECT_GT(replaced.heartbeat, newer.heartbeat);
+    EXPECT_EQ(replaced.rebalance, newer.rebalance);
+    EXPECT_EQ(replaced.rebalances, newer.rebalances);
+    // Acquisition has different semantics: rebuild steady-clock deadlines
+    // from now and keep the source's persisted activity timestamp verbatim.
+    CoordinatorPersistenceProbe::reacquireGroupCache(b, 0);
+    const auto acquired = CoordinatorAcquisitionProbe::runtime(groups, id);
+    EXPECT_GT(acquired.heartbeat, replaced.heartbeat);
+    EXPECT_GT(acquired.rebalance, replaced.rebalance);
+    EXPECT_EQ(acquired.rebalances, 0);
+    EXPECT_EQ(acquired.activity.time_since_epoch(),
+              std::chrono::milliseconds(changed.group.last_update_timestamp));
+}
+
+TEST_F(CoordinatorPersistenceTest, ShutdownDrainsAdmittedGroupAndTransactionProposals) {
+    for (bool group : {true, false}) {
+        const auto cfg = config(group ? 0 : 1);
+        KawasanBroker b(cfg, KawasanBroker::CoordinatorPersistenceOnly{format});
+        b.start();
+        b.reconcileReplicas();
+        std::promise<void> entered;
+        std::promise<void> release;
+        auto released = release.get_future().share();
+        const auto id = key(0);
+        auto pending = std::async(std::launch::async, [&] {
+            if (group)
+                return b.mutateCoordinatorGroup(id, [&](const auto&, auto& changes) {
+                    entered.set_value();
+                    released.wait();
+                    changes = {offsetRecord(id)};
+                    return ErrorCode::NONE;
+                });
+            return b.mutateCoordinatorTransaction(id, std::nullopt, [&](auto& proposal) {
+                entered.set_value();
+                released.wait();
+                proposal = transaction(id);
+                return ErrorCode::NONE;
+            });
+        });
+        const auto admitted = entered.get_future().wait_for(5s);
+        if (admitted != std::future_status::ready) {
+            release.set_value();
+            EXPECT_EQ(pending.get(), ErrorCode::NONE);
+            FAIL() << "Mutation proposal was not admitted";
+        }
+        auto stopped = std::async(std::launch::async, [&] { b.stop(); });
+        // An admitted proposal may still inspect its source/cache. Shutdown
+        // must wait until it exits, even before it has reached an ISR wait.
+        EXPECT_EQ(stopped.wait_for(2s), std::future_status::timeout);
+        EXPECT_NE(b.logManager()->getLog(group ? "__consumer_offsets" : "__transaction_state", 0),
+                  nullptr);
+        release.set_value();
+        EXPECT_EQ(pending.get(), ErrorCode::NOT_COORDINATOR);
+        EXPECT_EQ(stopped.wait_for(5s), std::future_status::ready);
+        stopped.get();
+        bool invoked = false;
+        EXPECT_EQ(b.mutateCoordinatorGroup(id,
+                                           [&](const auto&, auto&) {
+                                               invoked = true;
+                                               return ErrorCode::NONE;
+                                           }),
+                  ErrorCode::NOT_COORDINATOR);
+        EXPECT_FALSE(invoked);
+        EXPECT_EQ(b.mutateCoordinatorTransaction(id, std::nullopt,
+                                                 [&](auto&) {
+                                                     invoked = true;
+                                                     return ErrorCode::NONE;
+                                                 }),
+                  ErrorCode::NOT_COORDINATOR);
+        EXPECT_FALSE(invoked);
+    }
 }
 
 TEST_F(CoordinatorPersistenceTest, CommitsCompleteGroupOffsetsAndExactTombstonesBeforeCache) {
@@ -599,5 +749,54 @@ TEST_F(CoordinatorPersistenceTest, OwnershipLossDuringIsrWaitPreventsCachePublic
                                        }),
               ErrorCode::NOT_COORDINATOR);
     EXPECT_FALSE(invoked);
+}
+
+TEST_F(CoordinatorPersistenceTest, ShutdownCancelsIsrWaitBeforeClosingStorage) {
+    startCluster();
+    const auto id = key(1);
+    auto& b = *brokers[1];
+    ASSERT_TRUE(waitUntil([&] {
+        return b.coordinatorLoadStatus(id, protocol::CoordinatorType::GROUP) == ErrorCode::NONE;
+    }));
+    ASSERT_EQ(put(b, id, {offsetRecord(id, 10)}), ErrorCode::NONE);
+    const auto prior = transaction(id);
+    ASSERT_EQ(init(b, prior), ErrorCode::NONE);
+    const auto retained_offsets = CoordinatorPersistenceProbe::retainOffsets(b);
+    brokers[0]->replicaManager()->stop();
+    brokers[2]->replicaManager()->stop();
+    auto pending =
+        std::async(std::launch::async, [&] { return put(b, id, {offsetRecord(id, 11)}, 30s); });
+    ASSERT_TRUE(waitUntil(
+        [&] { return b.logManager()->getLog("__consumer_offsets", 1)->logEndOffset() == 2; }));
+    auto pending_txn = std::async(std::launch::async, [&] {
+        return b.mutateCoordinatorTransaction(
+            id, prior,
+            [&](auto& proposal) {
+                proposal->state = TransactionCoordinator::State::PrepareAbort;
+                return ErrorCode::NONE;
+            },
+            30s);
+    });
+    ASSERT_TRUE(waitUntil(
+        [&] { return b.logManager()->getLog("__transaction_state", 1)->logEndOffset() == 2; }));
+    std::atomic<bool> invoked{false};
+    auto queued = std::async(std::launch::async, [&] {
+        return b.mutateCoordinatorGroup(id, [&](const auto&, auto& changes) {
+            invoked.store(true);
+            changes = {offsetRecord(id, 12)};
+            return ErrorCode::NONE;
+        });
+    });
+    auto stopped = std::async(std::launch::async, [&] { b.stop(); });
+    EXPECT_EQ(pending.wait_for(2s), std::future_status::ready);
+    EXPECT_EQ(pending.get(), ErrorCode::NOT_COORDINATOR);
+    EXPECT_EQ(pending_txn.wait_for(2s), std::future_status::ready);
+    EXPECT_EQ(pending_txn.get(), ErrorCode::NOT_COORDINATOR);
+    EXPECT_EQ(queued.get(), ErrorCode::NOT_COORDINATOR);
+    EXPECT_FALSE(invoked.load());
+    EXPECT_EQ(stopped.wait_for(5s), std::future_status::ready);
+    stopped.get();
+    EXPECT_EQ(retained_offsets->fetchOffset(id, "data", 0), 10);
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), prior);
 }
 }  // namespace
