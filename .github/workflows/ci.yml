@@ -19,6 +19,9 @@ jobs:
           - macos-latest
     env:
       KAWASAN_BUILD_TYPE: RelWithDebInfo
+      # Match Docker builds and avoid GCC optimizer warnings in fmt under -Werror.
+      CC: clang
+      CXX: clang++
     steps:
       - name: Checkout
         uses: actions/checkout@v4
