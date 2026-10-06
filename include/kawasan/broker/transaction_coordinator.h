@@ -64,6 +64,7 @@ public:
         int64_t offset = 0;
         std::string metadata;
         int32_t committed_leader_epoch = -1;
+        bool operator==(const PendingOffset&) const = default;
     };
 
     /// @brief M1: a partition participating in a transaction, plus the
@@ -78,6 +79,7 @@ public:
         std::string topic;
         int32_t partition = 0;
         int64_t first_offset = -1;
+        bool operator==(const TxnPartition&) const = default;
     };
 
     struct TxnSnapshot {
@@ -96,6 +98,7 @@ public:
         // abort. This gates consumer-group offset visibility on the
         // transaction outcome — required for Streams EOS v2.
         std::vector<PendingOffset> pending_offsets;
+        bool operator==(const TxnSnapshot&) const = default;
     };
 
     /// @brief Records that an InitProducerId call established (or

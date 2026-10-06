@@ -85,6 +85,9 @@ members and assignments), offsets, producer/epoch-scoped pending transactional
 offsets and exact-key tombstones. Partition replay reads only below captured HW,
 uses assigned offset spans and validates identities/routing before returning an
 image. A group deletion requires tombstones for all of its group/offset/pending
-keys. Ownership fencing, cache installation and committed writes are subsequent
+keys. Owned cache acquisition and fsynced ISR-committed mutations now exist as
+internal staged integration seams. The writer fences metadata ownership at
+append/publication and compares transaction snapshots under a separate mutation
+lock. Public handler/background migration and remote-marker completion remain
 M10 work; these primitives do not activate replicated coordinator mode. The
 current broker refuses formatted stores before opening its legacy offset cache.

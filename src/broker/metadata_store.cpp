@@ -386,6 +386,23 @@ void MetadataStore::load() {
     Logger::info("Loaded {} topics from {}", topics_.size(), metadata_file_);
 }
 
+ErrorCode MetadataStore::withPartitionLeadership(
+    const TopicPartition& tp, BrokerId owner, int32_t epoch,
+    const std::function<ErrorCode(const PartitionMetadata&)>& action) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto topic = topics_.find(tp.topic);
+    if (topic == topics_.end())
+        return ErrorCode::COORDINATOR_LOAD_IN_PROGRESS;
+    const auto& partitions = topic->second.metadata.partitions;
+    const auto partition = std::find_if(partitions.begin(), partitions.end(),
+                                        [&](const auto& p) { return p.partition == tp.partition; });
+    if (partition == partitions.end())
+        return ErrorCode::COORDINATOR_LOAD_IN_PROGRESS;
+    if (partition->leader != owner || partition->leader_epoch != epoch)
+        return ErrorCode::NOT_COORDINATOR;
+    return action(*partition);
+}
+
 TopicOperationResult MetadataStore::applyCreate(const TopicSpecification& spec) {
     std::lock_guard<std::mutex> lock(mutex_);
     const bool coordinator_topic =

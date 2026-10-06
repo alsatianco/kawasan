@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -33,6 +34,11 @@ public:
     TopicOperationResult applyCoordinatorFormat(const CoordinatorFormat& format);
     std::optional<CoordinatorFormat> coordinatorFormat() const;
     storage::Log* openCoordinatorReplica(const std::string& topic, PartitionId partition);
+    // Runs a short append/publication action atomically with respect to metadata
+    // leadership/ISR changes. The action must not call back into this store.
+    ErrorCode withPartitionLeadership(
+        const TopicPartition& tp, BrokerId owner, int32_t epoch,
+        const std::function<ErrorCode(const PartitionMetadata&)>& action);
 
     /// @brief Loads metadata from disk (creates empty store if missing).
     void load();

@@ -34,6 +34,11 @@ public:
     storage::Log* openCoordinatorReplica(const std::string& topic, PartitionId partition) {
         return store_.openCoordinatorReplica(topic, partition);
     }
+    ErrorCode withPartitionLeadership(
+        const TopicPartition& tp, BrokerId owner, int32_t epoch,
+        const std::function<ErrorCode(const PartitionMetadata&)>& action) {
+        return store_.withPartitionLeadership(tp, owner, epoch, action);
+    }
 
     /// @brief Loads persisted metadata and installs commit hooks.
     void start();

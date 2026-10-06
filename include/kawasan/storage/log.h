@@ -86,7 +86,11 @@ public:
     ///        (`ReplicaManager::maybeAdvanceHighWatermark`), keeping
     ///        un-replicated records below the watermark and thus invisible to
     ///        consumers.
-    Offset appendBatch(RecordBatch batch, bool advance_high_watermark = true);
+    /// @param force_sync Fsync the WAL even under async durability. This does
+    ///        not commit the batch or persist HW; the ISR and a strict checkpoint
+    ///        must still cover it before a coordinator mutation is accepted.
+    Offset appendBatch(RecordBatch batch, bool advance_high_watermark = true,
+                       bool force_sync = false);
 
     /// @brief M5: result of a follower-side replicated append.
     enum class ReplicaAppendResult {
@@ -155,7 +159,9 @@ public:
     /// `replica.high.watermark.checkpoint.interval.ms` and close() always
     /// persists. Only the HW is recovered from the checkpoint — log start/end
     /// are rebuilt from the segments.
-    void flushCheckpoint();
+    // strict=true propagates checkpoint/file/directory fsync failures and writes
+    // even a clean checkpoint. Coordinator acknowledgement uses this barrier.
+    void flushCheckpoint(bool strict = false);
 
     /// @brief Closes the log
     void close();
@@ -233,7 +239,7 @@ private:
     Offset startOffsetUnlocked() const;
     void stampLeaderEpochLocked(RecordBatch& batch) const;
     void loadCheckpoint(bool strict);
-    void persistCheckpointLocked() const;
+    void persistCheckpointLocked(bool strict = false) const;
     std::optional<std::tuple<Offset, Offset, Offset>> readCheckpointFromDisk(
         bool strict = false) const;
     std::string checkpointPath() const;

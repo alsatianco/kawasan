@@ -129,7 +129,7 @@ The orchestration layer. `KawasanBroker` constructs and wires every subsystem be
 | `MetadataController` | Applies topic/config/ISR/leader mutations through Raft and serves cached metadata. Its opt-in M10 format declaration establishes the immutable coordinator storage contract. |
 | `MetadataStore` / `metadata_types.h` | Persistent and in-memory representation of cluster metadata (topics, partitions, brokers). |
 | `GroupCoordinator` | Consumer-group lifecycle: JoinGroup/SyncGroup/Heartbeat/LeaveGroup, rebalance generations, and member tracking. Persists group state and offsets through `OffsetManager`. |
-| `CoordinatorFormatStorage` / `GroupStateManager` | Staged M10 format admission, durable replica reservations and complete group/offset/pending records with committed partition replay and owned cache installation. Public activation waits for ISR-committed persistence. |
+| `CoordinatorFormatStorage` / `GroupStateManager` | Staged M10 format admission, durable replica reservations and complete group/offset/pending records with committed partition replay and owned cache installation. A separate staged writer fsyncs and waits for ISR before fenced cache publication; public activation waits for handler/background migration. |
 | `OffsetManager` | RocksDB-backed consumer offset and group-metadata store. See [Consumer offset storage](#consumer-offset-storage). |
 | `TransactionCoordinator` | Transactional-producer and exactly-once support (InitProducerId with epoch fencing, AddPartitionsToTxn, two-phase EndTxn, TxnOffsetCommit). |
 | `TransactionStateManager` | Persists transaction snapshots to `__transaction_state` and replays them on startup. Its strict HW-bounded partition replay API is used by staged M10 acquisition; legacy startup retains loadAll. |
@@ -581,9 +581,36 @@ recording the acquired epoch. Malformed committed records leave the partition
 unloaded; uncommitted tails are excluded. The diagnostic `coordinatorLoadStatus`
 compares live ownership/epochs even before the next reconciliation poll.
 
-No broker configuration activates staging. Coordinator wire requests remain
-refused, and cleanup, transaction sweep and legacy Prepare completion remain
-inactive until ISR-committed persistence and fenced state mutation are implemented.
-Requests cannot use external Produce/DeleteRecords to modify formatted coordinator
-sources. Cross-broker LSO/marker recovery and RF>1 coordinator acceptance remain
-pending; the default broker continues to reject formatted stores.
+`CoordinatorPersistenceOnly` extends staging with RF=min(3, configured cluster
+size) sources and per-partition durable mutation functions in
+`coordinator_persistence.cpp`. Group proposals see the current committed group,
+including offsets and producer/epoch-scoped pending records; deletion batches
+exact-key tombstones for every group-owned key. Transaction proposals compare the
+full observed snapshot before changing identity/state, so an old timeout sweep
+cannot abort a newer producer epoch or a new transaction in the same epoch.
+
+A separate mutation mutex spans admission, source proposal, append, ISR wait and
+cache installation. Acquisition tries that mutex and skips busy partitions; it
+cannot block the replica fetcher while an ISR wait needs progress. Partition-write
+and metadata ownership locks cover append and publication, and are released during
+the wait. All authoritative replicas use sync WAL writes even when broker data
+uses async durability. Appends cannot advance HW locally with ISR>1; acceptance
+requires the full offset span in the ISR, min(2, RF) in-sync replicas, a strict
+file/directory-fsynced HW checkpoint and current ownership/currency. Append,
+checkpoint, ISR, timeout and fencing errors propagate without successful cache
+publication. A failed append with an uncertain WAL outcome latches the partition
+until source reopen; an ambiguous acknowledged-prefix wait blocks reacquisition
+in that epoch until HW covers the attempted span. Failed requests may subsequently
+become committed: callers must treat them as ambiguous, not as rolled-back writes.
+
+No broker configuration activates staging. Coordinator wire requests, cleanup,
+transaction sweep and legacy Prepare completion remain gated until all handlers
+and background jobs use the new mutation functions. These functions currently
+install complete cache images; serving integration must preserve live heartbeat/
+rebalance clocks and metrics when publishing unrelated keys in the same partition.
+Requests cannot use external Produce/DeleteRecords to modify formatted sources.
+The native staged writer proves group/offset/pending and transaction continuity
+after an RF=3 owner stops, plus real RF=1 SIGKILL recovery after staged mutation
+success and cache deletion. It does not prove client acknowledgements, abrupt
+RF>1 owner death or cross-broker LSO/marker completion. Public coordinator failover
+and EOS acceptance remain pending; the default broker rejects formatted stores.

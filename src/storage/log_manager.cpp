@@ -91,6 +91,8 @@ Log* LogManager::getOrCreateLog(const std::string& topic, PartitionId partition)
         effective_config = cfg_it->second;
     }
     const bool authoritative = authoritative_topics_.contains(topic);
+    if (authoritative)
+        effective_config.flush_mode = FlushMode::kSync;
     try {
         Log* log_ptr = registerLogLocked(
             tp, std::make_unique<Log>(topic, partition, log_dir, effective_config, !authoritative));
@@ -155,10 +157,12 @@ Log* LogManager::initializeAuthoritativeLog(const std::string& topic, PartitionI
     auto config = default_config_;
     if (auto it = topic_configs_.find(topic); it != topic_configs_.end())
         config = it->second;
+    config.flush_mode = FlushMode::kSync;
     // Constructor persists the empty HW checkpoint. Flush the RocksDB source,
     // then reopen through the same strict validation used on restart.
     auto fresh = std::make_unique<Log>(topic, partition, dir, config);
     fresh->flush();
+    fresh->flushCheckpoint(/*strict=*/true);
     fresh->close();
     fresh.reset();
     return registerLogLocked(tp, std::make_unique<Log>(topic, partition, dir, config, false));
@@ -343,10 +347,13 @@ std::string LogManager::getLogDir(const std::string& topic, PartitionId partitio
 
 void LogManager::setTopicConfig(const std::string& topic, const LogConfig& config) {
     std::unique_lock<std::shared_mutex> write_lock(mutex_);
-    topic_configs_[topic] = config;
+    auto effective = config;
+    if (authoritative_topics_.contains(topic))
+        effective.flush_mode = FlushMode::kSync;
+    topic_configs_[topic] = effective;
     for (auto& [tp, log] : logs_) {
         if (tp.topic == topic)
-            log->updateConfig(config);
+            log->updateConfig(effective);
     }
     Logger::info("Registered LogConfig for topic '{}' (compact={}, delete={}, retention.ms={})",
                  topic, config.cleanup_policy_compact, config.cleanup_policy_delete,

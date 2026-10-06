@@ -158,8 +158,14 @@ KawasanBroker::KawasanBroker(const Config& config) : KawasanBroker(config, std::
 KawasanBroker::KawasanBroker(const Config& config, CoordinatorAcquisitionOnly staging)
     : KawasanBroker(config, std::optional<CoordinatorFormat>(std::move(staging.format))) {}
 
-KawasanBroker::KawasanBroker(const Config& config, std::optional<CoordinatorFormat> staging)
-    : staged_coordinator_format_(std::move(staging)), config_(config) {
+KawasanBroker::KawasanBroker(const Config& config, CoordinatorPersistenceOnly staging)
+    : KawasanBroker(config, std::optional<CoordinatorFormat>(std::move(staging.format)), true) {}
+
+KawasanBroker::KawasanBroker(const Config& config, std::optional<CoordinatorFormat> staging,
+                             bool persistence)
+    : staged_coordinator_format_(std::move(staging)),
+      staged_coordinator_persistence_(persistence),
+      config_(config) {
     const auto compatibility_profile =
         config_.get<std::string>("compatibility.max.api.version.profile", "4.x");
     if (compatibility_profile != "4.x" && compatibility_profile != "3.x") {
@@ -1510,7 +1516,10 @@ void KawasanBroker::ensureInternalTopics() {
         TopicSpecification spec;
         spec.name = name;
         spec.num_partitions = partitions;
-        spec.replication_factor = 1;
+        spec.replication_factor =
+            staged_coordinator_persistence_
+                ? static_cast<int16_t>(std::min<size_t>(3, cluster_brokers_.size() + 1))
+                : 1;
         spec.configs = std::move(cfg);
         const auto result = metadata_controller_->createTopic(spec);
         if (result.error_code == ErrorCode::NONE) {
@@ -6054,8 +6063,14 @@ void KawasanBroker::acquireCoordinatorPartitions() {
     for (const auto& tm : topics) {
         for (const auto& pm : tm.partitions) {
             const TopicPartition tp{tm.name, pm.partition};
+            auto mutation_mutex = coordinatorMutationMutex(tp);
+            std::unique_lock<std::mutex> mutation_lock(*mutation_mutex, std::try_to_lock);
+            if (!mutation_lock.owns_lock())
+                continue;  // ISR progress must never wait behind a coordinator mutation.
             auto write_lock = lockPartitionWrites(tp);
             std::lock_guard<std::mutex> acquisition_lock(coordinator_acquisition_mutex_);
+            if (failed_coordinator_appends_.contains(tp))
+                continue;
             const auto current = currentPartitionMetadata(tp);
             const bool owner = current && dataPlaneCurrent() && current->leader == broker_id_ &&
                                current->leader_epoch == pm.leader_epoch;
@@ -6074,8 +6089,11 @@ void KawasanBroker::acquireCoordinatorPartitions() {
                 if (!owner)
                     continue;
             }
-            if (acquired_coordinator_epochs_.contains(tp) ||
-                !replica_manager_->readableHighWatermark(tp, pm.leader_epoch))
+            const auto readable = replica_manager_->readableHighWatermark(tp, pm.leader_epoch);
+            const auto barrier = coordinator_commit_barriers_.find(tp);
+            if (acquired_coordinator_epochs_.contains(tp) || !readable ||
+                (barrier != coordinator_commit_barriers_.end() &&
+                 barrier->second.first == pm.leader_epoch && *readable < barrier->second.second))
                 continue;
             // Empty replacement erases stale entries even if committed replay
             // subsequently fails. Unrelated partitions are never scanned.
@@ -6110,6 +6128,7 @@ void KawasanBroker::acquireCoordinatorPartitions() {
                 }
                 if (dataPlaneCurrent() && isPartitionLeadership(tp, broker_id_, pm.leader_epoch)) {
                     acquired_coordinator_epochs_[tp] = pm.leader_epoch;
+                    coordinator_commit_barriers_.erase(tp);
                 } else if (tm.name == "__consumer_offsets") {
                     group_coordinator_->replaceCoordinatorPartition(
                         pm.partition, offsets_topic_num_partitions_, {}, offset_manager_);

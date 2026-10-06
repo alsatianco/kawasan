@@ -70,7 +70,7 @@ void crashChild(const std::string& config_path, int pass, int ready_fd) {
         Logger::init("warn");
         CoordinatorFormat contract{1, c.get<std::string>("cluster.id"),
                                    "java-byte-hash-unsigned-mod-v1", 1, 1};
-        KawasanBroker b(c, KawasanBroker::CoordinatorAcquisitionOnly{contract});
+        KawasanBroker b(c, KawasanBroker::CoordinatorPersistenceOnly{contract});
         b.start();
         b.reconcileReplicas();
         if (pass == 0) {
@@ -91,21 +91,23 @@ void crashChild(const std::string& config_path, int pass, int ready_fd) {
             pending.key.producer_id = 75;
             pending.key.producer_epoch = 4;
             pending.offset.offset = 568;
-            b.logManager()
-                ->getLog("__consumer_offsets", 0)
-                ->append({GroupStateManager::encode(group), GroupStateManager::encode(offset),
-                          GroupStateManager::encode(pending)},
-                         true);
+            if (b.mutateCoordinatorGroup(group.key.group_id, [&](const auto&, auto& changes) {
+                    changes = {group, offset, pending};
+                    return ErrorCode::NONE;
+                }) != ErrorCode::NONE)
+                throw std::runtime_error("SIGKILL worker group mutation was not acknowledged");
             TransactionCoordinator::TxnSnapshot txn;
             txn.transactional_id = "crash-txn";
             txn.producer_id = 75;
             txn.producer_epoch = 4;
             txn.state = TransactionCoordinator::State::PrepareCommit;
-            Record r;
-            r.key = std::vector<uint8_t>(txn.transactional_id.begin(), txn.transactional_id.end());
-            r.value = TransactionStateManager::serialize(txn);
-            b.logManager()->getLog("__transaction_state", 0)->append({r}, true);
-            b.logManager()->flushAll();
+            if (b.mutateCoordinatorTransaction(txn.transactional_id, std::nullopt,
+                                               [&](auto& proposal) {
+                                                   proposal = txn;
+                                                   return ErrorCode::NONE;
+                                               }) != ErrorCode::NONE)
+                throw std::runtime_error(
+                    "SIGKILL worker transaction mutation was not acknowledged");
         } else {
             const auto offset = CoordinatorAcquisitionProbe::offsets(b)->fetchOffsetWithMetadata(
                 "crash-group", "data", 0);
@@ -336,7 +338,8 @@ TEST_F(CoordinatorAcquisitionTest, PartitionReplacementPreservesUnrelatedCachesA
 
 TEST_F(CoordinatorAcquisitionTest, SigkillRestoresSourceWithoutCacheOrLegacyPrepareRedrive) {
     // The parent has no live broker threads. SIGKILL runs neither destructors
-    // nor a graceful checkpoint; child source writes explicitly fsync/checkpoint.
+    // nor a graceful checkpoint; only the staged writer's success barriers
+    // fsync/checkpoint before the child reports readiness for SIGKILL.
     fs::create_directories(dir);
     for (int pass = 0; pass < 2; ++pass) {
         int ready[2];

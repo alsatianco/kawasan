@@ -18,6 +18,7 @@
 
 #include "kawasan/broker/delayed_operation_purgatory.h"
 #include "kawasan/broker/group_coordinator.h"
+#include "kawasan/broker/group_state_manager.h"
 #include "kawasan/broker/metadata_controller.h"
 #include "kawasan/broker/metrics/request_metrics.h"
 #include "kawasan/broker/monitoring/metrics_collector.h"
@@ -60,11 +61,35 @@ class KawasanBroker {
 public:
     explicit KawasanBroker(const Config& config);
     // Internal M10 integration seam. Coordinator requests remain refused until
-    // ISR-committed persistence lands; no configuration enables this mode.
+    // handler migration lands; no configuration enables this mode.
     struct CoordinatorAcquisitionOnly {
         CoordinatorFormat format;
     };
     KawasanBroker(const Config& config, CoordinatorAcquisitionOnly staging);
+    // Internal persistence checkpoint: RF=min(3, cluster size), committed
+    // mutations, but coordinator wire handlers/background jobs remain gated.
+    struct CoordinatorPersistenceOnly {
+        CoordinatorFormat format;
+    };
+    KawasanBroker(const Config& config, CoordinatorPersistenceOnly staging);
+    using GroupMutation =
+        std::function<ErrorCode(const std::vector<GroupRecord>&, std::vector<GroupRecord>&)>;
+    // Proposal callbacks run under the mutation fence and must not reenter a
+    // coordinator mutation. Success currently replaces the whole cache image;
+    // serving integration must preserve clocks/counters for unaffected keys.
+    ErrorCode mutateCoordinatorGroup(const std::string& group_id, const GroupMutation& mutation,
+                                     std::chrono::milliseconds timeout = std::chrono::seconds(5));
+    ErrorCode deleteCoordinatorGroup(const std::string& group_id,
+                                     std::chrono::milliseconds timeout = std::chrono::seconds(5));
+    using TransactionMutation =
+        std::function<ErrorCode(std::optional<TransactionCoordinator::TxnSnapshot>&)>;
+    // null expected admits only a new ID. Existing mutations (including timeout
+    // sweep/cleanup) must compare the full observed snapshot under this fence.
+    ErrorCode mutateCoordinatorTransaction(
+        const std::string& transactional_id,
+        const std::optional<TransactionCoordinator::TxnSnapshot>& expected,
+        const TransactionMutation& mutation,
+        std::chrono::milliseconds timeout = std::chrono::seconds(5));
     ErrorCode coordinatorLoadStatus(const std::string& key, protocol::CoordinatorType type) const;
     void acquireCoordinatorPartitions();
     ~KawasanBroker();
@@ -160,10 +185,26 @@ public:
 
 private:
     friend struct CoordinatorAcquisitionProbe;
-    KawasanBroker(const Config& config, std::optional<CoordinatorFormat> staging);
+    friend struct CoordinatorPersistenceProbe;
+    KawasanBroker(const Config& config, std::optional<CoordinatorFormat> staging,
+                  bool persistence = false);
     std::optional<CoordinatorFormat> staged_coordinator_format_;
+    bool staged_coordinator_persistence_ = false;
     mutable std::mutex coordinator_acquisition_mutex_;
     std::map<TopicPartition, int32_t> acquired_coordinator_epochs_;
+    // An ambiguous append blocks reacquisition in the same epoch until its full
+    // span is committed. A new epoch uses ReplicaManager's safe-prefix barrier.
+    std::map<TopicPartition, std::pair<int32_t, Offset>> coordinator_commit_barriers_;
+    // An append/fsync exception may have written bytes without advancing LEO.
+    // Reopening the source is required; never retry over an unknown WAL result.
+    std::set<TopicPartition> failed_coordinator_appends_;
+    std::mutex coordinator_mutation_map_mutex_;
+    std::map<TopicPartition, std::shared_ptr<std::mutex>> coordinator_mutation_mutexes_;
+    std::shared_ptr<std::mutex> coordinatorMutationMutex(const TopicPartition& tp);
+    ErrorCode commitCoordinatorRecords(const TopicPartition& tp, int32_t epoch,
+                                       const std::vector<Record>& records,
+                                       const std::function<void()>& publish,
+                                       std::chrono::milliseconds timeout);
     void initializeRaft();
     void initializeMetadata();
     void startServices();

@@ -17,6 +17,7 @@
 #include <utility>
 
 #include "kawasan/common/error.h"
+#include "kawasan/common/file_util.h"
 #include "kawasan/common/logger.h"
 
 namespace fs = std::filesystem;
@@ -170,6 +171,8 @@ Log& Log::operator=(Log&& other) noexcept {
 
 Offset Log::append(const std::vector<Record>& records, bool force_sync) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (closed_)
+        throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR, "Cannot append to closed log");
 
     if (records.empty()) {
         return endOffsetUnlocked();
@@ -203,7 +206,7 @@ Offset Log::append(const std::vector<Record>& records, bool force_sync) {
     // Durability-critical writers get a synchronous checkpoint; everyone else
     // is flushed periodically by LogManager (see flushCheckpoint()).
     if (force_sync) {
-        persistCheckpointLocked();
+        persistCheckpointLocked(/*strict=*/true);
     } else {
         checkpoint_dirty_ = true;
     }
@@ -212,8 +215,10 @@ Offset Log::append(const std::vector<Record>& records, bool force_sync) {
     return offset;
 }
 
-Offset Log::appendBatch(RecordBatch batch, bool advance_high_watermark) {
+Offset Log::appendBatch(RecordBatch batch, bool advance_high_watermark, bool force_sync) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (closed_)
+        throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR, "Cannot append to closed log");
 
     // Assign the next available offset to this pre-built batch.
     batch.setBaseOffset(endOffsetUnlocked());
@@ -225,7 +230,7 @@ Offset Log::appendBatch(RecordBatch batch, bool advance_high_watermark) {
         segment = activeSegment();
     }
 
-    Offset offset = segment->append(batch, config_.flush_mode == FlushMode::kSync);
+    Offset offset = segment->append(batch, force_sync || config_.flush_mode == FlushMode::kSync);
     // M4: on a replicated partition (RF>1) the leader must NOT advance the high
     // watermark at append time — the record is not yet committed until the ISR
     // has it. The replication layer advances HW via maybeAdvanceHighWatermark.
@@ -242,6 +247,8 @@ Offset Log::appendBatch(RecordBatch batch, bool advance_high_watermark) {
 Log::ReplicaAppendResult Log::appendReplicatedBatch(const RecordBatch& batch,
                                                     Offset leader_high_watermark) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (closed_)
+        throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR, "Cannot append to closed log");
 
     if (!batch.hasValidOffsetSpan())
         throw StorageException(ErrorCode::CORRUPT_MESSAGE, "Invalid replicated batch offset span");
@@ -370,10 +377,12 @@ void Log::flush() {
     }
 }
 
-void Log::flushCheckpoint() {
+void Log::flushCheckpoint(bool strict) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (checkpoint_dirty_ && !closed_) {
-        persistCheckpointLocked();
+    if (strict && closed_)
+        throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR, "Cannot checkpoint closed log");
+    if ((checkpoint_dirty_ || strict) && !closed_) {
+        persistCheckpointLocked(strict);
     }
 }
 
@@ -840,8 +849,8 @@ void Log::loadCheckpoint(bool strict) {
     persistCheckpointLocked();
 }
 
-void Log::persistCheckpointLocked() const {
-    checkpoint_dirty_ = false;
+void Log::persistCheckpointLocked(bool strict) const {
+    checkpoint_dirty_ = true;
     const Offset start = startOffsetUnlocked();
     const Offset end = endOffsetUnlocked();
     const std::string path = checkpointPath();
@@ -860,6 +869,23 @@ void Log::persistCheckpointLocked() const {
     payload << "log_end_offset=" << end << "\n";
     payload << "high_watermark=" << high_watermark_ << "\n";
     const std::string data = payload.str();
+
+    if (strict) {
+        if (!writeFileAtomically(path, data))
+            throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR,
+                                   "Failed to persist durable checkpoint: " + path);
+        const int dir_fd = ::open(log_dir_.c_str(), O_RDONLY);
+        if (dir_fd < 0)
+            throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR,
+                                   "Failed to open checkpoint directory: " + log_dir_);
+        const bool synced = ::fsync(dir_fd) == 0;
+        const bool closed = ::close(dir_fd) == 0;
+        if (!synced || !closed)
+            throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR,
+                                   "Failed to fsync checkpoint directory: " + log_dir_);
+        checkpoint_dirty_ = false;
+        return;
+    }
 
     const std::string tmp_path = path + ".tmp";
     const int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -898,7 +924,9 @@ void Log::persistCheckpointLocked() const {
         Logger::error("Failed to rename checkpoint for {}-{}: {}", topic_, partition_,
                       std::strerror(errno));
         ::unlink(tmp_path.c_str());
+        return;
     }
+    checkpoint_dirty_ = false;
 }
 
 std::optional<std::tuple<Offset, Offset, Offset>> Log::readCheckpointFromDisk(bool strict) const {

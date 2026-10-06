@@ -11,9 +11,11 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <string>
 #include <vector>
 
+#include "kawasan/common/error.h"
 #include "kawasan/common/logger.h"
 #include "kawasan/storage/log.h"
 #include "kawasan/storage/log_manager.h"
@@ -24,8 +26,8 @@ namespace {
 
 std::string makeTestDir() {
     const auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
-    auto tmp = std::filesystem::temp_directory_path() /
-               ("kawasan-log-durability-" + std::to_string(ts));
+    auto tmp =
+        std::filesystem::temp_directory_path() / ("kawasan-log-durability-" + std::to_string(ts));
     std::filesystem::create_directories(tmp);
     return tmp.string();
 }
@@ -54,6 +56,10 @@ protected:
         dir_ = makeTestDir();
     }
     void TearDown() override {
+        if (HasFailure()) {
+            std::cerr << "Retained fixture: " << dir_ << '\n';
+            return;
+        }
         if (!dir_.empty() && std::filesystem::exists(dir_)) {
             std::filesystem::remove_all(dir_);
         }
@@ -158,6 +164,28 @@ TEST_F(LogDurabilityTest, ForceSyncAppendPersistsCheckpointImmediately) {
     record.value = std::vector<uint8_t>{'x'};
     log.append({record}, /*force_sync=*/true);
     EXPECT_EQ(1, checkpointHw(std::filesystem::path(dir_) / "checkpoint.meta"));
+}
+
+TEST_F(LogDurabilityTest, ForceSyncCheckpointFailurePropagatesAndCanBeRetried) {
+    Log log("durable-topic", 0, dir_);
+    const auto blocked = std::filesystem::path(dir_) / "checkpoint.meta.tmp";
+    std::filesystem::create_directory(blocked);
+    Record record;
+    record.value = std::vector<uint8_t>{'x'};
+    EXPECT_THROW(log.append({record}, true), StorageException);
+    EXPECT_EQ(0, checkpointHw(std::filesystem::path(dir_) / "checkpoint.meta"));
+    std::filesystem::remove(blocked);
+    log.flushCheckpoint();
+    EXPECT_EQ(1, checkpointHw(std::filesystem::path(dir_) / "checkpoint.meta"));
+}
+
+TEST_F(LogDurabilityTest, ClosedLogsRefuseAllAppendForms) {
+    Log log("closed", 0, dir_);
+    log.close();
+    EXPECT_THROW(log.append({}, true), StorageException);
+    EXPECT_THROW(log.appendBatch(makeBatch("x"), false, true), StorageException);
+    EXPECT_THROW(log.appendReplicatedBatch(makeBatch("x")), StorageException);
+    EXPECT_THROW(log.flushCheckpoint(true), StorageException);
 }
 
 // After a crash the checkpoint may lag the log. Single-node brokers recover HW

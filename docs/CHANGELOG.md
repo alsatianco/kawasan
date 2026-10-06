@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgrade and operational procedures see [./OPERATIONS.md](./OPERATIONS.md); for the full protocol surface see [./api_coverage_matrix.md](./api_coverage_matrix.md).
 
+## 2026-10-06
+
+- Add an internal M10 persistence seam with RF=min(3, configured cluster size),
+  fsynced ISR appends before cache publication, atomic metadata ownership guards,
+  complete group/offset/pending mutations and exact-key deletion batches. Compare
+  full transaction snapshots under a mutation lock to fence stale timeout sweeps
+  and concurrent admissions. Propagate append/checkpoint/ISR/fencing failures;
+  block unresolved tails and latch uncertain append failures until source reopen.
+  Force sync WAL writes for authoritative leader/follower sources. Verify staged
+  RF=3 owner-loss continuity and RF=1 SIGKILL/cache-loss recovery after staged
+  mutation success; coordinator wire/background migration, public
+  activation and cross-broker transaction completion remain pending.
+- Propagate durability-critical checkpoint failures and preserve dirty state for
+  retry; fsync the checkpoint directory before accepting a strict barrier. Reject
+  all append forms on closed logs with a storage error instead of dereferencing a
+  missing segment. Default record encodings and successful single-node behavior
+  remain unchanged.
+
 ## 2026-10-05
 
 - Stage early M10 broker format bootstrap before disposable-cache opening and

@@ -163,3 +163,8 @@ add_executable(coordinator_acquisition_test coordinator_acquisition_test.cpp)
 target_link_libraries(coordinator_acquisition_test PRIVATE kawasan GTest::gtest)
 add_test(NAME CoordinatorAcquisitionTest COMMAND coordinator_acquisition_test)
 set_tests_properties(CoordinatorAcquisitionTest PROPERTIES TIMEOUT 150)
+
+add_executable(coordinator_persistence_test coordinator_persistence_test.cpp)
+target_link_libraries(coordinator_persistence_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME CoordinatorPersistenceTest COMMAND coordinator_persistence_test)
+set_tests_properties(CoordinatorPersistenceTest PROPERTIES TIMEOUT 180)
