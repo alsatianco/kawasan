@@ -33,8 +33,9 @@ TEST(TcpSocketTuning, AppliesNoDelayKeepAliveAndBuffers) {
     SocketTuning tuning;
     tuning.no_delay = true;
     tuning.keep_alive = true;
-    tuning.send_buffer_bytes = 262144;
-    tuning.recv_buffer_bytes = 262144;
+    // Stay below common kernel caps, which can clamp larger requests.
+    tuning.send_buffer_bytes = 65536;
+    tuning.recv_buffer_bytes = 65536;
     applySocketTuning(accepted, tuning);
 
     tcp::no_delay no_delay;
@@ -47,11 +48,11 @@ TEST(TcpSocketTuning, AppliesNoDelayKeepAliveAndBuffers) {
 
     boost::asio::socket_base::send_buffer_size snd;
     accepted.get_option(snd);
-    EXPECT_GE(snd.value(), 262144) << "SO_SNDBUF must honor the configured size";
+    EXPECT_GE(snd.value(), tuning.send_buffer_bytes) << "SO_SNDBUF must honor the configured size";
 
     boost::asio::socket_base::receive_buffer_size rcv;
     accepted.get_option(rcv);
-    EXPECT_GE(rcv.value(), 262144) << "SO_RCVBUF must honor the configured size";
+    EXPECT_GE(rcv.value(), tuning.recv_buffer_bytes) << "SO_RCVBUF must honor the configured size";
 }
 
 TEST(TcpSocketTuning, ZeroBufferSizesKeepOsDefaults) {
