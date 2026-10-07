@@ -117,6 +117,7 @@ void RaftNode::start() {
 
     election_thread_ = std::thread(&RaftNode::electionThread, this);
     heartbeat_thread_ = std::thread(&RaftNode::heartbeatThread, this);
+    std::lock_guard<std::mutex> lock(log_mutex_);
     Logger::info("Started Raft node {} on port {} (term={}, log_size={})", id_, raft_port_,
                  current_term_.load(), log_.size());
 }

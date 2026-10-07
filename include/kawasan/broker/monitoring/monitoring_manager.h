@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <string>
 
@@ -48,8 +49,8 @@ private:
     std::unique_ptr<HttpServer> http_server_;
     std::shared_ptr<MetricsCollector> metrics_collector_;
 
-    bool broker_healthy_ = false;
-    bool broker_ready_ = false;
+    std::atomic<bool> broker_healthy_{false};
+    std::atomic<bool> broker_ready_{false};
 };
 
 }  // namespace kawasan::broker::monitoring

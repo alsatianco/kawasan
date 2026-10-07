@@ -104,12 +104,15 @@ void HttpServer::stop() {
 
     if (server_fd_ >= 0) {
         shutdown(server_fd_, SHUT_RDWR);
-        close(server_fd_);
-        server_fd_ = -1;
     }
 
     if (server_thread_.joinable()) {
         server_thread_.join();
+    }
+    // The accept loop still reads this descriptor until it has exited.
+    if (server_fd_ >= 0) {
+        close(server_fd_);
+        server_fd_ = -1;
     }
 
     Logger::info("HTTP server stopped");
