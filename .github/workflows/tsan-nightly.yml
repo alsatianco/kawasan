@@ -38,7 +38,11 @@ jobs:
       - name: Run tests (TSan)
         env:
           TSAN_OPTIONS: "halt_on_error=1:report_thread_leaks=0"
-        run: ctest --test-dir build --output-on-failure --timeout 600
+        run: |
+          # LLVM 15 supports up to 28 bits of x86 ASLR entropy. Ubuntu 24.04
+          # defaults to 32: https://github.com/google/sanitizers/issues/1716
+          sudo sysctl -w vm.mmap_rnd_bits=28
+          ctest --test-dir build --output-on-failure --timeout 600
 
       - uses: actions/upload-artifact@v4
         if: failure()

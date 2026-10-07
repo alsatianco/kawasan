@@ -64,8 +64,11 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           mkdir -p "corpus-${TARGET}"
+          mkdir -p /tmp/fuzz-artifacts
           "./build/tests/fuzz/fuzz_${TARGET}" "corpus-${TARGET}" \
             -max_total_time=300 \
+            -timeout=30 \
+            -artifact_prefix=/tmp/fuzz-artifacts/ \
             -print_final_stats=1
 
       - uses: actions/upload-artifact@v4
@@ -73,6 +76,5 @@ jobs:
         with:
           name: fuzz-crash-${{ matrix.target }}
           path: |
-            crash-*
-            leak-*
+            /tmp/fuzz-artifacts/
             /tmp/fuzz-build.log
