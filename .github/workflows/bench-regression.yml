@@ -1,5 +1,5 @@
 # Phase EX-4 (§6.4): Commit-triggered benchmark regression check. Compares the
-# current throughput + p99 latency against bench/baseline.json. Alerts
+# previous and current commits on the same runner. Alerts
 # (failing the job) when regression > 10%.
 name: bench-regression
 on:
@@ -9,48 +9,60 @@ on:
 
 jobs:
   bench:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      CC: clang
+      CXX: clang++
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            cmake build-essential ninja-build \
+            cmake build-essential ninja-build clang \
             libboost-all-dev librocksdb-dev libsnappy-dev liblz4-dev libzstd-dev \
             libfmt-dev libspdlog-dev libgtest-dev nlohmann-json3-dev \
             libssl-dev python3-pip
           pip install kafka-python confluent-kafka
 
       - name: Build (Release)
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -GNinja
-          cmake --build build -j$(nproc) --target kawasan-broker
+          base="${BEFORE_SHA:-HEAD^}"
+          if [[ "$base" =~ ^0+$ ]]; then base=HEAD^; fi
+          git worktree add --detach "$RUNNER_TEMP/bench-base" "$base"
+          for source in "$RUNNER_TEMP/bench-base" "$GITHUB_WORKSPACE"; do
+            cmake -S "$source" -B "$source/build" -DCMAKE_BUILD_TYPE=Release -GNinja \
+              -DKAWASAN_BUILD_TESTS=OFF -DKAWASAN_BUILD_EXAMPLES=OFF
+            cmake --build "$source/build" -j2 --target kawasan-broker
+          done
 
       - name: Run produce benchmark
         run: |
-          ./build/tools/kawasan-broker --config config/broker.dev.properties > /tmp/k-bench.log 2>&1 &
-          BPID=$!
-          sleep 5
-          # Single-producer confluent (librdkafka) run — the stable gate
-          # scenario recorded in bench/baseline.json. The concurrency sweep in
-          # bench/run_suite.sh is diagnostic-only (see baseline _note).
-          python3 bench/produce_perf.py --records 1000000 --record-size 1024 \
-            --producers 1 --client confluent > /tmp/bench-result.json
-          kill -9 $BPID
-          cat /tmp/bench-result.json
+          bash bench/run_ci.sh "$RUNNER_TEMP/bench-base/build/tools/kawasan-broker" /tmp/bench-base.json
+          bash bench/run_ci.sh "$GITHUB_WORKSPACE/build/tools/kawasan-broker" /tmp/bench-head.json
 
       - name: Compare to baseline
         run: |
           python3 bench/check_regression.py \
-            --baseline bench/baseline.json \
-            --current /tmp/bench-result.json \
+            --base /tmp/bench-base.json \
+            --head /tmp/bench-head.json \
             --threshold-pct 10
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: bench-result
-          path: /tmp/bench-result.json
+          path: |
+            /tmp/bench-base.json
+            /tmp/bench-head.json
+            /tmp/bench-*.json.broker.log
