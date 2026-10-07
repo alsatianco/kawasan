@@ -279,7 +279,9 @@ void RecordBatch::decode(Buffer& buffer) {
     } else if (compression == CompressionType::SNAPPY) {
         size_t uncompressed_len = 0;
         if (!snappy::GetUncompressedLength(reinterpret_cast<const char*>(records_payload.data()),
-                                           records_payload.size(), &uncompressed_len)) {
+                                           records_payload.size(), &uncompressed_len) ||
+            !snappy::IsValidCompressedBuffer(reinterpret_cast<const char*>(records_payload.data()),
+                                             records_payload.size())) {
             throw std::runtime_error("Invalid Snappy payload");
         }
         std::vector<char> out(uncompressed_len);
@@ -549,7 +551,9 @@ RecordBatch RecordBatch::deserializeFromProduceRequest(const std::vector<uint8_t
                 size_t uncompressed_len = 0;
                 if (!snappy::GetUncompressedLength(
                         reinterpret_cast<const char*>(records_payload.data()),
-                        records_payload.size(), &uncompressed_len)) {
+                        records_payload.size(), &uncompressed_len) ||
+                    !snappy::IsValidCompressedBuffer(
+                        reinterpret_cast<const char*>(records_payload.data()), records_payload.size())) {
                     throw std::runtime_error("Invalid Snappy payload");
                 }
                 std::vector<char> out(uncompressed_len);
