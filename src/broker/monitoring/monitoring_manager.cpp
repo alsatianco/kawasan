@@ -47,15 +47,18 @@ HttpResponse MonitoringManager::handleHealth(const HttpRequest& /*request*/) {
     HttpResponse response;
     response.content_type = "application/json";
 
+    const bool healthy = broker_healthy_.load();
+    const bool ready = broker_ready_.load();
+
     json health_status = {
-        {"status", broker_healthy_ && broker_ready_ ? "UP" : "DOWN"},
-        {"healthy", broker_healthy_},
-        {"ready", broker_ready_}
+        {"status", healthy && ready ? "UP" : "DOWN"},
+        {"healthy", healthy},
+        {"ready", ready}
     };
 
     response.body = health_status.dump(2);
-    response.status_code = (broker_healthy_ && broker_ready_) ? 200 : 503;
-    response.status_text = (broker_healthy_ && broker_ready_) ? "OK" : "Service Unavailable";
+    response.status_code = (healthy && ready) ? 200 : 503;
+    response.status_text = (healthy && ready) ? "OK" : "Service Unavailable";
 
     return response;
 }
@@ -64,14 +67,16 @@ HttpResponse MonitoringManager::handleReadiness(const HttpRequest& /*request*/) 
     HttpResponse response;
     response.content_type = "application/json";
 
+    const bool ready = broker_ready_.load();
+
     json readiness_status = {
-        {"status", broker_ready_ ? "READY" : "NOT_READY"},
-        {"ready", broker_ready_}
+        {"status", ready ? "READY" : "NOT_READY"},
+        {"ready", ready}
     };
 
     response.body = readiness_status.dump(2);
-    response.status_code = broker_ready_ ? 200 : 503;
-    response.status_text = broker_ready_ ? "OK" : "Service Unavailable";
+    response.status_code = ready ? 200 : 503;
+    response.status_text = ready ? "OK" : "Service Unavailable";
 
     return response;
 }
@@ -80,14 +85,16 @@ HttpResponse MonitoringManager::handleLiveness(const HttpRequest& /*request*/) {
     HttpResponse response;
     response.content_type = "application/json";
 
+    const bool healthy = broker_healthy_.load();
+
     json liveness_status = {
-        {"status", broker_healthy_ ? "ALIVE" : "DEAD"},
-        {"alive", broker_healthy_}
+        {"status", healthy ? "ALIVE" : "DEAD"},
+        {"alive", healthy}
     };
 
     response.body = liveness_status.dump(2);
-    response.status_code = broker_healthy_ ? 200 : 503;
-    response.status_text = broker_healthy_ ? "OK" : "Service Unavailable";
+    response.status_code = healthy ? 200 : 503;
+    response.status_text = healthy ? "OK" : "Service Unavailable";
 
     return response;
 }
