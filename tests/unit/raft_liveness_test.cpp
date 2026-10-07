@@ -420,6 +420,9 @@ TEST(RaftLivenessTest, FrozenFirstPeerDoesNotBlockElection) {
     boost::asio::io_context hole_io;
     boost::asio::ip::tcp::acceptor hole(
         hole_io, boost::asio::ip::tcp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 0));
+    // Closing an acceptor from another thread does not interrupt a blocking
+    // accept on Linux. Poll so teardown can stop and join the frozen peer.
+    hole.non_blocking(true);
     std::vector<std::unique_ptr<boost::asio::ip::tcp::socket>> held;
     std::atomic<bool> accepting{true};
     std::thread hole_thread([&] {
@@ -427,6 +430,10 @@ TEST(RaftLivenessTest, FrozenFirstPeerDoesNotBlockElection) {
             auto sock = std::make_unique<boost::asio::ip::tcp::socket>(hole_io);
             boost::system::error_code ec;
             hole.accept(*sock, ec);
+            if (ec == boost::asio::error::would_block || ec == boost::asio::error::try_again) {
+                std::this_thread::sleep_for(5ms);
+                continue;
+            }
             if (ec) {
                 break;
             }
@@ -470,9 +477,9 @@ TEST(RaftLivenessTest, FrozenFirstPeerDoesNotBlockElection) {
     nodes.clear();
     ios.clear();
     accepting.store(false);
+    hole_thread.join();
     hole.close();
     hole_io.stop();
-    hole_thread.join();
 }
 
 // A vote reply can be overtaken by a newer leader's AppendEntries. The
