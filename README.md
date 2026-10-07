@@ -43,7 +43,7 @@ Then point any Kafka client at `localhost:9092`. Prometheus metrics scrape from 
 | **Monitoring** | Prometheus metrics, health endpoints, Grafana dashboard | Stable |
 | **Deployment** | Docker, Compose, systemd, macOS launchd, Helm, k8s manifests | Stable |
 
-The [M9 chaos checker](docs/OPERATIONS.md#m9-consistency-and-chaos-evidence) records durable acknowledgements and verifies data and transaction invariants across broker pauses and SIGKILLs. Its nightly workflow is implemented; seven consecutive scheduled green runs remain the failover acceptance gate.
+The [M9 chaos checker](docs/OPERATIONS.md#m9-consistency-and-chaos-evidence) records durable acknowledgements and verifies data and transaction invariants across broker pauses and SIGKILLs. Its workflow runs on pushes to `main` and manual dispatches; daily schedules are disabled. The seven-consecutive-scheduled-green-run failover acceptance gate remains unmet.
 
 Known limitations: client/broker **TLS is not implemented** (the broker refuses an `SSL` config rather than serve plaintext under a TLS listener — terminate TLS at a proxy), and `raft.ssl.*` is accepted but not enforced, so inter-broker Raft traffic is plaintext. Details in [docs/FAQ.md](docs/FAQ.md); full per-API coverage is in the [API coverage matrix](docs/api_coverage_matrix.md).
 

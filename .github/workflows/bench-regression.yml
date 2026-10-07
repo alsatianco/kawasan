@@ -1,10 +1,10 @@
-# Phase EX-4 (§6.4): Nightly benchmark regression check. Compares the
+# Phase EX-4 (§6.4): Commit-triggered benchmark regression check. Compares the
 # current throughput + p99 latency against bench/baseline.json. Alerts
 # (failing the job) when regression > 10%.
 name: bench-regression
 on:
-  schedule:
-    - cron: "0 4 * * *"
+  push:
+    branches: [main]
   workflow_dispatch:
 
 jobs:

@@ -1,10 +1,10 @@
-# Phase EX-4 (§6.4): libFuzzer nightly. Each fuzz target runs 5 minutes
+# Phase EX-4 (§6.4): libFuzzer checks on main commits. Each fuzz target runs 5 minutes
 # against the previously-recorded corpus (cache the corpus dir between
 # runs so escaping coverage accumulates).
-name: fuzz-nightly
+name: fuzz
 on:
-  schedule:
-    - cron: "0 4 * * *"
+  push:
+    branches: [main]
   workflow_dispatch:
 
 jobs:

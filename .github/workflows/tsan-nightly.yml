@@ -1,8 +1,8 @@
-# Phase EX-4 (§6.4): ThreadSanitizer nightly.
-name: tsan-nightly
+# Phase EX-4 (§6.4): ThreadSanitizer checks on main commits.
+name: tsan
 on:
-  schedule:
-    - cron: "0 4 * * *"
+  push:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
