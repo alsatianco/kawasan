@@ -140,7 +140,10 @@ public:
     Offset logEndOffset() const;
 
     /// @brief Returns the high watermark
-    Offset highWatermark() const { return high_watermark_; }
+    Offset highWatermark() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return high_watermark_;
+    }
 
     /// @brief Total on-disk size of this partition's log in bytes (sum of all
     /// segment sizes). Used by DescribeLogDirs to report real per-partition
