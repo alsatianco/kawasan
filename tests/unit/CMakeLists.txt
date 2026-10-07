@@ -98,6 +98,9 @@ add_test(NAME RecordBatchCompressionTest COMMAND record_batch_compression_test)
 # Transaction state manager serialize/route + coordinator two-phase (M1)
 add_executable(transaction_state_manager_test transaction_state_manager_test.cpp)
 target_link_libraries(transaction_state_manager_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+if(KAWASAN_ENABLE_TSAN)
+    target_compile_definitions(transaction_state_manager_test PRIVATE KAWASAN_TEST_TSAN=1)
+endif()
 add_test(NAME TransactionStateManagerTest COMMAND transaction_state_manager_test)
 
 # M8-A1: the one group/txn-id -> coordinator partition routing function

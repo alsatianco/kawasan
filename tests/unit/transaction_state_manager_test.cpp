@@ -21,6 +21,14 @@ thread_local size_t largest_snapshot_allocation = 0;
 }  // namespace
 
 // This test binary measures allocations only inside the malformed decoder call.
+#ifdef KAWASAN_TEST_TSAN
+// TSan owns operator new/delete. Its allocation hook preserves the measurement
+// without defining a second allocator and breaking the sanitizer link.
+extern "C" void __sanitizer_malloc_hook(const volatile void*, std::size_t size) {
+    if (measure_snapshot_allocations)
+        largest_snapshot_allocation = std::max(largest_snapshot_allocation, size);
+}
+#else
 void* operator new(std::size_t size) {
     if (measure_snapshot_allocations)
         largest_snapshot_allocation = std::max(largest_snapshot_allocation, size);
@@ -31,6 +39,7 @@ void* operator new(std::size_t size) {
 void operator delete(void* value) noexcept {
     std::free(value);
 }
+#endif
 
 namespace kawasan::broker {
 namespace {
