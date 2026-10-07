@@ -7,7 +7,7 @@ on:
 
 jobs:
   tsan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -16,7 +16,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            cmake build-essential ninja-build clang-15 \
+            cmake build-essential ninja-build clang-15 libclang-rt-15-dev \
             libboost-all-dev librocksdb-dev libsnappy-dev liblz4-dev libzstd-dev \
             libfmt-dev libspdlog-dev libgtest-dev nlohmann-json3-dev \
             libssl-dev
@@ -33,7 +33,7 @@ jobs:
             -GNinja
 
       - name: Build
-        run: cmake --build build -j$(nproc)
+        run: cmake --build build -j2 2>&1 | tee /tmp/tsan-build.log
 
       - name: Run tests (TSan)
         env:
@@ -44,4 +44,6 @@ jobs:
         if: failure()
         with:
           name: tsan-logs
-          path: build/Testing/Temporary/
+          path: |
+            build/Testing/Temporary/
+            /tmp/tsan-build.log

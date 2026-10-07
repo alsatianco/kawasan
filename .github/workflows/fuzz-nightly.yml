@@ -9,7 +9,7 @@ on:
 
 jobs:
   fuzz:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -28,7 +28,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            cmake build-essential ninja-build clang-15 \
+            cmake build-essential ninja-build clang-15 libclang-rt-15-dev \
             libboost-all-dev librocksdb-dev libsnappy-dev liblz4-dev libzstd-dev \
             libfmt-dev libspdlog-dev libgtest-dev nlohmann-json3-dev \
             libssl-dev
@@ -47,7 +47,7 @@ jobs:
       - name: Build fuzzer
         env:
           TARGET: ${{ matrix.target }}
-        run: cmake --build build -j$(nproc) --target "fuzz_${TARGET}"
+        run: cmake --build build -j2 --target "fuzz_${TARGET}" 2>&1 | tee /tmp/fuzz-build.log
 
       - name: Cache corpus
         uses: actions/cache@v4
@@ -64,7 +64,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           mkdir -p "corpus-${TARGET}"
-          ./build/tests/fuzz/fuzz_${TARGET} "corpus-${TARGET}" \
+          "./build/tests/fuzz/fuzz_${TARGET}" "corpus-${TARGET}" \
             -max_total_time=300 \
             -print_final_stats=1
 
@@ -75,3 +75,4 @@ jobs:
           path: |
             crash-*
             leak-*
+            /tmp/fuzz-build.log
