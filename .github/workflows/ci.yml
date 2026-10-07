@@ -11,6 +11,7 @@ jobs:
   smoke:
     name: Quick Start & Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -54,4 +55,13 @@ jobs:
           rm -rf /tmp/kawasan-logs
 
       - name: Run unit tests
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --timeout 600
+
+      - name: Upload test and broker logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs-${{ matrix.os }}
+          path: |
+            build/Testing/Temporary/
+            /tmp/kawasan-broker-logs/
