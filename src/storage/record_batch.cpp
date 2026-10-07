@@ -267,9 +267,9 @@ void RecordBatch::decode(Buffer& buffer) {
             strm.next_out = reinterpret_cast<Bytef*>(out.data() + prev_size);
             strm.avail_out = static_cast<uInt>(kChunk);
             ret = inflate(&strm, Z_NO_FLUSH);
-            if (ret == Z_STREAM_ERROR) {
+            if (ret != Z_OK && ret != Z_STREAM_END) {
                 inflateEnd(&strm);
-                throw std::runtime_error("zlib stream error during inflate");
+                throw std::runtime_error("Invalid or truncated gzip payload");
             }
             const size_t produced = kChunk - strm.avail_out;
             out.resize(prev_size + produced);
@@ -536,9 +536,9 @@ RecordBatch RecordBatch::deserializeFromProduceRequest(const std::vector<uint8_t
                     strm.next_out = reinterpret_cast<Bytef*>(out.data() + prev_size);
                     strm.avail_out = static_cast<uInt>(kChunk);
                     ret = inflate(&strm, Z_NO_FLUSH);
-                    if (ret == Z_STREAM_ERROR) {
+                    if (ret != Z_OK && ret != Z_STREAM_END) {
                         inflateEnd(&strm);
-                        throw std::runtime_error("zlib stream error during inflate");
+                        throw std::runtime_error("Invalid or truncated gzip payload");
                     }
                     const size_t produced = kChunk - strm.avail_out;
                     out.resize(prev_size + produced);

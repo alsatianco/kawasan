@@ -62,6 +62,38 @@ TEST(RecordBatchCompression, NoneRoundTrips) {
 TEST(RecordBatchCompression, GzipRoundTrips) {
     expectRoundTrip(CompressionType::GZIP);
 }
+TEST(RecordBatchCompression, TruncatedGzipIsRejectedInBothWireLayouts) {
+    const auto complete = makeBatch(CompressionType::GZIP, 1).serialize();
+    for (size_t payload_size : {size_t{0}, size_t{1}, size_t{10}, complete.size() - 62}) {
+        SCOPED_TRACE(payload_size);
+        auto wire = complete;
+        wire.resize(61 + payload_size);
+        const auto batch_length = static_cast<uint32_t>(wire.size() - 12);
+        for (size_t i = 0; i < 4; ++i)
+            wire[8 + i] = static_cast<uint8_t>(batch_length >> (24 - 8 * i));
+        // Keep the wire CRC valid so rejection exercises the inflater.
+        uint32_t crc = 0xFFFFFFFFu;
+        for (size_t i = 21; i < wire.size(); ++i) {
+            crc ^= wire[i];
+            for (int bit = 0; bit < 8; ++bit)
+                crc = (crc >> 1) ^ ((crc & 1) ? 0x82F63B78u : 0u);
+        }
+        crc = ~crc;
+        for (size_t i = 0; i < 4; ++i)
+            wire[17 + i] = static_cast<uint8_t>(crc >> (24 - 8 * i));
+        EXPECT_THROW(RecordBatch::deserialize(wire), std::runtime_error);
+
+        Buffer wrapper;
+        wrapper.writeInt64(0);  // offset
+        wrapper.writeInt32(static_cast<int32_t>(6 + wire.size() - 23));
+        wrapper.writeInt32(0);  // legacy wrapper CRC
+        wrapper.writeInt8(2);   // magic
+        wrapper.writeInt8(static_cast<int8_t>(CompressionType::GZIP));
+        wrapper.writeBytes(wire.data() + 23, wire.size() - 23);
+        const std::vector<uint8_t> wrapped(wrapper.data(), wrapper.data() + wrapper.size());
+        EXPECT_THROW(RecordBatch::deserializeFromProduceRequest(wrapped), std::runtime_error);
+    }
+}
 TEST(RecordBatchCompression, SnappyRoundTrips) {
     expectRoundTrip(CompressionType::SNAPPY);
 }

@@ -94,6 +94,7 @@ add_test(NAME DecodeBoundsTest COMMAND decode_bounds_test)
 add_executable(record_batch_compression_test record_batch_compression_test.cpp)
 target_link_libraries(record_batch_compression_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME RecordBatchCompressionTest COMMAND record_batch_compression_test)
+set_tests_properties(RecordBatchCompressionTest PROPERTIES TIMEOUT 20)
 
 # Transaction state manager serialize/route + coordinator two-phase (M1)
 add_executable(transaction_state_manager_test transaction_state_manager_test.cpp)
