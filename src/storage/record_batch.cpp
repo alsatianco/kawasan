@@ -362,7 +362,8 @@ void RecordBatch::decode(Buffer& buffer) {
         record.value = readVarBytes(record_buffer);
 
         const int32_t header_count = record_buffer.readVarInt();
-        if (header_count < 0) {
+        // Each header needs at least two varints (key and value lengths).
+        if (header_count < 0 || static_cast<size_t>(header_count) > record_buffer.remaining() / 2) {
             throw std::runtime_error("Invalid header count");
         }
         record.headers.clear();
@@ -612,7 +613,8 @@ RecordBatch RecordBatch::deserializeFromProduceRequest(const std::vector<uint8_t
                 record.value = readVarBytes(record_buffer);
 
                 const int32_t header_count = record_buffer.readVarInt();
-                if (header_count < 0) {
+                if (header_count < 0 ||
+                    static_cast<size_t>(header_count) > record_buffer.remaining() / 2) {
                     throw std::runtime_error("Invalid header count");
                 }
                 record.headers.clear();
