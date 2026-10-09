@@ -28,3 +28,7 @@ add_test(NAME NemesisTest
 add_test(NAME ClientMatrixResultTest
     COMMAND ${Python3_EXECUTABLE} -m unittest discover
             -s ${CMAKE_SOURCE_DIR}/tests/clients -p test_results.py)
+
+add_test(NAME BenchmarkTest
+    COMMAND ${Python3_EXECUTABLE} -m unittest discover
+            -s ${CMAKE_SOURCE_DIR}/bench -p test_bench.py)
