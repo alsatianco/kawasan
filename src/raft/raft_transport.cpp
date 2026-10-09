@@ -394,6 +394,9 @@ std::shared_ptr<tcp::socket> RaftTransport::get_connection(
     auto socket = std::make_shared<tcp::socket>(io_context_);
     try {
         connectWithDeadline(*socket, host, port, deadline);
+        // Heartbeats must fit within the 150ms minimum election timeout.
+        // Nagle can hold a small RPC behind a delayed ACK, especially on macOS.
+        socket->set_option(tcp::no_delay(true));
     } catch (const std::exception& e) {
         std::lock_guard<std::mutex> lock(peers_mutex_);
         auto it = peers_.find(peer_id);
@@ -440,7 +443,10 @@ RaftTransport::Session::Session(tcp::socket socket, std::shared_ptr<ServerLifeti
     : socket_(std::move(socket)),
       native_fd_(socket_.native_handle()),
       lifetime_(std::move(lifetime)),
-      generation_(generation) {}
+      generation_(generation) {
+    // Responses need the same latency bound as outgoing heartbeats.
+    socket_.set_option(tcp::no_delay(true));
+}
 
 void RaftTransport::Session::shutdownSocket() {
     if (!stopped_.exchange(true)) {
