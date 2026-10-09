@@ -450,6 +450,21 @@ def run_writes(cluster, topic, duration, ledger, seed, no_faults=False):
                   'fault_coverage': sorted(nemesis.coverage) if nemesis else [], 'kills': kills}
 
 
+def fetch_committed_offset(admin, group_id, topic):
+    """Read the committed offset even while a transaction has staged an update."""
+    from confluent_kafka import ConsumerGroupTopicPartitions, KafkaException, TopicPartition
+    request = ConsumerGroupTopicPartitions(group_id, [TopicPartition(topic, 0)])
+    # Consumer.committed() requires stable offsets and retries UNSTABLE_OFFSET_COMMIT
+    # until the pending transaction ends. This checker must read the old offset
+    # before it ends the transaction to prove staged offsets remain invisible.
+    group = admin.list_consumer_group_offsets(
+        [request], require_stable=False, request_timeout=5)[group_id].result(timeout=6)
+    partition = group.topic_partitions[0]
+    if partition.error is not None:
+        raise KafkaException(partition.error)
+    return max(-1, partition.offset)
+
+
 def run_transactions(cluster, topic, duration, ledger):
     """Single-node I4: commit, abort and SIGKILL after staging group offsets.
 
@@ -482,8 +497,7 @@ def run_transactions(cluster, topic, duration, ledger):
     deadline = time.monotonic() + duration
     cycle = 0
     def committed():
-        offset = consumer.committed([TopicPartition(input_topic, 0)], timeout=5)[0].offset
-        return max(-1, offset)
+        return fetch_committed_offset(admin, topic + '-group', input_topic)
     try:
         observe_offsets(admin, topic, range(3), ledger)
         while time.monotonic() < deadline and cycle < 1000:

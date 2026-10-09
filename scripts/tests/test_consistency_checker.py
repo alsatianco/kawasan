@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch, Mock
 
-from consistency_checker import Ledger, Violation, verify_records, verify_watermarks, verify_transactions, observe_offsets, Cluster
+from consistency_checker import Ledger, Violation, verify_records, verify_watermarks, verify_transactions, observe_offsets, Cluster, fetch_committed_offset
 
 
 def record(offset, key=None, partition=0):
@@ -118,6 +118,43 @@ class CheckerTest(unittest.TestCase):
                                       ([record(0, 'a'), record(1, 'b')], 4)]:
             with self.subTest(records=records), self.assertRaisesRegex(Violation, 'I4'):
                 verify_transactions(txns, records, group_offset)
+
+    def test_pending_transaction_reads_the_previous_committed_offset(self):
+        from types import SimpleNamespace
+        import sys
+        fake_kafka = SimpleNamespace(
+            ConsumerGroupTopicPartitions=lambda group, partitions: SimpleNamespace(
+                group_id=group, topic_partitions=partitions),
+            TopicPartition=lambda topic, partition: SimpleNamespace(
+                topic=topic, partition=partition), KafkaException=RuntimeError)
+        admin = Mock()
+        def pending_offsets(requests, *, require_stable, request_timeout):
+            if require_stable:
+                raise TimeoutError('stable offsets wait for transaction completion')
+            self.assertEqual(requests[0].group_id, 'group')
+            self.assertEqual(requests[0].topic_partitions[0].topic, 'input')
+            future = Mock()
+            future.result.return_value = SimpleNamespace(topic_partitions=[
+                SimpleNamespace(offset=7, error=None)])
+            return {'group': future}
+        admin.list_consumer_group_offsets.side_effect = pending_offsets
+        with patch.dict(sys.modules, {'confluent_kafka': fake_kafka}):
+            self.assertEqual(fetch_committed_offset(admin, 'group', 'input'), 7)
+
+    def test_committed_offset_partition_errors_are_not_hidden(self):
+        from types import SimpleNamespace
+        import sys
+        fake_kafka = SimpleNamespace(
+            ConsumerGroupTopicPartitions=lambda *args: None,
+            TopicPartition=lambda *args: None, KafkaException=RuntimeError)
+        future = Mock()
+        future.result.return_value = SimpleNamespace(topic_partitions=[
+            SimpleNamespace(offset=-1, error='coordinator unavailable')])
+        admin = Mock()
+        admin.list_consumer_group_offsets.return_value = {'group': future}
+        with patch.dict(sys.modules, {'confluent_kafka': fake_kafka}), \
+             self.assertRaisesRegex(RuntimeError, 'coordinator unavailable'):
+            fetch_committed_offset(admin, 'group', 'input')
 
     def test_visible_unknown_transaction_still_requires_exact_acked_payload(self):
         events = [dict(type='txn', id='x', keys=['a'], decision='unknown', input_offset=1),
