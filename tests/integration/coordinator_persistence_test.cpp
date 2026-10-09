@@ -213,6 +213,22 @@ protected:
                 c, KawasanBroker::CoordinatorPersistenceOnly{format}));
             brokers.back()->start();
         }
+        // Group ownership can become readable while the transaction topic is
+        // still being created and replayed on other brokers. Wait for both
+        // coordinator types on every owner before mutations or replication
+        // pauses: slow startup I/O can otherwise invalidate metadata freshness
+        // between a test's group-only readiness check and its first append.
+        ASSERT_TRUE(waitUntil([&] {
+            for (int owner = 0; owner < 3; ++owner) {
+                const auto id = key(owner);
+                for (const auto type : {protocol::CoordinatorType::GROUP,
+                                        protocol::CoordinatorType::TRANSACTION}) {
+                    if (brokers[owner]->coordinatorLoadStatus(id, type) != ErrorCode::NONE)
+                        return false;
+                }
+            }
+            return true;
+        }));
     }
     std::string key(int p) {
         for (int n = 0;; ++n) {
