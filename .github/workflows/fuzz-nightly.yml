@@ -28,15 +28,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            cmake build-essential ninja-build clang-15 libclang-rt-15-dev \
+            cmake build-essential ninja-build clang-18 libclang-rt-18-dev \
             libboost-all-dev librocksdb-dev libsnappy-dev liblz4-dev libzstd-dev \
             libfmt-dev libspdlog-dev libgtest-dev nlohmann-json3-dev \
             libssl-dev
 
       - name: Configure (libFuzzer + ASan)
         env:
-          CC: clang-15
-          CXX: clang++-15
+          CC: clang-18
+          CXX: clang++-18
         run: |
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
@@ -47,7 +47,9 @@ jobs:
       - name: Build fuzzer
         env:
           TARGET: ${{ matrix.target }}
-        run: cmake --build build -j2 --target "fuzz_${TARGET}" 2>&1 | tee /tmp/fuzz-build.log
+        run: |
+          set -o pipefail
+          cmake --build build -j2 --target "fuzz_${TARGET}" 2>&1 | tee /tmp/fuzz-build.log
 
       - name: Cache corpus
         uses: actions/cache@v4

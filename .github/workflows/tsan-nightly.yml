@@ -16,15 +16,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            cmake build-essential ninja-build clang-15 libclang-rt-15-dev \
+            cmake build-essential ninja-build clang-18 libclang-rt-18-dev \
             libboost-all-dev librocksdb-dev libsnappy-dev liblz4-dev libzstd-dev \
             libfmt-dev libspdlog-dev libgtest-dev nlohmann-json3-dev \
             libssl-dev
 
       - name: Configure (TSan)
         env:
-          CC: clang-15
-          CXX: clang++-15
+          CC: clang-18
+          CXX: clang++-18
         run: |
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
@@ -33,14 +33,16 @@ jobs:
             -GNinja
 
       - name: Build
-        run: cmake --build build -j2 2>&1 | tee /tmp/tsan-build.log
+        run: |
+          set -o pipefail
+          cmake --build build -j2 2>&1 | tee /tmp/tsan-build.log
 
       - name: Run tests (TSan)
         env:
           TSAN_OPTIONS: "halt_on_error=1:report_thread_leaks=0"
         run: |
-          # LLVM 15 supports up to 28 bits of x86 ASLR entropy. Ubuntu 24.04
-          # defaults to 32: https://github.com/google/sanitizers/issues/1716
+          # Keep address placement compatible with the TSan runtime on Ubuntu
+          # 24.04: https://github.com/google/sanitizers/issues/1716
           sudo sysctl -w vm.mmap_rnd_bits=28
           ctest --test-dir build --output-on-failure --timeout 600
 
