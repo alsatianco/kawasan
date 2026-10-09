@@ -1446,6 +1446,19 @@ TEST_F(CoordinatorPersistenceTest, DeferredWireOwnerLossAfterMutationBeforeDeliv
         auto request = heartbeatWire(id);
         return test_support::brokerRequest(b.port(), request);
     });
+    // Destroy this guard before the async request's future. A fatal assertion
+    // must release the worker before that future waits for the wire response.
+    struct WorkerRelease {
+        std::promise<void>& promise;
+        bool released = false;
+        void release() {
+            if (!released) {
+                promise.set_value();
+                released = true;
+            }
+        }
+        ~WorkerRelease() { release(); }
+    } worker_release{release};
     auto durable = committed.get_future();
     ASSERT_EQ(durable.wait_for(5s), std::future_status::ready);
     EXPECT_EQ(durable.get(), ErrorCode::NONE);
@@ -1467,7 +1480,7 @@ TEST_F(CoordinatorPersistenceTest, DeferredWireOwnerLossAfterMutationBeforeDeliv
                    .partitions[1]
                    .leader == 0;
     }));
-    release.set_value();
+    worker_release.release();
     ASSERT_EQ(pending.wait_for(5s), std::future_status::ready);
     auto response = pending.get();
     EXPECT_EQ(response.readInt32(), 71);
