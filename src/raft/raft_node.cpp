@@ -549,31 +549,44 @@ void RaftNode::startElection() {
         responses.push_back(transport_->sendRequestVote(peer.id, request));
     }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
-    for (auto& future : responses) {
-        const auto remaining = std::max(deadline - std::chrono::steady_clock::now(),
-                                        std::chrono::steady_clock::duration::zero());
-        if (future.wait_for(remaining) != std::future_status::ready)
-            continue;
-        try {
-            const auto response = future.get();
+    // Count ready replies from every peer before waiting again. A frozen
+    // first peer must not consume the response window after a live quorum
+    // has voted: that delay can let the voters' election timers expire.
+    size_t pending = responses.size();
+    do {
+        for (auto& future : responses) {
+            if (!future.valid() ||
+                future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+                continue;
+            --pending;
+            try {
+                const auto response = future.get();
+                std::lock_guard<std::mutex> lock(log_mutex_);
+                if (response.term > current_term_) {
+                    becomeFollower(response.term);
+                    return;
+                }
+                if (current_term_ != request.term || state_ != NodeState::CANDIDATE)
+                    return;
+                if (response.vote_granted && response.term == request.term)
+                    ++votes;
+            } catch (const std::exception& e) {
+                Logger::debug("RequestVote failed: {}", e.what());
+            }
+        }
+        {
             std::lock_guard<std::mutex> lock(log_mutex_);
-            if (response.term > current_term_) {
-                becomeFollower(response.term);
+            if (!running_ || current_term_ != request.term || state_ != NodeState::CANDIDATE)
+                return;
+            if (votes >= needed) {
+                becomeLeader();
                 return;
             }
-            if (current_term_ != request.term || state_ != NodeState::CANDIDATE)
-                return;
-            if (response.vote_granted && response.term == request.term)
-                ++votes;
-        } catch (const std::exception& e) {
-            Logger::debug("RequestVote failed: {}", e.what());
         }
-    }
-    std::lock_guard<std::mutex> lock(log_mutex_);
-    if (running_ && current_term_ == request.term && state_ == NodeState::CANDIDATE &&
-        votes >= needed) {
-        becomeLeader();
-    }
+        if (pending == 0)
+            return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
 }
 
 void RaftNode::sendHeartbeats() {

@@ -482,6 +482,47 @@ TEST(RaftLivenessTest, FrozenFirstPeerDoesNotBlockElection) {
     hole_io.stop();
 }
 
+// A ready quorum must be counted before the frozen first peer consumes the
+// 100ms response window, leaving too little time for the first heartbeat.
+TEST(RaftLivenessTest, ReadyQuorumDoesNotWaitForFrozenFirstVote) {
+    NodeIo frozen_io;
+    NodeIo live_io;
+    NodeIo node_io;
+    RaftTransport frozen(frozen_io.io, 0);
+    RaftTransport live(live_io.io, 2);
+    const int frozen_port = freePort();
+    frozen.start(frozen_port);
+    const int live_port = freePort();
+    live.start(live_port);
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    frozen.setRequestVoteHandler([&](const RequestVoteRequest& request) {
+        released.wait_for(2s);
+        return RequestVoteResponse{request.term, false};
+    });
+    std::promise<void> voted;
+    auto vote = voted.get_future();
+    std::atomic<bool> notified{false};
+    live.setRequestVoteHandler([&](const RequestVoteRequest& request) {
+        if (!notified.exchange(true))
+            voted.set_value();
+        return RequestVoteResponse{request.term, true};
+    });
+    RaftNode node(1, {{0, "127.0.0.1", frozen_port}, {2, "127.0.0.1", live_port}},
+                  node_io.io, freePort(), "");
+    node.setCommitCallback([](const LogEntry&) {});
+    node.start();
+    EXPECT_EQ(vote.wait_for(2s), std::future_status::ready);
+    const auto deadline = std::chrono::steady_clock::now() + 75ms;
+    while (!node.isLeader() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(1ms);
+    EXPECT_TRUE(node.isLeader()) << "ready quorum waited behind the frozen first vote";
+    release.set_value();
+    node.stop();
+    frozen.stop();
+    live.stop();
+}
+
 // A vote reply can be overtaken by a newer leader's AppendEntries. The
 // election thread must compare against the CURRENT term, under the state lock.
 TEST(RaftLivenessTest, DelayedVoteReplyCannotRollBackANewerTerm) {
