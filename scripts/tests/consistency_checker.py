@@ -547,6 +547,8 @@ def run_transactions(cluster, topic, duration, ledger):
                     'group.id': topic + '-group', 'enable.auto.commit': False,
                     'isolation.level': 'read_committed'}))
                 consumer.assign([TopicPartition(input_topic, 0, 0)])
+                # Drop connections and reconnect backoff from the crashed broker.
+                admin = AdminClient(cluster.client_config)
                 decision = 'abort'
                 expected = baseline
                 counts['crash'] += 1
