@@ -1,8 +1,11 @@
 #include "kawasan/broker/monitoring/http_server.h"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <cstring>
@@ -91,6 +94,17 @@ void HttpServer::start() {
         return;
     }
 
+    // shutdown() does not interrupt a listening accept() on every platform.
+    // Poll a nonblocking listener so stop() can join before closing its fd.
+    const int flags = fcntl(server_fd_, F_GETFL, 0);
+    if (flags < 0 || fcntl(server_fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
+        Logger::error("Failed to make HTTP listener nonblocking: {}", std::strerror(errno));
+        close(server_fd_);
+        server_fd_ = -1;
+        running_ = false;
+        return;
+    }
+
     Logger::info("HTTP server listening on {}:{}", host_, port_);
 
     // Start server thread
@@ -120,14 +134,33 @@ void HttpServer::stop() {
 
 void HttpServer::serverLoop() {
     while (running_) {
+        pollfd listener{server_fd_, POLLIN, 0};
+        const int ready = poll(&listener, 1, 100);
+        if (ready < 0) {
+            if (errno != EINTR)
+                Logger::warn("Failed to poll HTTP listener: {}", std::strerror(errno));
+            continue;
+        }
+        if (ready == 0 || !running_)
+            continue;
+
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         
         int client_fd = accept(server_fd_, (struct sockaddr*)&client_addr, &client_len);
         if (client_fd < 0) {
-            if (running_) {
+            if (running_ && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                 Logger::warn("Failed to accept HTTP client connection: {}", std::strerror(errno));
             }
+            continue;
+        }
+
+        // A connected client that sends no request must not block shutdown.
+        const timeval timeout{1, 0};
+        if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0 ||
+            setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
+            Logger::warn("Failed to set HTTP client timeout: {}", std::strerror(errno));
+            close(client_fd);
             continue;
         }
 

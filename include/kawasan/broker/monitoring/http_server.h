@@ -3,8 +3,10 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
 namespace kawasan::broker::monitoring {
 

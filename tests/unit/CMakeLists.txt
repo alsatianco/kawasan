@@ -8,6 +8,11 @@ add_executable(config_test config_test.cpp)
 target_link_libraries(config_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME ConfigTest COMMAND config_test)
 
+add_executable(http_server_test http_server_test.cpp)
+target_link_libraries(http_server_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME HttpServerTest COMMAND http_server_test)
+set_tests_properties(HttpServerTest PROPERTIES TIMEOUT 10)
+
 # Record batch test
 add_executable(record_batch_test record_batch_test.cpp)
 target_link_libraries(record_batch_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
