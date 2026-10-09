@@ -19,7 +19,8 @@
       "name": "boost-system"
     },
     {
-      "name": "rocksdb"
+      "name": "rocksdb",
+      "features": ["snappy"]
     },
     {
       "name": "spdlog"
