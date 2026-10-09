@@ -1,5 +1,6 @@
 # Phase EX-4 (§6.4): Commit-triggered benchmark regression check. Compares the
-# previous and current commits on the same runner. Alerts
+# previous and current commits using five alternating runs on the same runner.
+# Compares median metrics and retains raw samples. Alerts
 # (failing the job) when regression > 10%.
 name: bench-regression
 on:
@@ -48,14 +49,16 @@ jobs:
 
       - name: Run produce benchmark
         run: |
-          bash bench/run_ci.sh "$RUNNER_TEMP/bench-base/build/tools/kawasan-broker" /tmp/bench-base.json
-          bash bench/run_ci.sh "$GITHUB_WORKSPACE/build/tools/kawasan-broker" /tmp/bench-head.json
+          python3 bench/run_comparison.py \
+            --base-binary "$RUNNER_TEMP/bench-base/build/tools/kawasan-broker" \
+            --head-binary "$GITHUB_WORKSPACE/build/tools/kawasan-broker" \
+            --output-dir /tmp/bench-results --samples 5
 
       - name: Compare to baseline
         run: |
           python3 bench/check_regression.py \
-            --base /tmp/bench-base.json \
-            --head /tmp/bench-head.json \
+            --base /tmp/bench-results/base.json \
+            --head /tmp/bench-results/head.json \
             --threshold-pct 10
 
       - uses: actions/upload-artifact@v4
@@ -63,6 +66,4 @@ jobs:
         with:
           name: bench-result
           path: |
-            /tmp/bench-base.json
-            /tmp/bench-head.json
-            /tmp/bench-*.json.broker.log
+            /tmp/bench-results/

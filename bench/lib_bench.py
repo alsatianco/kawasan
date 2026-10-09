@@ -29,7 +29,7 @@ def env_fingerprint():
     except Exception:
         pass
 
-    git_sha = os.environ.get("GITHUB_SHA", "")
+    git_sha = os.environ.get("BENCH_GIT_SHA") or os.environ.get("GITHUB_SHA", "")
     if not git_sha:
         try:
             git_sha = subprocess.check_output(

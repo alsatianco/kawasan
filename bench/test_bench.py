@@ -1,8 +1,16 @@
 """Benchmark timing fixtures; no Kafka client or broker is required."""
+import contextlib
+import io
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
+import check_regression
+import lib_bench
 import produce_perf
+import run_comparison
 
 
 class ProduceMeasurementTest(unittest.TestCase):
@@ -78,6 +86,67 @@ class ProduceMeasurementTest(unittest.TestCase):
         with patch.object(produce_perf, "Producer", Producer), \
                 patch.object(produce_perf.time, "perf_counter", now):
             produce_perf.measure("confluent", "host", "topic", 3, b"x", 3, 2)
+
+
+class ComparisonTest(unittest.TestCase):
+    def sample(self, throughput=350, p99=20):
+        return {"benchmark": "produce", "client": "confluent", "producers": 1,
+                "records": 1000000, "record_size": 1024, "measurement": "steady-state",
+                "wall_clock_s": 3, "throughput_mb_s": throughput, "msg_per_s": 350000,
+                "p50_ms": 10, "p95_ms": 15, "p99_ms": p99, "env": {"git_sha": "revision"}}
+
+    def test_median_retains_all_samples_and_limits_single_outlier(self):
+        rows = [self.sample(v) for v in (350, 349, 348, 351, 280)]
+        result = run_comparison.aggregate(rows)
+        self.assertEqual(result["throughput_mb_s"], 349)
+        self.assertEqual(result["samples"], rows)
+        self.assertEqual(result["sample_count"], 5)
+
+    def test_sustained_throughput_and_latency_regressions_still_fail(self):
+        baseline = run_comparison.aggregate([self.sample()] * 5)
+        for rows in ([self.sample(v) for v in (292, 293, 291, 290, 350)],
+                     [self.sample(p99=v) for v in (25, 26, 24, 25, 20)]):
+            with self.subTest(rows=rows), contextlib.redirect_stdout(io.StringIO()):
+                current = run_comparison.aggregate(rows)
+                failures = check_regression.compare({"scenario": baseline},
+                                                     {"scenario": current}, 10, "base", "head")
+                self.assertEqual(len(failures), 1)
+
+    def test_invalid_or_mismatched_samples_fail(self):
+        for rows in ([], [self.sample(), {**self.sample(), "records": 42}],
+                     [self.sample(float("nan"))], [self.sample(0)]):
+            with self.subTest(rows=rows), self.assertRaises(ValueError):
+                run_comparison.aggregate(rows)
+
+    def test_comparison_alternates_order_and_writes_raw_and_aggregate_results(self):
+        calls = []
+
+        def run(command, check):
+            calls.append(command[2])
+            Path(command[3]).write_text(json.dumps(self.sample()))
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(run_comparison.subprocess, "run", run), \
+                contextlib.redirect_stdout(io.StringIO()):
+            output = Path(directory)
+            run_comparison.run_comparison(Path("base-binary"), Path("head-binary"), output, 3)
+            self.assertEqual(calls, ["base-binary", "head-binary", "head-binary",
+                                     "base-binary", "base-binary", "head-binary"])
+            for label in ("base", "head"):
+                result = json.loads((output / f"{label}.json").read_text())
+                self.assertEqual(result["sample_count"], 3)
+                self.assertEqual(len(list(output.glob(f"{label}-*.json"))), 3)
+
+    def test_failed_benchmark_stops_comparison(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(run_comparison.subprocess, "run", side_effect=RuntimeError("failed")), \
+                    contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, "failed"):
+                run_comparison.run_comparison(Path("base"), Path("head"), Path(directory), 3)
+            self.assertFalse((Path(directory) / "base.json").exists())
+
+    def test_base_fingerprint_overrides_head_job_sha(self):
+        with patch.dict(lib_bench.os.environ, {"BENCH_GIT_SHA": "base", "GITHUB_SHA": "head"}):
+            self.assertEqual(lib_bench.env_fingerprint()["git_sha"], "base")
 
 
 if __name__ == "__main__":

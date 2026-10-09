@@ -7,6 +7,9 @@ result=$2
 bench_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 data_dir=$(mktemp -d)
 broker_pid=''
+# GITHUB_SHA names the head job even while measuring the base worktree.
+export BENCH_GIT_SHA
+BENCH_GIT_SHA=$(git -C "$(dirname "$binary")" rev-parse HEAD)
 cleanup() {
     if [[ -n "$broker_pid" ]]; then
         kill "$broker_pid" 2>/dev/null || true
