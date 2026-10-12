@@ -1834,8 +1834,16 @@ void KawasanBroker::registerProtocolHandlers() {
                 return deferCoordinatorDescriptions(context, work, errors);
             };
         }
+        const bool staged_listings =
+            staged_coordinator_persistence_ &&
+            (key == protocol::ApiKey::LIST_GROUPS || key == protocol::ApiKey::LIST_TRANSACTIONS);
+        if (staged_listings) {
+            handler = [this, errors](Context& context) {
+                return deferCoordinatorListings(context, errors);
+            };
+        }
         if (staged_coordinator_format_ && !staged_membership && !staged_offsets &&
-            !staged_producer && !staged_registration && !staged_descriptions) {
+            !staged_producer && !staged_registration && !staged_descriptions && !staged_listings) {
             // Staged acquisition must never reach legacy writes, cleanup or
             // marker completion. Version-specific builders retain wire shape.
             switch (key) {
@@ -1849,6 +1857,8 @@ void KawasanBroker::registerProtocolHandlers() {
                 case protocol::ApiKey::DESCRIBE_GROUPS:
                 case protocol::ApiKey::DESCRIBE_TRANSACTIONS:
                 case protocol::ApiKey::LIST_GROUPS:
+                case protocol::ApiKey::LIST_TRANSACTIONS:
+                case protocol::ApiKey::DESCRIBE_PRODUCERS:
                 case protocol::ApiKey::INIT_PRODUCER_ID:
                 case protocol::ApiKey::ADD_PARTITIONS_TO_TXN:
                 case protocol::ApiKey::ADD_OFFSETS_TO_TXN:
@@ -2130,6 +2140,10 @@ void KawasanBroker::registerProtocolHandlers() {
                     return buildTransactionRegistrationError(ctx, code, ver);
                 if (k == protocol::ApiKey::DESCRIBE_TRANSACTIONS)
                     return buildDescribeTransactionsError(ctx, code, ver);
+                if (k == protocol::ApiKey::LIST_TRANSACTIONS)
+                    return buildListTransactionsError(ctx, code, ver);
+                if (k == protocol::ApiKey::DESCRIBE_PRODUCERS)
+                    return buildDescribeProducersError(ctx, code, ver);
                 if (k == protocol::ApiKey::DELETE_GROUPS)
                     return buildDeleteGroupsError(ctx, code, ver);
                 if (k == protocol::ApiKey::OFFSET_DELETE)
@@ -4761,21 +4775,7 @@ Buffer KawasanBroker::buildDescribeGroupsError(const RequestDispatcher::RequestC
 }
 
 Buffer KawasanBroker::handleListGroups(RequestDispatcher::RequestContext& context) {
-    protocol::ListGroupsRequest request;
-    request.decode(context.payload, context.header.apiVersion());
-
-    Logger::info("ListGroups request");
-
-    auto groups = group_coordinator_->listGroups();
-
-    protocol::ListGroupsResponse response;
-    response.setErrorCode(ErrorCode::NONE);
-    response.setThrottleTimeMs(0);
-    response.setGroups(groups);
-
-    const int16_t version =
-        std::clamp<int16_t>(context.header.apiVersion(), 0, kListGroupsMaxVersion);
-    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
+    return readCoordinatorListing(context, {});
 }
 
 Buffer KawasanBroker::buildListGroupsError(const RequestDispatcher::RequestContext& context,
@@ -5807,28 +5807,7 @@ Buffer KawasanBroker::handleDescribeProducers(RequestDispatcher::RequestContext&
 }
 
 Buffer KawasanBroker::handleListTransactions(RequestDispatcher::RequestContext& context) {
-    protocol::ListTransactionsRequest req;
-    req.decode(context.payload, context.header.apiVersion());
-    protocol::ListTransactionsResponse resp;
-    resp.setThrottleTimeMs(0);
-    resp.setErrorCode(staged_coordinator_format_ ? ErrorCode::COORDINATOR_LOAD_IN_PROGRESS
-                                                 : ErrorCode::NONE);
-    // Phase 4.1l: enumerate known transactional IDs from the
-    // TransactionCoordinator with optional state/producer_id filters.
-    if (!staged_coordinator_format_ && transaction_coordinator_) {
-        const auto txns =
-            transaction_coordinator_->list(req.stateFilters(), req.producerIdFilters());
-        for (const auto& t : txns) {
-            protocol::ListTransactionsResponse::TxnState s;
-            s.transactional_id = t.transactional_id;
-            s.producer_id = t.producer_id;
-            s.state = TransactionCoordinator::stateName(t.state);
-            resp.addState(std::move(s));
-        }
-        Logger::info("ListTransactions: returned {} txn(s)", txns.size());
-    }
-    return encodeResponse(context,
-                          [&](Buffer& buf) { resp.encode(buf, context.header.apiVersion()); });
+    return readCoordinatorListing(context, {});
 }
 
 Buffer KawasanBroker::handleDescribeTransactions(RequestDispatcher::RequestContext& context) {

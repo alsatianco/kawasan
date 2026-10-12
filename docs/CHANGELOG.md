@@ -8,13 +8,24 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-13
 
+- Migrate persistence-staged ListGroups and ListTransactions to deferred enumeration
+  of owned, acquired, readable sources. Fence the complete source set and original
+  epochs through cache reads and response write initiation, including newly owned
+  partitions and empty ownership sets. Exclude nonowned cache entries, return complete
+  loading/ownership error bodies, and drain listing response tickets at shutdown.
+- Apply ListGroups v4 state filters, report unknown ListTransactions state filters
+  and omit Dead transaction identities in both runtimes. Refuse staged DescribeProducers
+  with complete requested topic/partition bodies pending truthful follower producer
+  state and replica/identity/epoch admission. Owned transaction timeout proposals,
+  discovery and public replicated coordinator activation remain unfinished.
+
 - Migrate persistence-staged DescribeGroups and DescribeTransactions to independent
   per-key original-epoch admission, cache-only deferred reads and simultaneous
   source fencing through response write initiation. Preserve duplicate/order and
   per-key ownership/loading errors; drain retained inspection responses at shutdown.
 - Return complete per-key Kafka error bodies for both inspection APIs. Missing or
   expired transactional IDs now return TRANSACTIONAL_ID_NOT_FOUND (105), and empty
-  transaction IDs return INVALID_REQUEST. Source enumeration for listings, owned
+  transaction IDs return INVALID_REQUEST. DescribeProducers migration, owned
   transaction timeout proposals and public replicated coordinator activation remain
   unfinished.
 

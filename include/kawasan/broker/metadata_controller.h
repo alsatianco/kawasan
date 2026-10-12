@@ -46,6 +46,13 @@ public:
         store_.withPartitionLeaderships(sources, owner, action);
     }
 
+    void withOwnedPartitionLeaderships(
+        const std::string& topic, BrokerId owner,
+        const std::vector<std::pair<TopicPartition, int32_t>>& sources,
+        const std::function<void(ErrorCode)>& action) {
+        store_.withOwnedPartitionLeaderships(topic, owner, sources, action);
+    }
+
     /// @brief Loads persisted metadata and installs commit hooks.
     void start();
 

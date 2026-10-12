@@ -46,6 +46,13 @@ public:
                                   BrokerId owner,
                                   const std::function<void(const std::vector<ErrorCode>&)>& action);
 
+    // Fence the complete owned partition set, including an empty set. New
+    // ownership or a changed epoch invalidates a previously admitted listing.
+    void withOwnedPartitionLeaderships(
+        const std::string& topic, BrokerId owner,
+        const std::vector<std::pair<TopicPartition, int32_t>>& sources,
+        const std::function<void(ErrorCode)>& action);
+
     /// @brief Loads metadata from disk (creates empty store if missing).
     void load();
 

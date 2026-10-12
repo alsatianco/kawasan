@@ -948,12 +948,15 @@ std::vector<protocol::DescribeGroupsResponse::Group> GroupCoordinator::describeG
     return groups;
 }
 
-std::vector<protocol::ListGroupsResponse::Group> GroupCoordinator::listGroups() const {
+std::vector<protocol::ListGroupsResponse::Group> GroupCoordinator::listGroups(
+    const std::function<bool(const std::string&)>& include) const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<protocol::ListGroupsResponse::Group> groups;
     groups.reserve(groups_.size());
 
     for (const auto& [group_id, group_state] : groups_) {
+        if (include && !include(group_id))
+            continue;
         protocol::ListGroupsResponse::Group group;
         group.group_id = group_id;
         group.protocol_type = group_state.protocol_type;

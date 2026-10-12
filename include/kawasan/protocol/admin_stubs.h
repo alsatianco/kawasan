@@ -85,6 +85,9 @@ public:
     };
     void setThrottleTimeMs(int32_t v) { throttle_time_ms_ = v; }
     void setErrorCode(ErrorCode v) { error_code_ = v; }
+    void setUnknownStateFilters(std::vector<std::string> filters) {
+        unknown_state_filters_ = std::move(filters);
+    }
     void addState(TxnState s) { states_.push_back(std::move(s)); }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);

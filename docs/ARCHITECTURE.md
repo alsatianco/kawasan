@@ -779,8 +779,21 @@ Missing/dead transaction identities return TRANSACTIONAL_ID_NOT_FOUND (105), and
 empty transaction IDs return INVALID_REQUEST, including in the default runtime.
 Reads of durable Prepare states do not invoke marker completion.
 
-Serving integration still needs owned/readable source enumeration for ListGroups,
-ListTransactions and DescribeProducers, plus owned transaction timeout proposals,
+ListGroups and ListTransactions enumerate committed metadata before selecting cache
+keys. The bounded executor pins the complete locally owned source set and its epochs;
+cache reads and response write initiation hold an exact-set metadata fence. Newly
+owned partitions invalidate an older listing, including an empty listing from a
+broker that originally owned no sources. An owned source that is loading, unreadable
+or has an uncertain append refuses the entire listing with an empty API-specific
+error body. Nonowned cached entries cannot appear. ListGroups v4 applies state
+filters; ListTransactions reports unknown state filters and omits Dead identities.
+These filter corrections also apply to the default runtime.
+
+DescribeProducers remains refused in both staging seams with complete requested
+topic/partition error bodies. Kafka permits hosted follower inspection, but follower
+producer caches are not yet refreshed on replication/truncation. Migration requires
+truthful follower state plus online replica, topic-identity and epoch admission.
+Serving integration still needs that DescribeProducers migration, owned transaction timeout proposals,
 unkeyed producer admission, and group-owned pending-offset routing.
 Abrupt RF>1 client continuity and remote
 marker/LSO/EOS acceptance remain separate requirements before public activation.

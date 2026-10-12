@@ -1748,6 +1748,531 @@ std::vector<Inspection> publishInspection(RequestDispatcher::DispatchResult& res
     return decodeInspection(std::move(body), api, version);
 }
 
+struct Listing {
+    ErrorCode error = ErrorCode::NONE;
+    std::vector<std::string> ids;
+    std::vector<std::string> states;
+    std::vector<std::string> unknown_filters;
+};
+Buffer listingPayload(protocol::ApiKey api, int16_t version,
+                      const std::vector<std::string>& states = {},
+                      const std::vector<int64_t>& producers = {}) {
+    Buffer payload;
+    if (api == protocol::ApiKey::LIST_GROUPS) {
+        protocol::ListGroupsRequest request;
+        request.setStatesFilter(states);
+        request.encode(payload, version);
+    } else {
+        payload.writeCompactArrayLen(static_cast<int32_t>(states.size()));
+        for (const auto& state : states)
+            payload.writeCompactString(state);
+        payload.writeCompactArrayLen(static_cast<int32_t>(producers.size()));
+        for (const auto pid : producers)
+            payload.writeInt64(pid);
+        payload.writeEmptyTaggedFields();
+    }
+    return payload;
+}
+Listing decodeListing(Buffer body, protocol::ApiKey api, int16_t version) {
+    protocol::ResponseHeader header;
+    header.setFlexible(
+        protocol::RequestHeader(api, version, 91, "listing-test").isFlexibleResponseHeader());
+    header.decode(body);
+    Listing listing;
+    if (api == protocol::ApiKey::LIST_GROUPS) {
+        protocol::ListGroupsResponse response;
+        response.decode(body, version);
+        listing.error = response.errorCode();
+        for (const auto& group : response.groups()) {
+            listing.ids.push_back(group.group_id);
+            listing.states.push_back(group.group_state);
+        }
+    } else {
+        (void)body.readInt32();
+        listing.error = static_cast<ErrorCode>(body.readInt16());
+        const auto unknown = body.readCompactArrayLen();
+        for (int i = 0; i < unknown; ++i)
+            listing.unknown_filters.push_back(body.readCompactString());
+        const auto count = body.readCompactArrayLen();
+        for (int i = 0; i < count; ++i) {
+            listing.ids.push_back(body.readCompactString());
+            (void)body.readInt64();
+            listing.states.push_back(body.readCompactString());
+            body.skipTaggedFields();
+        }
+        body.skipTaggedFields();
+    }
+    EXPECT_EQ(body.remaining(), 0u);
+    return listing;
+}
+Listing listingWire(KawasanBroker& b, protocol::ApiKey api, int16_t version,
+                    const std::vector<std::string>& states = {},
+                    const std::vector<int64_t>& producers = {}) {
+    Buffer payload;
+    protocol::RequestHeader(api, version, 91, "listing-test").encode(payload);
+    const auto body = listingPayload(api, version, states, producers);
+    payload.writeBytes(body.data(), body.size());
+    return decodeListing(test_support::brokerRequest(b.port(), payload), api, version);
+}
+Listing publishListing(RequestDispatcher::DispatchResult& result, protocol::ApiKey api,
+                       int16_t version) {
+    auto frame = result.frame;
+    if (result.publication_guard)
+        result.publication_guard([&](auto status) {
+            if (status != ErrorCode::NONE)
+                frame = result.publication_error(status);
+        });
+    Buffer body(frame);
+    (void)body.readInt32();
+    return decodeListing(std::move(body), api, version);
+}
+TEST_F(CoordinatorPersistenceTest, OwnedListingsWireEnumeratesCommittedSourcesAndFilters) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    for (int p = 0; p < 3; ++p) {
+        ASSERT_EQ(put(b, key(p), {groupRecord(key(p))}), ErrorCode::NONE);
+        auto snapshot = transaction(key(p));
+        snapshot.producer_id += p;
+        if (p == 1)
+            snapshot.state = TransactionCoordinator::State::PrepareAbort;
+        ASSERT_EQ(init(b, snapshot), ErrorCode::NONE);
+    }
+    const std::set<std::string> expected{key(0), key(1), key(2)};
+    for (int16_t version = 0; version <= 4; ++version) {
+        const auto groups = listingWire(b, protocol::ApiKey::LIST_GROUPS, version);
+        EXPECT_EQ(groups.error, ErrorCode::NONE);
+        EXPECT_EQ(std::set(groups.ids.begin(), groups.ids.end()), expected);
+    }
+    EXPECT_TRUE(listingWire(b, protocol::ApiKey::LIST_GROUPS, 4, {"Empty"}).ids.empty());
+    EXPECT_EQ(listingWire(b, protocol::ApiKey::LIST_GROUPS, 4, {"Stable"}).ids.size(), 3u);
+    const auto txns = listingWire(b, protocol::ApiKey::LIST_TRANSACTIONS, 0);
+    EXPECT_EQ(txns.error, ErrorCode::NONE);
+    EXPECT_EQ(std::set(txns.ids.begin(), txns.ids.end()), expected);
+    EXPECT_EQ(listingWire(b, protocol::ApiKey::LIST_TRANSACTIONS, 0, {"PrepareAbort"}).ids,
+              std::vector<std::string>{key(1)});
+    EXPECT_EQ(listingWire(b, protocol::ApiKey::LIST_TRANSACTIONS, 0, {}, {77}).ids,
+              std::vector<std::string>{key(2)});
+    const auto unknown =
+        listingWire(b, protocol::ApiKey::LIST_TRANSACTIONS, 0, {"MadeUp", "Ongoing"}, {75});
+    EXPECT_EQ(unknown.error, ErrorCode::NONE);
+    EXPECT_EQ(unknown.ids, std::vector<std::string>{key(0)});
+    EXPECT_EQ(unknown.unknown_filters, std::vector<std::string>{"MadeUp"});
+    b.stop();
+}
+TEST_F(CoordinatorPersistenceTest, OwnedListingsDefaultFiltersAndDeadTransactionsMatchKafka) {
+    KawasanBroker b(config());
+    b.start();
+    auto dead = transaction(key(0));
+    dead.state = TransactionCoordinator::State::Dead;
+    CoordinatorPersistenceProbe::transactions(b).restore(dead);
+    CoordinatorPersistenceProbe::transactions(b).restore(transaction(key(1)));
+    CoordinatorPersistenceProbe::groups(b).replaceCoordinatorPartition(
+        0, 3, {groupRecord(key(0))}, CoordinatorPersistenceProbe::retainOffsets(b));
+    EXPECT_EQ(listingWire(b, protocol::ApiKey::LIST_GROUPS, 4, {"Stable"}).ids,
+              std::vector<std::string>{key(0)});
+    EXPECT_TRUE(listingWire(b, protocol::ApiKey::LIST_GROUPS, 4, {"Empty"}).ids.empty());
+    const auto all = listingWire(b, protocol::ApiKey::LIST_TRANSACTIONS, 0);
+    EXPECT_EQ(all.error, ErrorCode::NONE);
+    EXPECT_EQ(all.ids, std::vector<std::string>{key(1)});
+    const auto unknown = listingWire(b, protocol::ApiKey::LIST_TRANSACTIONS, 0, {"NoSuchState"});
+    EXPECT_EQ(unknown.error, ErrorCode::NONE);
+    EXPECT_TRUE(unknown.ids.empty());
+    EXPECT_EQ(unknown.unknown_filters, std::vector<std::string>{"NoSuchState"});
+    b.stop();
+}
+TEST_F(CoordinatorPersistenceTest, OwnedListingsAcquisitionOnlyAndProducerInspectionRefuseCaches) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorAcquisitionOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    for (int16_t version = 0; version <= 4; ++version) {
+        const auto groups = listingWire(b, protocol::ApiKey::LIST_GROUPS, version);
+        EXPECT_EQ(groups.error, ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+        EXPECT_TRUE(groups.ids.empty());
+    }
+    const auto txns = listingWire(b, protocol::ApiKey::LIST_TRANSACTIONS, 0);
+    EXPECT_EQ(txns.error, ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+    EXPECT_TRUE(txns.ids.empty());
+    Buffer payload;
+    protocol::RequestHeader(protocol::ApiKey::DESCRIBE_PRODUCERS, 0, 91, "listing-test")
+        .encode(payload);
+    payload.writeCompactArrayLen(1);
+    payload.writeCompactString("data");
+    payload.writeCompactArrayLen(2);
+    payload.writeInt32(0);
+    payload.writeInt32(0);
+    payload.writeEmptyTaggedFields();
+    payload.writeEmptyTaggedFields();
+    auto body = test_support::brokerRequest(b.port(), payload);
+    protocol::ResponseHeader header;
+    header.setFlexible(true);
+    header.decode(body);
+    EXPECT_EQ(body.readInt32(), 0);
+    ASSERT_EQ(body.readCompactArrayLen(), 1);
+    EXPECT_EQ(body.readCompactString(), "data");
+    ASSERT_EQ(body.readCompactArrayLen(), 2);
+    for (int i = 0; i < 2; ++i) {
+        EXPECT_EQ(body.readInt32(), 0);
+        EXPECT_EQ(static_cast<ErrorCode>(body.readInt16()),
+                  ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+        (void)body.readCompactNullableString();
+        EXPECT_EQ(body.readCompactArrayLen(), 0);
+        body.skipTaggedFields();
+    }
+    body.skipTaggedFields();
+    body.skipTaggedFields();
+    EXPECT_EQ(body.remaining(), 0u);
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, OwnedListingsResponsesFenceOriginalEpochsAndDrain) {
+    for (const auto api : {protocol::ApiKey::LIST_GROUPS, protocol::ApiKey::LIST_TRANSACTIONS}) {
+        auto c = config();
+        const auto topic =
+            api == protocol::ApiKey::LIST_GROUPS ? "__consumer_offsets" : "__transaction_state";
+        c.setString("log.dirs", (dir / topic).string());
+        KawasanBroker b(c, KawasanBroker::CoordinatorPersistenceOnly{format});
+        b.start();
+        b.reconcileReplicas();
+        ASSERT_EQ(put(b, key(0), {groupRecord(key(0))}), ErrorCode::NONE);
+        ASSERT_EQ(init(b, transaction(key(0))), ErrorCode::NONE);
+        const int16_t version = api == protocol::ApiKey::LIST_GROUPS ? 4 : 0;
+        std::promise<RequestDispatcher::DispatchResult> delivered;
+        EXPECT_TRUE(CoordinatorExecutorProbe::dispatchProtocol(
+                        b, api, version, listingPayload(api, version),
+                        [&](auto result) { delivered.set_value(std::move(result)); })
+                        .deferred);
+        auto ready = delivered.get_future();
+        ASSERT_EQ(ready.wait_for(5s), std::future_status::ready);
+        auto result = ready.get();
+        ASSERT_TRUE(result.publication_guard);
+        const auto before = publishListing(result, api, version);
+        EXPECT_EQ(before.error, ErrorCode::NONE);
+        EXPECT_EQ(before.ids, std::vector<std::string>{key(0)});
+        fs::create_directory(dir / topic / (std::string(topic) + "-0/checkpoint.meta.tmp"));
+        if (api == protocol::ApiKey::LIST_GROUPS) {
+            EXPECT_EQ(put(b, key(0), {offsetRecord(key(0))}), ErrorCode::KAFKA_STORAGE_ERROR);
+        } else {
+            const auto previous = CoordinatorPersistenceProbe::transactions(b).describe(key(0));
+            EXPECT_EQ(b.mutateCoordinatorTransaction(key(0), previous,
+                                                     [](auto& snapshot) {
+                                                         ++snapshot->producer_epoch;
+                                                         return ErrorCode::NONE;
+                                                     }),
+                      ErrorCode::KAFKA_STORAGE_ERROR);
+        }
+        const auto unreadable = publishListing(result, api, version);
+        EXPECT_EQ(unreadable.error, ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+        EXPECT_TRUE(unreadable.ids.empty());
+        ASSERT_EQ(b.metadataController()->updatePartitionLeader(topic, 2, 0).error_code,
+                  ErrorCode::NONE);
+        b.reconcileReplicas();
+        b.acquireCoordinatorPartitions();
+        const auto after = publishListing(result, api, version);
+        EXPECT_EQ(after.error, ErrorCode::NOT_COORDINATOR);
+        EXPECT_TRUE(after.ids.empty());
+        auto stopped = std::async(std::launch::async, [&] { b.stop(); });
+        EXPECT_TRUE(waitUntil([&] { return CoordinatorExecutorProbe::stopping(b); }));
+        EXPECT_EQ(stopped.wait_for(50ms), std::future_status::timeout);
+        result = {};
+        ASSERT_EQ(stopped.wait_for(5s), std::future_status::ready);
+        stopped.get();
+    }
+}
+TEST_F(CoordinatorPersistenceTest, OwnedListingsUnreadableSourceRefusesEntireListing) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    for (int p : {0, 1}) {
+        ASSERT_EQ(put(b, key(p), {groupRecord(key(p))}), ErrorCode::NONE);
+        ASSERT_EQ(init(b, transaction(key(p))), ErrorCode::NONE);
+    }
+    fs::create_directory(dir / "0/__consumer_offsets-0/checkpoint.meta.tmp");
+    EXPECT_EQ(put(b, key(0), {offsetRecord(key(0))}), ErrorCode::KAFKA_STORAGE_ERROR);
+    fs::create_directory(dir / "0/__transaction_state-0/checkpoint.meta.tmp");
+    const auto previous = CoordinatorPersistenceProbe::transactions(b).describe(key(0));
+    EXPECT_EQ(b.mutateCoordinatorTransaction(key(0), previous,
+                                             [](auto& snapshot) {
+                                                 ++snapshot->producer_epoch;
+                                                 return ErrorCode::NONE;
+                                             }),
+              ErrorCode::KAFKA_STORAGE_ERROR);
+    for (const auto api : {protocol::ApiKey::LIST_GROUPS, protocol::ApiKey::LIST_TRANSACTIONS}) {
+        const auto listing = listingWire(b, api, api == protocol::ApiKey::LIST_GROUPS ? 4 : 0);
+        EXPECT_EQ(listing.error, ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+        EXPECT_TRUE(listing.ids.empty());
+    }
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, OwnedListingsClusterExcludesPoisonedNonownedCachesAndAcquires) {
+    startCluster();
+    for (int owner = 0; owner < 3; ++owner) {
+        ASSERT_EQ(put(*brokers[owner], key(owner), {groupRecord(key(owner))}), ErrorCode::NONE);
+        ASSERT_EQ(init(*brokers[owner], transaction(key(owner))), ErrorCode::NONE);
+    }
+    CoordinatorPersistenceProbe::transactions(*brokers[0]).restore(transaction(key(1)));
+    CoordinatorPersistenceProbe::groups(*brokers[0])
+        .replaceCoordinatorPartition(1, 3, {groupRecord(key(1))},
+                                     CoordinatorPersistenceProbe::retainOffsets(*brokers[0]));
+    for (const auto api : {protocol::ApiKey::LIST_GROUPS, protocol::ApiKey::LIST_TRANSACTIONS}) {
+        const auto listing =
+            listingWire(*brokers[0], api, api == protocol::ApiKey::LIST_GROUPS ? 4 : 0);
+        EXPECT_EQ(listing.error, ErrorCode::NONE);
+        EXPECT_EQ(listing.ids, std::vector<std::string>{key(0)});
+    }
+    KawasanBroker* controller = nullptr;
+    ASSERT_TRUE(waitUntil([&] {
+        for (auto& broker : brokers)
+            if (broker->raftNode()->isLeader())
+                controller = broker.get();
+        return controller != nullptr;
+    }));
+    std::vector<RequestDispatcher::DispatchResult> before_acquisition;
+    for (const auto api : {protocol::ApiKey::LIST_GROUPS, protocol::ApiKey::LIST_TRANSACTIONS}) {
+        const auto version = api == protocol::ApiKey::LIST_GROUPS ? 4 : 0;
+        std::promise<RequestDispatcher::DispatchResult> delivered;
+        EXPECT_TRUE(CoordinatorExecutorProbe::dispatchProtocol(
+                        *brokers[1], api, version, listingPayload(api, version),
+                        [&](auto result) { delivered.set_value(std::move(result)); })
+                        .deferred);
+        auto ready = delivered.get_future();
+        ASSERT_EQ(ready.wait_for(5s), std::future_status::ready);
+        before_acquisition.push_back(ready.get());
+        EXPECT_EQ(publishListing(before_acquisition.back(), api, version).error, ErrorCode::NONE);
+    }
+    for (const auto topic : {"__consumer_offsets", "__transaction_state"})
+        ASSERT_EQ(controller->metadataController()->updatePartitionLeader(topic, 0, 1).error_code,
+                  ErrorCode::NONE);
+    ASSERT_TRUE(waitUntil([&] {
+        brokers[1]->reconcileReplicas();
+        return brokers[1]->coordinatorLoadStatus(key(0), protocol::CoordinatorType::GROUP) ==
+                   ErrorCode::NONE &&
+               brokers[1]->coordinatorLoadStatus(key(0), protocol::CoordinatorType::TRANSACTION) ==
+                   ErrorCode::NONE;
+    }));
+    for (const auto api : {protocol::ApiKey::LIST_GROUPS, protocol::ApiKey::LIST_TRANSACTIONS}) {
+        const auto listing =
+            listingWire(*brokers[1], api, api == protocol::ApiKey::LIST_GROUPS ? 4 : 0);
+        EXPECT_EQ(listing.error, ErrorCode::NONE);
+        EXPECT_EQ(std::set(listing.ids.begin(), listing.ids.end()),
+                  (std::set<std::string>{key(0), key(1)}));
+    }
+    for (size_t i = 0; i < before_acquisition.size(); ++i) {
+        const auto listing = publishListing(
+            before_acquisition[i],
+            i == 0 ? protocol::ApiKey::LIST_GROUPS : protocol::ApiKey::LIST_TRANSACTIONS,
+            i == 0 ? 4 : 0);
+        EXPECT_EQ(listing.error, ErrorCode::NOT_COORDINATOR);
+        EXPECT_TRUE(listing.ids.empty());
+    }
+    before_acquisition.clear();
+}
+TEST_F(CoordinatorPersistenceTest, OwnedListingsEmptyOwnedSetIsFencedAgainstNewAcquisition) {
+    startCluster();
+    ASSERT_EQ(put(*brokers[0], key(0), {groupRecord(key(0))}), ErrorCode::NONE);
+    ASSERT_EQ(init(*brokers[0], transaction(key(0))), ErrorCode::NONE);
+    KawasanBroker* controller = nullptr;
+    ASSERT_TRUE(waitUntil([&] {
+        for (auto& broker : brokers)
+            if (broker->raftNode()->isLeader())
+                controller = broker.get();
+        return controller != nullptr;
+    }));
+    for (const auto topic : {"__consumer_offsets", "__transaction_state"})
+        ASSERT_EQ(controller->metadataController()->updatePartitionLeader(topic, 0, 1).error_code,
+                  ErrorCode::NONE);
+    ASSERT_TRUE(waitUntil([&] {
+        brokers[0]->reconcileReplicas();
+        const auto groups = listingWire(*brokers[0], protocol::ApiKey::LIST_GROUPS, 4);
+        const auto txns = listingWire(*brokers[0], protocol::ApiKey::LIST_TRANSACTIONS, 0);
+        return groups.error == ErrorCode::NONE && groups.ids.empty() &&
+               txns.error == ErrorCode::NONE && txns.ids.empty();
+    }));
+    std::vector<RequestDispatcher::DispatchResult> results;
+    for (const auto api : {protocol::ApiKey::LIST_GROUPS, protocol::ApiKey::LIST_TRANSACTIONS}) {
+        const auto version = api == protocol::ApiKey::LIST_GROUPS ? 4 : 0;
+        std::promise<RequestDispatcher::DispatchResult> delivered;
+        EXPECT_TRUE(CoordinatorExecutorProbe::dispatchProtocol(
+                        *brokers[0], api, version, listingPayload(api, version),
+                        [&](auto result) { delivered.set_value(std::move(result)); })
+                        .deferred);
+        auto ready = delivered.get_future();
+        ASSERT_EQ(ready.wait_for(5s), std::future_status::ready);
+        results.push_back(ready.get());
+        EXPECT_EQ(publishListing(results.back(), api, version).error, ErrorCode::NONE);
+    }
+    for (const auto topic : {"__consumer_offsets", "__transaction_state"})
+        ASSERT_EQ(controller->metadataController()->updatePartitionLeader(topic, 0, 0).error_code,
+                  ErrorCode::NONE);
+    ASSERT_TRUE(waitUntil([&] {
+        return brokers[0]->coordinatorLoadStatus(key(0), protocol::CoordinatorType::GROUP) ==
+                   ErrorCode::NONE &&
+               brokers[0]->coordinatorLoadStatus(key(0), protocol::CoordinatorType::TRANSACTION) ==
+                   ErrorCode::NONE;
+    }));
+    for (size_t i = 0; i < results.size(); ++i) {
+        const auto listing = publishListing(
+            results[i],
+            i == 0 ? protocol::ApiKey::LIST_GROUPS : protocol::ApiKey::LIST_TRANSACTIONS,
+            i == 0 ? 4 : 0);
+        EXPECT_EQ(listing.error, ErrorCode::NOT_COORDINATOR);
+        EXPECT_TRUE(listing.ids.empty());
+    }
+    results.clear();
+}
+TEST_F(CoordinatorPersistenceTest, OwnedListingsQueuedReadsRefuseNewerEpochs) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    ASSERT_EQ(put(b, key(0), {groupRecord(key(0))}), ErrorCode::NONE);
+    ASSERT_EQ(init(b, transaction(key(0))), ErrorCode::NONE);
+    std::promise<void> release;
+    const auto released = release.get_future().share();
+    struct ReleaseWorkers {
+        std::promise<void>& release;
+        bool done = false;
+        void finish() {
+            if (!done) {
+                done = true;
+                release.set_value();
+            }
+        }
+        ~ReleaseWorkers() { finish(); }
+    } guard{release};
+    const auto entered = std::make_shared<std::atomic<int>>(0);
+    for (int worker = 0; worker < 2; ++worker)
+        ASSERT_TRUE(CoordinatorExecutorProbe::submit(b, [entered, released](bool, auto) {
+            ++*entered;
+            released.wait();
+        }));
+    ASSERT_TRUE(waitUntil([&] { return entered->load() == 2; }));
+    std::vector<std::future<RequestDispatcher::DispatchResult>> results;
+    for (const auto api : {protocol::ApiKey::LIST_GROUPS, protocol::ApiKey::LIST_TRANSACTIONS}) {
+        const auto version = api == protocol::ApiKey::LIST_GROUPS ? 4 : 0;
+        auto delivered = std::make_shared<std::promise<RequestDispatcher::DispatchResult>>();
+        results.push_back(delivered->get_future());
+        EXPECT_TRUE(CoordinatorExecutorProbe::dispatchProtocol(
+                        b, api, version, listingPayload(api, version),
+                        [delivered](auto result) { delivered->set_value(std::move(result)); })
+                        .deferred);
+    }
+    for (const auto topic : {"__consumer_offsets", "__transaction_state"})
+        ASSERT_EQ(b.metadataController()->updatePartitionLeader(topic, 2, 0).error_code,
+                  ErrorCode::NONE);
+    b.reconcileReplicas();
+    b.acquireCoordinatorPartitions();
+    guard.finish();
+    for (size_t i = 0; i < results.size(); ++i) {
+        ASSERT_EQ(results[i].wait_for(5s), std::future_status::ready);
+        auto result = results[i].get();
+        const auto listing = publishListing(
+            result, i == 0 ? protocol::ApiKey::LIST_GROUPS : protocol::ApiKey::LIST_TRANSACTIONS,
+            i == 0 ? 4 : 0);
+        EXPECT_EQ(listing.error, ErrorCode::NOT_COORDINATOR);
+        EXPECT_TRUE(listing.ids.empty());
+    }
+    b.stop();
+}
+TEST_F(CoordinatorPersistenceTest, OwnedListingsHoldCompleteSourceSetThroughWriteInitiation) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    ASSERT_EQ(init(b, transaction(key(0))), ErrorCode::NONE);
+    std::promise<RequestDispatcher::DispatchResult> delivered;
+    EXPECT_TRUE(CoordinatorExecutorProbe::dispatchProtocol(
+                    b, protocol::ApiKey::LIST_TRANSACTIONS, 0,
+                    listingPayload(protocol::ApiKey::LIST_TRANSACTIONS, 0),
+                    [&](auto result) { delivered.set_value(std::move(result)); })
+                    .deferred);
+    auto ready = delivered.get_future();
+    ASSERT_EQ(ready.wait_for(5s), std::future_status::ready);
+    auto result = ready.get();
+    std::promise<void> entered, release;
+    auto publishing = entered.get_future();
+    const auto released = release.get_future().share();
+    auto publication = std::async(std::launch::async, [&] {
+        result.publication_guard([&](auto status) {
+            EXPECT_EQ(status, ErrorCode::NONE);
+            entered.set_value();
+            released.wait();
+        });
+    });
+    const bool started = publishing.wait_for(5s) == std::future_status::ready;
+    if (!started)
+        release.set_value();
+    ASSERT_TRUE(started);
+    auto changed = std::async(std::launch::async, [&] {
+        return b.metadataController()->updatePartitionLeader("__transaction_state", 2, 0);
+    });
+    EXPECT_EQ(changed.wait_for(50ms), std::future_status::timeout);
+    release.set_value();
+    publication.get();
+    EXPECT_EQ(changed.get().error_code, ErrorCode::NONE);
+    EXPECT_EQ(publishListing(result, protocol::ApiKey::LIST_TRANSACTIONS, 0).error,
+              ErrorCode::NOT_COORDINATOR);
+    result = {};
+    b.stop();
+}
+TEST_F(CoordinatorPersistenceTest,
+       OwnedListingsRestartRebuildsCachesAndKeepsPrepareWithoutRedrive) {
+    auto snapshot = transaction(key(0));
+    snapshot.state = TransactionCoordinator::State::PrepareAbort;
+    {
+        KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+        b.start();
+        b.reconcileReplicas();
+        ASSERT_EQ(put(b, key(0), {groupRecord(key(0))}), ErrorCode::NONE);
+        ASSERT_EQ(init(b, snapshot), ErrorCode::NONE);
+        b.stop();
+    }
+    fs::remove_all(dir / "0/consumer_offsets");
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto end = b.logManager()->getLog("__transaction_state", 0)->logEndOffset();
+    EXPECT_EQ(listingWire(b, protocol::ApiKey::LIST_GROUPS, 4).ids,
+              std::vector<std::string>{key(0)});
+    const auto txns = listingWire(b, protocol::ApiKey::LIST_TRANSACTIONS, 0);
+    EXPECT_EQ(txns.error, ErrorCode::NONE);
+    EXPECT_EQ(txns.ids, std::vector<std::string>{key(0)});
+    EXPECT_EQ(txns.states, std::vector<std::string>{"PrepareAbort"});
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(key(0)), snapshot);
+    EXPECT_EQ(b.logManager()->getLog("__transaction_state", 0)->logEndOffset(), end);
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, OwnedListingsPersistenceProducerInspectionRemainsGated) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    Buffer payload;
+    protocol::RequestHeader(protocol::ApiKey::DESCRIBE_PRODUCERS, 0, 91, "listing-test")
+        .encode(payload);
+    payload.writeCompactArrayLen(1);
+    payload.writeCompactString("data");
+    payload.writeCompactArrayLen(1);
+    payload.writeInt32(7);
+    payload.writeEmptyTaggedFields();
+    payload.writeEmptyTaggedFields();
+    auto body = test_support::brokerRequest(b.port(), payload);
+    protocol::ResponseHeader header;
+    header.setFlexible(true);
+    header.decode(body);
+    EXPECT_EQ(body.readInt32(), 0);
+    ASSERT_EQ(body.readCompactArrayLen(), 1);
+    EXPECT_EQ(body.readCompactString(), "data");
+    ASSERT_EQ(body.readCompactArrayLen(), 1);
+    EXPECT_EQ(body.readInt32(), 7);
+    EXPECT_EQ(static_cast<ErrorCode>(body.readInt16()), ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+    (void)body.readCompactNullableString();
+    EXPECT_EQ(body.readCompactArrayLen(), 0);
+    body.skipTaggedFields();
+    body.skipTaggedFields();
+    body.skipTaggedFields();
+    EXPECT_EQ(body.remaining(), 0u);
+    b.stop();
+}
 TEST_F(CoordinatorPersistenceTest, KeyedInspectionWireReadsCommittedStateAndErrors) {
     KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
     b.start();

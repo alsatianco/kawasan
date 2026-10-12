@@ -228,6 +228,17 @@ private:
     RequestDispatcher::HandlerResult deferCoordinatorDescriptions(
         RequestDispatcher::RequestContext context, RequestDispatcher::HandlerFunc work,
         RequestDispatcher::ErrorBuilder errors);
+    RequestDispatcher::HandlerResult deferCoordinatorListings(
+        RequestDispatcher::RequestContext context, RequestDispatcher::ErrorBuilder errors);
+    void withCoordinatorEnumerationFence(const std::string& topic,
+                                         const std::vector<RequestOwnership>& sources,
+                                         const std::function<void(ErrorCode)>& publish);
+    Buffer readCoordinatorListing(RequestDispatcher::RequestContext& context,
+                                  const std::vector<RequestOwnership>& sources);
+    Buffer buildListTransactionsError(const RequestDispatcher::RequestContext& context,
+                                      ErrorCode code, int16_t version) const;
+    Buffer buildDescribeProducersError(const RequestDispatcher::RequestContext& context,
+                                       ErrorCode code, int16_t version) const;
     RequestDispatcher::HandlerResult deferCoordinatorOffsetFetch(
         RequestDispatcher::RequestContext context, RequestDispatcher::HandlerFunc work,
         RequestDispatcher::ErrorBuilder errors);

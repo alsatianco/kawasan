@@ -181,12 +181,14 @@ TransactionCoordinator::Metrics TransactionCoordinator::getMetrics() const {
 }
 
 std::vector<TransactionCoordinator::TxnSnapshot> TransactionCoordinator::list(
-    const std::vector<std::string>& state_filters,
-    const std::vector<int64_t>& producer_id_filters) const {
+    const std::vector<std::string>& state_filters, const std::vector<int64_t>& producer_id_filters,
+    const std::function<bool(const std::string&)>& include) const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<TxnSnapshot> out;
     out.reserve(txns_.size());
-    for (const auto& [_, s] : txns_) {
+    for (const auto& [id, s] : txns_) {
+        if ((include && !include(id)) || s.state == State::Dead)
+            continue;
         if (!state_filters.empty()) {
             const std::string name = stateName(s.state);
             if (std::find(state_filters.begin(), state_filters.end(), name) ==

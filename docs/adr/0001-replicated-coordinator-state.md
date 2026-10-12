@@ -10,8 +10,8 @@ the membership/timeout state machine without exposing changes before commitment.
 Persistence staging now migrates group membership handlers and owned timeout
 jobs through those proposals and the deferred executor, along with offset
 commits/reads, exact deletions, owned retention cleanup and keyed producer
-initialization, transaction partition/offset participation and keyed group/transaction
-inspection. Public runtime
+initialization, transaction partition/offset participation, keyed group/transaction
+inspection and owned source listings. Public runtime
 activation, remaining handler/background migration,
 marker redrive and failover acceptance remain pending. No broker configuration enables either seam.
 
@@ -122,9 +122,19 @@ and transaction sources. DescribeGroups and DescribeTransactions inspect caches
 only inside the admitted epoch fence, preserve per-key errors and duplicates, and
 hold all response source epochs through write initiation. Error builders do not
 reenter metadata or expose cached state on refusal. Missing/dead transaction IDs
-return Kafka error 105. Listings still need explicit owned/acquired/readable source
-enumeration, and owned transaction timeout PrepareAbort proposals remain pending.
+return Kafka error 105. Owned transaction timeout PrepareAbort proposals remain pending.
 This checkpoint does not enable discovery, marker redrive or public activation.
+
+The listing checkpoint admits ListGroups/ListTransactions against the complete
+owned source set and original epochs from committed metadata. A simultaneous
+metadata fence covers cache selection and response write initiation, including
+empty-to-nonempty ownership changes. Any owned source that is loading or unreadable
+refuses the whole listing; nonowned cache entries are excluded before inspection.
+Response tickets drain at shutdown. DescribeProducers remains a separate migration:
+Kafka allows local follower inspection, and replicated/truncated follower logs need
+truthful producer state before replica/UUID/epoch-fenced inspection can serve it.
+Both staging seams now refuse that API with complete per-partition error bodies.
+Public discovery/configuration, timeout proposals and marker completion remain gated.
 
 The staged membership checkpoint enables normal JoinGroup/SyncGroup/Heartbeat/
 LeaveGroup registrations only in the internal persistence seam, plus a bounded

@@ -165,8 +165,10 @@ public:
 
     /// @brief Lists all known transactional IDs, optionally filtered by
     /// state and producer_id.
-    std::vector<TxnSnapshot> list(const std::vector<std::string>& state_filters,
-                                  const std::vector<int64_t>& producer_id_filters) const;
+    std::vector<TxnSnapshot> list(
+        const std::vector<std::string>& state_filters,
+        const std::vector<int64_t>& producer_id_filters,
+        const std::function<bool(const std::string&)>& include = {}) const;
 
     /// @brief Returns the snapshot for a single transactional_id, or
     /// nullopt if unknown.

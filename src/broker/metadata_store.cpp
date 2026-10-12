@@ -426,6 +426,25 @@ void MetadataStore::withPartitionLeaderships(
     action(statuses);
 }
 
+void MetadataStore::withOwnedPartitionLeaderships(
+    const std::string& topic, BrokerId owner,
+    const std::vector<std::pair<TopicPartition, int32_t>>& sources,
+    const std::function<void(ErrorCode)>& action) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = topics_.find(topic);
+    if (found == topics_.end()) {
+        action(ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+        return;
+    }
+    std::map<TopicPartition, int32_t> current;
+    for (const auto& partition : found->second.metadata.partitions)
+        if (partition.leader == owner)
+            current.emplace(TopicPartition{topic, partition.partition}, partition.leader_epoch);
+    const std::map<TopicPartition, int32_t> admitted(sources.begin(), sources.end());
+    action(admitted.size() == sources.size() && current == admitted ? ErrorCode::NONE
+                                                                    : ErrorCode::NOT_COORDINATOR);
+}
+
 TopicOperationResult MetadataStore::applyCreate(const TopicSpecification& spec) {
     std::lock_guard<std::mutex> lock(mutex_);
     const bool coordinator_topic =

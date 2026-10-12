@@ -109,7 +109,10 @@ public:
     std::vector<protocol::DescribeGroupsResponse::Group> describeGroups(
         const std::vector<std::string>& group_ids) const;
 
-    std::vector<protocol::ListGroupsResponse::Group> listGroups() const;
+    // Optional key predicate runs under the cache lock and must not reenter
+    // metadata. Staged enumeration selects admitted partitions before reading state.
+    std::vector<protocol::ListGroupsResponse::Group> listGroups(
+        const std::function<bool(const std::string&)>& include = {}) const;
 
     /// @brief Loads group state from persistent storage on startup.
     /// Should be called after initialization to restore groups.
