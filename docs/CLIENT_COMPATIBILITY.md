@@ -40,6 +40,12 @@ leg. It deliberately corrupts one produced value; the Kafka oracle must fail
 the ordered value assertion and the runner must stop before the candidate.
 Never use this setting for acceptance.
 
+The ecosystem SIGKILL durability check polls for its acknowledged records within
+one 90-second restart recovery deadline. It verifies every value at its original
+offset, rejects wrong values immediately and fails if any acknowledged record
+remains missing at the deadline. Broker connectivity alone does not establish
+partition recovery or an empty recovered log.
+
 These checks prove client behavior against a single broker. Cluster acceptance
 still requires the recovery harness and M9 scheduled nightlies; clustering
 remains experimental.

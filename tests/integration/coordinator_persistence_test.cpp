@@ -1,4 +1,7 @@
+#include <fcntl.h>
 #include <gtest/gtest.h>
+#include <sys/resource.h>
+#include <unistd.h>
 
 #include <boost/asio.hpp>
 #include <chrono>
@@ -17,6 +20,7 @@
 #include "kawasan/protocol/admin_misc_requests.h"
 #include "kawasan/protocol/api_versions.h"
 #include "kawasan/protocol/leave_group_request.h"
+#include "kawasan/protocol/txn_request.h"
 
 using namespace kawasan;
 using namespace kawasan::broker;
@@ -428,6 +432,806 @@ ProducerIdentity producerInitWire(KawasanBroker& b, const std::optional<std::str
     const auto payload = producerInitPayload(id, version, expected_id, expected_epoch, timeout);
     request.writeBytes(payload.data(), payload.size());
     return producerIdentity(test_support::brokerRequest(b.port(), request), version);
+}
+
+protocol::AddPartitionsToTxnRequest addPartitions(const std::string& id, ProducerIdentity producer,
+                                                  std::vector<int32_t> partitions = {0}) {
+    protocol::AddPartitionsToTxnRequest request;
+    request.setTransactionalId(id);
+    request.setProducerId(producer.id);
+    request.setProducerEpoch(producer.epoch);
+    request.addTopic({"data", std::move(partitions)});
+    return request;
+}
+protocol::AddOffsetsToTxnRequest addOffsets(const std::string& id, ProducerIdentity producer,
+                                            const std::string& group) {
+    protocol::AddOffsetsToTxnRequest request;
+    request.setTransactionalId(id);
+    request.setProducerId(producer.id);
+    request.setProducerEpoch(producer.epoch);
+    request.setGroupId(group);
+    return request;
+}
+void createData(KawasanBroker& b) {
+    TopicSpecification spec;
+    spec.name = "data";
+    spec.num_partitions = 2;
+    spec.replication_factor = 1;
+    ASSERT_EQ(b.metadataController()->createTopic(spec).error_code, ErrorCode::NONE);
+    b.reconcileReplicas();
+}
+TEST_F(CoordinatorPersistenceTest, TransactionRegistrationWireCommitsAndPreservesFirstOffsets) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    createData(b);
+    const auto id = key(0);
+    auto producer = producerInitWire(b, id);
+    ASSERT_EQ(producer.error, ErrorCode::NONE);
+    producer = producerInitWire(b, id, 4, producer.id, producer.epoch);
+    ASSERT_EQ(producer.error, ErrorCode::NONE);
+    const auto before = *CoordinatorPersistenceProbe::transactions(b).describe(id);
+    auto response = membershipWire<protocol::AddPartitionsToTxnResponse>(
+        b, protocol::ApiKey::ADD_PARTITIONS_TO_TXN, addPartitions(id, producer, {0, 0}), 3);
+    ASSERT_EQ(response.topics().size(), 1u);
+    EXPECT_EQ(response.topics()[0].partitions[0].error_code, ErrorCode::NONE);
+    auto committed = *CoordinatorPersistenceProbe::transactions(b).describe(id);
+    EXPECT_EQ(committed.state, TransactionCoordinator::State::Ongoing);
+    EXPECT_EQ(committed.partitions,
+              (std::vector<TransactionCoordinator::TxnPartition>{{"data", 0, 0}}));
+    EXPECT_EQ(committed.previous_producer_id, before.previous_producer_id);
+    EXPECT_EQ(committed.previous_producer_epoch, before.previous_producer_epoch);
+    auto* data = b.logManager()->getLog("data", 0);
+    data->append({Record("advance", "value")});
+    auto* source = b.logManager()->getLog("__transaction_state", 0);
+    const auto end = source->logEndOffset();
+    for (int16_t version = 0; version <= 3; ++version) {
+        response = membershipWire<protocol::AddPartitionsToTxnResponse>(
+            b, protocol::ApiKey::ADD_PARTITIONS_TO_TXN, addPartitions(id, producer), version);
+        EXPECT_EQ(response.topics()[0].partitions[0].error_code, ErrorCode::NONE);
+        EXPECT_EQ(*CoordinatorPersistenceProbe::transactions(b).describe(id), committed);
+        EXPECT_EQ(source->logEndOffset(), end);
+    }
+    const auto group = key(2);  // group source is independent of transaction source
+    for (int16_t version = 0; version <= 3; ++version) {
+        auto offsets = membershipWire<protocol::AddOffsetsToTxnResponse>(
+            b, protocol::ApiKey::ADD_OFFSETS_TO_TXN, addOffsets(id, producer, group), version);
+        EXPECT_EQ(offsets.errorCode(), ErrorCode::NONE);
+    }
+    const auto registered = *CoordinatorPersistenceProbe::transactions(b).describe(id);
+    EXPECT_EQ(registered.state_start_time_ms, committed.state_start_time_ms);
+    EXPECT_EQ(registered.partitions, (std::vector<TransactionCoordinator::TxnPartition>{
+                                         {"data", 0, 0}, {"__consumer_offsets", 2, -1}}));
+    EXPECT_EQ(source->logEndOffset(), end + 1);
+    EXPECT_EQ(TransactionStateManager(b.logManager(), 3).loadCommittedPartition(0)[0], registered);
+}
+TEST_F(CoordinatorPersistenceTest,
+       TransactionRegistrationRejectsUnknownPartitionsWithoutGhostLogs) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    createData(b);
+    const auto id = key(0);
+    const auto producer = producerInitWire(b, id);
+    ASSERT_EQ(producer.error, ErrorCode::NONE);
+    const auto before = CoordinatorPersistenceProbe::transactions(b).describe(id);
+    auto request = addPartitions(id, producer, {0, -1, 2});
+    request.addTopic({"missing", {0}});
+    request.addTopic({"__transaction_state", {0}});
+    const auto result = membershipWire<protocol::AddPartitionsToTxnResponse>(
+        b, protocol::ApiKey::ADD_PARTITIONS_TO_TXN, request, 3);
+    ASSERT_EQ(result.topics().size(), 3u);
+    ASSERT_EQ(result.topics()[0].partitions.size(), 3u);
+    EXPECT_EQ(result.topics()[0].partitions[0].error_code, ErrorCode::OPERATION_NOT_ATTEMPTED);
+    EXPECT_EQ(result.topics()[0].partitions[1].error_code, ErrorCode::UNKNOWN_TOPIC_OR_PARTITION);
+    EXPECT_EQ(result.topics()[0].partitions[2].error_code, ErrorCode::UNKNOWN_TOPIC_OR_PARTITION);
+    EXPECT_EQ(result.topics()[1].partitions[0].error_code, ErrorCode::UNKNOWN_TOPIC_OR_PARTITION);
+    EXPECT_EQ(result.topics()[2].partitions[0].error_code, ErrorCode::TOPIC_AUTHORIZATION_FAILED);
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), before);
+    EXPECT_EQ(b.logManager()->getLog("__transaction_state", 0)->logEndOffset(), 1);
+    EXPECT_FALSE(b.logManager()->getLog("missing", 0));
+    EXPECT_FALSE(b.logManager()->getLog("data", -1));
+    EXPECT_FALSE(b.logManager()->getLog("data", 2));
+    EXPECT_FALSE(fs::exists(dir / "0/missing-0"));
+}
+
+TEST_F(CoordinatorPersistenceTest, TransactionRegistrationWireFencesProducerAndPrepareStates) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    createData(b);
+    const auto id = key(0);
+    auto producer = producerInitWire(b, id);
+    ASSERT_EQ(producer.error, ErrorCode::NONE);
+    auto* source = b.logManager()->getLog("__transaction_state", 0);
+    auto check = [&](const std::string& txn, ProducerIdentity identity, int16_t version,
+                     ErrorCode expected) {
+        const auto before = CoordinatorPersistenceProbe::transactions(b).describe(id);
+        const auto end = source->logEndOffset();
+        const auto parts = membershipWire<protocol::AddPartitionsToTxnResponse>(
+            b, protocol::ApiKey::ADD_PARTITIONS_TO_TXN, addPartitions(txn, identity), version);
+        ASSERT_EQ(parts.topics().size(), 1u);
+        EXPECT_EQ(parts.topics()[0].partitions[0].error_code, expected);
+        const auto offsets = membershipWire<protocol::AddOffsetsToTxnResponse>(
+            b, protocol::ApiKey::ADD_OFFSETS_TO_TXN, addOffsets(txn, identity, key(1)), version);
+        EXPECT_EQ(offsets.errorCode(), expected);
+        EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), before);
+        EXPECT_EQ(source->logEndOffset(), end);
+    };
+    for (int16_t version = 0; version <= 3; ++version) {
+        check("", producer, version, ErrorCode::INVALID_REQUEST);
+        check("unknown", producer, version, ErrorCode::INVALID_PRODUCER_ID_MAPPING);
+        check(id, {ErrorCode::NONE, -1, 0}, version, ErrorCode::INVALID_REQUEST);
+        check(id, {ErrorCode::NONE, producer.id, -1}, version, ErrorCode::INVALID_REQUEST);
+        check(id, {ErrorCode::NONE, producer.id + 1, 0}, version,
+              ErrorCode::INVALID_PRODUCER_ID_MAPPING);
+        check(id, {ErrorCode::NONE, producer.id, 10}, version,
+              version < 2 ? ErrorCode::INVALID_PRODUCER_EPOCH : ErrorCode::PRODUCER_FENCED);
+    }
+    producer = producerInitWire(b, id, 4, producer.id, producer.epoch);
+    ASSERT_EQ(producer.error, ErrorCode::NONE);
+    check(id, {ErrorCode::NONE, producer.id, 0}, 3, ErrorCode::PRODUCER_FENCED);
+    using State = TransactionCoordinator::State;
+    for (auto state :
+         {State::PrepareCommit, State::PrepareAbort, State::PrepareEpochFence, State::Dead}) {
+        const auto before = CoordinatorPersistenceProbe::transactions(b).describe(id);
+        ASSERT_EQ(b.mutateCoordinatorTransaction(id, before,
+                                                 [&](auto& draft) {
+                                                     draft->state = state;
+                                                     draft->partitions = {{"data", 0, 17}};
+                                                     draft->pending_offsets = {
+                                                         {key(1), "data", 0, 41, "pending", 8}};
+                                                     return ErrorCode::NONE;
+                                                 }),
+                  ErrorCode::NONE);
+        check(id, producer, 3,
+              state == State::Dead ? ErrorCode::INVALID_TXN_STATE
+                                   : ErrorCode::CONCURRENT_TRANSACTIONS);
+    }
+    for (auto state : {State::Empty, State::CompleteCommit, State::CompleteAbort}) {
+        const auto before = CoordinatorPersistenceProbe::transactions(b).describe(id);
+        ASSERT_EQ(b.mutateCoordinatorTransaction(id, before,
+                                                 [&](auto& draft) {
+                                                     draft->state = state;
+                                                     draft->partitions.clear();
+                                                     draft->pending_offsets.clear();
+                                                     draft->state_start_time_ms = 123;
+                                                     return ErrorCode::NONE;
+                                                 }),
+                  ErrorCode::NONE);
+        const auto offsets = membershipWire<protocol::AddOffsetsToTxnResponse>(
+            b, protocol::ApiKey::ADD_OFFSETS_TO_TXN, addOffsets(id, producer, key(1)), 3);
+        EXPECT_EQ(offsets.errorCode(), ErrorCode::NONE);
+        auto ongoing = *CoordinatorPersistenceProbe::transactions(b).describe(id);
+        EXPECT_EQ(ongoing.state, State::Ongoing);
+        EXPECT_GT(ongoing.state_start_time_ms, 123);
+        ASSERT_EQ(b.mutateCoordinatorTransaction(id, ongoing,
+                                                 [&](auto& draft) {
+                                                     draft->pending_offsets = {
+                                                         {key(1), "data", 0, 41, "pending", 8}};
+                                                     return ErrorCode::NONE;
+                                                 }),
+                  ErrorCode::NONE);
+        ongoing = *CoordinatorPersistenceProbe::transactions(b).describe(id);
+        EXPECT_EQ(membershipWire<protocol::AddPartitionsToTxnResponse>(
+                      b, protocol::ApiKey::ADD_PARTITIONS_TO_TXN, addPartitions(id, producer), 3)
+                      .topics()[0]
+                      .partitions[0]
+                      .error_code,
+                  ErrorCode::NONE);
+        const auto registered = *CoordinatorPersistenceProbe::transactions(b).describe(id);
+        EXPECT_EQ(registered.pending_offsets, ongoing.pending_offsets);
+        EXPECT_EQ(registered.state_start_time_ms, ongoing.state_start_time_ms);
+        EXPECT_EQ(registered.previous_producer_epoch, ongoing.previous_producer_epoch);
+    }
+}
+
+TEST_F(CoordinatorPersistenceTest,
+       TransactionRegistrationAcceptsUserTopicWithDoubleUnderscorePrefix) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    TopicSpecification spec;
+    spec.name = "__user_data";
+    spec.num_partitions = 1;
+    spec.replication_factor = 1;
+    ASSERT_EQ(b.metadataController()->createTopic(spec).error_code, ErrorCode::NONE);
+    b.reconcileReplicas();
+    const auto id = key(0);
+    const auto producer = producerInitWire(b, id);
+    ASSERT_EQ(producer.error, ErrorCode::NONE);
+    auto request = addPartitions(id, producer, {});
+    request.addTopic({spec.name, {0}});
+    const auto response = membershipWire<protocol::AddPartitionsToTxnResponse>(
+        b, protocol::ApiKey::ADD_PARTITIONS_TO_TXN, request, 3);
+    EXPECT_EQ(response.topics()[1].partitions[0].error_code, ErrorCode::NONE);
+    const auto snapshot = *CoordinatorPersistenceProbe::transactions(b).describe(id);
+    EXPECT_EQ(snapshot.partitions,
+              (std::vector<TransactionCoordinator::TxnPartition>{{spec.name, 0, 0}}));
+}
+
+TEST_F(CoordinatorPersistenceTest, TransactionRegistrationCheckpointFailurePreservesSnapshot) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    createData(b);
+    const auto id = key(0);
+    const auto producer = producerInitWire(b, id);
+    ASSERT_EQ(producer.error, ErrorCode::NONE);
+    const auto blocked = dir / "0/__transaction_state-0/checkpoint.meta.tmp";
+    for (auto api :
+         {protocol::ApiKey::ADD_PARTITIONS_TO_TXN, protocol::ApiKey::ADD_OFFSETS_TO_TXN}) {
+        const auto before = CoordinatorPersistenceProbe::transactions(b).describe(id);
+        fs::create_directory(blocked);
+        if (api == protocol::ApiKey::ADD_PARTITIONS_TO_TXN) {
+            const auto result = membershipWire<protocol::AddPartitionsToTxnResponse>(
+                b, api, addPartitions(id, producer), 3);
+            EXPECT_EQ(result.topics()[0].partitions[0].error_code, ErrorCode::KAFKA_STORAGE_ERROR);
+        } else {
+            const auto result = membershipWire<protocol::AddOffsetsToTxnResponse>(
+                b, api, addOffsets(id, producer, key(1)), 3);
+            EXPECT_EQ(result.errorCode(), ErrorCode::KAFKA_STORAGE_ERROR);
+        }
+        EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), before);
+        fs::remove(blocked);
+        b.reconcileReplicas();
+        ASSERT_TRUE(waitUntil([&] {
+            return b.coordinatorLoadStatus(id, protocol::CoordinatorType::TRANSACTION) ==
+                   ErrorCode::NONE;
+        }));
+        // The attempted append may have committed despite a failed checkpoint;
+        // acquisition recovers it before a retry can acknowledge that snapshot.
+        EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id)->state,
+                  TransactionCoordinator::State::Ongoing);
+    }
+}
+
+TEST_F(CoordinatorPersistenceTest, TransactionRegistrationSourceReadFailureLatchesSource) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    createData(b);
+    for (int partition = 0; partition < 2; ++partition) {
+        const auto id = key(partition);
+        const auto producer = producerInitWire(b, id);
+        ASSERT_EQ(producer.error, ErrorCode::NONE);
+        const auto before = CoordinatorPersistenceProbe::transactions(b).describe(id);
+        b.logManager()->getLog("__transaction_state", partition)->close();
+        if (partition == 0) {
+            const auto result = membershipWire<protocol::AddPartitionsToTxnResponse>(
+                b, protocol::ApiKey::ADD_PARTITIONS_TO_TXN, addPartitions(id, producer), 0);
+            EXPECT_EQ(result.topics()[0].partitions[0].error_code, ErrorCode::KAFKA_STORAGE_ERROR);
+        } else {
+            const auto result = membershipWire<protocol::AddOffsetsToTxnResponse>(
+                b, protocol::ApiKey::ADD_OFFSETS_TO_TXN, addOffsets(id, producer, key(2)), 0);
+            EXPECT_EQ(result.errorCode(), ErrorCode::KAFKA_STORAGE_ERROR);
+        }
+        EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), before);
+        b.acquireCoordinatorPartitions();
+        EXPECT_EQ(b.coordinatorLoadStatus(id, protocol::CoordinatorType::TRANSACTION),
+                  ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+    }
+}
+
+// Fault the actual RocksDB WAL descriptor, without a production test hook.
+// A read-only replacement fails write; a pipe accepts write but refuses fsync.
+int sourceWalDescriptor(const fs::path& source) {
+    struct rlimit limit{};
+    if (::getrlimit(RLIMIT_NOFILE, &limit) != 0)
+        return -1;
+    for (int fd = 0; fd < static_cast<int>(std::min<rlim_t>(limit.rlim_cur, 65536)); ++fd) {
+        const auto flags = ::fcntl(fd, F_GETFL);
+        if (flags == -1 || (flags & O_ACCMODE) == O_RDONLY)
+            continue;
+        fs::path path;
+#ifdef __APPLE__
+        std::array<char, 4096> name{};
+        if (::fcntl(fd, F_GETPATH, name.data()) == -1)
+            continue;
+        path = name.data();
+#else
+        std::error_code error;
+        path = fs::read_symlink("/proc/self/fd/" + std::to_string(fd), error);
+        if (error)
+            continue;
+#endif
+        if (path.extension() == ".log" && path.string().starts_with(source.string() + "/"))
+            return fd;
+    }
+    return -1;
+}
+TEST_F(CoordinatorPersistenceTest,
+       TransactionRegistrationWalWriteAndSyncFailuresRefuseAcknowledgement) {
+    for (bool fail_sync : {false, true}) {
+        auto cfg = config();
+        const auto root = fs::canonical(fs::temp_directory_path()) / dir.filename() /
+                          (fail_sync ? "sync-failure" : "write-failure");
+        cfg.setString("log.dirs", root.string());
+        KawasanBroker b(cfg, KawasanBroker::CoordinatorPersistenceOnly{format});
+        b.start();
+        b.reconcileReplicas();
+        createData(b);
+        for (int partition = 0; partition < 2; ++partition) {
+            const auto id = key(partition);
+            const auto producer = producerInitWire(b, id);
+            ASSERT_EQ(producer.error, ErrorCode::NONE);
+            const auto before = CoordinatorPersistenceProbe::transactions(b).describe(id);
+            const auto source = root / ("__transaction_state-" + std::to_string(partition));
+            const int wal = sourceWalDescriptor(source);
+            ASSERT_GE(wal, 0);
+            struct RestoreDescriptor {
+                int wal;
+                int original;
+                std::array<int, 2> pipe{-1, -1};
+                int replacement = -1;
+                ~RestoreDescriptor() {
+                    if (original >= 0) {
+                        ::dup2(original, wal);
+                        ::close(original);
+                    }
+                    if (replacement >= 0)
+                        ::close(replacement);
+                    for (const int fd : pipe)
+                        if (fd >= 0)
+                            ::close(fd);
+                }
+            } restore{wal, ::dup(wal)};
+            ASSERT_GE(restore.original, 0);
+            if (fail_sync) {
+                ASSERT_EQ(::pipe(restore.pipe.data()), 0);
+                ASSERT_GE(::dup2(restore.pipe[1], wal), 0);
+            } else {
+                restore.replacement = ::open("/dev/null", O_RDONLY);
+                ASSERT_GE(restore.replacement, 0);
+                ASSERT_GE(::dup2(restore.replacement, wal), 0);
+            }
+            if (partition == 0) {
+                const auto result = membershipWire<protocol::AddPartitionsToTxnResponse>(
+                    b, protocol::ApiKey::ADD_PARTITIONS_TO_TXN, addPartitions(id, producer), 3);
+                EXPECT_EQ(result.topics()[0].partitions[0].error_code,
+                          ErrorCode::KAFKA_STORAGE_ERROR);
+            } else {
+                const auto result = membershipWire<protocol::AddOffsetsToTxnResponse>(
+                    b, protocol::ApiKey::ADD_OFFSETS_TO_TXN, addOffsets(id, producer, key(2)), 3);
+                EXPECT_EQ(result.errorCode(), ErrorCode::KAFKA_STORAGE_ERROR);
+            }
+            EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), before);
+            EXPECT_EQ(b.logManager()->getLog("__transaction_state", partition)->logEndOffset(), 1);
+            b.acquireCoordinatorPartitions();
+            EXPECT_EQ(b.coordinatorLoadStatus(id, protocol::CoordinatorType::TRANSACTION),
+                      ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+        }
+    }
+}
+
+TEST_F(CoordinatorPersistenceTest, TransactionRegistrationWireRestartRebuildsParticipation) {
+    const auto id = key(0);
+    ProducerIdentity producer{};
+    std::optional<TransactionCoordinator::TxnSnapshot> snapshot;
+    {
+        KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+        b.start();
+        b.reconcileReplicas();
+        createData(b);
+        producer = producerInitWire(b, id);
+        ASSERT_EQ(producer.error, ErrorCode::NONE);
+        EXPECT_EQ(membershipWire<protocol::AddPartitionsToTxnResponse>(
+                      b, protocol::ApiKey::ADD_PARTITIONS_TO_TXN, addPartitions(id, producer), 3)
+                      .topics()[0]
+                      .partitions[0]
+                      .error_code,
+                  ErrorCode::NONE);
+        EXPECT_EQ(membershipWire<protocol::AddOffsetsToTxnResponse>(
+                      b, protocol::ApiKey::ADD_OFFSETS_TO_TXN, addOffsets(id, producer, key(2)), 3)
+                      .errorCode(),
+                  ErrorCode::NONE);
+        snapshot = CoordinatorPersistenceProbe::transactions(b).describe(id);
+        b.stop();
+    }
+    fs::remove_all(dir / "0/consumer_offsets");
+    KawasanBroker recovered(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    recovered.start();
+    recovered.reconcileReplicas();
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(recovered).describe(id), snapshot);
+    const auto end = recovered.logManager()->getLog("__transaction_state", 0)->logEndOffset();
+    EXPECT_EQ(
+        membershipWire<protocol::AddPartitionsToTxnResponse>(
+            recovered, protocol::ApiKey::ADD_PARTITIONS_TO_TXN, addPartitions(id, producer), 0)
+            .topics()[0]
+            .partitions[0]
+            .error_code,
+        ErrorCode::NONE);
+    EXPECT_EQ(
+        membershipWire<protocol::AddOffsetsToTxnResponse>(
+            recovered, protocol::ApiKey::ADD_OFFSETS_TO_TXN, addOffsets(id, producer, key(2)), 0)
+            .errorCode(),
+        ErrorCode::NONE);
+    EXPECT_EQ(recovered.logManager()->getLog("__transaction_state", 0)->logEndOffset(), end);
+    // Completion remains gated: registration does not silently run markers.
+    Buffer end_payload;
+    end_payload.writeCompactString(id);
+    end_payload.writeInt64(producer.id);
+    end_payload.writeInt16(producer.epoch);
+    end_payload.writeInt8(1);
+    end_payload.writeEmptyTaggedFields();
+    std::promise<RequestDispatcher::DispatchResult> delivered;
+    const auto result = CoordinatorExecutorProbe::dispatchProtocol(
+        recovered, protocol::ApiKey::END_TXN, 3, std::move(end_payload),
+        [&](auto response) { delivered.set_value(std::move(response)); });
+    EXPECT_FALSE(result.deferred);
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(recovered).describe(id), snapshot);
+}
+
+TEST_F(CoordinatorPersistenceTest,
+       ThreeBrokerTransactionRegistrationWireWaitsForIsrAndKeepsIoLive) {
+    startCluster();
+    KawasanBroker* controller = nullptr;
+    ASSERT_TRUE(waitUntil([&] {
+        for (auto& broker : brokers)
+            if (broker->raftNode()->isLeader())
+                controller = broker.get();
+        return controller != nullptr;
+    }));
+    createData(*controller);
+    for (auto& broker : brokers)
+        broker->reconcileReplicas();
+    const auto id = key(1);
+    auto& b = *brokers[1];
+    const auto producer = producerInitWire(b, id);
+    ASSERT_EQ(producer.error, ErrorCode::NONE);
+    for (int wrong : {0, 2}) {
+        const auto parts = membershipWire<protocol::AddPartitionsToTxnResponse>(
+            *brokers[wrong], protocol::ApiKey::ADD_PARTITIONS_TO_TXN,
+            addPartitions(id, producer, {0, 1}), 3);
+        EXPECT_EQ(parts.topics()[0].partitions[0].error_code, ErrorCode::NOT_COORDINATOR);
+        EXPECT_EQ(membershipWire<protocol::AddOffsetsToTxnResponse>(
+                      *brokers[wrong], protocol::ApiKey::ADD_OFFSETS_TO_TXN,
+                      addOffsets(id, producer, key(2)), 3)
+                      .errorCode(),
+                  ErrorCode::NOT_COORDINATOR);
+    }
+    for (auto api :
+         {protocol::ApiKey::ADD_PARTITIONS_TO_TXN, protocol::ApiKey::ADD_OFFSETS_TO_TXN}) {
+        const auto before = CoordinatorPersistenceProbe::transactions(b).describe(id);
+        const auto end = b.logManager()->getLog("__transaction_state", 1)->logEndOffset();
+        brokers[0]->replicaManager()->stop();
+        brokers[2]->replicaManager()->stop();
+        auto pending = std::async(std::launch::async, [&] {
+            if (api == protocol::ApiKey::ADD_PARTITIONS_TO_TXN)
+                return membershipWire<protocol::AddPartitionsToTxnResponse>(
+                           b, api, addPartitions(id, producer, {0, 1}), 3)
+                    .topics()[0]
+                    .partitions[0]
+                    .error_code;
+            return membershipWire<protocol::AddOffsetsToTxnResponse>(
+                       b, api, addOffsets(id, producer, key(2)), 3)
+                .errorCode();
+        });
+        EXPECT_TRUE(waitUntil([&] {
+            return b.logManager()->getLog("__transaction_state", 1)->logEndOffset() == end + 1;
+        }));
+        EXPECT_EQ(pending.wait_for(50ms), std::future_status::timeout);
+        EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), before);
+        Buffer versions;
+        protocol::RequestHeader(protocol::ApiKey::API_VERSIONS, 1, 95, "io-progress")
+            .encode(versions);
+        protocol::ApiVersionsRequest{}.encode(versions, 1);
+        auto progress = test_support::brokerRequest(b.port(), versions);
+        EXPECT_EQ(progress.readInt32(), 95);
+        brokers[0]->replicaManager()->start();
+        brokers[2]->replicaManager()->start();
+        ASSERT_EQ(pending.wait_for(10s), std::future_status::ready);
+        EXPECT_EQ(pending.get(), ErrorCode::NONE);
+        ASSERT_TRUE(waitUntil([&] {
+            for (auto& broker : brokers)
+                if (broker->logManager()->getLog("__transaction_state", 1)->highWatermark() <
+                    end + 1)
+                    return false;
+            return true;
+        }));
+        for (auto& broker : brokers)
+            EXPECT_EQ(TransactionStateManager(broker->logManager(), 3).loadCommittedPartition(1)[0],
+                      *CoordinatorPersistenceProbe::transactions(b).describe(id));
+    }
+    const auto snapshot = *CoordinatorPersistenceProbe::transactions(b).describe(id);
+    EXPECT_EQ(snapshot.partitions,
+              (std::vector<TransactionCoordinator::TxnPartition>{
+                  {"data", 0, -1}, {"data", 1, 0}, {"__consumer_offsets", 2, -1}}));
+    // Move ownership through an actual Raft command and acquire the committed image.
+    ASSERT_EQ(controller->metadataController()
+                  ->updatePartitionLeader("__transaction_state", 1, 2)
+                  .error_code,
+              ErrorCode::NONE);
+    ASSERT_TRUE(waitUntil([&] {
+        return brokers[2]->coordinatorLoadStatus(id, protocol::CoordinatorType::TRANSACTION) ==
+               ErrorCode::NONE;
+    }));
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(*brokers[2]).describe(id), snapshot);
+    EXPECT_EQ(membershipWire<protocol::AddPartitionsToTxnResponse>(
+                  *brokers[2], protocol::ApiKey::ADD_PARTITIONS_TO_TXN,
+                  addPartitions(id, producer, {0, 1}), 3)
+                  .topics()[0]
+                  .partitions[0]
+                  .error_code,
+              ErrorCode::NONE);
+}
+
+TEST_F(CoordinatorPersistenceTest, ThreeBrokerRegistrationPropagatesMinIsrAndTimeoutFailures) {
+    startCluster();
+    KawasanBroker* controller = nullptr;
+    ASSERT_TRUE(waitUntil([&] {
+        for (auto& broker : brokers)
+            if (broker->raftNode()->isLeader())
+                controller = broker.get();
+        return controller != nullptr;
+    }));
+    createData(*controller);
+    const auto id = key(1);
+    auto& b = *brokers[1];
+    const auto producer = producerInitWire(b, id);
+    ASSERT_EQ(producer.error, ErrorCode::NONE);
+    const auto before = CoordinatorPersistenceProbe::transactions(b).describe(id);
+    brokers[0]->replicaManager()->stop();
+    brokers[2]->replicaManager()->stop();
+    ASSERT_EQ(controller->metadataController()
+                  ->updatePartitionISR("__transaction_state", 1, {1})
+                  .error_code,
+              ErrorCode::NONE);
+    ASSERT_TRUE(waitUntil([&] {
+        b.reconcileReplicas();
+        return b.replicaManager()->getISR({"__transaction_state", 1}).size() == 1;
+    }));
+    EXPECT_EQ(membershipWire<protocol::AddPartitionsToTxnResponse>(
+                  b, protocol::ApiKey::ADD_PARTITIONS_TO_TXN, addPartitions(id, producer), 3)
+                  .topics()[0]
+                  .partitions[0]
+                  .error_code,
+              ErrorCode::NOT_ENOUGH_REPLICAS);
+    EXPECT_EQ(membershipWire<protocol::AddOffsetsToTxnResponse>(
+                  b, protocol::ApiKey::ADD_OFFSETS_TO_TXN, addOffsets(id, producer, key(0)), 3)
+                  .errorCode(),
+              ErrorCode::NOT_ENOUGH_REPLICAS);
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), before);
+    ASSERT_EQ(controller->metadataController()
+                  ->updatePartitionISR("__transaction_state", 1, {0, 1, 2})
+                  .error_code,
+              ErrorCode::NONE);
+    ASSERT_TRUE(waitUntil([&] {
+        b.reconcileReplicas();
+        return b.replicaManager()->getISR({"__transaction_state", 1}).size() == 3;
+    }));
+    EXPECT_EQ(membershipWire<protocol::AddPartitionsToTxnResponse>(
+                  b, protocol::ApiKey::ADD_PARTITIONS_TO_TXN, addPartitions(id, producer), 3)
+                  .topics()[0]
+                  .partitions[0]
+                  .error_code,
+              ErrorCode::REQUEST_TIMED_OUT);
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), before);
+    brokers[0]->replicaManager()->start();
+    brokers[2]->replicaManager()->start();
+    ASSERT_TRUE(waitUntil([&] {
+        return b.coordinatorLoadStatus(id, protocol::CoordinatorType::TRANSACTION) ==
+               ErrorCode::NONE;
+    }));
+    const auto ongoing = CoordinatorPersistenceProbe::transactions(b).describe(id);
+    ASSERT_EQ(ongoing->state, TransactionCoordinator::State::Ongoing);
+    brokers[0]->replicaManager()->stop();
+    brokers[2]->replicaManager()->stop();
+    const auto end = b.logManager()->getLog("__transaction_state", 1)->logEndOffset();
+    auto pending = std::async(std::launch::async, [&] {
+        return membershipWire<protocol::AddOffsetsToTxnResponse>(
+                   b, protocol::ApiKey::ADD_OFFSETS_TO_TXN, addOffsets(id, producer, key(0)), 3)
+            .errorCode();
+    });
+    EXPECT_TRUE(waitUntil([&] {
+        return b.logManager()->getLog("__transaction_state", 1)->logEndOffset() == end + 1;
+    }));
+    EXPECT_EQ(controller->metadataController()
+                  ->updatePartitionISR("__transaction_state", 1, {1})
+                  .error_code,
+              ErrorCode::NONE);
+    EXPECT_EQ(pending.get(), ErrorCode::NOT_ENOUGH_REPLICAS_AFTER_APPEND);
+    // Preserve a reference while acquisition invalidates/rebuilds the live image.
+    EXPECT_TRUE(CoordinatorPersistenceProbe::transactions(b).describe(id) == ongoing ||
+                b.coordinatorLoadStatus(id, protocol::CoordinatorType::TRANSACTION) !=
+                    ErrorCode::NONE);
+    brokers[0]->replicaManager()->start();
+    brokers[2]->replicaManager()->start();
+}
+
+TEST_F(CoordinatorPersistenceTest,
+       ThreeBrokerRegistrationOwnerEpochLossDuringIsrRefusesWireSuccess) {
+    startCluster();
+    KawasanBroker* controller = nullptr;
+    ASSERT_TRUE(waitUntil([&] {
+        for (auto& broker : brokers)
+            if (broker->raftNode()->isLeader())
+                controller = broker.get();
+        return controller != nullptr;
+    }));
+    createData(*controller);
+    const auto id = key(1);
+    auto& b = *brokers[1];
+    const auto producer = producerInitWire(b, id);
+    ASSERT_EQ(producer.error, ErrorCode::NONE);
+    for (auto api :
+         {protocol::ApiKey::ADD_PARTITIONS_TO_TXN, protocol::ApiKey::ADD_OFFSETS_TO_TXN}) {
+        const auto end = b.logManager()->getLog("__transaction_state", 1)->logEndOffset();
+        brokers[0]->replicaManager()->stop();
+        brokers[2]->replicaManager()->stop();
+        auto pending = std::async(std::launch::async, [&] {
+            if (api == protocol::ApiKey::ADD_PARTITIONS_TO_TXN)
+                return membershipWire<protocol::AddPartitionsToTxnResponse>(
+                           b, api, addPartitions(id, producer), 3)
+                    .topics()[0]
+                    .partitions[0]
+                    .error_code;
+            return membershipWire<protocol::AddOffsetsToTxnResponse>(
+                       b, api, addOffsets(id, producer, key(2)), 3)
+                .errorCode();
+        });
+        EXPECT_TRUE(waitUntil([&] {
+            return b.logManager()->getLog("__transaction_state", 1)->logEndOffset() == end + 1;
+        }));
+        EXPECT_EQ(pending.wait_for(50ms), std::future_status::timeout);
+        // A new owner epoch on this broker must still fence the old request.
+        EXPECT_EQ(controller->metadataController()
+                      ->updatePartitionLeader("__transaction_state", 1, 1)
+                      .error_code,
+                  ErrorCode::NONE);
+        EXPECT_EQ(pending.get(), ErrorCode::NOT_COORDINATOR);
+        brokers[0]->replicaManager()->start();
+        brokers[2]->replicaManager()->start();
+        ASSERT_TRUE(waitUntil([&] {
+            return b.coordinatorLoadStatus(id, protocol::CoordinatorType::TRANSACTION) ==
+                   ErrorCode::NONE;
+        }));
+    }
+}
+
+Buffer registrationPayload(protocol::ApiKey api, const std::string& id, ProducerIdentity producer) {
+    Buffer payload;
+    if (api == protocol::ApiKey::ADD_PARTITIONS_TO_TXN)
+        addPartitions(id, producer).encode(payload, 3);
+    else
+        addOffsets(id, producer, "group").encode(payload, 3);
+    return payload;
+}
+ErrorCode publishRegistration(RequestDispatcher::DispatchResult& result, protocol::ApiKey api) {
+    auto frame = result.frame;
+    result.publication_guard([&](auto status) {
+        if (status != ErrorCode::NONE)
+            frame = result.publication_error(status);
+    });
+    Buffer response(frame);
+    (void)response.readInt32();
+    (void)response.readInt32();
+    response.skipTaggedFields();
+    if (api == protocol::ApiKey::ADD_OFFSETS_TO_TXN) {
+        protocol::AddOffsetsToTxnResponse decoded;
+        decoded.decode(response, 3);
+        EXPECT_EQ(response.remaining(), 0);
+        return decoded.errorCode();
+    }
+    protocol::AddPartitionsToTxnResponse decoded;
+    decoded.decode(response, 3);
+    EXPECT_EQ(response.remaining(), 0);
+    return decoded.topics().at(0).partitions.at(0).error_code;
+}
+TEST_F(CoordinatorPersistenceTest, TransactionRegistrationResponsesFenceEpochAndDrainShutdown) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    createData(b);
+    const auto id = key(0);
+    const auto producer = producerInitWire(b, id);
+    ASSERT_EQ(producer.error, ErrorCode::NONE);
+    std::vector<RequestDispatcher::DispatchResult> retained;
+    for (auto api :
+         {protocol::ApiKey::ADD_PARTITIONS_TO_TXN, protocol::ApiKey::ADD_OFFSETS_TO_TXN}) {
+        std::promise<RequestDispatcher::DispatchResult> delivered;
+        EXPECT_TRUE(CoordinatorExecutorProbe::dispatchProtocol(
+                        b, api, 3, registrationPayload(api, id, producer),
+                        [&](auto result) { delivered.set_value(std::move(result)); })
+                        .deferred);
+        auto ready = delivered.get_future();
+        ASSERT_EQ(ready.wait_for(5s), std::future_status::ready);
+        retained.push_back(ready.get());
+        EXPECT_EQ(publishRegistration(retained.back(), api), ErrorCode::NONE);
+    }
+    ASSERT_EQ(b.metadataController()->updatePartitionLeader("__transaction_state", 0, 0).error_code,
+              ErrorCode::NONE);
+    b.reconcileReplicas();
+    EXPECT_EQ(publishRegistration(retained[0], protocol::ApiKey::ADD_PARTITIONS_TO_TXN),
+              ErrorCode::NOT_COORDINATOR);
+    EXPECT_EQ(publishRegistration(retained[1], protocol::ApiKey::ADD_OFFSETS_TO_TXN),
+              ErrorCode::NOT_COORDINATOR);
+    auto stopped = std::async(std::launch::async, [&] { b.stop(); });
+    EXPECT_TRUE(waitUntil([&] { return CoordinatorExecutorProbe::stopping(b); }));
+    EXPECT_EQ(stopped.wait_for(50ms), std::future_status::timeout);
+    retained.clear();
+    EXPECT_EQ(stopped.wait_for(5s), std::future_status::ready);
+    stopped.get();
+}
+
+TEST_F(CoordinatorPersistenceTest, QueuedRegistrationsCannotMutateNewIdentityOrReacquiredEpoch) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    createData(b);
+    const auto id = key(0);
+    const auto producer = producerInitWire(b, id);
+    ASSERT_EQ(producer.error, ErrorCode::NONE);
+    for (bool change_epoch : {false, true}) {
+        std::array<std::promise<void>, 2> release;
+        struct ReleaseWorkers {
+            std::array<std::promise<void>, 2>& release;
+            bool first_done = false;
+            bool done = false;
+            void finish() {
+                if (!done) {
+                    done = true;
+                    if (!first_done)
+                        release[0].set_value();
+                    release[1].set_value();
+                }
+            }
+            ~ReleaseWorkers() { finish(); }
+        };
+        std::array<std::shared_future<void>, 2> released{release[0].get_future().share(),
+                                                         release[1].get_future().share()};
+        auto entered = std::make_shared<std::atomic<int>>(0);
+        ReleaseWorkers guard{release};
+        for (int worker = 0; worker < 2; ++worker)
+            ASSERT_TRUE(
+                CoordinatorExecutorProbe::submit(b, [worker, released, entered](bool, auto) {
+                    ++*entered;
+                    released[worker].wait();
+                }));
+        ASSERT_TRUE(waitUntil([&] { return entered->load() == 2; }));
+        std::vector<std::future<RequestDispatcher::DispatchResult>> results;
+        for (auto api :
+             {protocol::ApiKey::ADD_PARTITIONS_TO_TXN, protocol::ApiKey::ADD_OFFSETS_TO_TXN}) {
+            auto delivered = std::make_shared<std::promise<RequestDispatcher::DispatchResult>>();
+            results.push_back(delivered->get_future());
+            EXPECT_TRUE(CoordinatorExecutorProbe::dispatchProtocol(
+                            b, api, 3, registrationPayload(api, id, producer),
+                            [delivered](auto result) { delivered->set_value(std::move(result)); })
+                            .deferred);
+        }
+        if (change_epoch) {
+            EXPECT_EQ(b.metadataController()
+                          ->updatePartitionLeader("__transaction_state", 0, 0)
+                          .error_code,
+                      ErrorCode::NONE);
+            b.reconcileReplicas();
+        } else {
+            const auto before = CoordinatorPersistenceProbe::transactions(b).describe(id);
+            ASSERT_EQ(b.mutateCoordinatorTransaction(id, before,
+                                                     [](auto& snapshot) {
+                                                         ++snapshot->producer_epoch;
+                                                         return ErrorCode::NONE;
+                                                     }),
+                      ErrorCode::NONE);
+        }
+        const auto before = CoordinatorPersistenceProbe::transactions(b).describe(id);
+        const auto end = b.logManager()->getLog("__transaction_state", 0)->logEndOffset();
+        // Leave only one worker free so producer refusals are deterministic,
+        // rather than racing the documented busy-source admission refusal.
+        release[0].set_value();
+        guard.first_done = true;
+        for (auto& result : results)
+            ASSERT_EQ(result.wait_for(5s), std::future_status::ready);
+        for (size_t i = 0; i < results.size(); ++i) {
+            auto result = results[i].get();
+            EXPECT_EQ(publishRegistration(result, i == 0 ? protocol::ApiKey::ADD_PARTITIONS_TO_TXN
+                                                         : protocol::ApiKey::ADD_OFFSETS_TO_TXN),
+                      change_epoch ? ErrorCode::NOT_COORDINATOR : ErrorCode::PRODUCER_FENCED);
+        }
+        guard.finish();
+        EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), before);
+        EXPECT_EQ(b.logManager()->getLog("__transaction_state", 0)->logEndOffset(), end);
+    }
 }
 
 TEST_F(CoordinatorPersistenceTest, KeyedProducerInitializationCommitsIdentityAndRetries) {

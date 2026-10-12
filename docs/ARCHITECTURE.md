@@ -664,8 +664,8 @@ normal JoinGroup, SyncGroup, Heartbeat and LeaveGroup registrations now defer to
 the executor and mutate detached committed proposals. Protocol results are sent
 only after durable success. A LeaveGroup member batch commits as one proposal.
 Persistence staging also migrates OffsetCommit/OffsetFetch, OffsetDelete and
-DeleteGroups and keyed InitProducerId. Acquisition-only staging still refuses
-them. Transaction partition/offset additions, transaction sweeps and legacy
+DeleteGroups, keyed InitProducerId, AddPartitionsToTxn and AddOffsetsToTxn.
+Acquisition-only staging still refuses them. Transaction sweeps and legacy
 Prepare completion remain gated.
 FindCoordinator is also gated until serving integration is complete.
 
@@ -740,9 +740,33 @@ observed allocations); cluster sequences cannot wrap their low 32 bits,
 and single-node increments cannot overflow int64. Successful counter fsync followed
 by failed source persistence may leave unused IDs, which are never recycled.
 
-Serving integration still needs transaction partition/offset additions, remaining
-read handlers and sweep migration, unkeyed producer admission, and group-owned
-pending-offset routing.
+AddPartitionsToTxn and AddOffsetsToTxn use the same original-epoch deferred
+admission, complete snapshot CAS and ISR/fsync/checkpoint writer. Mapping/epoch
+checks run inside the mutation lock; Prepare states return CONCURRENT_TRANSACTIONS.
+Version 0/1 epoch fencing uses INVALID_PRODUCER_EPOCH, and version 2/3 uses
+PRODUCER_FENCED. API-specific error builders preserve partition identities and
+flexible bodies through storage, admission and response fencing failures.
+
+Registration validates topic/partition metadata without creating user logs. A
+mixed-invalid partition request rejects all additions, reporting the invalid
+entries and OPERATION_NOT_ATTEMPTED for the others. Internal topics cannot be
+registered through AddPartitionsToTxn. Duplicate entries/retries retain the
+existing first offset, start time, pending offsets and producer retry history;
+unchanged snapshots append nothing. A new local participating partition captures
+its LEO under the partition write/leadership fences. Remote partitions retain -1
+because a follower's LEO cannot establish the transaction's first data offset.
+AddOffsetsToTxn records the group's offsets-source partition with -1 and never
+mutates its group cache or pending records. Empty/completed transactions start
+Ongoing; Prepare/dead or inconsistent completed snapshots cannot be overwritten.
+
+Committed publication changes only the transaction snapshot cache. Registration
+never invokes legacy live mutators, LSO tracking or marker completion. Remote
+partition-leader LSO recovery and pending offset completion remain prerequisites
+for public activation. An unreadable authoritative transaction prefix invalidates
+source admission until reopening, preventing subsequent cached acknowledgements.
+
+Serving integration still needs remaining read handlers and sweep migration,
+unkeyed producer admission, and group-owned pending-offset routing.
 Abrupt RF>1 client continuity and remote
 marker/LSO/EOS acceptance remain separate requirements before public activation.
 InitProducerId now propagates counter-write and directory-fsync failures before acknowledging an ID or creating a transaction;

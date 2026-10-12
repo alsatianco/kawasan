@@ -10,7 +10,8 @@ the membership/timeout state machine without exposing changes before commitment.
 Persistence staging now migrates group membership handlers and owned timeout
 jobs through those proposals and the deferred executor, along with offset
 commits/reads, exact deletions, owned retention cleanup and keyed producer
-initialization. Public runtime activation, remaining handler/background migration,
+initialization and transaction partition/offset participation. Public runtime
+activation, remaining handler/background migration,
 marker redrive and failover acceptance remain pending. No broker configuration enables either seam.
 
 M10 will make committed `__consumer_offsets` and `__transaction_state` log
@@ -145,6 +146,18 @@ Counter corruption/exhaustion refuses allocation instead of wrapping into a prio
 producer's range. An unchanged retry or protocol refusal is a fenced no-op; a
 valid retry changing timeout commits without another identity bump. Ongoing and
 Prepare transactions remain unchanged and return CONCURRENT_TRANSACTIONS until
-idempotent marker completion exists. Unkeyed allocation, AddPartitionsToTxn/
-AddOffsetsToTxn, remaining reads/sweeps, pending routing and public activation are
-still unfinished. No public format gate or API cap changed.
+idempotent marker completion exists. Unkeyed allocation, remaining reads/sweeps,
+pending routing and public activation are still unfinished. No public format
+gate or API cap changed.
+
+The registration checkpoint migrates AddPartitionsToTxn/AddOffsetsToTxn onto the
+same original-epoch deferred execution and full-snapshot CAS. Duplicate/retried
+partitions preserve their first offsets and ongoing transaction clock; complete
+producer/retry identity and pending offsets survive publication. Validate all
+partition metadata without creating logs; reject mixed-invalid user additions
+and refuse direct registration of internal topics. Local first offsets use the
+partition write/leadership fences; remote offsets remain unresolved (-1), never
+borrowed from a follower's LEO. AddOffsets records participation only and cannot
+write group-owned pending offsets. Cache publication is separate from LSO and
+marker effects; EndTxn, Prepare redrive and public activation remain gated.
+Unreadable authoritative prefixes invalidate source admission until reopening.

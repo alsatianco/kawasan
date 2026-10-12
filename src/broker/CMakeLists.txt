@@ -11,6 +11,7 @@ add_library(kawasan_broker OBJECT
     coordinator_persistence.cpp
     coordinator_offsets.cpp
     coordinator_producers.cpp
+    coordinator_transactions.cpp
     metadata_store.cpp
     metadata_controller.cpp
     group_state_manager.cpp

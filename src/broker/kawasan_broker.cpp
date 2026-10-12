@@ -1806,8 +1806,28 @@ void KawasanBroker::registerProtocolHandlers() {
                                                errors);
             };
         }
+        const bool staged_registration =
+            staged_coordinator_persistence_ && (key == protocol::ApiKey::ADD_PARTITIONS_TO_TXN ||
+                                                key == protocol::ApiKey::ADD_OFFSETS_TO_TXN);
+        if (staged_registration) {
+            handler = [this, key, work = std::move(handler), errors](Context& context) {
+                Buffer payload = context.payload;
+                std::string id;
+                if (key == protocol::ApiKey::ADD_PARTITIONS_TO_TXN) {
+                    protocol::AddPartitionsToTxnRequest request;
+                    request.decode(payload, context.header.apiVersion());
+                    id = request.transactionalId();
+                } else {
+                    protocol::AddOffsetsToTxnRequest request;
+                    request.decode(payload, context.header.apiVersion());
+                    id = request.transactionalId();
+                }
+                return deferCoordinatorRequest(context, id, protocol::CoordinatorType::TRANSACTION,
+                                               work, errors);
+            };
+        }
         if (staged_coordinator_format_ && !staged_membership && !staged_offsets &&
-            !staged_producer) {
+            !staged_producer && !staged_registration) {
             // Staged acquisition must never reach legacy writes, cleanup or
             // marker completion. Version-specific builders retain wire shape.
             switch (key) {
@@ -2096,6 +2116,9 @@ void KawasanBroker::registerProtocolHandlers() {
                     return encodeResponse(ctx,
                                           [&](Buffer& buffer) { response.encode(buffer, ver); });
                 }
+                if (k == protocol::ApiKey::ADD_PARTITIONS_TO_TXN ||
+                    k == protocol::ApiKey::ADD_OFFSETS_TO_TXN)
+                    return buildTransactionRegistrationError(ctx, code, ver);
                 if (k == protocol::ApiKey::DELETE_GROUPS)
                     return buildDeleteGroupsError(ctx, code, ver);
                 if (k == protocol::ApiKey::OFFSET_DELETE)
@@ -6231,6 +6254,8 @@ Buffer KawasanBroker::handleSaslAuthenticate(RequestDispatcher::RequestContext& 
 Buffer KawasanBroker::handleAddPartitionsToTxn(RequestDispatcher::RequestContext& context) {
     protocol::AddPartitionsToTxnRequest req;
     req.decode(context.payload, context.header.apiVersion());
+    if (staged_coordinator_persistence_)
+        return handleCoordinatorAddPartitions(context, req);
     Logger::info("AddPartitionsToTxn: transactional_id='{}' pid={} epoch={} {} topics",
                  req.transactionalId(), req.producerId(), req.producerEpoch(), req.topics().size());
     // M2: fence a zombie producer whose epoch is older than the current one.
@@ -6308,6 +6333,8 @@ Buffer KawasanBroker::handleAddPartitionsToTxn(RequestDispatcher::RequestContext
 Buffer KawasanBroker::handleAddOffsetsToTxn(RequestDispatcher::RequestContext& context) {
     protocol::AddOffsetsToTxnRequest req;
     req.decode(context.payload, context.header.apiVersion());
+    if (staged_coordinator_persistence_)
+        return handleCoordinatorAddOffsets(context, req);
     Logger::info("AddOffsetsToTxn: txn='{}' group='{}' pid={} epoch={}", req.transactionalId(),
                  req.groupId(), req.producerId(), req.producerEpoch());
 

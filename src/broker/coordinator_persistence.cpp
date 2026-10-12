@@ -488,7 +488,18 @@ ErrorCode KawasanBroker::mutateCoordinatorTransaction(
             (void)TransactionStateManager::deserialize(*record.value);
         }
         // Build the complete replacement without changing the live cache.
-        auto image = transaction_state_manager_->loadCommittedPartition(tp.partition);
+        std::vector<TransactionCoordinator::TxnSnapshot> image;
+        try {
+            image = transaction_state_manager_->loadCommittedPartition(tp.partition);
+        } catch (...) {
+            // An unreadable authoritative prefix cannot remain a serving cache.
+            // Require source reopen, as for an uncertain failed append; a later
+            // no-op retry must not acknowledge an identity from a broken source.
+            std::lock_guard<std::mutex> lock(coordinator_acquisition_mutex_);
+            acquired_coordinator_epochs_.erase(tp);
+            failed_coordinator_appends_.insert(tp);
+            throw;
+        }
         std::erase_if(image, [&](const auto& snapshot) {
             return snapshot.transactional_id == transactional_id;
         });

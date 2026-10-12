@@ -8,6 +8,21 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-13
 
+- Migrate persistence-staged AddPartitionsToTxn and AddOffsetsToTxn to deferred
+  original-epoch admission and committed full-snapshot CAS. Preserve existing
+  first offsets, producer retry history, pending offsets and ongoing start times;
+  propagate ISR, WAL write/fsync and checkpoint failures through Kafka-shaped
+  error responses. Unknown partitions cannot create logs, mixed-invalid requests
+  reject all additions, and Prepare transactions remain fenced from new additions.
+- Separate transaction participation publication from local/remote LSO effects
+  and group-owned pending offsets. Remote first offsets remain unresolved until
+  partition-leader tracking exists. Invalidate unreadable authoritative transaction
+  sources before cached retries can be acknowledged. Public activation, remaining
+  read/timeout paths and remote marker/EOS acceptance remain gated.
+
+- Keep the Docker SIGKILL durability check's exact offset/value assertions while
+  polling within the restart recovery deadline. A listening broker with partitions
+  still recovering must not be mistaken for an empty recovered log.
 - Migrate keyed InitProducerId in persistence staging to deferred original-epoch
   admission and full-snapshot transaction CAS. Persist KIP-360 retry history in
   transaction snapshot v3, rotate IDs before epoch overflow, and return committed

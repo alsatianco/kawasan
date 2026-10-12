@@ -25,6 +25,10 @@ public:
     int64_t producerId() const { return producer_id_; }
     int16_t producerEpoch() const { return producer_epoch_; }
     const std::vector<PartitionList>& topics() const { return topics_; }
+    void setTransactionalId(std::string id) { transactional_id_ = std::move(id); }
+    void setProducerId(int64_t id) { producer_id_ = id; }
+    void setProducerEpoch(int16_t epoch) { producer_epoch_ = epoch; }
+    void addTopic(PartitionList topic) { topics_.push_back(std::move(topic)); }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
 
@@ -45,6 +49,7 @@ public:
         std::string topic;
         std::vector<PartitionResult> partitions;
     };
+    const std::vector<TopicResult>& topics() const { return topics_; }
     void setThrottleTimeMs(int32_t v) { throttle_time_ms_ = v; }
     void addTopic(TopicResult t) { topics_.push_back(std::move(t)); }
     void encode(Buffer& buf, int16_t v) const;
@@ -62,6 +67,10 @@ public:
     int64_t producerId() const { return producer_id_; }
     int16_t producerEpoch() const { return producer_epoch_; }
     const std::string& groupId() const { return group_id_; }
+    void setTransactionalId(std::string id) { transactional_id_ = std::move(id); }
+    void setProducerId(int64_t id) { producer_id_ = id; }
+    void setProducerEpoch(int16_t epoch) { producer_epoch_ = epoch; }
+    void setGroupId(std::string group) { group_id_ = std::move(group); }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
 
@@ -74,6 +83,7 @@ private:
 
 class AddOffsetsToTxnResponse {
 public:
+    ErrorCode errorCode() const { return error_code_; }
     void setThrottleTimeMs(int32_t v) { throttle_time_ms_ = v; }
     void setErrorCode(ErrorCode v) { error_code_ = v; }
     void encode(Buffer& buf, int16_t v) const;

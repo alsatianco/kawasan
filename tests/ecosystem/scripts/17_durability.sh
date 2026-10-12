@@ -31,7 +31,7 @@ deadline = time.monotonic() + 90
 while True:
     try:
         c = KafkaConsumer(bootstrap_servers='localhost:9092', group_id=None,
-                          enable_auto_commit=False, consumer_timeout_ms=10000,
+                          enable_auto_commit=False,
                           isolation_level='read_committed')
         break
     except Exception:
@@ -39,8 +39,20 @@ while True:
         time.sleep(1)
 c.assign([TopicPartition(os.environ['TOPIC'], 0)])
 c.seek_to_beginning()
-got = {m.offset: m.value.decode() for m in c}
-c.close()
+# A listening broker can still be recovering partition leadership/HW. An
+# empty fetch is not end-of-log evidence after SIGKILL; retain the same exact
+# offset/value gate and poll within the restart recovery deadline.
+got = {}
+try:
+    while time.monotonic() < deadline and not acked.keys() <= got.keys():
+        for records in c.poll(timeout_ms=1000).values():
+            for m in records:
+                value = m.value.decode()
+                if m.offset in acked:
+                    assert value == acked[m.offset], (m.offset, acked[m.offset], value)
+                got[m.offset] = value
+finally:
+    c.close()
 assert all(got.get(o) == v for o, v in acked.items()), (acked, got)
 print('PASS: every acknowledged record survived SIGKILL at its exact offset')
 PY

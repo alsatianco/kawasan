@@ -36,6 +36,7 @@
 #include "kawasan/protocol/api_versions.h"
 #include "kawasan/protocol/find_coordinator_request.h"
 #include "kawasan/protocol/init_producer_id_request.h"
+#include "kawasan/protocol/txn_request.h"
 #include "kawasan/raft/raft_node.h"
 #include "kawasan/storage/log_manager.h"
 
@@ -402,6 +403,15 @@ private:
     ErrorCode validateProducerInitialization(const protocol::InitProducerIdRequest& request) const;
     Buffer handleCoordinatorProducerInitialization(RequestDispatcher::RequestContext& context,
                                                    const protocol::InitProducerIdRequest& request);
+    Buffer handleCoordinatorAddPartitions(RequestDispatcher::RequestContext& context,
+                                          const protocol::AddPartitionsToTxnRequest& request);
+    Buffer handleCoordinatorAddOffsets(RequestDispatcher::RequestContext& context,
+                                       const protocol::AddOffsetsToTxnRequest& request);
+    ErrorCode registerCoordinatorTransactionPartitions(
+        const std::string& id, int64_t producer_id, int16_t producer_epoch,
+        const std::vector<TopicPartition>& partitions, bool capture_first_offsets);
+    Buffer buildTransactionRegistrationError(const RequestDispatcher::RequestContext& context,
+                                             ErrorCode code, int16_t response_version) const;
     Buffer buildInitProducerIdError(const RequestDispatcher::RequestContext& context,
                                     ErrorCode code, int16_t response_version) const;
     int64_t allocateNextProducerId();

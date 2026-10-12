@@ -74,7 +74,9 @@ public:
     /// startup replay can re-register the in-flight txn in the
     /// IsolationTracker at the same offset. `first_offset < 0` means "no
     /// LSO hold for this partition" (e.g. the __consumer_offsets partition
-    /// added by AddOffsetsToTxn, which still gets a control marker).
+    /// added by AddOffsetsToTxn, which still gets a control marker). Staged
+    /// remote user partitions also use -1 until partition-leader LSO tracking
+    /// supplies their first data offsets; public staged EOS stays gated.
     struct TxnPartition {
         std::string topic;
         int32_t partition = 0;
