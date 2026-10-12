@@ -161,6 +161,7 @@ public:
     Metrics getMetrics() const;
     // Staged scheduler only: inspect deadlines without mutating the live cache.
     std::vector<std::string> timeoutCandidates() const;
+    std::vector<std::string> retentionCandidates() const;
 
 private:
     friend struct CoordinatorAcquisitionProbe;
@@ -347,6 +348,9 @@ public:
     ErrorCode handleHeartbeat(const protocol::HeartbeatRequest& request);
     ErrorCode handleLeaveGroup(const std::string& member_id);
     void checkTimeouts();
+    // Validate and update only the detached group activity/heartbeat. Offsets
+    // are supplied to the source writer alongside record() by the broker.
+    ErrorCode prepareOffsetCommit(const protocol::OffsetCommitRequest& request);
     std::optional<GroupRecord> record() const;
 
 private:

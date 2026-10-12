@@ -403,6 +403,29 @@ ErrorCode MetadataStore::withPartitionLeadership(
     return action(*partition);
 }
 
+void MetadataStore::withPartitionLeaderships(
+    const std::vector<std::pair<TopicPartition, int32_t>>& sources, BrokerId owner,
+    const std::function<void(const std::vector<ErrorCode>&)>& action) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<ErrorCode> statuses;
+    for (const auto& [tp, epoch] : sources) {
+        auto status = ErrorCode::COORDINATOR_LOAD_IN_PROGRESS;
+        const auto topic = topics_.find(tp.topic);
+        if (topic != topics_.end()) {
+            for (const auto& partition : topic->second.metadata.partitions) {
+                if (partition.partition == tp.partition) {
+                    status = partition.leader == owner && partition.leader_epoch == epoch
+                                 ? ErrorCode::NONE
+                                 : ErrorCode::NOT_COORDINATOR;
+                    break;
+                }
+            }
+        }
+        statuses.push_back(status);
+    }
+    action(statuses);
+}
+
 TopicOperationResult MetadataStore::applyCreate(const TopicSpecification& spec) {
     std::lock_guard<std::mutex> lock(mutex_);
     const bool coordinator_topic =

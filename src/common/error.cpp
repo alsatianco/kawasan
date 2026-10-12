@@ -170,6 +170,8 @@ std::string KawasanException::toString(ErrorCode code) {
             return "Group max size reached";
         case ErrorCode::FENCED_INSTANCE_ID:
             return "Fenced instance ID";
+        case ErrorCode::GROUP_SUBSCRIBED_TO_TOPIC:
+            return "Group is subscribed to topic";
         case ErrorCode::UNSTABLE_OFFSET_COMMIT:
             return "Unstable offset commit";
         case ErrorCode::UNKNOWN_TOPIC_ID:

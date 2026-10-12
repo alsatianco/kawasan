@@ -220,6 +220,7 @@ public:
     };
     void setThrottleTimeMs(int32_t v) { throttle_time_ms_ = v; }
     void addResult(Result r) { results_.push_back(std::move(r)); }
+    const std::vector<Result>& results() const { return results_; }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
 
@@ -259,6 +260,8 @@ public:
         std::vector<PartitionResult> partitions;
     };
     void setErrorCode(ErrorCode v) { error_code_ = v; }
+    ErrorCode errorCode() const { return error_code_; }
+    const std::vector<TopicResult>& topics() const { return topics_; }
     void setThrottleTimeMs(int32_t v) { throttle_time_ms_ = v; }
     void addTopic(TopicResult t) { topics_.push_back(std::move(t)); }
     void encode(Buffer& buf, int16_t v) const;

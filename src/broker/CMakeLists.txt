@@ -9,6 +9,7 @@ add_library(kawasan_broker OBJECT
     coordinator_format.cpp
     coordinator_executor.cpp
     coordinator_persistence.cpp
+    coordinator_offsets.cpp
     metadata_store.cpp
     metadata_controller.cpp
     group_state_manager.cpp

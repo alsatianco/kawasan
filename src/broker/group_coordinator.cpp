@@ -1,6 +1,7 @@
 #include "kawasan/broker/group_coordinator.h"
 
 #include <algorithm>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -235,6 +236,32 @@ ErrorCode GroupCoordinator::GroupProposal::handleHeartbeat(
 ErrorCode GroupCoordinator::GroupProposal::handleLeaveGroup(const std::string& member_id) {
     requireGroup(group_id_);
     return draft_->handleLeaveGroup(group_id_, member_id);
+}
+
+ErrorCode GroupCoordinator::GroupProposal::prepareOffsetCommit(
+    const protocol::OffsetCommitRequest& request) {
+    requireGroup(request.groupId());
+    auto* group = draft_->findGroup(group_id_);
+    if (group && group->kind == GroupStateKind::Dead)
+        return ErrorCode::COORDINATOR_NOT_AVAILABLE;
+    if (request.generationId() < 0 && (!group || group->kind == GroupStateKind::Empty)) {
+        if (!group)
+            group = &draft_->groups_[group_id_];
+    } else {
+        if (!group)
+            return ErrorCode::ILLEGAL_GENERATION;
+        if (request.generationId() < 0)
+            return ErrorCode::UNKNOWN_MEMBER_ID;
+        const auto error = draft_->validateTxnOffsetCommit(
+            group_id_, request.generationId(), request.memberId(), request.groupInstanceId());
+        if (error != ErrorCode::NONE)
+            return error;
+        if (group->kind == GroupStateKind::CompletingRebalance)
+            return ErrorCode::REBALANCE_IN_PROGRESS;
+        group->members.at(request.memberId()).last_heartbeat = std::chrono::steady_clock::now();
+    }
+    group->last_activity = std::chrono::system_clock::now();
+    return ErrorCode::NONE;
 }
 
 void GroupCoordinator::GroupProposal::checkTimeouts() {
@@ -1343,5 +1370,16 @@ std::vector<std::string> GroupCoordinator::timeoutCandidates() const {
             result.push_back(id);
     }
     return result;
+}
+std::vector<std::string> GroupCoordinator::retentionCandidates() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::set<std::string> ids;
+    for (const auto& [id, group] : groups_)
+        if (group.members.empty())
+            ids.insert(id);
+    for (const auto& id : offset_manager_->listGroups())
+        if (!groups_.contains(id))
+            ids.insert(id);
+    return {ids.begin(), ids.end()};
 }
 }  // namespace kawasan::broker

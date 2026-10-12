@@ -40,6 +40,12 @@ public:
         const TopicPartition& tp, BrokerId owner, int32_t epoch,
         const std::function<ErrorCode(const PartitionMetadata&)>& action);
 
+    // Fence several response sources under one metadata lock. Report each
+    // source independently; the continuation must not reenter metadata.
+    void withPartitionLeaderships(const std::vector<std::pair<TopicPartition, int32_t>>& sources,
+                                  BrokerId owner,
+                                  const std::function<void(const std::vector<ErrorCode>&)>& action);
+
     /// @brief Loads metadata from disk (creates empty store if missing).
     void load();
 

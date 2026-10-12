@@ -841,8 +841,10 @@ void KawasanBroker::start() {
     // cluster it retries until a controller is elected and the topics exist.
     bootstrap_stop_.store(false);
     bootstrap_thread_ = std::thread(&KawasanBroker::controllerBootstrapLoop, this);
-    if (staged_coordinator_persistence_)
+    if (staged_coordinator_persistence_) {
+        coordinator_retention_scan_ = std::chrono::steady_clock::now();
         coordinator_timeout_thread_ = std::thread(&KawasanBroker::coordinatorTimeoutLoop, this);
+    }
 
     // 0A.11: Mark the broker as healthy and ready for serving traffic.
     // Probes against /readiness and /liveness previously returned 503 forever
@@ -1708,6 +1710,31 @@ void KawasanBroker::registerProtocolHandlers() {
             api->max_version > codec_max) {
             throw std::logic_error("advertised API range exceeds registered codec range");
         }
+        const bool staged_offsets =
+            staged_coordinator_persistence_ &&
+            (key == protocol::ApiKey::OFFSET_COMMIT || key == protocol::ApiKey::OFFSET_FETCH ||
+             key == protocol::ApiKey::OFFSET_DELETE || key == protocol::ApiKey::DELETE_GROUPS);
+        if (staged_offsets) {
+            handler = [this, key, work = std::move(handler), errors](Context& context) {
+                if (key == protocol::ApiKey::OFFSET_FETCH)
+                    return deferCoordinatorOffsetFetch(context, work, errors);
+                if (key == protocol::ApiKey::DELETE_GROUPS)
+                    return deferCoordinatorDeleteGroups(context, work, errors);
+                Buffer input = context.payload;
+                std::string group;
+                if (key == protocol::ApiKey::OFFSET_COMMIT) {
+                    protocol::OffsetCommitRequest request;
+                    request.decode(input, context.header.apiVersion());
+                    group = request.groupId();
+                } else {
+                    protocol::OffsetDeleteRequest request;
+                    request.decode(input, context.header.apiVersion());
+                    group = request.groupId();
+                }
+                return deferCoordinatorRequest(context, group, protocol::CoordinatorType::GROUP,
+                                               work, errors);
+            };
+        }
         const bool staged_membership =
             staged_coordinator_persistence_ &&
             (key == protocol::ApiKey::JOIN_GROUP || key == protocol::ApiKey::SYNC_GROUP ||
@@ -1749,7 +1776,7 @@ void KawasanBroker::registerProtocolHandlers() {
                                                work, errors);
             };
         }
-        if (staged_coordinator_format_ && !staged_membership) {
+        if (staged_coordinator_format_ && !staged_membership && !staged_offsets) {
             // Staged acquisition must never reach legacy writes, cleanup or
             // marker completion. Version-specific builders retain wire shape.
             switch (key) {
@@ -2038,6 +2065,10 @@ void KawasanBroker::registerProtocolHandlers() {
                     return encodeResponse(ctx,
                                           [&](Buffer& buffer) { response.encode(buffer, ver); });
                 }
+                if (k == protocol::ApiKey::DELETE_GROUPS)
+                    return buildDeleteGroupsError(ctx, code, ver);
+                if (k == protocol::ApiKey::OFFSET_DELETE)
+                    return buildOffsetDeleteError(ctx, code, ver);
                 if (k == protocol::ApiKey::DELETE_RECORDS) {
                     protocol::DeleteRecordsResponse response;
                     try {
@@ -3941,6 +3972,59 @@ Buffer KawasanBroker::buildLeaveGroupError(const RequestDispatcher::RequestConte
 Buffer KawasanBroker::handleOffsetCommit(RequestDispatcher::RequestContext& context) {
     protocol::OffsetCommitRequest request;
     request.decode(context.payload, context.header.apiVersion());
+    if (staged_coordinator_persistence_) {
+        ErrorCode protocol_error = ErrorCode::NONE;
+        std::unique_ptr<GroupCoordinator::GroupProposal> proposal;
+        const auto durable = mutateCoordinatorGroupImpl(
+            request.groupId(),
+            [&](const auto& current, auto& changes) {
+                std::optional<GroupRecord> committed;
+                for (const auto& record : current)
+                    if (record.key.kind == GroupRecordKey::Kind::Group)
+                        committed = record;
+                proposal = group_coordinator_->proposeGroup(request.groupId(), committed);
+                protocol_error = proposal->prepareOffsetCommit(request);
+                if (protocol_error != ErrorCode::NONE)
+                    return ErrorCode::NONE;
+                const auto now = proposal->record()->group.last_update_timestamp;
+                std::map<GroupRecordKey, GroupRecord> offsets;
+                for (const auto& topic : request.topics()) {
+                    for (const auto& partition : topic.partitions) {
+                        if (topic.topic.empty() || partition.partition < 0 ||
+                            partition.offset < 0 || partition.committed_leader_epoch < -1) {
+                            protocol_error = ErrorCode::INVALID_REQUEST;
+                            return ErrorCode::NONE;
+                        }
+                        GroupRecord record;
+                        record.key.kind = GroupRecordKey::Kind::Offset;
+                        record.key.group_id = request.groupId();
+                        record.key.topic = topic.topic;
+                        record.key.partition = partition.partition;
+                        const auto retention = request.retentionTimeMs();
+                        if (retention > std::numeric_limits<int64_t>::max() - now) {
+                            protocol_error = ErrorCode::INVALID_REQUEST;
+                            return ErrorCode::NONE;
+                        }
+                        record.offset = {partition.offset, partition.metadata, now,
+                                         retention >= 0 ? now + retention : int64_t{-1},
+                                         partition.committed_leader_epoch};
+                        offsets[record.key] = std::move(record);
+                    }
+                }
+                if (!offsets.empty()) {
+                    changes.push_back(*proposal->record());
+                    for (const auto& [key, record] : offsets) {
+                        (void)key;
+                        changes.push_back(record);
+                    }
+                }
+                return ErrorCode::NONE;
+            },
+            std::chrono::seconds(5), &proposal);
+        if (durable != ErrorCode::NONE)
+            throw KawasanException(durable);
+        return buildOffsetCommitError(context, protocol_error, context.header.apiVersion());
+    }
     if (!isCoordinatorFor(request.groupId(), protocol::CoordinatorType::GROUP)) {
         protocol::OffsetCommitResponse response;
         std::vector<protocol::OffsetCommitResponse::Topic> topics;
@@ -4019,13 +4103,24 @@ Buffer KawasanBroker::handleOffsetCommit(RequestDispatcher::RequestContext& cont
 Buffer KawasanBroker::buildOffsetCommitError(const RequestDispatcher::RequestContext& context,
                                              ErrorCode code, int16_t response_version) const {
     protocol::OffsetCommitResponse response;
-    protocol::OffsetCommitResponse::Partition partition;
-    partition.error = code;
-    protocol::OffsetCommitResponse::Topic topic;
-    topic.partitions.push_back(partition);
-    response.setTopics({topic});
-
     const int16_t version = std::clamp<int16_t>(response_version, 0, kOffsetCommitMaxVersion);
+    std::vector<protocol::OffsetCommitResponse::Topic> topics;
+    try {
+        Buffer input = context.payload;
+        input.setPosition(context.payload_start);
+        protocol::OffsetCommitRequest request;
+        request.decode(input, version);
+        for (const auto& requested : request.topics()) {
+            protocol::OffsetCommitResponse::Topic topic;
+            topic.topic = requested.topic;
+            for (const auto& partition : requested.partitions)
+                topic.partitions.push_back({partition.partition, code});
+            topics.push_back(std::move(topic));
+        }
+    } catch (const std::exception&) {
+        topics.push_back({"__kawasan_error__", {{-1, code}}});
+    }
+    response.setTopics(topics);
     return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
@@ -4034,19 +4129,43 @@ Buffer KawasanBroker::handleOffsetFetch(RequestDispatcher::RequestContext& conte
     request.decode(context.payload, context.header.apiVersion());
 
     auto fetch_owned = [&](const protocol::OffsetFetchRequest& req, ErrorCode& error) {
-        if (isCoordinatorFor(req.groupId(), protocol::CoordinatorType::GROUP)) {
+        // Staged read work already runs inside the admitted ownership fence;
+        // it must not reenter metadata here.
+        if (staged_coordinator_persistence_ ||
+            isCoordinatorFor(req.groupId(), protocol::CoordinatorType::GROUP)) {
             // Capture pending transactions before reading the committed cache.
             // Resolved transactions clear this list only after applying offsets.
             std::set<std::pair<std::string, int32_t>> pending;
             if (req.requireStable()) {
-                for (const auto& txn : transaction_coordinator_->list({}, {})) {
-                    for (const auto& offset : txn.pending_offsets) {
-                        if (offset.group_id == req.groupId())
-                            pending.emplace(offset.topic, offset.partition);
+                if (staged_coordinator_persistence_) {
+                    for (const auto& offset : group_coordinator_->pendingCoordinatorOffsets())
+                        if (offset.key.group_id == req.groupId())
+                            pending.emplace(offset.key.topic, offset.key.partition);
+                } else
+                    for (const auto& txn : transaction_coordinator_->list({}, {})) {
+                        for (const auto& offset : txn.pending_offsets) {
+                            if (offset.group_id == req.groupId())
+                                pending.emplace(offset.topic, offset.partition);
+                        }
+                    }
+            }
+            auto topics = group_coordinator_->handleOffsetFetch(req, error);
+            if (staged_coordinator_persistence_ && req.fetchAllTopics()) {
+                for (const auto& [name, partition_id] : pending) {
+                    auto topic = std::find_if(topics.begin(), topics.end(),
+                                              [&](const auto& t) { return t.topic == name; });
+                    if (topic == topics.end()) {
+                        topics.push_back({name, {}});
+                        topic = std::prev(topics.end());
+                    }
+                    if (std::none_of(topic->partitions.begin(), topic->partitions.end(),
+                                     [&](const auto& p) { return p.partition == partition_id; })) {
+                        protocol::OffsetFetchResponse::Partition partition;
+                        partition.partition = partition_id;
+                        topic->partitions.push_back(std::move(partition));
                     }
                 }
             }
-            auto topics = group_coordinator_->handleOffsetFetch(req, error);
             for (auto& topic : topics) {
                 for (auto& partition : topic.partitions) {
                     if (pending.count({topic.topic, partition.partition})) {
@@ -4150,11 +4269,30 @@ Buffer KawasanBroker::buildOffsetFetchError(const RequestDispatcher::RequestCont
             response.addGroup({"__kawasan_error__", {}, code});
         }
     } else {
-        protocol::OffsetFetchResponse::Partition partition;
-        partition.error = code;
-        protocol::OffsetFetchResponse::Topic topic;
-        topic.partitions.push_back(partition);
-        response.setTopics({topic});
+        std::vector<protocol::OffsetFetchResponse::Topic> topics;
+        try {
+            Buffer input = context.payload;
+            input.setPosition(context.payload_start);
+            protocol::OffsetFetchRequest request;
+            request.decode(input, version);
+            for (const auto& requested : request.topics()) {
+                protocol::OffsetFetchResponse::Topic topic;
+                topic.topic = requested.topic;
+                for (const auto& p : requested.partitions) {
+                    protocol::OffsetFetchResponse::Partition partition;
+                    partition.partition = p.partition;
+                    partition.error = code;
+                    topic.partitions.push_back(std::move(partition));
+                }
+                topics.push_back(std::move(topic));
+            }
+        } catch (const std::exception&) {
+            protocol::OffsetFetchResponse::Partition partition;
+            partition.partition = -1;
+            partition.error = code;
+            topics.push_back({"__kawasan_error__", {partition}});
+        }
+        response.setTopics(topics);
     }
     return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
@@ -5268,6 +5406,28 @@ Buffer KawasanBroker::handleDeleteGroups(RequestDispatcher::RequestContext& cont
     for (const auto& g : request.groups()) {
         protocol::DeleteGroupsResponse::Result r;
         r.group_id = g;
+        if (staged_coordinator_persistence_) {
+            r.error_code = mutateCoordinatorGroup(g, [](const auto& current, auto& changes) {
+                if (current.empty())
+                    return ErrorCode::GROUP_ID_NOT_FOUND;
+                for (const auto& record : current) {
+                    if (record.key.kind == GroupRecordKey::Kind::Group &&
+                        !record.group.members.empty())
+                        return ErrorCode::NON_EMPTY_GROUP;
+                }
+                for (const auto& record : current) {
+                    auto tombstone = record;
+                    tombstone.tombstone = true;
+                    changes.push_back(std::move(tombstone));
+                }
+                return ErrorCode::NONE;
+            });
+            if (r.error_code != ErrorCode::NONE && r.error_code != ErrorCode::NON_EMPTY_GROUP &&
+                r.error_code != ErrorCode::GROUP_ID_NOT_FOUND)
+                throw KawasanException(r.error_code);
+            response.addResult(std::move(r));
+            continue;
+        }
         if (staged_coordinator_format_) {
             r.error_code = coordinatorLoadStatus(g, protocol::CoordinatorType::GROUP);
             if (r.error_code == ErrorCode::NONE)
@@ -5295,6 +5455,76 @@ Buffer KawasanBroker::handleOffsetDelete(RequestDispatcher::RequestContext& cont
     protocol::OffsetDeleteRequest request;
     request.decode(context.payload, context.header.apiVersion());
 
+    if (staged_coordinator_persistence_) {
+        std::set<std::string> subscribed;
+        const auto status = mutateCoordinatorGroup(request.groupId(), [&](const auto& current,
+                                                                          auto& changes) {
+            if (current.empty())
+                return ErrorCode::GROUP_ID_NOT_FOUND;
+            for (const auto& record : current) {
+                if (record.key.kind != GroupRecordKey::Kind::Group || record.group.members.empty())
+                    continue;
+                if (record.group.protocol_type != "consumer")
+                    return ErrorCode::NON_EMPTY_GROUP;
+                // Kafka consumer subscription metadata starts with version and
+                // topics. Other protocol bytes are opaque; malformed metadata
+                // cannot authorize deleting an active member's checkpoint.
+                try {
+                    for (const auto& member : record.group.members) {
+                        Buffer metadata(member.metadata);
+                        if (metadata.readInt16() < 0)
+                            return ErrorCode::NON_EMPTY_GROUP;
+                        const auto count = metadata.readArrayLength(false);
+                        if (count < 0)
+                            return ErrorCode::NON_EMPTY_GROUP;
+                        for (int32_t n = 0; n < count; ++n)
+                            subscribed.insert(metadata.readString());
+                    }
+                } catch (const std::exception&) {
+                    return ErrorCode::NON_EMPTY_GROUP;
+                }
+            }
+            std::map<GroupRecordKey, GroupRecord> tombstones;
+            for (const auto& topic : request.topics()) {
+                for (const auto& partition : topic.partitions) {
+                    if (topic.topic.empty() || partition.partition < 0)
+                        return ErrorCode::INVALID_REQUEST;
+                    if (subscribed.contains(topic.topic))
+                        continue;
+                    GroupRecord tombstone;
+                    tombstone.key.kind = GroupRecordKey::Kind::Offset;
+                    tombstone.key.group_id = request.groupId();
+                    tombstone.key.topic = topic.topic;
+                    tombstone.key.partition = partition.partition;
+                    tombstone.tombstone = true;
+                    tombstones[tombstone.key] = std::move(tombstone);
+                }
+            }
+            for (const auto& [key, tombstone] : tombstones) {
+                (void)key;
+                changes.push_back(tombstone);
+            }
+            return ErrorCode::NONE;
+        });
+        if (status != ErrorCode::NONE && status != ErrorCode::NON_EMPTY_GROUP &&
+            status != ErrorCode::GROUP_ID_NOT_FOUND && status != ErrorCode::INVALID_REQUEST)
+            throw KawasanException(status);
+        if (status != ErrorCode::NONE)
+            return buildOffsetDeleteError(context, status, context.header.apiVersion());
+        protocol::OffsetDeleteResponse response;
+        for (const auto& topic : request.topics()) {
+            protocol::OffsetDeleteResponse::TopicResult result;
+            result.topic = topic.topic;
+            for (const auto& partition : topic.partitions)
+                result.partitions.push_back(
+                    {partition.partition, subscribed.contains(topic.topic)
+                                              ? ErrorCode::GROUP_SUBSCRIBED_TO_TOPIC
+                                              : ErrorCode::NONE});
+            response.addTopic(std::move(result));
+        }
+        return encodeResponse(
+            context, [&](Buffer& buffer) { response.encode(buffer, context.header.apiVersion()); });
+    }
     protocol::OffsetDeleteResponse response;
     response.setErrorCode(ErrorCode::NONE);
     if (staged_coordinator_format_) {
@@ -5334,6 +5564,44 @@ Buffer KawasanBroker::handleOffsetDelete(RequestDispatcher::RequestContext& cont
                  request.topics().size());
     return encodeResponse(
         context, [&](Buffer& buffer) { response.encode(buffer, context.header.apiVersion()); });
+}
+
+Buffer KawasanBroker::buildDeleteGroupsError(const RequestDispatcher::RequestContext& context,
+                                             ErrorCode code, int16_t version) const {
+    protocol::DeleteGroupsResponse response;
+    try {
+        Buffer input = context.payload;
+        input.setPosition(context.payload_start);
+        protocol::DeleteGroupsRequest request;
+        request.decode(input, version);
+        for (const auto& group : request.groups())
+            response.addResult({group, code});
+    } catch (const std::exception&) {
+        response.addResult({"__kawasan_error__", code});
+    }
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
+}
+
+Buffer KawasanBroker::buildOffsetDeleteError(const RequestDispatcher::RequestContext& context,
+                                             ErrorCode code, int16_t version) const {
+    protocol::OffsetDeleteResponse response;
+    response.setErrorCode(code);
+    try {
+        Buffer input = context.payload;
+        input.setPosition(context.payload_start);
+        protocol::OffsetDeleteRequest request;
+        request.decode(input, version);
+        for (const auto& topic : request.topics()) {
+            protocol::OffsetDeleteResponse::TopicResult result;
+            result.topic = topic.topic;
+            for (const auto& partition : topic.partitions)
+                result.partitions.push_back({partition.partition, code});
+            response.addTopic(std::move(result));
+        }
+    } catch (const std::exception&) {
+        response.addTopic({"__kawasan_error__", {{-1, code}}});
+    }
+    return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
 Buffer KawasanBroker::handleCreatePartitions(RequestDispatcher::RequestContext& context) {

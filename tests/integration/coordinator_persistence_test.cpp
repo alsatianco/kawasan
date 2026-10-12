@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <thread>
 
 #include "../sparse_broker_test_client.h"
@@ -13,6 +14,7 @@
 #include "kawasan/broker/kawasan_broker.h"
 #include "kawasan/broker/transaction_state_manager.h"
 #include "kawasan/common/logger.h"
+#include "kawasan/protocol/admin_misc_requests.h"
 #include "kawasan/protocol/api_versions.h"
 #include "kawasan/protocol/leave_group_request.h"
 
@@ -69,6 +71,21 @@ struct CoordinatorExecutorProbe {
         return b.coordinator_executor_->submit(std::move(task));
     }
     static void scheduleTimeouts(KawasanBroker& b) { b.scheduleCoordinatorTimeouts(); }
+    static void scheduleRetention(KawasanBroker& b) { b.scheduleCoordinatorRetention(); }
+    static bool retentionPending(KawasanBroker& b, const std::string& id) {
+        std::lock_guard<std::mutex> lock(b.coordinator_timeout_mutex_);
+        return b.coordinator_retention_pending_.contains(id);
+    }
+    static RequestDispatcher::DispatchResult dispatchProtocol(
+        KawasanBroker& b, protocol::ApiKey api, int16_t version, Buffer payload,
+        std::function<void(RequestDispatcher::DispatchResult)> sink) {
+        RequestDispatcher::RequestContext context;
+        context.header = {api, version, 91, "offset-test"};
+        context.payload = std::move(payload);
+        context.deferred_sink = std::move(sink);
+        return b.request_dispatcher_->dispatch(std::move(context));
+    }
+
     static bool timeoutPending(KawasanBroker& b, const std::string& id) {
         std::lock_guard<std::mutex> lock(b.coordinator_timeout_mutex_);
         return b.coordinator_timeout_pending_.contains(id);
@@ -335,6 +352,632 @@ Response membershipWire(KawasanBroker& b, protocol::ApiKey api, const Request& r
     Response response;
     response.decode(body, version);
     return response;
+}
+
+protocol::OffsetCommitRequest offsetCommit(const std::string& id, int64_t offset = 123) {
+    protocol::OffsetCommitRequest request;
+    request.setGroupId(id);
+    request.setGenerationId(7);
+    request.setMemberId("member");
+    request.setGroupInstanceId("instance");
+    request.setTopics({{"data", {{0, offset, 9, -1, "wire-checkpoint"}}}});
+    return request;
+}
+
+Buffer deleteWire(KawasanBroker& b, protocol::ApiKey api, const std::string& id,
+                  const std::vector<std::string>& groups = {}) {
+    Buffer payload;
+    protocol::RequestHeader(api, 0, 92, "offset-test").encode(payload);
+    if (api == protocol::ApiKey::DELETE_GROUPS) {
+        payload.writeInt32(static_cast<int32_t>(groups.size()));
+        for (const auto& group : groups)
+            payload.writeString(group);
+    } else {
+        payload.writeString(id);
+        payload.writeInt32(1);
+        payload.writeString("data");
+        payload.writeInt32(1);
+        payload.writeInt32(0);
+    }
+    auto response = test_support::brokerRequest(b.port(), payload);
+    EXPECT_EQ(response.readInt32(), 92);
+    return response;
+}
+
+TEST_F(CoordinatorPersistenceTest, StagedOffsetWireCommitFetchAndExactDeletion) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    ASSERT_EQ(put(b, id, {groupRecord(id)}), ErrorCode::NONE);
+    const auto commit = membershipWire<protocol::OffsetCommitResponse>(
+        b, protocol::ApiKey::OFFSET_COMMIT, offsetCommit(id), 8);
+    ASSERT_EQ(commit.topics().size(), 1);
+    EXPECT_EQ(commit.topics()[0].topic, "data");
+    ASSERT_EQ(commit.topics()[0].partitions.size(), 1);
+    EXPECT_EQ(commit.topics()[0].partitions[0].error, ErrorCode::NONE);
+    protocol::OffsetFetchRequest fetch;
+    fetch.setRequireStable(true);
+    fetch.addGroup({id, std::nullopt, -1, true, {}});
+    const auto result =
+        membershipWire<protocol::OffsetFetchResponse>(b, protocol::ApiKey::OFFSET_FETCH, fetch, 9);
+    ASSERT_EQ(result.groups().size(), 1);
+    EXPECT_EQ(result.groups()[0].error_code, ErrorCode::NONE);
+    ASSERT_EQ(result.groups()[0].topics.size(), 1);
+    EXPECT_EQ(result.groups()[0].topics[0].partitions[0].offset, 123);
+    EXPECT_EQ(result.groups()[0].topics[0].partitions[0].committed_leader_epoch, 9);
+    auto empty = groupRecord(id);
+    empty.group.members.clear();
+    empty.group.leader_id.clear();
+    empty.group.state = 0;
+    auto pending = offsetRecord(id, 456);
+    pending.key.kind = GroupRecordKey::Kind::PendingOffset;
+    pending.key.transactional_id = "txn";
+    pending.key.producer_id = 75;
+    pending.key.producer_epoch = 2;
+    ASSERT_EQ(put(b, id, {empty, pending}), ErrorCode::NONE);
+    const auto unstable =
+        membershipWire<protocol::OffsetFetchResponse>(b, protocol::ApiKey::OFFSET_FETCH, fetch, 9);
+    ASSERT_EQ(unstable.groups()[0].topics.size(), 1);
+    EXPECT_EQ(unstable.groups()[0].topics[0].partitions[0].error,
+              ErrorCode::UNSTABLE_OFFSET_COMMIT);
+    auto deleted = deleteWire(b, protocol::ApiKey::OFFSET_DELETE, id);
+    EXPECT_EQ(static_cast<ErrorCode>(deleted.readInt16()), ErrorCode::NONE);
+    deleted.readInt32();
+    EXPECT_FALSE(CoordinatorPersistenceProbe::offsets(b).fetchOffset(id, "data", 0));
+    EXPECT_EQ(CoordinatorPersistenceProbe::groups(b).pendingCoordinatorOffsets().size(), 1);
+    auto all = deleteWire(b, protocol::ApiKey::DELETE_GROUPS, {}, {id});
+    all.readInt32();
+    ASSERT_EQ(all.readInt32(), 1);
+    EXPECT_EQ(all.readString(), id);
+    EXPECT_EQ(static_cast<ErrorCode>(all.readInt16()), ErrorCode::NONE);
+    EXPECT_TRUE(GroupStateManager(b.logManager(), 3).loadCommittedPartition(0).empty());
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, OffsetCheckpointFailurePreservesKeysAndLiveActivity) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    ASSERT_EQ(put(b, id, {groupRecord(id), offsetRecord(id)}), ErrorCode::NONE);
+    const auto before =
+        CoordinatorAcquisitionProbe::runtime(CoordinatorPersistenceProbe::groups(b), id);
+    fs::create_directory(dir / "0/__consumer_offsets-0/checkpoint.meta.tmp");
+    const auto commit = membershipWire<protocol::OffsetCommitResponse>(
+        b, protocol::ApiKey::OFFSET_COMMIT, offsetCommit(id), 8);
+    ASSERT_EQ(commit.topics().size(), 1);
+    EXPECT_EQ(commit.topics()[0].topic, "data");
+    EXPECT_EQ(commit.topics()[0].partitions[0].error, ErrorCode::KAFKA_STORAGE_ERROR);
+    EXPECT_EQ(CoordinatorPersistenceProbe::offsets(b).fetchOffset(id, "data", 0), 42);
+    EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(CoordinatorPersistenceProbe::groups(b), id),
+              before);
+    fs::remove(dir / "0/__consumer_offsets-0/checkpoint.meta.tmp");
+    b.stop();
+}
+
+GroupRecord emptyGroup(const std::string& id, int64_t timestamp = 123) {
+    auto group = groupRecord(id);
+    group.group.state = 0;
+    group.group.members.clear();
+    group.group.leader_id.clear();
+    group.group.last_update_timestamp = timestamp;
+    return group;
+}
+
+template <typename Response>
+Response publishProtocol(RequestDispatcher::DispatchResult& result, protocol::ApiKey api,
+                         int16_t version) {
+    auto frame = result.frame;
+    if (result.publication_guard)
+        result.publication_guard([&](auto status) {
+            if (status != ErrorCode::NONE)
+                frame = result.publication_error(status);
+        });
+    Buffer body(frame);
+    (void)body.readInt32();
+    protocol::ResponseHeader header;
+    header.setFlexible(
+        protocol::RequestHeader(api, version, 91, "offset-test").isFlexibleResponseHeader());
+    header.decode(body);
+    Response response;
+    response.decode(body, version);
+    EXPECT_EQ(body.remaining(), 0u);
+    return response;
+}
+
+TEST_F(CoordinatorPersistenceTest, OffsetProtocolValidationDoesNotMutateCommittedSource) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    ASSERT_EQ(put(b, id, {groupRecord(id), offsetRecord(id)}), ErrorCode::NONE);
+    const auto before =
+        CoordinatorAcquisitionProbe::runtime(CoordinatorPersistenceProbe::groups(b), id);
+    const auto end = b.logManager()->getLog("__consumer_offsets", 0)->logEndOffset();
+    auto request = offsetCommit(id);
+    request.setMemberId("old-member");
+    EXPECT_EQ(membershipWire<protocol::OffsetCommitResponse>(b, protocol::ApiKey::OFFSET_COMMIT,
+                                                             request, 8)
+                  .topics()[0]
+                  .partitions[0]
+                  .error,
+              ErrorCode::FENCED_INSTANCE_ID);
+    request = offsetCommit(id);
+    request.setGenerationId(6);
+    EXPECT_EQ(membershipWire<protocol::OffsetCommitResponse>(b, protocol::ApiKey::OFFSET_COMMIT,
+                                                             request, 8)
+                  .topics()[0]
+                  .partitions[0]
+                  .error,
+              ErrorCode::ILLEGAL_GENERATION);
+    request = offsetCommit(id);
+    request.setGenerationId(-1);
+    request.setMemberId("");
+    request.setGroupInstanceId(std::nullopt);
+    EXPECT_EQ(membershipWire<protocol::OffsetCommitResponse>(b, protocol::ApiKey::OFFSET_COMMIT,
+                                                             request, 8)
+                  .topics()[0]
+                  .partitions[0]
+                  .error,
+              ErrorCode::UNKNOWN_MEMBER_ID);
+    EXPECT_EQ(b.logManager()->getLog("__consumer_offsets", 0)->logEndOffset(), end);
+    EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(CoordinatorPersistenceProbe::groups(b), id),
+              before);
+    const auto manual = key(1);
+    request.setGroupId(manual);
+    EXPECT_EQ(membershipWire<protocol::OffsetCommitResponse>(b, protocol::ApiKey::OFFSET_COMMIT,
+                                                             request, 8)
+                  .topics()[0]
+                  .partitions[0]
+                  .error,
+              ErrorCode::NONE);
+    EXPECT_EQ(committedGroup(b, manual).state, 0);
+    EXPECT_EQ(CoordinatorPersistenceProbe::offsets(b).fetchOffset(manual, "data", 0), 123);
+    // v0 manual commits and legacy single-group reads retain their negotiated shape.
+    EXPECT_EQ(membershipWire<protocol::OffsetCommitResponse>(b, protocol::ApiKey::OFFSET_COMMIT,
+                                                             request, 0)
+                  .topics()[0]
+                  .partitions[0]
+                  .error,
+              ErrorCode::NONE);
+    protocol::OffsetFetchRequest fetch;
+    fetch.setGroupId(manual);
+    fetch.setTopics({{"data", {{0}, {1}}}});
+    const auto result =
+        membershipWire<protocol::OffsetFetchResponse>(b, protocol::ApiKey::OFFSET_FETCH, fetch, 0);
+    EXPECT_EQ(result.topics()[0].partitions[0].offset, 123);
+    EXPECT_EQ(result.topics()[0].partitions[1].offset, -1);
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, ActiveConsumerDeletionChecksSubscriptionsAndGroupIdentity) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    auto group = groupRecord(id);
+    Buffer subscription;
+    subscription.writeInt16(0);
+    subscription.writeInt32(1);
+    subscription.writeString("data");
+    subscription.writeInt32(-1);
+    group.group.members[0].metadata.assign(subscription.data(),
+                                           subscription.data() + subscription.size());
+    auto other = offsetRecord(id, 90);
+    other.key.topic = "old-topic";
+    ASSERT_EQ(put(b, id, {group, offsetRecord(id), other}), ErrorCode::NONE);
+    auto nonempty = deleteWire(b, protocol::ApiKey::DELETE_GROUPS, {}, {id});
+    nonempty.readInt32();
+    EXPECT_EQ(nonempty.readInt32(), 1);
+    EXPECT_EQ(nonempty.readString(), id);
+    EXPECT_EQ(static_cast<ErrorCode>(nonempty.readInt16()), ErrorCode::NON_EMPTY_GROUP);
+    Buffer body;
+    body.writeString(id);
+    body.writeInt32(2);
+    for (const auto& topic : {"data", "old-topic"}) {
+        body.writeString(topic);
+        body.writeInt32(1);
+        body.writeInt32(0);
+    }
+    std::promise<RequestDispatcher::DispatchResult> response;
+    EXPECT_TRUE(CoordinatorExecutorProbe::dispatchProtocol(
+                    b, protocol::ApiKey::OFFSET_DELETE, 0, body,
+                    [&](auto result) { response.set_value(std::move(result)); })
+                    .deferred);
+    auto future = response.get_future();
+    ASSERT_EQ(future.wait_for(5s), std::future_status::ready);
+    auto result = future.get();
+    const auto deleted =
+        publishProtocol<protocol::OffsetDeleteResponse>(result, protocol::ApiKey::OFFSET_DELETE, 0);
+    EXPECT_EQ(deleted.errorCode(), ErrorCode::NONE);
+    ASSERT_EQ(deleted.topics().size(), 2u);
+    EXPECT_EQ(deleted.topics()[0].partitions[0].error_code, ErrorCode::GROUP_SUBSCRIBED_TO_TOPIC);
+    EXPECT_EQ(deleted.topics()[1].partitions[0].error_code, ErrorCode::NONE);
+    EXPECT_EQ(CoordinatorPersistenceProbe::offsets(b).fetchOffset(id, "data", 0), 42);
+    EXPECT_FALSE(CoordinatorPersistenceProbe::offsets(b).fetchOffset(id, "old-topic", 0));
+    EXPECT_EQ(committedGroup(b, id), group.group);
+    result = {};
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, MultiGroupReadsFenceEachSourceThroughDelivery) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    for (int p : {0, 1})
+        ASSERT_EQ(put(b, key(p), {offsetRecord(key(p), 50 + p)}), ErrorCode::NONE);
+    protocol::OffsetFetchRequest request;
+    for (int p : {0, 1})
+        request.addGroup({key(p), std::nullopt, -1, true, {}});
+    request.addGroup({key(2), "modern-member", 3, true, {}});
+    Buffer payload;
+    request.encode(payload, 9);
+    std::promise<RequestDispatcher::DispatchResult> delivered;
+    EXPECT_TRUE(CoordinatorExecutorProbe::dispatchProtocol(
+                    b, protocol::ApiKey::OFFSET_FETCH, 9, payload,
+                    [&](auto result) { delivered.set_value(std::move(result)); })
+                    .deferred);
+    auto future = delivered.get_future();
+    ASSERT_EQ(future.wait_for(5s), std::future_status::ready);
+    auto result = future.get();
+    auto before =
+        publishProtocol<protocol::OffsetFetchResponse>(result, protocol::ApiKey::OFFSET_FETCH, 9);
+    ASSERT_EQ(before.groups().size(), 3u);
+    EXPECT_EQ(before.groups()[0].topics[0].partitions[0].offset, 50);
+    EXPECT_EQ(before.groups()[1].topics[0].partitions[0].offset, 51);
+    EXPECT_EQ(before.groups()[2].error_code, ErrorCode::UNSUPPORTED_VERSION);
+    // Same broker, newer epoch is a different admission, even after reacquisition.
+    ASSERT_EQ(b.metadataController()->updatePartitionLeader("__consumer_offsets", 0, 0).error_code,
+              ErrorCode::NONE);
+    b.reconcileReplicas();
+    b.acquireCoordinatorPartitions();
+    auto after =
+        publishProtocol<protocol::OffsetFetchResponse>(result, protocol::ApiKey::OFFSET_FETCH, 9);
+    EXPECT_EQ(after.groups()[0].error_code, ErrorCode::NOT_COORDINATOR);
+    EXPECT_TRUE(after.groups()[0].topics.empty());
+    EXPECT_EQ(after.groups()[1].error_code, ErrorCode::NONE);
+    EXPECT_EQ(after.groups()[1].topics[0].partitions[0].offset, 51);
+    EXPECT_EQ(after.groups()[2].error_code, ErrorCode::UNSUPPORTED_VERSION);
+    result = {};
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest,
+       MultiGroupDeletionPreservesPerSourceStorageFailureAndDrainsResponse) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    for (int p : {0, 1})
+        ASSERT_EQ(put(b, key(p), {emptyGroup(key(p)), offsetRecord(key(p))}), ErrorCode::NONE);
+    fs::create_directory(dir / "0/__consumer_offsets-0/checkpoint.meta.tmp");
+    Buffer payload;
+    payload.writeInt32(2);
+    payload.writeString(key(0));
+    payload.writeString(key(1));
+    std::promise<RequestDispatcher::DispatchResult> delivered;
+    EXPECT_TRUE(CoordinatorExecutorProbe::dispatchProtocol(
+                    b, protocol::ApiKey::DELETE_GROUPS, 0, payload,
+                    [&](auto result) { delivered.set_value(std::move(result)); })
+                    .deferred);
+    auto future = delivered.get_future();
+    ASSERT_EQ(future.wait_for(5s), std::future_status::ready);
+    auto result = future.get();
+    const auto deleted =
+        publishProtocol<protocol::DeleteGroupsResponse>(result, protocol::ApiKey::DELETE_GROUPS, 0);
+    ASSERT_EQ(deleted.results().size(), 2u);
+    EXPECT_EQ(deleted.results()[0].group_id, key(0));
+    EXPECT_EQ(deleted.results()[0].error_code, ErrorCode::KAFKA_STORAGE_ERROR);
+    EXPECT_EQ(deleted.results()[1].error_code, ErrorCode::NONE);
+    EXPECT_EQ(CoordinatorPersistenceProbe::offsets(b).fetchOffset(key(0), "data", 0), 42);
+    EXPECT_FALSE(CoordinatorPersistenceProbe::offsets(b).fetchOffset(key(1), "data", 0));
+    auto stopped = std::async(std::launch::async, [&] { b.stop(); });
+    EXPECT_TRUE(waitUntil([&] { return CoordinatorExecutorProbe::stopping(b); }));
+    EXPECT_EQ(stopped.wait_for(50ms), std::future_status::timeout);
+    const auto fenced =
+        publishProtocol<protocol::DeleteGroupsResponse>(result, protocol::ApiKey::DELETE_GROUPS, 0);
+    EXPECT_EQ(fenced.results()[0].error_code, ErrorCode::NOT_COORDINATOR);
+    EXPECT_EQ(fenced.results()[1].error_code, ErrorCode::NOT_COORDINATOR);
+    result = {};
+    EXPECT_EQ(stopped.wait_for(5s), std::future_status::ready);
+    stopped.get();
+    fs::remove(dir / "0/__consumer_offsets-0/checkpoint.meta.tmp");
+}
+
+TEST_F(CoordinatorPersistenceTest, OwnedRetentionUsesExactKeysAndPreservesPendingOffsets) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    const auto neighbor = id + ":suffix";
+    auto pending = offsetRecord(id, 99);
+    pending.key.kind = GroupRecordKey::Kind::PendingOffset;
+    pending.key.transactional_id = "pending-txn";
+    pending.key.producer_id = 90;
+    pending.key.producer_epoch = 2;
+    auto expired = offsetRecord(id);
+    expired.key.partition = 1;
+    ASSERT_EQ(put(b, id, {emptyGroup(id), offsetRecord(id), expired, pending}), ErrorCode::NONE);
+    auto fresh = offsetRecord(neighbor);
+    fresh.offset.expiry_timestamp = std::numeric_limits<int64_t>::max();
+    ASSERT_EQ(put(b, neighbor, {emptyGroup(neighbor), fresh}), ErrorCode::NONE);
+    ASSERT_EQ(put(b, key(1), {emptyGroup(key(1)), offsetRecord(key(1))}), ErrorCode::NONE);
+    ASSERT_EQ(put(b, key(2), {offsetRecord(key(2))}), ErrorCode::NONE);
+    CoordinatorExecutorProbe::scheduleRetention(b);
+    ASSERT_TRUE(waitUntil([&] {
+        return !CoordinatorExecutorProbe::retentionPending(b, id) &&
+               !CoordinatorExecutorProbe::retentionPending(b, key(1)) &&
+               !CoordinatorExecutorProbe::retentionPending(b, key(2));
+    }));
+    EXPECT_EQ(CoordinatorPersistenceProbe::offsets(b).fetchOffset(id, "data", 0), 42);
+    EXPECT_FALSE(CoordinatorPersistenceProbe::offsets(b).fetchOffset(id, "data", 1));
+    EXPECT_EQ(CoordinatorPersistenceProbe::groups(b).pendingCoordinatorOffsets().size(), 1u);
+    EXPECT_EQ(CoordinatorPersistenceProbe::offsets(b).fetchOffset(neighbor, "data", 0), 42);
+    EXPECT_FALSE(CoordinatorPersistenceProbe::offsets(b).fetchOffset(key(1), "data", 0));
+    EXPECT_FALSE(CoordinatorPersistenceProbe::offsets(b).fetchOffset(key(2), "data", 0));
+    EXPECT_TRUE(GroupStateManager(b.logManager(), 3).loadCommittedPartition(1).empty());
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, QueuedRetentionRechecksCommitRejoinAndOriginalEpoch) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    for (int p : {0, 1, 2})
+        ASSERT_EQ(put(b, key(p), {emptyGroup(key(p)), offsetRecord(key(p))}), ErrorCode::NONE);
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    std::atomic<int> entered{0};
+    for (int n = 0; n < 2; ++n)
+        ASSERT_TRUE(CoordinatorExecutorProbe::submit(b, [&](bool, auto) {
+            ++entered;
+            released.wait();
+        }));
+    const bool workers_ready = waitUntil([&] { return entered.load() == 2; });
+    if (!workers_ready)
+        release.set_value();
+    ASSERT_TRUE(workers_ready);
+    CoordinatorExecutorProbe::scheduleRetention(b);
+    EXPECT_TRUE(CoordinatorExecutorProbe::retentionPending(b, key(0)));
+    auto fresh = offsetRecord(key(0), 77);
+    fresh.offset.expiry_timestamp = std::numeric_limits<int64_t>::max();
+    EXPECT_EQ(put(b, key(0), {fresh}), ErrorCode::NONE);
+    EXPECT_EQ(b.mutateCoordinatorGroupState(
+                  key(1),
+                  [&](auto& draft) {
+                      EXPECT_EQ(draft.handleJoinGroup(joinRequest(key(1))).error, ErrorCode::NONE);
+                  }),
+              ErrorCode::NONE);
+    EXPECT_EQ(b.metadataController()->updatePartitionLeader("__consumer_offsets", 2, 0).error_code,
+              ErrorCode::NONE);
+    b.reconcileReplicas();
+    b.acquireCoordinatorPartitions();
+    release.set_value();
+    ASSERT_TRUE(waitUntil([&] {
+        for (int p : {0, 1, 2})
+            if (CoordinatorExecutorProbe::retentionPending(b, key(p)))
+                return false;
+        return true;
+    }));
+    EXPECT_EQ(CoordinatorPersistenceProbe::offsets(b).fetchOffset(key(0), "data", 0), 77);
+    EXPECT_EQ(CoordinatorPersistenceProbe::offsets(b).fetchOffset(key(1), "data", 0), 42);
+    EXPECT_EQ(CoordinatorPersistenceProbe::offsets(b).fetchOffset(key(2), "data", 0), 42);
+    CoordinatorExecutorProbe::scheduleRetention(b);
+    ASSERT_TRUE(waitUntil([&] { return !CoordinatorExecutorProbe::retentionPending(b, key(2)); }));
+    EXPECT_FALSE(CoordinatorPersistenceProbe::offsets(b).fetchOffset(key(2), "data", 0));
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, ThreeBrokerOffsetWireWaitsForIsrAndAggregatesWrongOwners) {
+    startCluster();
+    const auto id = key(1);
+    auto& b = *brokers[1];
+    ASSERT_EQ(put(b, id, {groupRecord(id)}), ErrorCode::NONE);
+    brokers[0]->replicaManager()->stop();
+    brokers[2]->replicaManager()->stop();
+    auto pending = std::async(std::launch::async, [&] {
+        return membershipWire<protocol::OffsetCommitResponse>(b, protocol::ApiKey::OFFSET_COMMIT,
+                                                              offsetCommit(id), 8);
+    });
+    const bool appended = waitUntil(
+        [&] { return b.logManager()->getLog("__consumer_offsets", 1)->logEndOffset() == 3; });
+    EXPECT_TRUE(appended);
+    EXPECT_EQ(pending.wait_for(50ms), std::future_status::timeout);
+    EXPECT_FALSE(CoordinatorPersistenceProbe::offsets(b).fetchOffset(id, "data", 0));
+    Buffer versions;
+    protocol::RequestHeader(protocol::ApiKey::API_VERSIONS, 1, 95, "io-progress").encode(versions);
+    protocol::ApiVersionsRequest{}.encode(versions, 1);
+    auto progress = test_support::brokerRequest(b.port(), versions);
+    EXPECT_EQ(progress.readInt32(), 95);
+    brokers[0]->replicaManager()->start();
+    brokers[2]->replicaManager()->start();
+    ASSERT_EQ(pending.wait_for(10s), std::future_status::ready);
+    const auto committed = pending.get();
+    ASSERT_EQ(committed.topics().size(), 1u);
+    EXPECT_EQ(committed.topics()[0].partitions[0].error, ErrorCode::NONE);
+    protocol::OffsetFetchRequest fetch;
+    for (int p : {0, 1, 2})
+        fetch.addGroup({key(p), std::nullopt, -1, true, {}});
+    const auto read =
+        membershipWire<protocol::OffsetFetchResponse>(b, protocol::ApiKey::OFFSET_FETCH, fetch, 9);
+    ASSERT_EQ(read.groups().size(), 3u);
+    EXPECT_EQ(read.groups()[0].error_code, ErrorCode::NOT_COORDINATOR);
+    EXPECT_EQ(read.groups()[1].error_code, ErrorCode::NONE);
+    EXPECT_EQ(read.groups()[1].topics[0].partitions[0].offset, 123);
+    EXPECT_EQ(read.groups()[2].error_code, ErrorCode::NOT_COORDINATOR);
+    auto deletes = deleteWire(b, protocol::ApiKey::DELETE_GROUPS, {}, {key(0), key(1), key(2)});
+    deletes.readInt32();
+    EXPECT_EQ(deletes.readInt32(), 3);
+    for (int p : {0, 1, 2}) {
+        EXPECT_EQ(deletes.readString(), key(p));
+        EXPECT_EQ(static_cast<ErrorCode>(deletes.readInt16()),
+                  p == 1 ? ErrorCode::NON_EMPTY_GROUP : ErrorCode::NOT_COORDINATOR);
+    }
+}
+
+TEST_F(CoordinatorPersistenceTest, OffsetWireRestartRebuildsCommittedCacheAndExactDeletion) {
+    const auto id = key(0);
+    {
+        KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+        b.start();
+        b.reconcileReplicas();
+        auto request = offsetCommit(id, 321);
+        request.setGenerationId(-1);
+        request.setMemberId("");
+        request.setGroupInstanceId(std::nullopt);
+        EXPECT_EQ(membershipWire<protocol::OffsetCommitResponse>(b, protocol::ApiKey::OFFSET_COMMIT,
+                                                                 request, 8)
+                      .topics()[0]
+                      .partitions[0]
+                      .error,
+                  ErrorCode::NONE);
+        auto retained = offsetRecord(id, 222);
+        retained.key.partition = 1;
+        ASSERT_EQ(put(b, id, {retained}), ErrorCode::NONE);
+        auto deleted = deleteWire(b, protocol::ApiKey::OFFSET_DELETE, id);
+        EXPECT_EQ(static_cast<ErrorCode>(deleted.readInt16()), ErrorCode::NONE);
+        deleted.readInt32();
+        b.stop();
+    }
+    fs::remove_all(dir / "0/consumer_offsets");
+    KawasanBroker recovered(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    recovered.start();
+    recovered.reconcileReplicas();
+    protocol::OffsetFetchRequest fetch;
+    fetch.addGroup({id, std::nullopt, -1, true, {}});
+    const auto result = membershipWire<protocol::OffsetFetchResponse>(
+        recovered, protocol::ApiKey::OFFSET_FETCH, fetch, 9);
+    ASSERT_EQ(result.groups().size(), 1u);
+    EXPECT_EQ(result.groups()[0].error_code, ErrorCode::NONE);
+    ASSERT_EQ(result.groups()[0].topics.size(), 1u);
+    ASSERT_EQ(result.groups()[0].topics[0].partitions.size(), 1u);
+    EXPECT_EQ(result.groups()[0].topics[0].partitions[0].partition, 1);
+    EXPECT_EQ(result.groups()[0].topics[0].partitions[0].offset, 222);
+    recovered.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, OffsetDeletionCheckpointFailureKeepsCacheAndPendingIdentity) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    auto pending = offsetRecord(id, 333);
+    pending.key.kind = GroupRecordKey::Kind::PendingOffset;
+    pending.key.transactional_id = "txn";
+    pending.key.producer_id = 10;
+    pending.key.producer_epoch = 2;
+    ASSERT_EQ(put(b, id, {emptyGroup(id), offsetRecord(id), pending}), ErrorCode::NONE);
+    const auto blocked = dir / "0/__consumer_offsets-0/checkpoint.meta.tmp";
+    fs::create_directory(blocked);
+    auto failed = deleteWire(b, protocol::ApiKey::OFFSET_DELETE, id);
+    EXPECT_EQ(static_cast<ErrorCode>(failed.readInt16()), ErrorCode::KAFKA_STORAGE_ERROR);
+    failed.readInt32();
+    EXPECT_EQ(failed.readInt32(), 1);
+    EXPECT_EQ(failed.readString(), "data");
+    EXPECT_EQ(failed.readInt32(), 1);
+    EXPECT_EQ(failed.readInt32(), 0);
+    EXPECT_EQ(static_cast<ErrorCode>(failed.readInt16()), ErrorCode::KAFKA_STORAGE_ERROR);
+    EXPECT_EQ(CoordinatorPersistenceProbe::offsets(b).fetchOffset(id, "data", 0), 42);
+    EXPECT_EQ(CoordinatorPersistenceProbe::groups(b).pendingCoordinatorOffsets().size(), 1u);
+    fs::remove(blocked);
+    b.acquireCoordinatorPartitions();
+    EXPECT_FALSE(CoordinatorPersistenceProbe::offsets(b).fetchOffset(id, "data", 0));
+    EXPECT_EQ(CoordinatorPersistenceProbe::groups(b).pendingCoordinatorOffsets().size(), 1u);
+    protocol::OffsetFetchRequest fetch;
+    fetch.setRequireStable(true);
+    fetch.addGroup({id, std::nullopt, -1, true, {}});
+    const auto stable =
+        membershipWire<protocol::OffsetFetchResponse>(b, protocol::ApiKey::OFFSET_FETCH, fetch, 9);
+    ASSERT_EQ(stable.groups()[0].topics.size(), 1u);
+    EXPECT_EQ(stable.groups()[0].topics[0].partitions[0].error, ErrorCode::UNSTABLE_OFFSET_COMMIT);
+    fetch.setRequireStable(false);
+    EXPECT_TRUE(
+        membershipWire<protocol::OffsetFetchResponse>(b, protocol::ApiKey::OFFSET_FETCH, fetch, 9)
+            .groups()[0]
+            .topics.empty());
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, QueuedRetentionShutdownDrainsJobsWithoutDeletingCache) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    ASSERT_EQ(put(b, id, {emptyGroup(id), offsetRecord(id)}), ErrorCode::NONE);
+    auto cache = CoordinatorPersistenceProbe::retainOffsets(b);
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    std::atomic<int> entered{0};
+    for (int n = 0; n < 2; ++n)
+        EXPECT_TRUE(CoordinatorExecutorProbe::submit(b, [&](bool, auto) {
+            ++entered;
+            released.wait();
+        }));
+    const bool ready = waitUntil([&] { return entered.load() == 2; });
+    if (!ready)
+        release.set_value();
+    ASSERT_TRUE(ready);
+    CoordinatorExecutorProbe::scheduleRetention(b);
+    EXPECT_TRUE(CoordinatorExecutorProbe::retentionPending(b, id));
+    auto stopped = std::async(std::launch::async, [&] { b.stop(); });
+    EXPECT_TRUE(waitUntil([&] { return CoordinatorExecutorProbe::stopping(b); }));
+    EXPECT_EQ(stopped.wait_for(50ms), std::future_status::timeout);
+    release.set_value();
+    EXPECT_EQ(stopped.wait_for(5s), std::future_status::ready);
+    stopped.get();
+    EXPECT_FALSE(CoordinatorExecutorProbe::retentionPending(b, id));
+    EXPECT_EQ(cache->fetchOffset(id, "data", 0), 42);
+}
+
+TEST_F(CoordinatorPersistenceTest, MultiSourceResponseHoldsEveryEpochThroughWriteInitiation) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    for (int p : {0, 1})
+        ASSERT_EQ(put(b, key(p), {offsetRecord(key(p))}), ErrorCode::NONE);
+    protocol::OffsetFetchRequest request;
+    // Repeated groups share one partition mutex; order and entries are retained.
+    for (int p : {0, 0, 1})
+        request.addGroup({key(p), std::nullopt, -1, true, {}});
+    Buffer payload;
+    request.encode(payload, 9);
+    std::promise<RequestDispatcher::DispatchResult> delivered;
+    EXPECT_TRUE(CoordinatorExecutorProbe::dispatchProtocol(
+                    b, protocol::ApiKey::OFFSET_FETCH, 9, payload,
+                    [&](auto result) { delivered.set_value(std::move(result)); })
+                    .deferred);
+    auto future = delivered.get_future();
+    ASSERT_EQ(future.wait_for(5s), std::future_status::ready);
+    auto result = future.get();
+    std::promise<void> entered, release;
+    auto ready = entered.get_future();
+    auto released = release.get_future().share();
+    auto publication = std::async(std::launch::async, [&] {
+        result.publication_guard([&](auto error) {
+            EXPECT_EQ(error, ErrorCode::NONE);
+            entered.set_value();
+            released.wait();  // Models synchronous socket write initiation.
+        });
+    });
+    const bool publishing = ready.wait_for(5s) == std::future_status::ready;
+    if (!publishing)
+        release.set_value();
+    ASSERT_TRUE(publishing);
+    auto changed = std::async(std::launch::async, [&] {
+        return b.metadataController()->updatePartitionLeader("__consumer_offsets", 1, 0);
+    });
+    EXPECT_EQ(changed.wait_for(50ms), std::future_status::timeout);
+    release.set_value();
+    publication.get();
+    EXPECT_EQ(changed.get().error_code, ErrorCode::NONE);
+    const auto fenced =
+        publishProtocol<protocol::OffsetFetchResponse>(result, protocol::ApiKey::OFFSET_FETCH, 9);
+    ASSERT_EQ(fenced.groups().size(), 3u);
+    EXPECT_EQ(fenced.groups()[0].error_code, ErrorCode::NONE);
+    EXPECT_EQ(fenced.groups()[1].error_code, ErrorCode::NONE);
+    EXPECT_EQ(fenced.groups()[2].error_code, ErrorCode::NOT_COORDINATOR);
+    result = {};
+    b.stop();
 }
 
 TEST_F(CoordinatorPersistenceTest, StagedMembershipWireCommitsJoinSyncHeartbeatAndBatchLeave) {
@@ -1099,7 +1742,7 @@ TEST_F(CoordinatorPersistenceTest, CommitsCompleteGroupOffsetsAndExactTombstones
                                                                               "instance"),
               ErrorCode::NONE);
     ASSERT_EQ(CoordinatorPersistenceProbe::groups(*b).pendingCoordinatorOffsets().size(), 1);
-    // A successful staged mutation does not authorize legacy wire handlers.
+    // Migrated staged reads observe only the committed owned cache.
     Buffer payload;
     protocol::RequestHeader(protocol::ApiKey::OFFSET_FETCH, 8, 1, "persistence-test")
         .encode(payload);
@@ -1115,7 +1758,9 @@ TEST_F(CoordinatorPersistenceTest, CommitsCompleteGroupOffsetsAndExactTombstones
     protocol::OffsetFetchResponse response;
     response.decode(wire, 8);
     ASSERT_EQ(response.groups().size(), 1);
-    EXPECT_EQ(response.groups()[0].error_code, ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+    EXPECT_EQ(response.groups()[0].error_code, ErrorCode::NONE);
+    ASSERT_EQ(response.groups()[0].topics.size(), 1u);
+    EXPECT_EQ(response.groups()[0].topics[0].partitions[0].offset, 42);
     EXPECT_EQ(wire.remaining(), 0);
     const auto illegal = test_support::brokerProduce(b->port(), "__consumer_offsets",
                                                      test_support::producerBatch(99, 0));

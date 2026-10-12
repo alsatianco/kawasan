@@ -8,6 +8,16 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-13
 
+- Migrate persistence-staged offset commits/fetches and exact offset/group deletion
+  onto committed proposals and deferred execution. Preserve requested error
+  identities, group-owned stable-offset reads, static-member fencing and active
+  subscription deletion checks. Public coordinator activation remains gated.
+- Aggregate multi-group reads/deletes with independent original-epoch admissions
+  and simultaneous source fencing through response write initiation; preserve
+  per-group durable failures and drain batch response tickets during shutdown.
+- Run owned retention jobs through the bounded executor, rechecking committed
+  expiry, membership and pending keys before exact tombstones. New commits,
+  rejoins and ownership epochs prevent stale cleanup; no-op proposals append nothing.
 - Migrate staged JoinGroup, SyncGroup, Heartbeat and batched LeaveGroup through
   detached committed proposals and the deferred coordinator executor. Preserve
   state-changing protocol results only after persistence succeeds, and retain

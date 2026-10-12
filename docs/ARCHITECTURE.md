@@ -663,9 +663,10 @@ No broker configuration activates staging. In `CoordinatorPersistenceOnly`, the
 normal JoinGroup, SyncGroup, Heartbeat and LeaveGroup registrations now defer to
 the executor and mutate detached committed proposals. Protocol results are sent
 only after durable success. A LeaveGroup member batch commits as one proposal.
-Acquisition-only staging still refuses these requests. All other coordinator
-handlers, retention cleanup, transaction sweeps and legacy Prepare completion
-remain gated. FindCoordinator is also gated until serving integration is complete.
+Persistence staging also migrates OffsetCommit/OffsetFetch, OffsetDelete and
+DeleteGroups. Acquisition-only staging still refuses them. Transaction/producer
+handlers, transaction sweeps and legacy Prepare completion remain gated.
+FindCoordinator is also gated until serving integration is complete.
 
 A one-second staged scheduler inspects member/rebalance deadlines without changing
 the cache and queues at most one timeout job per group. Jobs retain the admitted
@@ -682,15 +683,49 @@ preserves the original storage/ISR/timeout error instead of replacing it with a
 loading response. Actual ownership/epoch loss still overrides that error with
 NOT_COORDINATOR. Successful responses remain subject to every source barrier.
 
-Serving integration still needs offset/transaction/read/delete/producer handler
-and retention/sweep migration, multi-key aggregation, unkeyed producer admission,
-and group-owned pending-offset routing. Abrupt RF>1 client continuity and remote
+OffsetCommit validates membership/static identity on a detached committed group
+and writes its complete activity/heartbeat proposal and offsets in one ISR-committed
+batch. Empty-group manual commits create an empty identity; failed validation or
+storage cannot alter live activity or checkpoints. Error replies retain every
+requested topic/partition. OffsetFetch reads the committed cache under the source
+fence. `require_stable` uses group-owned pending records, including pending-only
+keys in fetch-all results, independently of transaction-owned caches.
+
+Multi-group OffsetFetch and DeleteGroups use one bounded executor job/ticket and
+an independent source/epoch admission per group. Worker mutations retain that
+single-source pin. At response delivery, sorted deduplicated mutation locks and
+one acquisition/metadata fence cover every source through socket write initiation.
+Busy or lost sources get per-group errors while other results survive; original
+storage failures survive their source barriers. Batch response builders only
+encode saved results and never reenter metadata.
+
+OffsetDelete appends exact offset tombstones, preserving pending transaction and
+group identities. Active classic consumer groups retain subscribed topics with
+GROUP_SUBSCRIBED_TO_TOPIC while unsubscribed topics can be deleted; opaque or
+malformed active subscriptions refuse deletion. DeleteGroups rejects active
+membership and tombstones all exact group/offset/pending keys for an empty group.
+Unknown groups return GROUP_ID_NOT_FOUND. Neither path uses wildcard cache erasure.
+
+The owned scheduler checks retention every ten minutes, queues at most one job
+per group and rechecks current committed records under the original admitted
+epoch. Active groups and pending offsets prevent unsafe expiration. Empty-group
+and standalone offsets use persisted explicit expiry or the seven-day retention
+age, with empty managed-group activity included. An identity is removed only when
+its retention elapsed and no retained offset/pending keys remain. A later commit,
+rejoin or owner epoch fences an obsolete cleanup. No-op rechecks append nothing.
+The existing scheduler/queue/worker shutdown drain covers retention too.
+Subscription-aware retention for active managed groups remains future work.
+
+Serving integration still needs transaction/producer/read handlers and sweep
+migration, unkeyed producer admission, and group-owned pending-offset routing.
+Abrupt RF>1 client continuity and remote
 marker/LSO/EOS acceptance remain separate requirements before public activation.
 InitProducerId now propagates counter-write and directory-fsync failures before acknowledging an ID or creating a transaction;
 the successful counter format and sequential single-node IDs stay compatible.
 Requests cannot use external Produce/DeleteRecords to modify formatted sources.
 The native staged writer proves group/offset/pending and transaction continuity
 after an RF=3 owner stops, plus real RF=1 SIGKILL recovery after staged mutation
-success and cache deletion. It does not prove client acknowledgements, abrupt
-RF>1 owner death or cross-broker LSO/marker completion. Public coordinator failover
+success and cache deletion. Staged offset wire tests also prove ISR-waiting
+acknowledgements and IO progress. Abrupt RF>1 acknowledged owner-loss continuity
+and cross-broker LSO/marker completion remain unproved. Public coordinator failover
 and EOS acceptance remain pending; the default broker rejects formatted stores.

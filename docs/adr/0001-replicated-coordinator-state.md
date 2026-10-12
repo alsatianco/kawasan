@@ -8,7 +8,8 @@ A separate persistence seam supplies fsynced ISR-committed mutations, fenced
 cache publication and shutdown draining. Detached group-state proposals now reuse
 the membership/timeout state machine without exposing changes before commitment.
 Persistence staging now migrates group membership handlers and owned timeout
-jobs through those proposals and the deferred executor. Public runtime activation,
+jobs through those proposals and the deferred executor, along with offset
+commits/reads, exact deletions and owned retention cleanup. Public runtime activation,
 remaining handler/background migration, marker redrive and failover acceptance
 remain pending. No broker configuration enables either seam.
 
@@ -110,8 +111,9 @@ ISR waits, joins workers and drains TCP delivery/write tickets while source and
 metadata lifetimes still exist. Read callbacks use the ownership fence and
 committed mutations refuse older admissions after reacquisition. Dispatcher
 completion and retained TCP sinks no longer depend on destroyed owners. These
-are internal, single-source seams; the remaining coordinator handlers/background
-jobs, multi-key aggregation, pending-offset routing and public activation remain gated.
+are internal seams. Offset read/group deletion aggregation now fences several
+sources together; remaining group/admin/transaction/producer handlers, pending-offset
+routing and public activation remain gated.
 
 The staged membership checkpoint enables normal JoinGroup/SyncGroup/Heartbeat/
 LeaveGroup registrations only in the internal persistence seam, plus a bounded
@@ -121,5 +123,15 @@ closed because their missing durations cannot be reconstructed safely. The
 format-v1 manifest, compaction keys, offset/pending schemas and legacy single-node
 storage are unchanged. A batched LeaveGroup has one durable proposal. Storage
 failures survive source-barrier response fencing; owner loss still refuses the
-response. Remaining coordinator handlers/jobs, discovery, multi-key aggregation,
-pending-offset routing, public activation and abrupt RF>1/EOS gates are unfinished.
+response. Remaining coordinator handlers/jobs, discovery, pending-offset routing,
+public activation and abrupt RF>1/EOS gates are unfinished; offset/deletion/retention
+and their multi-key aggregation are implemented by the checkpoint below.
+
+The staged offset checkpoint gives each group in a batched read/delete its own
+original source/epoch admission. A single metadata critical section fences every
+source through transport write initiation; errors stay per group. Committed
+offset proposals include activity/heartbeat effects, stable reads use group-owned
+pending keys, and deletion/retention append exact tombstones. Queued retention
+rechecks current committed membership, expiry and pending state. This checkpoint
+keeps discovery, transaction/producer/sweep migration and public activation gated;
+abrupt RF>1 client continuity and marker/EOS acceptance remain unfinished.

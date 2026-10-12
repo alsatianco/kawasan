@@ -198,7 +198,7 @@ private:
     friend struct CoordinatorExecutorProbe;
     KawasanBroker(const Config& config, std::optional<CoordinatorFormat> staging,
                   bool persistence = false);
-    // Internal deferred seam; no registration/public mode calls this yet.
+    // Internal deferred seam used by migrated persistence-staging registrations.
     // Work must use committed mutations. read_only callbacks access caches only
     // under the ownership fence, without calling metadata or reentering mutations.
     // Error builders also run inside the publication fence and must not call metadata.
@@ -213,9 +213,27 @@ private:
         TopicPartition tp;
         int32_t epoch;
     };
+    void withCoordinatorRequestFences(
+        const std::vector<RequestOwnership>& sources,
+        const std::function<void(const std::vector<ErrorCode>&)>& publish);
+    using CoordinatorBatchAssembler = std::function<Buffer(const std::vector<Buffer>&)>;
+    RequestDispatcher::HandlerResult deferCoordinatorGroupBatch(
+        RequestDispatcher::RequestContext context,
+        std::vector<RequestDispatcher::RequestContext> parts, const std::vector<std::string>& keys,
+        RequestDispatcher::HandlerFunc work, RequestDispatcher::ErrorBuilder errors,
+        CoordinatorBatchAssembler assemble, bool read_only);
+    RequestDispatcher::HandlerResult deferCoordinatorOffsetFetch(
+        RequestDispatcher::RequestContext context, RequestDispatcher::HandlerFunc work,
+        RequestDispatcher::ErrorBuilder errors);
+    RequestDispatcher::HandlerResult deferCoordinatorDeleteGroups(
+        RequestDispatcher::RequestContext context, RequestDispatcher::HandlerFunc work,
+        RequestDispatcher::ErrorBuilder errors);
     static thread_local std::optional<RequestOwnership> coordinator_request_owner_;
     void coordinatorTimeoutLoop();
     void scheduleCoordinatorTimeouts();
+    void scheduleCoordinatorRetention();
+    std::chrono::steady_clock::time_point coordinator_retention_scan_;
+    std::set<std::string> coordinator_retention_pending_;
     std::thread coordinator_timeout_thread_;
     std::atomic<bool> coordinator_timeout_stop_{false};
     std::mutex coordinator_timeout_mutex_;
@@ -403,6 +421,10 @@ private:
     Buffer handleDeleteRecords(RequestDispatcher::RequestContext& context);
     Buffer handleDeleteGroups(RequestDispatcher::RequestContext& context);
     Buffer handleOffsetDelete(RequestDispatcher::RequestContext& context);
+    Buffer buildOffsetDeleteError(const RequestDispatcher::RequestContext& context, ErrorCode code,
+                                  int16_t version) const;
+    Buffer buildDeleteGroupsError(const RequestDispatcher::RequestContext& context, ErrorCode code,
+                                  int16_t version) const;
     Buffer handleCreatePartitions(RequestDispatcher::RequestContext& context);
     // Phase 4.1 stubs that will fill in once their backends land.
     Buffer handleDescribeProducers(RequestDispatcher::RequestContext& context);

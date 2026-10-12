@@ -346,6 +346,16 @@ ErrorCode KawasanBroker::mutateCoordinatorGroupImpl(
             (void)key;
             proposed.push_back(record);
         }
+        // A validated no-op (empty request/retention recheck/protocol refusal)
+        // still passed original-epoch admission, but needs no source append.
+        if (records.empty())
+            return metadata_controller_->withPartitionLeadership(
+                tp, broker_id_, metadata->leader_epoch, [&](const auto&) {
+                    return !coordinator_mutations_stopping_.load() && running_.load() &&
+                                   dataPlaneCurrent()
+                               ? ErrorCode::NONE
+                               : ErrorCode::NOT_COORDINATOR;
+                });
         return commitCoordinatorRecords(
             tp, metadata->leader_epoch, records,
             [&] {
@@ -496,6 +506,11 @@ void KawasanBroker::coordinatorTimeoutLoop() {
         lock.unlock();
         try {
             scheduleCoordinatorTimeouts();
+            const auto now = std::chrono::steady_clock::now();
+            if (now - coordinator_retention_scan_ >= std::chrono::minutes(10)) {
+                coordinator_retention_scan_ = now;
+                scheduleCoordinatorRetention();
+            }
         } catch (const std::exception& ex) {
             Logger::error("Coordinator timeout scheduling failed: {}", ex.what());
         }
