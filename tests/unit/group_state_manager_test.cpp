@@ -271,13 +271,31 @@ TEST_F(GroupStateManagerTest, InvalidCommittedBatchAndUnavailableSourceFailClose
     EXPECT_THROW(manager.loadCommittedPartition(0), std::exception);
 }
 
-TEST_F(GroupStateManagerTest, VersionOneGroupKeyAndEmptySnapshotHaveStableBytes) {
+TEST_F(GroupStateManagerTest, VersionOneKeyAndVersionTwoGroupValueHaveStableBytes) {
     auto r = group();
     r.group = {};
     const auto wire = GroupStateManager::encode(r);
     EXPECT_EQ(*wire.key,
               (std::vector<uint8_t>{'G', 1, 0, 0, 0, 0, 7, 'g', 'r', 'o', 'u', 'p', ':', 0}));
     std::vector<uint8_t> expected(34, 0);
-    expected[0] = 1;
+    expected[0] = 2;
     EXPECT_EQ(*wire.value, expected);
+}
+
+TEST_F(GroupStateManagerTest, MemberDeadlinesRoundTripAndOldMissingDeadlinesFailClosed) {
+    auto r = group();
+    r.group.members[0].session_timeout_ms = 120000;
+    auto wire = GroupStateManager::encode(r);
+    EXPECT_EQ(GroupStateManager::decode(wire).group, r.group);
+    (*wire.value)[0] = 1;
+    wire.value->resize(wire.value->size() - 4);
+    EXPECT_THROW(GroupStateManager::decode(wire), std::exception);
+    for (const auto timeout : {0, 5999, 300001}) {
+        r.group.members[0].session_timeout_ms = timeout;
+        EXPECT_THROW(GroupStateManager::encode(r), std::exception);
+    }
+    r.group.members[0].session_timeout_ms = 6000;
+    wire = GroupStateManager::encode(r);
+    std::fill(wire.value->end() - 4, wire.value->end(), 0);
+    EXPECT_THROW(GroupStateManager::decode(wire), std::exception);
 }

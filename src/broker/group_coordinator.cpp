@@ -138,7 +138,7 @@ GroupCoordinator::GroupState GroupCoordinator::restoreGroup(const GroupRecord& r
     for (const auto& m : r.group.members) {
         g.members.emplace(m.member_id,
                           MemberState{m.member_id, m.client_id, m.client_host, m.group_instance_id,
-                                      m.metadata, m.assignment, now});
+                                      m.metadata, m.assignment, now, m.session_timeout_ms});
     }
     if (live) {
         g.last_activity = std::max(g.last_activity, live->last_activity);
@@ -173,7 +173,7 @@ GroupRecord GroupCoordinator::snapshotGroup(const std::string& group_id, const G
     for (const auto& [id, m] : g.members) {
         (void)id;
         s.members.push_back({m.member_id, m.client_id, m.client_host, m.group_instance_id,
-                             m.metadata, m.assignment});
+                             m.metadata, m.assignment, m.session_timeout_ms});
     }
     std::sort(s.members.begin(), s.members.end(),
               [](const auto& a, const auto& b) { return a.member_id < b.member_id; });
@@ -378,6 +378,7 @@ GroupCoordinator::JoinGroupResult GroupCoordinator::handleJoinGroup(
         session_ms = 6000;
     if (session_ms > 300000)
         session_ms = 300000;
+    member.session_timeout_ms = session_ms;
     if (static_cast<int64_t>(session_ms) > member_timeout_ms_) {
         member_timeout_ms_ = session_ms;
     }
@@ -1151,7 +1152,9 @@ void GroupCoordinator::checkMemberTimeouts() {
                               now - member_state.last_heartbeat)
                               .count();
 
-            if (age_ms > member_timeout_ms_) {
+            const auto timeout =
+                proposal_only_ ? member_state.session_timeout_ms : member_timeout_ms_;
+            if (age_ms > timeout) {
                 timed_out_members.push_back(member_id);
             }
         }
@@ -1321,4 +1324,24 @@ GroupCoordinator::Metrics GroupCoordinator::getMetrics() const {
     return m;
 }
 
+std::vector<std::string> GroupCoordinator::timeoutCandidates() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<std::string> result;
+    for (const auto& [id, group] : groups_) {
+        const bool rebalancing = group.kind == GroupStateKind::PreparingRebalance ||
+                                 group.kind == GroupStateKind::CompletingRebalance;
+        bool expired = rebalancing && group.rebalance_timeout_ms > 0 &&
+                       now - group.rebalance_started_at >
+                           std::chrono::milliseconds(group.rebalance_timeout_ms);
+        for (const auto& [member_id, member] : group.members) {
+            (void)member_id;
+            expired = expired || now - member.last_heartbeat >
+                                     std::chrono::milliseconds(member.session_timeout_ms);
+        }
+        if (expired)
+            result.push_back(id);
+    }
+    return result;
+}
 }  // namespace kawasan::broker

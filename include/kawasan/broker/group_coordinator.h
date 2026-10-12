@@ -159,6 +159,8 @@ public:
         int64_t member_timeout_total;
     };
     Metrics getMetrics() const;
+    // Staged scheduler only: inspect deadlines without mutating the live cache.
+    std::vector<std::string> timeoutCandidates() const;
 
 private:
     friend struct CoordinatorAcquisitionProbe;
@@ -181,6 +183,7 @@ private:
         std::vector<uint8_t> metadata;
         std::vector<uint8_t> assignment;
         std::chrono::steady_clock::time_point last_heartbeat;
+        int32_t session_timeout_ms = 30000;
     };
 
     struct OffsetKey {

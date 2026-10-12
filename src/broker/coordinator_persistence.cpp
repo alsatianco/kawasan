@@ -139,7 +139,15 @@ RequestDispatcher::HandlerResult KawasanBroker::deferCoordinatorRequest(
                 result.payload = error_payload(status);
             result.deferred = false;
             result.lifetime = std::move(ticket);
-            result.publication_error = error_payload;
+            // A failed append/checkpoint leaves a source barrier. Preserve the
+            // original failure instead of disguising it as a loading response;
+            // owner/epoch loss still takes priority over all previous results.
+            result.publication_error = [error_payload, status](ErrorCode error) {
+                return error_payload(error == ErrorCode::COORDINATOR_LOAD_IN_PROGRESS &&
+                                             status != ErrorCode::NONE
+                                         ? status
+                                         : error);
+            };
             result.publication_guard = [this, tp, epoch,
                                         ticket = result.lifetime](const auto& publish) {
                 (void)ticket;
@@ -479,4 +487,66 @@ ErrorCode KawasanBroker::mutateCoordinatorTransaction(
     }
 }
 
+void KawasanBroker::coordinatorTimeoutLoop() {
+    std::unique_lock<std::mutex> lock(coordinator_timeout_mutex_);
+    while (!coordinator_timeout_stop_.load()) {
+        if (coordinator_timeout_cv_.wait_for(lock, std::chrono::seconds(1),
+                                             [&] { return coordinator_timeout_stop_.load(); }))
+            break;
+        lock.unlock();
+        try {
+            scheduleCoordinatorTimeouts();
+        } catch (const std::exception& ex) {
+            Logger::error("Coordinator timeout scheduling failed: {}", ex.what());
+        }
+        lock.lock();
+    }
+}
+
+void KawasanBroker::scheduleCoordinatorTimeouts() {
+    if (!staged_coordinator_persistence_ || coordinator_mutations_stopping_.load() ||
+        !running_.load() || !internal_topics_ready_.load())
+        return;
+    for (const auto& id : group_coordinator_->timeoutCandidates()) {
+        const TopicPartition tp{"__consumer_offsets",
+                                coordinatorPartitionFor(id, offsets_topic_num_partitions_)};
+        const auto metadata = currentPartitionMetadata(tp);
+        if (!metadata)
+            continue;
+        const auto epoch = metadata->leader_epoch;
+        ErrorCode status = ErrorCode::NOT_COORDINATOR;
+        withCoordinatorRequestFence(tp, epoch, [&](auto error) { status = error; });
+        if (status != ErrorCode::NONE)
+            continue;
+        {
+            std::lock_guard<std::mutex> lock(coordinator_timeout_mutex_);
+            if (!coordinator_timeout_pending_.insert(id).second)
+                continue;
+        }
+        const bool queued =
+            coordinator_executor_->submit([this, id, tp, epoch](bool admitted, auto ticket) {
+                (void)ticket;
+                const auto previous = coordinator_request_owner_;
+                coordinator_request_owner_ = RequestOwnership{this, tp, epoch};
+                try {
+                    if (admitted) {
+                        const auto error = mutateCoordinatorGroupState(
+                            id, [](auto& draft) { draft.checkTimeouts(); });
+                        if (error != ErrorCode::NONE)
+                            Logger::debug("Coordinator timeout '{}' refused: {}", id,
+                                          static_cast<int>(error));
+                    }
+                } catch (const std::exception& ex) {
+                    Logger::error("Coordinator timeout '{}' failed: {}", id, ex.what());
+                }
+                coordinator_request_owner_ = previous;
+                std::lock_guard<std::mutex> lock(coordinator_timeout_mutex_);
+                coordinator_timeout_pending_.erase(id);
+            });
+        if (!queued) {
+            std::lock_guard<std::mutex> lock(coordinator_timeout_mutex_);
+            coordinator_timeout_pending_.erase(id);
+        }
+    }
+}
 }  // namespace kawasan::broker

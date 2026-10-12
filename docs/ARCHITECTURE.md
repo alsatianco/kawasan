@@ -659,15 +659,33 @@ pointer and delivers at most once. TCP sinks retain only a weak session plus a
 sealed per-generation posting gate; session strands serialize socket access and
 shutdown drains IO naturally instead of abandoning posted callbacks.
 
-No broker configuration activates staging. Coordinator wire requests, cleanup,
-transaction sweep and legacy Prepare completion remain gated until all handlers
-and background jobs use the new mutation functions. Test-only Heartbeat overrides
-exercise deferred staged offset writes on real sockets; they do not enable the
-normal protocol handlers. Serving integration still needs complete handler/job
-migration, multi-key request aggregation, pending-offset routing and negotiated
-session-timeout recovery. Keyed producer identity creation and reads can use this
-executor; unkeyed producer admission remains part of that migration. The group
-proposal and executor primitives do not themselves activate handlers.
+No broker configuration activates staging. In `CoordinatorPersistenceOnly`, the
+normal JoinGroup, SyncGroup, Heartbeat and LeaveGroup registrations now defer to
+the executor and mutate detached committed proposals. Protocol results are sent
+only after durable success. A LeaveGroup member batch commits as one proposal.
+Acquisition-only staging still refuses these requests. All other coordinator
+handlers, retention cleanup, transaction sweeps and legacy Prepare completion
+remain gated. FindCoordinator is also gated until serving integration is complete.
+
+A one-second staged scheduler inspects member/rebalance deadlines without changing
+the cache and queues at most one timeout job per group. Jobs retain the admitted
+source epoch, re-evaluate current state in a draft, and use the same ISR writer.
+Shutdown joins the scheduler before sealing/draining workers. Group values use
+schema v2 to persist each member's negotiated session timeout (clamped to
+6–300 seconds); acquisition rebuilds steady-clock deadlines with those durations.
+Old prerelease v1 group values lack this information and fail closed rather than
+inventing deadlines. Group compaction keys and offset/pending schemas remain v1;
+the manifest contract is still format v1. Legacy single-node storage is unchanged.
+
+When an append/checkpoint failure creates a source barrier, deferred error delivery
+preserves the original storage/ISR/timeout error instead of replacing it with a
+loading response. Actual ownership/epoch loss still overrides that error with
+NOT_COORDINATOR. Successful responses remain subject to every source barrier.
+
+Serving integration still needs offset/transaction/read/delete/producer handler
+and retention/sweep migration, multi-key aggregation, unkeyed producer admission,
+and group-owned pending-offset routing. Abrupt RF>1 client continuity and remote
+marker/LSO/EOS acceptance remain separate requirements before public activation.
 InitProducerId now propagates counter-write and directory-fsync failures before acknowledging an ID or creating a transaction;
 the successful counter format and sequential single-node IDs stay compatible.
 Requests cannot use external Produce/DeleteRecords to modify formatted sources.

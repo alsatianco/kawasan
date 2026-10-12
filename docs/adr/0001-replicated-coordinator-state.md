@@ -7,9 +7,10 @@ cache acquisition are implemented through an internal acquisition-only C++ seam.
 A separate persistence seam supplies fsynced ISR-committed mutations, fenced
 cache publication and shutdown draining. Detached group-state proposals now reuse
 the membership/timeout state machine without exposing changes before commitment.
-Public runtime activation, handler/background migration, marker redrive and
-failover acceptance remain pending. No broker configuration enables either seam; coordinator requests
-remain refused in staging.
+Persistence staging now migrates group membership handlers and owned timeout
+jobs through those proposals and the deferred executor. Public runtime activation,
+remaining handler/background migration, marker redrive and failover acceptance
+remain pending. No broker configuration enables either seam.
 
 M10 will make committed `__consumer_offsets` and `__transaction_state` log
 records authoritative in clustered mode. Each new owner must rebuild only its
@@ -91,7 +92,7 @@ image. A group deletion requires tombstones for all of its group/offset/pending
 keys. Owned cache acquisition and fsynced ISR-committed mutations now exist as
 internal staged integration seams. The writer fences metadata ownership at
 append/publication and compares transaction snapshots under a separate mutation
-lock. Public handler/background migration and remote-marker completion remain
+lock. Remaining handler/background migration and remote-marker completion remain
 M10 work; these primitives do not activate replicated coordinator mode. The
 current broker refuses formatted stores before opening its legacy offset cache.
 
@@ -109,5 +110,16 @@ ISR waits, joins workers and drains TCP delivery/write tickets while source and
 metadata lifetimes still exist. Read callbacks use the ownership fence and
 committed mutations refuse older admissions after reacquisition. Dispatcher
 completion and retained TCP sinks no longer depend on destroyed owners. These
-are internal, single-source seams; normal coordinator handlers/background jobs,
-multi-key aggregation, pending-offset routing and public activation remain gated.
+are internal, single-source seams; the remaining coordinator handlers/background
+jobs, multi-key aggregation, pending-offset routing and public activation remain gated.
+
+The staged membership checkpoint enables normal JoinGroup/SyncGroup/Heartbeat/
+LeaveGroup registrations only in the internal persistence seam, plus a bounded
+owned timeout scheduler. Group value schema v2 adds per-member negotiated session
+timeouts; their deadlines restart at acquisition. Prerelease v1 group values fail
+closed because their missing durations cannot be reconstructed safely. The
+format-v1 manifest, compaction keys, offset/pending schemas and legacy single-node
+storage are unchanged. A batched LeaveGroup has one durable proposal. Storage
+failures survive source-barrier response fencing; owner loss still refuses the
+response. Remaining coordinator handlers/jobs, discovery, multi-key aggregation,
+pending-offset routing, public activation and abrupt RF>1/EOS gates are unfinished.

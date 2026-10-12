@@ -214,6 +214,13 @@ private:
         int32_t epoch;
     };
     static thread_local std::optional<RequestOwnership> coordinator_request_owner_;
+    void coordinatorTimeoutLoop();
+    void scheduleCoordinatorTimeouts();
+    std::thread coordinator_timeout_thread_;
+    std::atomic<bool> coordinator_timeout_stop_{false};
+    std::mutex coordinator_timeout_mutex_;
+    std::condition_variable coordinator_timeout_cv_;
+    std::set<std::string> coordinator_timeout_pending_;
     std::unique_ptr<CoordinatorExecutor> coordinator_executor_;
     std::optional<CoordinatorFormat> staged_coordinator_format_;
     bool staged_coordinator_persistence_ = false;

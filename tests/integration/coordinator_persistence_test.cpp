@@ -14,6 +14,7 @@
 #include "kawasan/broker/transaction_state_manager.h"
 #include "kawasan/common/logger.h"
 #include "kawasan/protocol/api_versions.h"
+#include "kawasan/protocol/leave_group_request.h"
 
 using namespace kawasan;
 using namespace kawasan::broker;
@@ -64,6 +65,14 @@ struct CoordinatorExecutorProbe {
         return status;
     }
     static int64_t allocate(KawasanBroker& b) { return b.allocateNextProducerId(); }
+    static bool submit(KawasanBroker& b, CoordinatorExecutor::Task task) {
+        return b.coordinator_executor_->submit(std::move(task));
+    }
+    static void scheduleTimeouts(KawasanBroker& b) { b.scheduleCoordinatorTimeouts(); }
+    static bool timeoutPending(KawasanBroker& b, const std::string& id) {
+        std::lock_guard<std::mutex> lock(b.coordinator_timeout_mutex_);
+        return b.coordinator_timeout_pending_.contains(id);
+    }
     static bool stopping(KawasanBroker& b) { return b.coordinator_executor_->stopping(); }
 };
 struct CoordinatorPersistenceProbe {
@@ -100,6 +109,11 @@ struct CoordinatorAcquisitionProbe {
         const auto& group = coordinator.groups_.at(id);
         return {group.members.at("member").last_heartbeat, group.rebalance_started_at,
                 group.last_activity, group.rebalances_total.load()};
+    }
+    static void ageMember(GroupCoordinator& coordinator, const std::string& id,
+                          const std::string& member, std::chrono::milliseconds age) {
+        std::lock_guard<std::mutex> lock(coordinator.mutex_);
+        coordinator.groups_.at(id).members.at(member).last_heartbeat -= age;
     }
     static void ageRuntime(GroupCoordinator& coordinator, const std::string& id) {
         std::lock_guard<std::mutex> lock(coordinator.mutex_);
@@ -221,8 +235,8 @@ protected:
         ASSERT_TRUE(waitUntil([&] {
             for (int owner = 0; owner < 3; ++owner) {
                 const auto id = key(owner);
-                for (const auto type : {protocol::CoordinatorType::GROUP,
-                                        protocol::CoordinatorType::TRANSACTION}) {
+                for (const auto type :
+                     {protocol::CoordinatorType::GROUP, protocol::CoordinatorType::TRANSACTION}) {
                     if (brokers[owner]->coordinatorLoadStatus(id, type) != ErrorCode::NONE)
                         return false;
                 }
@@ -305,6 +319,242 @@ GroupSnapshot committedGroup(KawasanBroker& b, const std::string& id) {
     GroupRecordKey key;
     key.group_id = id;
     return image.at(key).group;
+}
+
+template <typename Response, typename Request>
+Response membershipWire(KawasanBroker& b, protocol::ApiKey api, const Request& request,
+                        int16_t version) {
+    Buffer payload;
+    protocol::RequestHeader(api, version, 91, "membership-test").encode(payload);
+    request.encode(payload, version);
+    auto body = test_support::brokerRequest(b.port(), payload);
+    protocol::ResponseHeader header;
+    header.setFlexible(
+        protocol::RequestHeader(api, version, 91, "membership-test").isFlexibleResponseHeader());
+    header.decode(body);
+    Response response;
+    response.decode(body, version);
+    return response;
+}
+
+TEST_F(CoordinatorPersistenceTest, StagedMembershipWireCommitsJoinSyncHeartbeatAndBatchLeave) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    auto join = joinRequest(id);
+    join.setGroupInstanceId("instance");
+    join.setSessionTimeoutMs(120000);
+    const auto joined =
+        membershipWire<protocol::JoinGroupResponse>(b, protocol::ApiKey::JOIN_GROUP, join, 9);
+    ASSERT_EQ(joined.errorCode(), ErrorCode::NONE);
+    EXPECT_EQ(committedGroup(b, id).members.at(0).member_id, joined.memberId());
+    EXPECT_EQ(committedGroup(b, id).members.at(0).session_timeout_ms, 120000);
+    protocol::SyncGroupRequest sync;
+    sync.setGroupId(id);
+    sync.setMemberId(joined.memberId());
+    sync.setGenerationId(joined.generationId());
+    sync.setGroupInstanceId("instance");
+    sync.setProtocolType("consumer");
+    sync.setProtocolName("range");
+    sync.setAssignments({{joined.memberId(), {128, 255}}});
+    EXPECT_EQ(membershipWire<protocol::SyncGroupResponse>(b, protocol::ApiKey::SYNC_GROUP, sync, 5)
+                  .errorCode(),
+              ErrorCode::NONE);
+    EXPECT_EQ(committedGroup(b, id).members.at(0).assignment, (std::vector<uint8_t>{128, 255}));
+    auto heartbeat = heartbeatRequest(id, joined.generationId());
+    heartbeat.setMemberId(joined.memberId());
+    EXPECT_EQ(
+        membershipWire<protocol::HeartbeatResponse>(b, protocol::ApiKey::HEARTBEAT, heartbeat, 4)
+            .errorCode(),
+        ErrorCode::NONE);
+    const auto before = b.logManager()->getLog("__consumer_offsets", 0)->logEndOffset();
+    protocol::LeaveGroupRequest leave;
+    leave.setGroupId(id);
+    leave.addMember({joined.memberId(), "instance", {}});
+    leave.addMember({"unknown", {}, {}});
+    const auto left =
+        membershipWire<protocol::LeaveGroupResponse>(b, protocol::ApiKey::LEAVE_GROUP, leave, 5);
+    ASSERT_EQ(left.members().size(), 2u);
+    EXPECT_EQ(left.members()[0].error_code, ErrorCode::NONE);
+    EXPECT_EQ(left.members()[1].error_code, ErrorCode::UNKNOWN_MEMBER_ID);
+    EXPECT_TRUE(committedGroup(b, id).members.empty());
+    EXPECT_EQ(b.logManager()->getLog("__consumer_offsets", 0)->logEndOffset(), before + 1);
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, MembershipCheckpointFailureKeepsStorageErrorAndLiveState) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    ASSERT_EQ(put(b, id, {groupRecord(id)}), ErrorCode::NONE);
+    const auto before =
+        CoordinatorAcquisitionProbe::runtime(CoordinatorPersistenceProbe::groups(b), id);
+    const auto blocked = dir / "0/__consumer_offsets-0/checkpoint.meta.tmp";
+    fs::create_directory(blocked);
+    EXPECT_EQ(membershipWire<protocol::HeartbeatResponse>(b, protocol::ApiKey::HEARTBEAT,
+                                                          heartbeatRequest(id), 4)
+                  .errorCode(),
+              ErrorCode::KAFKA_STORAGE_ERROR);
+    EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(CoordinatorPersistenceProbe::groups(b), id),
+              before);
+    EXPECT_EQ(b.coordinatorLoadStatus(id, protocol::CoordinatorType::GROUP),
+              ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+    fs::remove(blocked);
+    b.acquireCoordinatorPartitions();
+    EXPECT_EQ(membershipWire<protocol::HeartbeatResponse>(b, protocol::ApiKey::HEARTBEAT,
+                                                          heartbeatRequest(id), 0)
+                  .errorCode(),
+              ErrorCode::NONE);
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest,
+       RecoveredNegotiatedDeadlinesExpireMembersIndependentlyInBackground) {
+    const auto id = key(0);
+    {
+        KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+        b.start();
+        b.reconcileReplicas();
+        auto r = groupRecord(id);
+        r.group.members[0].session_timeout_ms = 120000;
+        auto short_member = r.group.members[0];
+        short_member.member_id = "short";
+        short_member.group_instance_id = "short-instance";
+        short_member.session_timeout_ms = 6000;
+        r.group.members.push_back(short_member);
+        ASSERT_EQ(put(b, id, {r, offsetRecord(id)}), ErrorCode::NONE);
+        b.stop();
+    }
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    ASSERT_EQ(committedGroup(b, id).members.size(), 2u);
+    auto& groups = CoordinatorPersistenceProbe::groups(b);
+    CoordinatorAcquisitionProbe::ageMember(groups, id, "member", 40s);
+    CoordinatorAcquisitionProbe::ageMember(groups, id, "short", 10s);
+    // Real scheduler, no direct draft timeout call; cache publication follows commitment.
+    ASSERT_TRUE(waitUntil([&] { return groups.describeGroups({id})[0].members.size() == 1; }));
+    const auto committed = committedGroup(b, id);
+    ASSERT_EQ(committed.members.size(), 1u);
+    EXPECT_EQ(committed.members[0].member_id, "member");
+    EXPECT_EQ(committed.members[0].session_timeout_ms, 120000);
+    EXPECT_EQ(groups.getMetrics().member_timeout_total, 1);
+    EXPECT_EQ(CoordinatorPersistenceProbe::offsets(b).fetchOffset(id, "data", 0), 42);
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest,
+       ActualMembershipIsrWaitLeavesIoResponsiveAndPublishesOnlyAfterCommit) {
+    startCluster();
+    const auto id = key(1);
+    auto& b = *brokers[1];
+    ASSERT_EQ(put(b, id, {groupRecord(id)}), ErrorCode::NONE);
+    const auto before =
+        CoordinatorAcquisitionProbe::runtime(CoordinatorPersistenceProbe::groups(b), id);
+    auto* log = b.logManager()->getLog("__consumer_offsets", 1);
+    const auto initial_end = log->logEndOffset();
+    brokers[0]->replicaManager()->stop();
+    brokers[2]->replicaManager()->stop();
+    auto pending = std::async(std::launch::async, [&] {
+        return membershipWire<protocol::HeartbeatResponse>(b, protocol::ApiKey::HEARTBEAT,
+                                                           heartbeatRequest(id), 4);
+    });
+    ASSERT_TRUE(waitUntil([&] { return log->logEndOffset() > initial_end; }));
+    EXPECT_EQ(pending.wait_for(50ms), std::future_status::timeout);
+    EXPECT_EQ(CoordinatorAcquisitionProbe::runtime(CoordinatorPersistenceProbe::groups(b), id),
+              before);
+    Buffer payload;
+    protocol::RequestHeader(protocol::ApiKey::API_VERSIONS, 1, 92, "io-progress").encode(payload);
+    protocol::ApiVersionsRequest{}.encode(payload, 1);
+    auto progress = test_support::brokerRequest(b.port(), payload);
+    EXPECT_EQ(progress.readInt32(), 92);
+    EXPECT_EQ(progress.readInt16(), 0);
+    brokers[0]->replicaManager()->start();
+    brokers[2]->replicaManager()->start();
+    ASSERT_EQ(pending.wait_for(10s), std::future_status::ready);
+    EXPECT_EQ(pending.get().errorCode(), ErrorCode::NONE);
+    EXPECT_GT(
+        CoordinatorAcquisitionProbe::runtime(CoordinatorPersistenceProbe::groups(b), id).heartbeat,
+        before.heartbeat);
+}
+
+TEST_F(CoordinatorPersistenceTest, QueuedTimeoutCannotMutateReacquiredOwnershipEpoch) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    auto record = groupRecord(id);
+    record.group.members[0].session_timeout_ms = 6000;
+    ASSERT_EQ(put(b, id, {record}), ErrorCode::NONE);
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    struct ReleaseOnExit {
+        std::promise<void>& promise;
+        bool done = false;
+        void finish() {
+            if (!done) {
+                promise.set_value();
+                done = true;
+            }
+        }
+        ~ReleaseOnExit() { finish(); }
+    } release_on_exit{release};
+    std::atomic<int> entered{0};
+    for (int i = 0; i < 2; ++i)
+        ASSERT_TRUE(CoordinatorExecutorProbe::submit(b, [&](bool, auto) {
+            entered.fetch_add(1);
+            released.wait();
+        }));
+    ASSERT_TRUE(waitUntil([&] { return entered.load() == 2; }));
+    CoordinatorAcquisitionProbe::ageMember(CoordinatorPersistenceProbe::groups(b), id, "member",
+                                           10s);
+    CoordinatorExecutorProbe::scheduleTimeouts(b);
+    ASSERT_TRUE(CoordinatorExecutorProbe::timeoutPending(b, id));
+    ASSERT_EQ(b.metadataController()->updatePartitionLeader("__consumer_offsets", 0, 0).error_code,
+              ErrorCode::NONE);
+    b.reconcileReplicas();
+    ASSERT_EQ(b.coordinatorLoadStatus(id, protocol::CoordinatorType::GROUP), ErrorCode::NONE);
+    release_on_exit.finish();
+    ASSERT_TRUE(waitUntil([&] { return !CoordinatorExecutorProbe::timeoutPending(b, id); }));
+    EXPECT_EQ(b.logManager()->getLog("__consumer_offsets", 0)->logEndOffset(), 1);
+    EXPECT_EQ(committedGroup(b, id).members.size(), 1u);
+    EXPECT_EQ(CoordinatorPersistenceProbe::groups(b).getMetrics().member_timeout_total, 0);
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, WireProtocolErrorCommitsGenerationAndHeartbeatEffects) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    auto record = groupRecord(id);
+    record.group.state = 2;
+    auto other = record.group.members[0];
+    other.member_id = "other";
+    other.group_instance_id = "other-instance";
+    record.group.members.push_back(other);
+    ASSERT_EQ(put(b, id, {record}), ErrorCode::NONE);
+    protocol::SyncGroupRequest sync;
+    sync.setGroupId(id);
+    sync.setGenerationId(7);
+    sync.setMemberId("member");
+    sync.setAssignments({{"member", {1}}});
+    EXPECT_EQ(membershipWire<protocol::SyncGroupResponse>(b, protocol::ApiKey::SYNC_GROUP, sync, 0)
+                  .errorCode(),
+              ErrorCode::ILLEGAL_GENERATION);
+    EXPECT_EQ(committedGroup(b, id).generation, 8);
+    auto& groups = CoordinatorPersistenceProbe::groups(b);
+    CoordinatorAcquisitionProbe::ageMember(groups, id, "member", 1s);
+    const auto before = CoordinatorAcquisitionProbe::runtime(groups, id);
+    EXPECT_EQ(membershipWire<protocol::HeartbeatResponse>(b, protocol::ApiKey::HEARTBEAT,
+                                                          heartbeatRequest(id, 8), 0)
+                  .errorCode(),
+              ErrorCode::REBALANCE_IN_PROGRESS);
+    EXPECT_GT(CoordinatorAcquisitionProbe::runtime(groups, id).heartbeat, before.heartbeat);
+    EXPECT_EQ(committedGroup(b, id).generation, 8);
+    b.stop();
 }
 
 TEST_F(CoordinatorPersistenceTest, GroupStateProposalsCommitMembershipAndTouchedRuntimeTogether) {
@@ -545,6 +795,12 @@ TEST_F(CoordinatorPersistenceTest, GroupTimeoutProposalPublishesEvictionMetricsO
     ASSERT_EQ(put(b, id, {groupRecord(id)}), ErrorCode::NONE);
     auto& groups = CoordinatorPersistenceProbe::groups(b);
     groups.setMemberTimeoutMs(1);
+    {
+        // Staged expiration uses the durable member deadline rather than the legacy maximum.
+        auto r = groupRecord(id);
+        r.group.members[0].session_timeout_ms = 6000;
+        ASSERT_EQ(put(b, id, {r}), ErrorCode::NONE);
+    }
     CoordinatorAcquisitionProbe::ageRuntime(groups, id);
     const auto before = CoordinatorAcquisitionProbe::runtime(groups, id);
     const auto metrics_before = groups.getMetrics().member_timeout_total;

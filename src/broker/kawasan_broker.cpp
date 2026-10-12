@@ -841,6 +841,8 @@ void KawasanBroker::start() {
     // cluster it retries until a controller is elected and the topics exist.
     bootstrap_stop_.store(false);
     bootstrap_thread_ = std::thread(&KawasanBroker::controllerBootstrapLoop, this);
+    if (staged_coordinator_persistence_)
+        coordinator_timeout_thread_ = std::thread(&KawasanBroker::coordinatorTimeoutLoop, this);
 
     // 0A.11: Mark the broker as healthy and ready for serving traffic.
     // Probes against /readiness and /liveness previously returned 503 forever
@@ -861,6 +863,10 @@ void KawasanBroker::stop() {
     // to finish while storage, metadata and replica progress are still alive.
     // The writer observes the stop flag and cancels an uncommitted ISR wait.
     if (staged_coordinator_persistence_) {
+        coordinator_timeout_stop_.store(true);
+        coordinator_timeout_cv_.notify_all();
+        if (coordinator_timeout_thread_.joinable())
+            coordinator_timeout_thread_.join();
         // Seal the queue first, then cancel active ISR waits. Workers complete
         // queued requests with refusal while dispatcher/transport are alive.
         if (coordinator_executor_)
@@ -1702,7 +1708,48 @@ void KawasanBroker::registerProtocolHandlers() {
             api->max_version > codec_max) {
             throw std::logic_error("advertised API range exceeds registered codec range");
         }
-        if (staged_coordinator_format_) {
+        const bool staged_membership =
+            staged_coordinator_persistence_ &&
+            (key == protocol::ApiKey::JOIN_GROUP || key == protocol::ApiKey::SYNC_GROUP ||
+             key == protocol::ApiKey::HEARTBEAT || key == protocol::ApiKey::LEAVE_GROUP);
+        if (staged_membership) {
+            handler = [this, key, work = std::move(handler), errors](Context& context) {
+                // Decode a copy for routing; the worker retains the original payload.
+                Buffer payload = context.payload;
+                std::string group;
+                switch (key) {
+                    case protocol::ApiKey::JOIN_GROUP: {
+                        protocol::JoinGroupRequest request;
+                        request.decode(payload, context.header.apiVersion());
+                        group = request.groupId();
+                        break;
+                    }
+                    case protocol::ApiKey::SYNC_GROUP: {
+                        protocol::SyncGroupRequest request;
+                        request.decode(payload, context.header.apiVersion());
+                        group = request.groupId();
+                        break;
+                    }
+                    case protocol::ApiKey::HEARTBEAT: {
+                        protocol::HeartbeatRequest request;
+                        request.decode(payload, context.header.apiVersion());
+                        group = request.groupId();
+                        break;
+                    }
+                    case protocol::ApiKey::LEAVE_GROUP: {
+                        protocol::LeaveGroupRequest request;
+                        request.decode(payload, context.header.apiVersion());
+                        group = request.groupId();
+                        break;
+                    }
+                    default:
+                        throw std::logic_error("invalid membership route");
+                }
+                return deferCoordinatorRequest(context, group, protocol::CoordinatorType::GROUP,
+                                               work, errors);
+            };
+        }
+        if (staged_coordinator_format_ && !staged_membership) {
             // Staged acquisition must never reach legacy writes, cleanup or
             // marker completion. Version-specific builders retain wire shape.
             switch (key) {
@@ -3690,15 +3737,26 @@ Buffer KawasanBroker::buildFindCoordinatorError(const RequestDispatcher::Request
 Buffer KawasanBroker::handleJoinGroup(RequestDispatcher::RequestContext& context) {
     protocol::JoinGroupRequest request;
     request.decode(context.payload, context.header.apiVersion());
-    if (!isCoordinatorFor(request.groupId(), protocol::CoordinatorType::GROUP)) {
+    if (!staged_coordinator_persistence_ &&
+        !isCoordinatorFor(request.groupId(), protocol::CoordinatorType::GROUP)) {
         return buildJoinGroupError(context, ErrorCode::NOT_COORDINATOR,
                                    context.header.apiVersion());
     }
 
     // 0A.10: forward the real client identity so DescribeGroups returns
     // something useful instead of "unknown".
-    const auto result = group_coordinator_->handleJoinGroup(request, context.header.clientId(),
-                                                            context.peer_identity);
+    GroupCoordinator::JoinGroupResult result;
+    if (staged_coordinator_persistence_) {
+        const auto status = mutateCoordinatorGroupState(request.groupId(), [&](auto& draft) {
+            result =
+                draft.handleJoinGroup(request, context.header.clientId(), context.peer_identity);
+        });
+        if (status != ErrorCode::NONE)
+            throw KawasanException(status);
+    } else {
+        result = group_coordinator_->handleJoinGroup(request, context.header.clientId(),
+                                                     context.peer_identity);
+    }
 
     protocol::JoinGroupResponse response;
     response.setErrorCode(result.error);
@@ -3742,7 +3800,8 @@ Buffer KawasanBroker::buildJoinGroupError(const RequestDispatcher::RequestContex
 Buffer KawasanBroker::handleSyncGroup(RequestDispatcher::RequestContext& context) {
     protocol::SyncGroupRequest request;
     request.decode(context.payload, context.header.apiVersion());
-    if (!isCoordinatorFor(request.groupId(), protocol::CoordinatorType::GROUP)) {
+    if (!staged_coordinator_persistence_ &&
+        !isCoordinatorFor(request.groupId(), protocol::CoordinatorType::GROUP)) {
         return buildSyncGroupError(context, ErrorCode::NOT_COORDINATOR,
                                    context.header.apiVersion());
     }
@@ -3751,7 +3810,15 @@ Buffer KawasanBroker::handleSyncGroup(RequestDispatcher::RequestContext& context
                  request.groupId(), request.generationId(), request.memberId(),
                  request.assignments().size());
 
-    const auto result = group_coordinator_->handleSyncGroup(request);
+    GroupCoordinator::SyncGroupResult result;
+    if (staged_coordinator_persistence_) {
+        const auto status = mutateCoordinatorGroupState(
+            request.groupId(), [&](auto& draft) { result = draft.handleSyncGroup(request); });
+        if (status != ErrorCode::NONE)
+            throw KawasanException(status);
+    } else {
+        result = group_coordinator_->handleSyncGroup(request);
+    }
 
     Logger::info("SyncGroup response: error={} assignment_size={}", static_cast<int>(result.error),
                  result.assignment.size());
@@ -3785,12 +3852,21 @@ Buffer KawasanBroker::buildSyncGroupError(const RequestDispatcher::RequestContex
 Buffer KawasanBroker::handleHeartbeat(RequestDispatcher::RequestContext& context) {
     protocol::HeartbeatRequest request;
     request.decode(context.payload, context.header.apiVersion());
-    if (!isCoordinatorFor(request.groupId(), protocol::CoordinatorType::GROUP)) {
+    if (!staged_coordinator_persistence_ &&
+        !isCoordinatorFor(request.groupId(), protocol::CoordinatorType::GROUP)) {
         return buildHeartbeatError(context, ErrorCode::NOT_COORDINATOR,
                                    context.header.apiVersion());
     }
 
-    const ErrorCode error = group_coordinator_->handleHeartbeat(request);
+    ErrorCode error;
+    if (staged_coordinator_persistence_) {
+        const auto status = mutateCoordinatorGroupState(
+            request.groupId(), [&](auto& draft) { error = draft.handleHeartbeat(request); });
+        if (status != ErrorCode::NONE)
+            throw KawasanException(status);
+    } else {
+        error = group_coordinator_->handleHeartbeat(request);
+    }
 
     protocol::HeartbeatResponse response;
     response.setErrorCode(error);
@@ -3812,7 +3888,8 @@ Buffer KawasanBroker::buildHeartbeatError(const RequestDispatcher::RequestContex
 Buffer KawasanBroker::handleLeaveGroup(RequestDispatcher::RequestContext& context) {
     protocol::LeaveGroupRequest request;
     request.decode(context.payload, context.header.apiVersion());
-    if (!isCoordinatorFor(request.groupId(), protocol::CoordinatorType::GROUP)) {
+    if (!staged_coordinator_persistence_ &&
+        !isCoordinatorFor(request.groupId(), protocol::CoordinatorType::GROUP)) {
         return buildLeaveGroupError(context, ErrorCode::NOT_COORDINATOR,
                                     context.header.apiVersion());
     }
@@ -3822,17 +3899,28 @@ Buffer KawasanBroker::handleLeaveGroup(RequestDispatcher::RequestContext& contex
     // v0–v2 there is exactly one member and the top-level error_code holds it.
     protocol::LeaveGroupResponse response;
     ErrorCode top_level_error = ErrorCode::NONE;
-    for (const auto& member : request.members()) {
-        const ErrorCode err =
-            group_coordinator_->handleLeaveGroup(request.groupId(), member.member_id);
-        if (err != ErrorCode::NONE && top_level_error == ErrorCode::NONE) {
-            top_level_error = err;
+    auto leave = [&](GroupCoordinator::GroupProposal* draft) {
+        for (const auto& member : request.members()) {
+            const ErrorCode err =
+                draft ? draft->handleLeaveGroup(member.member_id)
+                      : group_coordinator_->handleLeaveGroup(request.groupId(), member.member_id);
+            if (err != ErrorCode::NONE && top_level_error == ErrorCode::NONE) {
+                top_level_error = err;
+            }
+            protocol::LeaveGroupResponse::MemberResult mr;
+            mr.member_id = member.member_id;
+            mr.group_instance_id = member.group_instance_id;
+            mr.error_code = err;
+            response.addMember(std::move(mr));
         }
-        protocol::LeaveGroupResponse::MemberResult mr;
-        mr.member_id = member.member_id;
-        mr.group_instance_id = member.group_instance_id;
-        mr.error_code = err;
-        response.addMember(std::move(mr));
+    };
+    if (staged_coordinator_persistence_) {
+        const auto status =
+            mutateCoordinatorGroupState(request.groupId(), [&](auto& draft) { leave(&draft); });
+        if (status != ErrorCode::NONE)
+            throw KawasanException(status);
+    } else {
+        leave(nullptr);
     }
     response.setErrorCode(top_level_error);
 

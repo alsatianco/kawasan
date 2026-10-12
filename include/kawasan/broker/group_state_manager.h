@@ -24,6 +24,7 @@ struct GroupSnapshot {
         std::optional<std::string> group_instance_id;
         std::vector<uint8_t> metadata;
         std::vector<uint8_t> assignment;
+        int32_t session_timeout_ms = 30000;
         bool operator==(const Member&) const = default;
     };
     int32_t generation = 0;

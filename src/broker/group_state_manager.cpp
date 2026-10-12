@@ -13,6 +13,8 @@ namespace kawasan::broker {
 namespace {
 constexpr int8_t KEY_MAGIC = 'G';
 constexpr int8_t VERSION = 1;
+// Prerelease group values without negotiated deadlines cannot safely be served.
+constexpr int8_t GROUP_VALUE_VERSION = 2;
 using Kind = GroupRecordKey::Kind;
 
 [[noreturn]] void reject(const char* reason) {
@@ -66,6 +68,8 @@ void validateGroup(const GroupSnapshot& group) {
     std::set<std::string> members;
     std::set<std::string> instances;
     for (const auto& member : group.members) {
+        if (member.session_timeout_ms < 6000 || member.session_timeout_ms > 300000)
+            reject("invalid member session timeout");
         if (member.member_id.empty() || !members.insert(member.member_id).second)
             reject("duplicate or missing member identity");
         if (member.group_instance_id && (member.group_instance_id->empty() ||
@@ -114,7 +118,7 @@ Record GroupStateManager::encode(const GroupRecord& record) {
     if (record.tombstone)
         return result;
     Buffer value;
-    value.writeInt8(VERSION);
+    value.writeInt8(record.key.kind == Kind::Group ? GROUP_VALUE_VERSION : VERSION);
     if (record.key.kind == Kind::Group) {
         const auto& group = record.group;
         validateGroup(group);
@@ -135,6 +139,7 @@ Record GroupStateManager::encode(const GroupRecord& record) {
                 putString(value, *member.group_instance_id);
             putBytes(value, member.metadata);
             putBytes(value, member.assignment);
+            value.writeInt32(member.session_timeout_ms);
         }
     } else {
         validateOffset(record.offset);
@@ -176,7 +181,7 @@ GroupRecord GroupStateManager::decode(const Record& record) {
         return result;
     }
     Buffer value(*record.value);
-    if (value.readInt8() != VERSION)
+    if (value.readInt8() != (result.key.kind == Kind::Group ? GROUP_VALUE_VERSION : VERSION))
         reject("unsupported record value");
     if (result.key.kind == Kind::Group) {
         auto& group = result.group;
@@ -188,7 +193,7 @@ GroupRecord GroupStateManager::decode(const Record& record) {
         group.rebalance_timeout_ms = value.readInt32();
         group.last_update_timestamp = value.readInt64();
         const int32_t count = value.readInt32();
-        if (count < 0 || static_cast<size_t>(count) > value.remaining() / 21)
+        if (count < 0 || static_cast<size_t>(count) > value.remaining() / 25)
             reject("invalid member count");
         group.members.reserve(static_cast<size_t>(count));
         for (int32_t i = 0; i < count; ++i) {
@@ -203,6 +208,7 @@ GroupRecord GroupStateManager::decode(const Record& record) {
                 member.group_instance_id = getString(value);
             member.metadata = getBytes(value);
             member.assignment = getBytes(value);
+            member.session_timeout_ms = value.readInt32();
             group.members.push_back(std::move(member));
         }
         validateGroup(group);

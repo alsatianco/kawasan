@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgrade and operational procedures see [./OPERATIONS.md](./OPERATIONS.md); for the full protocol surface see [./api_coverage_matrix.md](./api_coverage_matrix.md).
 
+## 2026-10-13
+
+- Migrate staged JoinGroup, SyncGroup, Heartbeat and batched LeaveGroup through
+  detached committed proposals and the deferred coordinator executor. Preserve
+  state-changing protocol results only after persistence succeeds, and retain
+  original storage failures when response fencing encounters a source barrier.
+- Schedule owned member/rebalance timeouts through the bounded executor with
+  original-epoch fencing and shutdown draining. Persist each negotiated member
+  session timeout in group value schema v2 and rebuild its deadline on recovery;
+  reject prerelease v1 group values that lack those durations. Default legacy
+  single-node storage remains unchanged. Remaining coordinator handlers/jobs,
+  discovery, public format activation and RF>1/EOS acceptance stay gated.
+
 ## 2026-10-06
 
 - Add a bounded staged coordinator executor with shutdown queue refusal, ISR
