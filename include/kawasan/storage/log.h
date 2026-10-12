@@ -125,6 +125,31 @@ public:
     /// @return Vector of record batches
     std::vector<RecordBatch> read(Offset start_offset, size_t max_bytes);
 
+    /// @brief Log-derived producer state for inspection on a leader or follower.
+    /// This is independent of the broker's dedup cache and its older snapshots.
+    struct ProducerState {
+        int64_t producer_id = -1;
+        int16_t producer_epoch = -1;
+        int32_t last_sequence = -1;
+        Timestamp last_timestamp = -1;
+        int32_t coordinator_epoch = -1;
+        Offset current_txn_start_offset = -1;
+        bool operator==(const ProducerState&) const = default;
+    };
+    struct ProducerInspection {
+        Offset log_end_offset = 0;
+        std::vector<ProducerState> producers;
+    };
+
+    /// @brief Inspect one consistent local log image through LEO (not HW).
+    /// Scans in bounded chunks under the log lock, including uncommitted batches.
+    /// Throws OFFSET_NOT_AVAILABLE if prefix deletion/whole-batch compaction has
+    /// removed history: existing dedup snapshots lack timestamps/transaction fields
+    /// and cannot safely fill those holes. Throws on closed/corrupt/unreadable
+    /// sources; never returns a partial image. Caller must pin the log lifetime
+    /// and separately fence assignment/topic identity/epochs before wire success.
+    ProducerInspection inspectProducerState();
+
     /// @brief Phase 5.1: raw-bytes fetch path. Returns serialized
     /// record-batch bytes concatenated, suitable for direct write into
     /// the Fetch response body. Saves a deserialize-then-serialize cycle

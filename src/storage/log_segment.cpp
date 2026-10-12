@@ -291,6 +291,8 @@ std::vector<uint8_t> LogSegment::readRaw(Offset start_offset, size_t max_bytes) 
 
 std::vector<RecordBatch> LogSegment::read(Offset start_offset, size_t max_bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (closed_)
+        throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR, "Cannot read closed segment");
 
     std::vector<RecordBatch> batches;
     size_t bytes_read = 0;
@@ -314,6 +316,10 @@ std::vector<RecordBatch> LogSegment::read(Offset start_offset, size_t max_bytes)
         std::vector<uint8_t> data(value.begin(), value.end());
 
         auto batch = RecordBatch::deserialize(data);
+        if (!batch.hasValidOffsetSpan() || batch.baseOffset() != batch_base || batch_base < 0 ||
+            batch_base > std::numeric_limits<Offset>::max() - batch.offsetSpan())
+            throw StorageException(ErrorCode::CORRUPT_MESSAGE,
+                                   "Invalid stored record batch offset span or key in " + path_);
 
         // Skip this batch if it ends entirely before the requested start_offset
         Offset batch_end = batch_base + batch.offsetSpan();
@@ -329,6 +335,10 @@ std::vector<RecordBatch> LogSegment::read(Offset start_offset, size_t max_bytes)
         it->Next();
     }
 
+    if (!it->status().ok())
+        throw StorageException(
+            ErrorCode::KAFKA_STORAGE_ERROR,
+            "Failed to read log segment " + path_ + ": " + it->status().ToString());
     return batches;
 }
 

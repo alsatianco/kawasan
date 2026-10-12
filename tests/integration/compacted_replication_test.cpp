@@ -92,6 +92,7 @@ protected:
             config.setInt("transaction.state.topic.num.partitions", 1);
             config.setLong("replica.lag.time.max.ms", 1000);
             config.setString("log.dirs", (directory_ / std::to_string(id)).string());
+            configs_.push_back(config);
             brokers_.push_back(std::make_unique<kawasan::broker::KawasanBroker>(config));
         }
         for (size_t id = 0; id < brokers_.size(); ++id) {
@@ -126,6 +127,7 @@ protected:
     asio::io_context reservation_io_;
     std::vector<std::unique_ptr<asio::ip::tcp::acceptor>> reservations_;
     std::vector<std::unique_ptr<kawasan::broker::KawasanBroker>> brokers_;
+    std::vector<kawasan::Config> configs_;
 };
 
 TEST_F(CompactedReplicationTest, LaggingFollowerCrossesCommittedCompactionGaps) {
@@ -228,5 +230,85 @@ TEST_F(CompactedReplicationTest, PromotionReplaysSparseSequencesAndLaterProducer
     const auto next = brokerProduce(brokers_[1]->port(), topic, producerBatch(99, 10));
     EXPECT_EQ(next.error_code, kawasan::ErrorCode::NONE);
     EXPECT_EQ(next.base_offset, 12);
+}
+
+TEST_F(CompactedReplicationTest, FollowerProducerInspectionTracksIngestionOverlapAndRestart) {
+    using namespace kawasan;
+    using namespace kawasan::test_support;
+    constexpr const char* topic = "producer-inspection";
+    const TopicPartition tp{topic, 0};
+    broker::TopicSpecification spec;
+    spec.name = topic;
+    spec.num_partitions = 1;
+    spec.replication_factor = 3;
+    spec.assignments = {{0, 1, 2}};
+    spec.configs = {{"cleanup.policy", "compact"}};
+    ASSERT_EQ(controller()->createTopic(spec).error_code, ErrorCode::NONE);
+    ASSERT_TRUE(waitUntil([&] {
+        for (auto& broker : brokers_)
+            if (!broker->logManager()->getLog(topic, 0))
+                return false;
+        return brokers_[0]->replicaManager()->isLeader(tp);
+    }));
+    auto* leader = brokers_[0]->logManager()->getLog(topic, 0);
+    {
+        auto write_lock = brokers_[0]->lockPartitionWrites(tp);
+        auto first = sparseProducerBatch();
+        first.setAttributes(0x10);
+        first.setFirstTimestamp(500);
+        first.setMaxTimestamp(500);
+        ASSERT_EQ(leader->appendReplicatedBatch(first),
+                  storage::Log::ReplicaAppendResult::kAppended);
+    }
+    auto* follower = brokers_[1]->logManager()->getLog(topic, 0);
+    ASSERT_TRUE(waitUntil([&] { return follower->logEndOffset() == 10; }));
+    ASSERT_FALSE(brokers_[1]->replicaManager()->isLeader(tp));
+    auto image = follower->inspectProducerState();
+    ASSERT_EQ(image.producers.size(), 1u);
+    EXPECT_EQ(image.producers[0], (storage::Log::ProducerState{99, 0, 9, 500, -1, 0}));
+    {
+        auto write_lock = brokers_[0]->lockPartitionWrites(tp);
+        leader->appendBatch(storage::RecordBatch::makeControlBatch(99, 0, 10, false, 700), false);
+        auto later = producerBatch(100, 0);
+        later.setFirstTimestamp(900);
+        later.setMaxTimestamp(900);
+        leader->appendBatch(later, false);
+    }
+    ASSERT_TRUE(waitUntil(
+        [&] { return follower->logEndOffset() == 12 && follower->highWatermark() == 12; }));
+    const auto expected = leader->inspectProducerState().producers;
+    ASSERT_EQ(expected.size(), 2u);
+    EXPECT_EQ(expected[0], (storage::Log::ProducerState{99, 0, 9, 700, 0, -1}));
+    EXPECT_EQ(expected[1], (storage::Log::ProducerState{100, 0, 0, 900, -1, -1}));
+    EXPECT_EQ(follower->inspectProducerState().producers, expected);
+
+    // Keep the metadata epoch, but seed a shorter divergent tail. The resumed
+    // real Fetch crosses the leader's sparse batch and exercises kOverlap.
+    brokers_[1]->replicaManager()->stop();
+    {
+        auto write_lock = brokers_[1]->lockPartitionWrites(tp);
+        ASSERT_EQ(follower->truncateSuffix(0), 0);
+        auto divergent = batchWithWireSpan(producerBatch(42, 0), 4);
+        ASSERT_EQ(follower->appendReplicatedBatch(divergent),
+                  storage::Log::ReplicaAppendResult::kAppended);
+    }
+    image = follower->inspectProducerState();
+    ASSERT_EQ(image.producers.size(), 1u);
+    EXPECT_EQ(image.producers[0].producer_id, 42);
+    brokers_[1]->replicaManager()->start();
+    ASSERT_TRUE(waitUntil([&] { return follower->logEndOffset() == 12; }));
+    EXPECT_EQ(follower->inspectProducerState().producers, expected);
+
+    // Destroy/reopen the actual follower, preserving its source directory.
+    brokers_[1].reset();
+    brokers_[1] = std::make_unique<broker::KawasanBroker>(configs_[1]);
+    brokers_[1]->start();
+    ASSERT_TRUE(waitUntil([&] {
+        const auto current = brokers_[1]->replicaManager()->getLeader(tp);
+        return current == 0 && brokers_[1]->logManager()->getLog(topic, 0) != nullptr;
+    }));
+    follower = brokers_[1]->logManager()->getLog(topic, 0);
+    EXPECT_EQ(follower->inspectProducerState().producers, expected);
+    EXPECT_FALSE(brokers_[1]->replicaManager()->isLeader(tp));
 }
 }  // namespace

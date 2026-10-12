@@ -313,6 +313,108 @@ std::vector<uint8_t> Log::readRaw(Offset start_offset, size_t max_bytes) {
     return out;
 }
 
+Log::ProducerInspection Log::inspectProducerState() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (closed_)
+        throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR, "Cannot inspect closed log");
+
+    const auto incomplete = [] {
+        throw StorageException(ErrorCode::OFFSET_NOT_AVAILABLE,
+                               "Producer inspection requires complete history or a full "
+                               "inspection snapshot; dedup snapshots are insufficient");
+    };
+    if (startOffsetUnlocked() != 0)
+        incomplete();
+
+    ProducerInspection image;
+    image.log_end_offset = endOffsetUnlocked();
+    std::map<int64_t, ProducerState> producers;
+    Offset next = 0;
+    constexpr size_t kChunkBytes = 8 * 1024 * 1024;
+    for (const auto& segment : segments_) {
+        const Offset end = segment->nextOffset();
+        while (next < end) {
+            const auto batches = segment->read(next, kChunkBytes);
+            if (batches.empty())
+                incomplete();
+            for (const auto& batch : batches) {
+                // Missing whole batches may have contained another producer,
+                // a transaction start or a marker. Never invent their fields.
+                if (batch.baseOffset() != next)
+                    incomplete();
+                if (!batch.hasValidOffsetSpan() || batch.offsetSpan() > end - next)
+                    throw StorageException(ErrorCode::CORRUPT_MESSAGE,
+                                           "Invalid producer inspection batch span");
+                next += batch.offsetSpan();
+                if (batch.producerId() < 0) {
+                    if (batch.isControlBatch())
+                        throw StorageException(ErrorCode::CORRUPT_MESSAGE,
+                                               "Control marker has no producer identity");
+                    continue;
+                }
+                if (batch.producerEpoch() < 0)
+                    throw StorageException(ErrorCode::CORRUPT_MESSAGE,
+                                           "Invalid producer inspection epoch");
+
+                if (batch.isControlBatch() && batch.records().empty())
+                    continue;  // Kafka ignores a fully cleaned control batch.
+
+                auto& state = producers[batch.producerId()];
+                state.producer_id = batch.producerId();
+                if (state.producer_epoch != batch.producerEpoch())
+                    state.last_sequence = -1;
+                state.producer_epoch = batch.producerEpoch();
+                if (batch.isControlBatch()) {
+                    if (!batch.isTransactional() || batch.records().size() != 1 ||
+                        batch.offsetSpan() != 1)
+                        throw StorageException(ErrorCode::CORRUPT_MESSAGE,
+                                               "Invalid transaction marker batch");
+                    const auto& record = batch.records().front();
+                    if (!record.key || record.key->size() < 4 || !record.value ||
+                        record.value->size() < 6)
+                        throw StorageException(ErrorCode::CORRUPT_MESSAGE,
+                                               "Invalid versioned transaction marker");
+                    Buffer key(*record.key);
+                    Buffer value(*record.value);
+                    const auto key_version = key.readInt16();
+                    const auto type = key.readInt16();
+                    const auto value_version = value.readInt16();
+                    if (key_version < 0 || value_version < 0 || (type != 0 && type != 1))
+                        throw StorageException(ErrorCode::CORRUPT_MESSAGE,
+                                               "Unsupported transaction control record");
+                    // Kafka parses future positive versions using the known
+                    // prefix. Markers update epoch/time, preserve a same-epoch
+                    // data sequence, and end even an empty transaction.
+                    state.coordinator_epoch = value.readInt32();
+                    state.last_timestamp = record.timestamp;
+                    state.current_txn_start_offset = -1;
+                } else {
+                    if (batch.baseSequence() < 0)
+                        throw StorageException(ErrorCode::CORRUPT_MESSAGE,
+                                               "Invalid producer inspection data sequence");
+                    state.last_sequence = static_cast<int32_t>(
+                        (static_cast<int64_t>(batch.baseSequence()) + batch.lastOffsetDelta()) %
+                        (static_cast<int64_t>(std::numeric_limits<int32_t>::max()) + 1));
+                    state.last_timestamp = batch.maxTimestamp();
+                    if (state.current_txn_start_offset >= 0 && !batch.isTransactional())
+                        throw StorageException(ErrorCode::CORRUPT_MESSAGE,
+                                               "Nontransactional data inside an open transaction");
+                    if (batch.isTransactional() && state.current_txn_start_offset < 0)
+                        state.current_txn_start_offset = batch.baseOffset();
+                }
+            }
+        }
+    }
+    if (next != image.log_end_offset)
+        incomplete();
+    image.producers.reserve(producers.size());
+    for (const auto& [id, state] : producers) {
+        (void)id;
+        image.producers.push_back(state);
+    }
+    return image;
+}
+
 std::vector<RecordBatch> Log::read(Offset start_offset, size_t max_bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
 

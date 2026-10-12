@@ -32,6 +32,10 @@ add_executable(replicated_append_test replicated_append_test.cpp)
 target_link_libraries(replicated_append_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME ReplicatedAppendTest COMMAND replicated_append_test)
 
+add_executable(log_producer_inspection_test log_producer_inspection_test.cpp)
+target_link_libraries(log_producer_inspection_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
+add_test(NAME LogProducerInspectionTest COMMAND log_producer_inspection_test)
+
 add_executable(truncate_suffix_test truncate_suffix_test.cpp)
 target_link_libraries(truncate_suffix_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME TruncateSuffixTest COMMAND truncate_suffix_test)
