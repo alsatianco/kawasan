@@ -178,6 +178,8 @@ std::string KawasanException::toString(ErrorCode code) {
             return "Unstable offset commit";
         case ErrorCode::UNKNOWN_TOPIC_ID:
             return "Unknown topic ID";
+        case ErrorCode::TRANSACTIONAL_ID_NOT_FOUND:
+            return "Transactional ID not found";
         case ErrorCode::INVALID_UPDATE_VERSION:
             return "Invalid partition update version";
         default:

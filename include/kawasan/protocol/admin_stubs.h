@@ -125,6 +125,7 @@ public:
     };
     void setThrottleTimeMs(int32_t v) { throttle_time_ms_ = v; }
     void addState(State s) { states_.push_back(std::move(s)); }
+    const std::vector<State>& states() const { return states_; }
     void encode(Buffer& buf, int16_t v) const;
     void decode(Buffer& buf, int16_t v);
 

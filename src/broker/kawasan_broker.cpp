@@ -1826,8 +1826,16 @@ void KawasanBroker::registerProtocolHandlers() {
                                                work, errors);
             };
         }
+        const bool staged_descriptions =
+            staged_coordinator_persistence_ && (key == protocol::ApiKey::DESCRIBE_GROUPS ||
+                                                key == protocol::ApiKey::DESCRIBE_TRANSACTIONS);
+        if (staged_descriptions) {
+            handler = [this, work = std::move(handler), errors](Context& context) {
+                return deferCoordinatorDescriptions(context, work, errors);
+            };
+        }
         if (staged_coordinator_format_ && !staged_membership && !staged_offsets &&
-            !staged_producer && !staged_registration) {
+            !staged_producer && !staged_registration && !staged_descriptions) {
             // Staged acquisition must never reach legacy writes, cleanup or
             // marker completion. Version-specific builders retain wire shape.
             switch (key) {
@@ -1839,6 +1847,7 @@ void KawasanBroker::registerProtocolHandlers() {
                 case protocol::ApiKey::HEARTBEAT:
                 case protocol::ApiKey::LEAVE_GROUP:
                 case protocol::ApiKey::DESCRIBE_GROUPS:
+                case protocol::ApiKey::DESCRIBE_TRANSACTIONS:
                 case protocol::ApiKey::LIST_GROUPS:
                 case protocol::ApiKey::INIT_PRODUCER_ID:
                 case protocol::ApiKey::ADD_PARTITIONS_TO_TXN:
@@ -2119,6 +2128,8 @@ void KawasanBroker::registerProtocolHandlers() {
                 if (k == protocol::ApiKey::ADD_PARTITIONS_TO_TXN ||
                     k == protocol::ApiKey::ADD_OFFSETS_TO_TXN)
                     return buildTransactionRegistrationError(ctx, code, ver);
+                if (k == protocol::ApiKey::DESCRIBE_TRANSACTIONS)
+                    return buildDescribeTransactionsError(ctx, code, ver);
                 if (k == protocol::ApiKey::DELETE_GROUPS)
                     return buildDeleteGroupsError(ctx, code, ver);
                 if (k == protocol::ApiKey::OFFSET_DELETE)
@@ -4729,10 +4740,23 @@ Buffer KawasanBroker::buildDescribeGroupsError(const RequestDispatcher::RequestC
                                                ErrorCode code, int16_t response_version) const {
     protocol::DescribeGroupsResponse response;
     response.setThrottleTimeMs(0);
-    response.setGroups({});
-    (void)code;  // Error code not used in error response for this API
-
     const int16_t version = std::clamp<int16_t>(response_version, 0, kDescribeGroupsMaxVersion);
+    std::vector<protocol::DescribeGroupsResponse::Group> groups;
+    try {
+        Buffer input = context.payload;
+        input.setPosition(context.payload_start);
+        protocol::DescribeGroupsRequest request;
+        request.decode(input, version);
+        for (const auto& id : request.groups()) {
+            protocol::DescribeGroupsResponse::Group group;
+            group.group_id = id;
+            group.error_code = code;
+            groups.push_back(std::move(group));
+        }
+    } catch (const std::exception&) {
+        // Undecodable requests have no trustworthy group identities.
+    }
+    response.setGroups(groups);
     return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
@@ -5812,26 +5836,19 @@ Buffer KawasanBroker::handleDescribeTransactions(RequestDispatcher::RequestConte
     req.decode(context.payload, context.header.apiVersion());
     protocol::DescribeTransactionsResponse resp;
     resp.setThrottleTimeMs(0);
-    // Phase 4.1k: return per-txn state from the TransactionCoordinator.
-    // Unknown transactional_ids get TRANSACTIONAL_ID_NOT_FOUND (52) or
-    // NONE-with-Empty depending on Kafka semantics — we follow the
-    // "NONE + Empty" path so kafka-consumer-groups.sh and Kafka UI
-    // don't error on probing.
+    // Staged callbacks run inside their source fence and access caches only.
+    // Missing/expired identities use Kafka's TRANSACTIONAL_ID_NOT_FOUND (105).
     for (const auto& tid : req.transactionalIds()) {
         protocol::DescribeTransactionsResponse::State s;
         s.transactional_id = tid;
-        s.error_code = ErrorCode::NONE;
-        s.state = "Empty";
-        if (staged_coordinator_format_) {
-            s.error_code = coordinatorLoadStatus(tid, protocol::CoordinatorType::TRANSACTION);
-            if (s.error_code == ErrorCode::NONE)
-                s.error_code = ErrorCode::COORDINATOR_LOAD_IN_PROGRESS;
+        if (tid.empty()) {
+            s.error_code = ErrorCode::INVALID_REQUEST;
             resp.addState(std::move(s));
             continue;
         }
         const auto opt =
             transaction_coordinator_ ? transaction_coordinator_->describe(tid) : std::nullopt;
-        if (opt.has_value()) {
+        if (opt && opt->state != TransactionCoordinator::State::Dead) {
             s.state = TransactionCoordinator::stateName(opt->state);
             s.transaction_timeout_ms = opt->transaction_timeout_ms;
             s.transaction_start_time_ms = opt->state_start_time_ms;
@@ -5845,6 +5862,8 @@ Buffer KawasanBroker::handleDescribeTransactions(RequestDispatcher::RequestConte
             for (auto& [topic, partitions] : by_topic) {
                 s.topics.push_back({topic, std::move(partitions)});
             }
+        } else {
+            s.error_code = ErrorCode::TRANSACTIONAL_ID_NOT_FOUND;
         }
         resp.addState(std::move(s));
     }

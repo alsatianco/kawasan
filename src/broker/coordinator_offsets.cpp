@@ -53,11 +53,14 @@ void KawasanBroker::withCoordinatorRequestFences(
     });
 }
 
-RequestDispatcher::HandlerResult KawasanBroker::deferCoordinatorGroupBatch(
+RequestDispatcher::HandlerResult KawasanBroker::deferCoordinatorBatch(
     RequestDispatcher::RequestContext context, std::vector<RequestDispatcher::RequestContext> parts,
     const std::vector<std::string>& keys, RequestDispatcher::HandlerFunc work,
-    RequestDispatcher::ErrorBuilder errors, CoordinatorBatchAssembler assemble, bool read_only) {
-    if (parts.size() != keys.size() || !work || !errors || !assemble)
+    RequestDispatcher::ErrorBuilder errors, CoordinatorBatchAssembler assemble, bool read_only,
+    protocol::CoordinatorType type) {
+    if (parts.size() != keys.size() || !work || !errors || !assemble ||
+        (type != protocol::CoordinatorType::GROUP &&
+         type != protocol::CoordinatorType::TRANSACTION))
         throw std::invalid_argument("Invalid coordinator batch");
     struct Batch {
         std::vector<RequestDispatcher::RequestContext> parts;
@@ -76,12 +79,17 @@ RequestDispatcher::HandlerResult KawasanBroker::deferCoordinatorGroupBatch(
         part.connection = batch->connection.get();
         part.complete = {};
         part.deferred_sink = {};
-        const TopicPartition tp{"__consumer_offsets",
-                                coordinatorPartitionFor(keys[i], offsets_topic_num_partitions_)};
+        const std::string topic =
+            type == protocol::CoordinatorType::GROUP ? "__consumer_offsets" : "__transaction_state";
+        const TopicPartition tp{
+            topic,
+            coordinatorPartitionFor(keys[i], staged_coordinator_format_->partitionCount(topic))};
         const auto metadata = currentPartitionMetadata(tp);
         batch->sources.push_back({this, tp, metadata ? metadata->leader_epoch : -1});
-        ErrorCode status =
-            keys[i].empty() ? ErrorCode::INVALID_GROUP_ID : ErrorCode::COORDINATOR_LOAD_IN_PROGRESS;
+        ErrorCode status = ErrorCode::COORDINATOR_LOAD_IN_PROGRESS;
+        if (keys[i].empty())
+            status = type == protocol::CoordinatorType::GROUP ? ErrorCode::INVALID_GROUP_ID
+                                                              : ErrorCode::INVALID_REQUEST;
         if (!coordinator_executor_ || !context.complete)
             status = ErrorCode::INVALID_REQUEST;
         else if (!keys[i].empty() && metadata)
@@ -109,7 +117,7 @@ RequestDispatcher::HandlerResult KawasanBroker::deferCoordinatorGroupBatch(
     if (!coordinator_executor_->submit([this, batch, work = std::move(work), errors, assemble,
                                         complete, read_only](bool admitted, auto ticket) {
             // One bounded job/ticket, but a separate original-source admission
-            // for every group. Mutation work cannot cross that epoch pin.
+            // for every key. Mutation work cannot cross that epoch pin.
             std::vector<size_t> admitted_indices;
             std::vector<RequestOwnership> sources;
             for (size_t i = 0; i < batch->parts.size(); ++i) {
@@ -178,7 +186,7 @@ RequestDispatcher::HandlerResult KawasanBroker::deferCoordinatorGroupBatch(
                     }
                     if (changed)
                         *fenced_payload = assemble(payloads);
-                    // A nonzero guard status selects the per-group replacement
+                    // A nonzero guard status selects the per-key replacement
                     // factory; it is not a wire-wide error.
                     publish(changed ? ErrorCode::COORDINATOR_LOAD_IN_PROGRESS : ErrorCode::NONE);
                 });
@@ -238,8 +246,8 @@ RequestDispatcher::HandlerResult KawasanBroker::deferCoordinatorOffsetFetch(
         result.payload = assemble(std::vector<Buffer>{});
         return result;
     }
-    return deferCoordinatorGroupBatch(admission, std::move(parts), keys, std::move(work),
-                                      std::move(errors), std::move(assemble), true);
+    return deferCoordinatorBatch(admission, std::move(parts), keys, std::move(work),
+                                 std::move(errors), std::move(assemble), true);
 }
 
 RequestDispatcher::HandlerResult KawasanBroker::deferCoordinatorDeleteGroups(
@@ -274,9 +282,8 @@ RequestDispatcher::HandlerResult KawasanBroker::deferCoordinatorDeleteGroups(
         }
         return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
     };
-    return deferCoordinatorGroupBatch(admission, std::move(parts), request.groups(),
-                                      std::move(work), std::move(errors), std::move(assemble),
-                                      false);
+    return deferCoordinatorBatch(admission, std::move(parts), request.groups(), std::move(work),
+                                 std::move(errors), std::move(assemble), false);
 }
 
 void KawasanBroker::scheduleCoordinatorRetention() {

@@ -8,6 +8,16 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-13
 
+- Migrate persistence-staged DescribeGroups and DescribeTransactions to independent
+  per-key original-epoch admission, cache-only deferred reads and simultaneous
+  source fencing through response write initiation. Preserve duplicate/order and
+  per-key ownership/loading errors; drain retained inspection responses at shutdown.
+- Return complete per-key Kafka error bodies for both inspection APIs. Missing or
+  expired transactional IDs now return TRANSACTIONAL_ID_NOT_FOUND (105), and empty
+  transaction IDs return INVALID_REQUEST. Source enumeration for listings, owned
+  transaction timeout proposals and public replicated coordinator activation remain
+  unfinished.
+
 - Migrate persistence-staged AddPartitionsToTxn and AddOffsetsToTxn to deferred
   original-epoch admission and committed full-snapshot CAS. Preserve existing
   first offsets, producer retry history, pending offsets and ongoing start times;

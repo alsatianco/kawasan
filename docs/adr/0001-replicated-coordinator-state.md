@@ -10,7 +10,8 @@ the membership/timeout state machine without exposing changes before commitment.
 Persistence staging now migrates group membership handlers and owned timeout
 jobs through those proposals and the deferred executor, along with offset
 commits/reads, exact deletions, owned retention cleanup and keyed producer
-initialization and transaction partition/offset participation. Public runtime
+initialization, transaction partition/offset participation and keyed group/transaction
+inspection. Public runtime
 activation, remaining handler/background migration,
 marker redrive and failover acceptance remain pending. No broker configuration enables either seam.
 
@@ -115,6 +116,15 @@ completion and retained TCP sinks no longer depend on destroyed owners. These
 are internal seams. Offset read/group deletion aggregation now fences several
 sources together; remaining group/admin/transaction/producer handlers, pending-offset
 routing and public activation remain gated.
+
+The keyed inspection checkpoint shares independent batch admission between group
+and transaction sources. DescribeGroups and DescribeTransactions inspect caches
+only inside the admitted epoch fence, preserve per-key errors and duplicates, and
+hold all response source epochs through write initiation. Error builders do not
+reenter metadata or expose cached state on refusal. Missing/dead transaction IDs
+return Kafka error 105. Listings still need explicit owned/acquired/readable source
+enumeration, and owned transaction timeout PrepareAbort proposals remain pending.
+This checkpoint does not enable discovery, marker redrive or public activation.
 
 The staged membership checkpoint enables normal JoinGroup/SyncGroup/Heartbeat/
 LeaveGroup registrations only in the internal persistence seam, plus a bounded

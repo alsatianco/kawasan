@@ -105,6 +105,7 @@ enum class ErrorCode : int16_t {
     PRODUCER_FENCED = 90,
     INVALID_UPDATE_VERSION = 95,
     UNKNOWN_TOPIC_ID = 100,
+    TRANSACTIONAL_ID_NOT_FOUND = 105,
 };
 
 // Compression types

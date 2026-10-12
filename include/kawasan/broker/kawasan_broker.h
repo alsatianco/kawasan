@@ -219,11 +219,15 @@ private:
         const std::vector<RequestOwnership>& sources,
         const std::function<void(const std::vector<ErrorCode>&)>& publish);
     using CoordinatorBatchAssembler = std::function<Buffer(const std::vector<Buffer>&)>;
-    RequestDispatcher::HandlerResult deferCoordinatorGroupBatch(
+    RequestDispatcher::HandlerResult deferCoordinatorBatch(
         RequestDispatcher::RequestContext context,
         std::vector<RequestDispatcher::RequestContext> parts, const std::vector<std::string>& keys,
         RequestDispatcher::HandlerFunc work, RequestDispatcher::ErrorBuilder errors,
-        CoordinatorBatchAssembler assemble, bool read_only);
+        CoordinatorBatchAssembler assemble, bool read_only,
+        protocol::CoordinatorType type = protocol::CoordinatorType::GROUP);
+    RequestDispatcher::HandlerResult deferCoordinatorDescriptions(
+        RequestDispatcher::RequestContext context, RequestDispatcher::HandlerFunc work,
+        RequestDispatcher::ErrorBuilder errors);
     RequestDispatcher::HandlerResult deferCoordinatorOffsetFetch(
         RequestDispatcher::RequestContext context, RequestDispatcher::HandlerFunc work,
         RequestDispatcher::ErrorBuilder errors);
@@ -444,6 +448,8 @@ private:
     Buffer handleDescribeProducers(RequestDispatcher::RequestContext& context);
     Buffer handleListTransactions(RequestDispatcher::RequestContext& context);
     Buffer handleDescribeTransactions(RequestDispatcher::RequestContext& context);
+    Buffer buildDescribeTransactionsError(const RequestDispatcher::RequestContext& context,
+                                          ErrorCode code, int16_t version) const;
     Buffer handleAlterPartition(RequestDispatcher::RequestContext& context);
     Buffer handleDescribeAcls(RequestDispatcher::RequestContext& context);
     Buffer handleCreateAcls(RequestDispatcher::RequestContext& context);

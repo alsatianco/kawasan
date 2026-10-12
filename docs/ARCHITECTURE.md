@@ -765,7 +765,22 @@ partition-leader LSO recovery and pending offset completion remain prerequisites
 for public activation. An unreadable authoritative transaction prefix invalidates
 source admission until reopening, preventing subsequent cached acknowledgements.
 
-Serving integration still needs remaining read handlers and sweep migration,
+DescribeGroups and DescribeTransactions use independent batch admission for each
+group/transaction key and retain its original source epoch through worker execution
+and response write initiation. Read callbacks inspect acquired caches only; they
+never reenter metadata. The shared batch executor routes both coordinator types,
+deduplicates partition locks and holds every response source under one metadata
+fence. Duplicate keys and request order survive aggregation. A changed epoch,
+unreadable source or uncertain append refuses the affected key without exposing its
+cached membership/producer identity or suppressing other keys' results. Inspection
+tickets drain with the executor and transport at shutdown. API-specific error
+builders preserve key identities and Kafka bodies even in acquisition-only staging.
+Missing/dead transaction identities return TRANSACTIONAL_ID_NOT_FOUND (105), and
+empty transaction IDs return INVALID_REQUEST, including in the default runtime.
+Reads of durable Prepare states do not invoke marker completion.
+
+Serving integration still needs owned/readable source enumeration for ListGroups,
+ListTransactions and DescribeProducers, plus owned transaction timeout proposals,
 unkeyed producer admission, and group-owned pending-offset routing.
 Abrupt RF>1 client continuity and remote
 marker/LSO/EOS acceptance remain separate requirements before public activation.
