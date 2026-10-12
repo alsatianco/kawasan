@@ -1,14 +1,29 @@
-#include <arpa/inet.h>
-#include <cstring>
+#include "kawasan/storage/record_batch.h"
 
+#include <arpa/inet.h>
 #include <gtest/gtest.h>
 #include <lz4frame.h>
 #include <zlib.h>
 
+#include <cstring>
+
 #include "kawasan/common/buffer.h"
-#include "kawasan/storage/record_batch.h"
 
 namespace kawasan::storage {
+
+TEST(RecordBatchTest, TransactionMarkerValueIncludesKafkaVersionAndCoordinatorEpoch) {
+    for (bool committed : {false, true}) {
+        const auto marker = RecordBatch::deserialize(
+            RecordBatch::makeControlBatch(7, 2, 19, committed, 1234).serialize());
+        ASSERT_EQ(marker.records().size(), 1u);
+        ASSERT_TRUE(marker.records()[0].key.has_value());
+        EXPECT_EQ(*marker.records()[0].key,
+                  (std::vector<uint8_t>{0, 0, 0, static_cast<uint8_t>(committed)}));
+        ASSERT_TRUE(marker.records()[0].value.has_value());
+        // Kafka EndTransactionMarker v0: INT16 version + INT32 coordinator epoch.
+        EXPECT_EQ(*marker.records()[0].value, (std::vector<uint8_t>{0, 0, 0, 0, 0, 0}));
+    }
+}
 
 namespace {
 
@@ -224,8 +239,8 @@ TEST(RecordBatchTest, DecodesLz4CompressedPayloads) {
     prefs.compressionLevel = 0;
     const size_t bound = LZ4F_compressFrameBound(records.size(), &prefs);
     std::vector<uint8_t> compressed(bound);
-    const size_t written = LZ4F_compressFrame(compressed.data(), compressed.size(),
-                                              records.data(), records.size(), &prefs);
+    const size_t written = LZ4F_compressFrame(compressed.data(), compressed.size(), records.data(),
+                                              records.size(), &prefs);
     ASSERT_EQ(LZ4F_isError(written), 0U) << LZ4F_getErrorName(written);
     ASSERT_GT(written, 0U);
     compressed.resize(written);
@@ -238,16 +253,15 @@ TEST(RecordBatchTest, DecodesLz4CompressedPayloads) {
         static_cast<int32_t>(kRecordBatchHeaderBytes + compressed.size());
     writeInt32BE(compressed_batch, sizeof(int64_t), static_cast<uint32_t>(new_batch_length));
 
-    const int16_t attributes =
-        RecordBatchAttributes::encode(CompressionType::LZ4, false, false);
-    writeInt16BE(compressed_batch, sizeof(int64_t) + sizeof(int32_t) + sizeof(int32_t) +
-                                        sizeof(int8_t) + sizeof(int32_t),
-                 attributes);
+    const int16_t attributes = RecordBatchAttributes::encode(CompressionType::LZ4, false, false);
+    writeInt16BE(
+        compressed_batch,
+        sizeof(int64_t) + sizeof(int32_t) + sizeof(int32_t) + sizeof(int8_t) + sizeof(int32_t),
+        attributes);
 
     const uint32_t crc = computeCompressedCrc(batch, attributes, compressed);
-    writeInt32BE(compressed_batch, sizeof(int64_t) + sizeof(int32_t) + sizeof(int32_t) +
-                                       sizeof(int8_t),
-                 crc);
+    writeInt32BE(compressed_batch,
+                 sizeof(int64_t) + sizeof(int32_t) + sizeof(int32_t) + sizeof(int8_t), crc);
 
     auto restored = RecordBatch::deserialize(compressed_batch);
     ASSERT_EQ(restored.records().size(), 1);

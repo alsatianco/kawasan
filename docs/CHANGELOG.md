@@ -8,6 +8,10 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-13
 
+- Correct transaction marker values to Kafka's versioned six-byte layout
+  (INT16 version plus INT32 coordinator epoch). Earlier prerelease markers
+  omitted the version field; new markers now support strict Kafka decoding.
+
 - Migrate persistence-staged ListGroups and ListTransactions to deferred enumeration
   of owned, acquired, readable sources. Fence the complete source set and original
   epochs through cache reads and response write initiation, including newly owned

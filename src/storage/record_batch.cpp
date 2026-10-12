@@ -554,7 +554,8 @@ RecordBatch RecordBatch::deserializeFromProduceRequest(const std::vector<uint8_t
                         reinterpret_cast<const char*>(records_payload.data()),
                         records_payload.size(), &uncompressed_len) ||
                     !snappy::IsValidCompressedBuffer(
-                        reinterpret_cast<const char*>(records_payload.data()), records_payload.size())) {
+                        reinterpret_cast<const char*>(records_payload.data()),
+                        records_payload.size())) {
                     throw std::runtime_error("Invalid Snappy payload");
                 }
                 std::vector<char> out(uncompressed_len);
@@ -882,7 +883,7 @@ RecordBatch RecordBatch::makeControlBatch(int64_t producer_id, int16_t producer_
 
     // The single control record:
     //   key   = INT16 version=0 + INT16 type (0=ABORT, 1=COMMIT)
-    //   value = INT32 coordinator_epoch (we use 0)
+    //   value = INT16 version=0 + INT32 coordinator_epoch (we use 0)
     // Per KIP-98, the key encodes the marker type and version, value
     // encodes the coordinator epoch (which we treat as 0 in
     // single-broker mode).
@@ -895,7 +896,7 @@ RecordBatch RecordBatch::makeControlBatch(int64_t producer_id, int16_t producer_
     key[3] = committed ? 1 : 0;  // type
     r.key = std::move(key);
 
-    std::vector<uint8_t> value(4, 0);  // coordinator_epoch = 0
+    std::vector<uint8_t> value(6, 0);  // version = 0, coordinator_epoch = 0
     r.value = std::move(value);
 
     batch.addRecord(r);
