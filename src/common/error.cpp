@@ -98,6 +98,8 @@ std::string KawasanException::toString(ErrorCode code) {
             return "Out of order sequence number";
         case ErrorCode::DUPLICATE_SEQUENCE_NUMBER:
             return "Duplicate sequence number";
+        case ErrorCode::PRODUCER_FENCED:
+            return "Producer fenced";
         case ErrorCode::INVALID_PRODUCER_EPOCH:
             return "Invalid producer epoch";
         case ErrorCode::INVALID_TXN_STATE:

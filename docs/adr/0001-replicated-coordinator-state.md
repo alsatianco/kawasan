@@ -9,9 +9,9 @@ cache publication and shutdown draining. Detached group-state proposals now reus
 the membership/timeout state machine without exposing changes before commitment.
 Persistence staging now migrates group membership handlers and owned timeout
 jobs through those proposals and the deferred executor, along with offset
-commits/reads, exact deletions and owned retention cleanup. Public runtime activation,
-remaining handler/background migration, marker redrive and failover acceptance
-remain pending. No broker configuration enables either seam.
+commits/reads, exact deletions, owned retention cleanup and keyed producer
+initialization. Public runtime activation, remaining handler/background migration,
+marker redrive and failover acceptance remain pending. No broker configuration enables either seam.
 
 M10 will make committed `__consumer_offsets` and `__transaction_state` log
 records authoritative in clustered mode. Each new owner must rebuild only its
@@ -135,3 +135,16 @@ pending keys, and deletion/retention append exact tombstones. Queued retention
 rechecks current committed membership, expiry and pending state. This checkpoint
 keeps discovery, transaction/producer/sweep migration and public activation gated;
 abrupt RF>1 client continuity and marker/EOS acceptance remain unfinished.
+
+The keyed producer checkpoint migrates InitProducerId onto original-epoch deferred
+execution and full-snapshot CAS. Snapshot value v3 persists the previous successful
+expected identity for KIP-360 retry fencing and epoch-exhaustion ID rotation; v1/v2
+values without that history remain readable with unset fields. Invalid inputs,
+wrong owners and stale admissions cannot allocate or publish transaction identities.
+Counter corruption/exhaustion refuses allocation instead of wrapping into a prior
+producer's range. An unchanged retry or protocol refusal is a fenced no-op; a
+valid retry changing timeout commits without another identity bump. Ongoing and
+Prepare transactions remain unchanged and return CONCURRENT_TRANSACTIONS until
+idempotent marker completion exists. Unkeyed allocation, AddPartitionsToTxn/
+AddOffsetsToTxn, remaining reads/sweeps, pending routing and public activation are
+still unfinished. No public format gate or API cap changed.

@@ -8,6 +8,19 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-13
 
+- Migrate keyed InitProducerId in persistence staging to deferred original-epoch
+  admission and full-snapshot transaction CAS. Persist KIP-360 retry history in
+  transaction snapshot v3, rotate IDs before epoch overflow, and return committed
+  identities after ISR/fsync/checkpoint success. Invalid expected identities,
+  timeouts and active/Prepare completion cannot overwrite live state. Unchanged
+  retries append nothing and response tickets drain during shutdown. Remaining
+  transaction handlers/jobs, unkeyed admission and public activation stay gated.
+- Refuse malformed, rolled-back and exhausted producer counters before allocation;
+  prevent clustered sequence masking and signed counter overflow across restarts.
+- Correct InitProducerId v2/v3 compact/tagged bodies and reset expected identity
+  fields when reusing a decoder. Verify all advertised versions against independent
+  Kafka 4.2 generated request/response fixtures.
+
 - Migrate persistence-staged offset commits/fetches and exact offset/group deletion
   onto committed proposals and deferred execution. Preserve requested error
   identities, group-owned stable-offset reads, static-member fencing and active

@@ -174,6 +174,11 @@ KawasanBroker::KawasanBroker(const Config& config, std::optional<CoordinatorForm
         throw std::invalid_argument("compatibility.max.api.version.profile must be 4.x or 3.x");
     }
     broker_id_ = config_.get<BrokerId>("broker.id");
+    if (staged_coordinator_persistence_) {
+        const auto maximum = config_.get<int64_t>("transaction.max.timeout.ms", 900000);
+        if (maximum <= 0 || maximum > std::numeric_limits<int32_t>::max())
+            throw std::invalid_argument("transaction.max.timeout.ms must be a positive int32");
+    }
     host_ = config_.get<std::string>("host", "localhost");
     advertised_host_ = config_.get<std::string>("advertised.host", host_);
     port_ = config_.get<int32_t>("port", 9092);
@@ -1776,7 +1781,33 @@ void KawasanBroker::registerProtocolHandlers() {
                                                work, errors);
             };
         }
-        if (staged_coordinator_format_ && !staged_membership && !staged_offsets) {
+        const bool staged_producer =
+            staged_coordinator_persistence_ && key == protocol::ApiKey::INIT_PRODUCER_ID;
+        if (staged_producer) {
+            handler = [this, work = std::move(handler), errors](Context& context) {
+                Buffer payload = context.payload;
+                protocol::InitProducerIdRequest request;
+                request.decode(payload, context.header.apiVersion());
+                if (const auto invalid = validateProducerInitialization(request);
+                    invalid != ErrorCode::NONE) {
+                    RequestDispatcher::HandlerResult result;
+                    result.payload = errors(context, invalid, context.header.apiVersion());
+                    return result;
+                }
+                // Null IDs need broker-wide admission, implemented separately.
+                if (!request.transactionalId()) {
+                    RequestDispatcher::HandlerResult result;
+                    result.payload = errors(context, ErrorCode::COORDINATOR_LOAD_IN_PROGRESS,
+                                            context.header.apiVersion());
+                    return result;
+                }
+                return deferCoordinatorRequest(context, *request.transactionalId(),
+                                               protocol::CoordinatorType::TRANSACTION, work,
+                                               errors);
+            };
+        }
+        if (staged_coordinator_format_ && !staged_membership && !staged_offsets &&
+            !staged_producer) {
             // Staged acquisition must never reach legacy writes, cleanup or
             // marker completion. Version-specific builders retain wire shape.
             switch (key) {
@@ -4879,15 +4910,31 @@ int64_t KawasanBroker::allocateNextProducerId() {
     std::lock_guard<std::mutex> lock(producer_id_mutex_);
     const std::string counter_path = metadata_dir_ + "/producer_id.counter";
     int64_t current = next_producer_id_.load();
-    // If counter file exists and we haven't loaded it yet, load now.
-    std::ifstream in(counter_path);
-    if (in.is_open()) {
+    // Fail closed on corruption or rollback. Ignoring a bad durable counter
+    // can reissue an acknowledged ID, causing silent producer dedup data loss.
+    std::error_code exists_error;
+    const bool exists = std::filesystem::exists(counter_path, exists_error);
+    if (exists_error)
+        throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR, "Cannot inspect producer counter");
+    if (exists) {
+        std::ifstream in(counter_path);
         int64_t stored = 0;
-        if (in >> stored && stored >= current) {
-            current = stored;
-        }
-        in.close();
+        if (!(in >> stored) || stored < current)
+            throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR, "Invalid producer counter");
+        in >> std::ws;
+        if (!in.eof() || in.bad())
+            throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR, "Malformed producer counter");
+        current = stored;
+    } else if (current != 1) {
+        throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR,
+                               "Missing allocated producer counter");
     }
+    // Cluster sequences occupy exactly the low 32 bits. Keep one representable
+    // successor as the durable exhausted sentinel; never wrap or overflow.
+    const int64_t limit =
+        cluster_brokers_.empty() ? std::numeric_limits<int64_t>::max() - 1 : 0xFFFFFFFFLL;
+    if (current < 1 || current > limit || (!cluster_brokers_.empty() && broker_id_ < 0))
+        throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR, "Producer ID range exhausted");
     const int64_t allocated = current;
     const int64_t next = current + 1;
     // Crash-atomic and durable: re-issuing an id after a crash would make the
@@ -4918,6 +4965,9 @@ int64_t KawasanBroker::allocateNextProducerId() {
 Buffer KawasanBroker::handleInitProducerId(RequestDispatcher::RequestContext& context) {
     protocol::InitProducerIdRequest request;
     request.decode(context.payload, context.header.apiVersion());
+
+    if (staged_coordinator_persistence_)
+        return handleCoordinatorProducerInitialization(context, request);
 
     Logger::info("InitProducerId request from {}: transactional_id='{}' timeout={}ms",
                  context.peer_identity, request.transactionalId().value_or("<null>"),
@@ -4986,7 +5036,9 @@ Buffer KawasanBroker::buildInitProducerIdError(const RequestDispatcher::RequestC
                                                ErrorCode code, int16_t response_version) const {
     protocol::InitProducerIdResponse response;
     response.setThrottleTimeMs(0);
-    response.setErrorCode(code);
+    response.setErrorCode(code == ErrorCode::PRODUCER_FENCED && response_version < 4
+                              ? ErrorCode::INVALID_PRODUCER_EPOCH
+                              : code);
     response.setProducerId(-1);
     response.setProducerEpoch(-1);
     const int16_t version = std::clamp<int16_t>(response_version, 0, 4);

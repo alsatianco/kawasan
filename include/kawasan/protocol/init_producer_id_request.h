@@ -9,22 +9,9 @@
 
 namespace kawasan::protocol {
 
-// Phase 1.18: InitProducerId (API 22). Minimal viable implementation.
-//
-// Schema (Kafka 4.2):
-//   Request:
-//     v0–v1: transactional_id NULLABLE_STRING + transaction_timeout_ms INT32
-//     v2:    same (no new fields)
-//     v3:    + producer_id INT64 + producer_epoch INT16   (KIP-360)
-//     v4:    flexible (compact strings + tagged fields)
-//   Response:
-//     throttle_time_ms INT32, error_code INT16,
-//     producer_id INT64, producer_epoch INT16
-//     v4: flexible
-//
-// This minimal handler ignores transactional_id semantics — it allocates a
-// fresh producer_id from a durable monotonic counter and always returns
-// epoch=0. Producer-state-manager dedup arrives in Phase 2.1.
+// Kafka InitProducerId v0-4: v2+ uses compact strings and tagged fields;
+// v3+ carries the expected producer ID/epoch for KIP-360 retry fencing;
+// v4 adds PRODUCER_FENCED (older versions use INVALID_PRODUCER_EPOCH).
 class InitProducerIdRequest {
 public:
     void decode(Buffer& buffer, int16_t api_version);

@@ -12,6 +12,7 @@
 #include "kawasan/protocol/describe_configs_request.h"
 #include "kawasan/protocol/describe_groups_request.h"
 #include "kawasan/protocol/fetch_request.h"
+#include "kawasan/protocol/init_producer_id_request.h"
 #include "kawasan/protocol/list_offsets_request.h"
 #include "kawasan/protocol/offset_fetch_request.h"
 #include "kawasan/protocol/produce_request.h"
@@ -439,5 +440,25 @@ TEST(ApiVersionParityTest, TransactionalHeadersMatchKafkaGeneratedCodecs) {
             EXPECT_EQ(std::vector<uint8_t>(response.data(), response.data() + response.size()),
                       golden(prefix + "-response"));
         }
+    }
+}
+
+TEST(ApiVersionParityTest, InitProducerIdentityMatchesKafkaEveryAdvertisedVersion) {
+    kawasan::protocol::InitProducerIdRequest request;
+    for (int16_t version : {4, 3, 2, 1, 0}) {
+        SCOPED_TRACE(version);
+        kawasan::Buffer input(golden("init-producer-request-v" + std::to_string(version)));
+        ASSERT_NO_THROW(request.decode(input, version));
+        EXPECT_EQ(request.transactionalId(), "txn");
+        EXPECT_EQ(request.transactionTimeoutMs(), 60000);
+        EXPECT_EQ(request.producerId(), version >= 3 ? 42 : -1);
+        EXPECT_EQ(request.producerEpoch(), version >= 3 ? 7 : -1);
+        EXPECT_EQ(input.remaining(), 0);
+        kawasan::protocol::InitProducerIdResponse response;
+        response.setProducerId(42);
+        response.setProducerEpoch(8);
+        kawasan::Buffer output;
+        response.encode(output, version);
+        EXPECT_EQ(output.vector(), golden("init-producer-response-v" + std::to_string(version)));
     }
 }

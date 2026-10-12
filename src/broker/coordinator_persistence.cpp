@@ -467,6 +467,17 @@ ErrorCode KawasanBroker::mutateCoordinatorTransaction(
         const auto admitted = mutation(proposed);
         if (admitted != ErrorCode::NONE)
             return admitted;
+        // Protocol refusals and exact identity retries are fenced no-ops.
+        // Keep them distinct from durable failures and do not append tombstones
+        // for an absent identity or rewrite an unchanged snapshot.
+        if (proposed == expected)
+            return metadata_controller_->withPartitionLeadership(
+                tp, broker_id_, metadata->leader_epoch, [&](const auto&) {
+                    return !coordinator_mutations_stopping_.load() && running_.load() &&
+                                   dataPlaneCurrent()
+                               ? ErrorCode::NONE
+                               : ErrorCode::NOT_COORDINATOR;
+                });
         Record record;
         record.key = std::vector<uint8_t>(transactional_id.begin(), transactional_id.end());
         if (proposed) {

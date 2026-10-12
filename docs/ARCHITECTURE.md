@@ -664,8 +664,9 @@ normal JoinGroup, SyncGroup, Heartbeat and LeaveGroup registrations now defer to
 the executor and mutate detached committed proposals. Protocol results are sent
 only after durable success. A LeaveGroup member batch commits as one proposal.
 Persistence staging also migrates OffsetCommit/OffsetFetch, OffsetDelete and
-DeleteGroups. Acquisition-only staging still refuses them. Transaction/producer
-handlers, transaction sweeps and legacy Prepare completion remain gated.
+DeleteGroups and keyed InitProducerId. Acquisition-only staging still refuses
+them. Transaction partition/offset additions, transaction sweeps and legacy
+Prepare completion remain gated.
 FindCoordinator is also gated until serving integration is complete.
 
 A one-second staged scheduler inspects member/rebalance deadlines without changing
@@ -716,8 +717,32 @@ rejoin or owner epoch fences an obsolete cleanup. No-op rechecks append nothing.
 The existing scheduler/queue/worker shutdown drain covers retention too.
 Subscription-aware retention for active managed groups remains future work.
 
-Serving integration still needs transaction/producer/read handlers and sweep
-migration, unkeyed producer admission, and group-owned pending-offset routing.
+Keyed InitProducerId uses deferred transaction-source admission and full-snapshot
+CAS under the original owner epoch. New identities, epoch bumps and ID rotations
+publish only after source fsync, ISR commitment and strict HW checkpointing.
+Transaction snapshot v3 appends the last successful expected producer ID/epoch,
+so KIP-360 retries survive restart and owner acquisition, including rotation at
+epoch 32,766. Snapshots without retry history retain their v1/v2 encoding and read
+with unset history; recovery never invents it. An exact unchanged retry and a
+protocol refusal append nothing but still pass the final owner fence. Timeout
+changes on a valid retry commit without bumping its identity. A new producer
+without an expectation invalidates previous retry history. InitProducerId v0–v3
+maps fencing to INVALID_PRODUCER_EPOCH; v4 uses PRODUCER_FENCED. Its v2+ request
+and response bodies now use Kafka's compact/tagged encoding.
+
+Staged initialization validates nonempty transactional IDs, paired expected
+ID/epoch fields and the configured transaction timeout before allocation. Pending
+Ongoing/Prepare states return CONCURRENT_TRANSACTIONS without clearing partitions,
+pending offsets or invoking legacy marker completion. This refusal remains until
+marker completion is implemented. Malformed, rolled-back or exhausted durable
+producer counters fail closed (rollback is checked against the current process's
+observed allocations); cluster sequences cannot wrap their low 32 bits,
+and single-node increments cannot overflow int64. Successful counter fsync followed
+by failed source persistence may leave unused IDs, which are never recycled.
+
+Serving integration still needs transaction partition/offset additions, remaining
+read handlers and sweep migration, unkeyed producer admission, and group-owned
+pending-offset routing.
 Abrupt RF>1 client continuity and remote
 marker/LSO/EOS acceptance remain separate requirements before public activation.
 InitProducerId now propagates counter-write and directory-fsync failures before acknowledging an ID or creating a transaction;

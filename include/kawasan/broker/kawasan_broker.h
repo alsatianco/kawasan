@@ -35,6 +35,7 @@
 #include "kawasan/common/types.h"
 #include "kawasan/protocol/api_versions.h"
 #include "kawasan/protocol/find_coordinator_request.h"
+#include "kawasan/protocol/init_producer_id_request.h"
 #include "kawasan/raft/raft_node.h"
 #include "kawasan/storage/log_manager.h"
 
@@ -398,6 +399,9 @@ private:
     // counter and returns epoch=0. Full ProducerStateManager + transactional
     // semantics arrive in Phase 2.1 / Phase 3.3.
     Buffer handleInitProducerId(RequestDispatcher::RequestContext& context);
+    ErrorCode validateProducerInitialization(const protocol::InitProducerIdRequest& request) const;
+    Buffer handleCoordinatorProducerInitialization(RequestDispatcher::RequestContext& context,
+                                                   const protocol::InitProducerIdRequest& request);
     Buffer buildInitProducerIdError(const RequestDispatcher::RequestContext& context,
                                     ErrorCode code, int16_t response_version) const;
     int64_t allocateNextProducerId();

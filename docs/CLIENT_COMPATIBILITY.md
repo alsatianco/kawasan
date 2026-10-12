@@ -48,7 +48,7 @@ Wire regression fixtures are emitted by Kafka 4.2's generated codecs in
 [WireFixtures.java](../tests/clients/java/src/fixtures/java/WireFixtures.java),
 independent of Kawasan. The generator uses the opt-in `wire-fixtures` Maven
 profile, keeping Kafka 4.2 internal schema classes out of the Java 3.9 matrix
-build. Fixtures include UUID, SASL, DeleteRecords and OffsetFetch shapes;
+build. Fixtures include UUID, SASL, DeleteRecords, OffsetFetch and InitProducerId shapes;
 regressions are added before each corresponding correctness repair. Regenerate with:
 
 ```bash
@@ -129,3 +129,11 @@ The final CM-4 local gates pass: native CTest 77/77; both Java profiles each
 failure allowlist is empty. Ecosystem `21_streams_eos.sh` tests confluent-kafka
 KIP-447 behavior; actual JVM Streams and Connect data-flow coverage belongs to
 CM-6 and M10 acceptance. Scheduled M9 nightlies remain a separate gate.
+
+InitProducerId v2–v4 uses compact nullable strings and tagged fields, including
+response body tags; v3 adds the paired expected producer ID/epoch. Independent
+Kafka 4.2 fixtures cover every advertised version and decoder reuse. In internal
+persistence staging, keyed initialization persists KIP-360 retry history and
+refuses stale identities (INVALID_PRODUCER_EPOCH before v4, PRODUCER_FENCED in v4).
+Active/Prepare completion, unkeyed admission and public replicated coordinator
+activation remain gated; this does not establish cross-broker EOS.

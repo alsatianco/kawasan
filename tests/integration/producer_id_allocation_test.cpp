@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <limits>
 
 #include "kawasan/broker/kawasan_broker.h"
 #include "kawasan/broker/producer_id.h"
@@ -205,4 +207,50 @@ TEST_F(ProducerIdAllocationTest, ConnectedClusterBrokersDestroyCleanly) {
     EXPECT_TRUE(second.raftNode()->hasCurrentMetadata(1000));
     first.stop();
     second.stop();
+}
+
+TEST_F(ProducerIdAllocationTest, CounterExhaustionAndMalformedStateNeverIssueAnId) {
+    const std::string peers =
+        "2:127.0.0.1:" + std::to_string(freePort()) + ",5:127.0.0.1:" + std::to_string(freePort());
+    kawasan::broker::KawasanBroker broker(config(dir_, 2, peers));
+    broker.start();
+    const auto counter = std::filesystem::path(dir_) / "meta/producer_id.counter";
+    for (const std::string value : {"4294967296", "-1", "garbage", "17garbage", ""}) {
+        std::ofstream(counter) << value;
+        const auto response = allocationResponse(broker.port());
+        EXPECT_EQ(response.error, kawasan::ErrorCode::KAFKA_STORAGE_ERROR) << value;
+        EXPECT_EQ(response.producer_id, -1) << value;
+        EXPECT_EQ(response.producer_epoch, -1) << value;
+    }
+    broker.stop();
+}
+
+TEST_F(ProducerIdAllocationTest, LastRepresentableIdsAreIssuedOnceAndStayExhaustedAfterRestart) {
+    for (bool clustered : {false, true}) {
+        const auto data = dir_ + (clustered ? "/cluster" : "/local");
+        const std::string peers = clustered ? "2:127.0.0.1:" + std::to_string(freePort()) +
+                                                  ",5:127.0.0.1:" + std::to_string(freePort())
+                                            : "";
+        const auto cfg = config(data, 2, peers);
+        const auto last = clustered ? 0xFFFFFFFFLL : std::numeric_limits<int64_t>::max() - 1;
+        {
+            kawasan::broker::KawasanBroker broker(cfg);
+            broker.start();
+            std::ofstream(std::filesystem::path(data) / "meta/producer_id.counter") << last;
+            const auto accepted = allocationResponse(broker.port());
+            EXPECT_EQ(accepted.error, kawasan::ErrorCode::NONE);
+            EXPECT_EQ(accepted.producer_id,
+                      clustered ? kawasan::broker::clusterProducerId(2, last) : last);
+            const auto refused = allocationResponse(broker.port());
+            EXPECT_EQ(refused.error, kawasan::ErrorCode::KAFKA_STORAGE_ERROR);
+            EXPECT_EQ(refused.producer_id, -1);
+            broker.stop();
+        }
+        kawasan::broker::KawasanBroker restarted(cfg);
+        restarted.start();
+        const auto refused = allocationResponse(restarted.port());
+        EXPECT_EQ(refused.error, kawasan::ErrorCode::KAFKA_STORAGE_ERROR);
+        EXPECT_EQ(refused.producer_id, -1);
+        restarted.stop();
+    }
 }

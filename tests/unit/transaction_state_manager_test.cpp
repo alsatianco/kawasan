@@ -94,6 +94,33 @@ TEST(TxnStateSerialization, RoundTripsEveryField) {
     }
 }
 
+TEST(TxnStateSerialization, RetryIdentityHistoryRoundTripsAndRejectsMalformedValues) {
+    auto snapshot = makeSnapshot();
+    snapshot.previous_producer_id = snapshot.producer_id;
+    snapshot.previous_producer_epoch = snapshot.producer_epoch - 1;
+    auto bytes = TSM::serialize(snapshot);
+    EXPECT_EQ(bytes[0], 3);
+    EXPECT_EQ(TSM::deserialize(bytes), snapshot);
+    snapshot.previous_producer_id = 111;
+    snapshot.previous_producer_epoch = 32766;
+    snapshot.producer_epoch = 0;
+    bytes = TSM::serialize(snapshot);
+    EXPECT_EQ(TSM::deserialize(bytes), snapshot);
+    bytes.pop_back();
+    EXPECT_THROW(TSM::deserialize(bytes), std::exception);
+    for (const auto& [id, epoch] :
+         std::vector<std::pair<int64_t, int16_t>>{{-2, 5}, {1, -1}, {111, 7}, {4242, 0}}) {
+        snapshot.previous_producer_id = id;
+        snapshot.previous_producer_epoch = epoch;
+        EXPECT_THROW(TSM::deserialize(TSM::serialize(snapshot)), std::runtime_error);
+    }
+    snapshot.previous_producer_id = -1;
+    snapshot.previous_producer_epoch = -1;
+    auto old = TSM::deserialize(TSM::serialize(snapshot));
+    EXPECT_EQ(old.previous_producer_id, -1);
+    EXPECT_EQ(old.previous_producer_epoch, -1);
+}
+
 TEST(TxnStateSerialization, ReadsLegacySnapshotWithoutLeaderEpoch) {
     Buffer legacy;
     auto field = [&](const std::string& value) {

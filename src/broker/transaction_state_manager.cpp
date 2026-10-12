@@ -18,7 +18,7 @@ namespace kawasan::broker {
 
 namespace {
 
-constexpr int8_t kSnapshotVersion = 2;
+constexpr int8_t kSnapshotVersion = 3;
 
 // Length-prefixed (INT32) byte field — UTF-8-agnostic, so PendingOffset
 // metadata (arbitrary bytes) round-trips safely, unlike JSON.
@@ -48,11 +48,12 @@ TransactionStateManager::TransactionStateManager(storage::LogManager* log_manage
 std::vector<uint8_t> TransactionStateManager::serialize(
     const TransactionCoordinator::TxnSnapshot& s) {
     Buffer buf;
-    // Preserve v1 bytes for snapshots without leader-epoch metadata.
+    // Preserve old bytes when no retry history is present.
     const int8_t version =
-        std::any_of(s.pending_offsets.begin(), s.pending_offsets.end(),
-                    [](const auto& offset) { return offset.committed_leader_epoch != -1; })
-            ? kSnapshotVersion
+        s.previous_producer_id != -1 || s.previous_producer_epoch != -1 ? kSnapshotVersion
+        : std::any_of(s.pending_offsets.begin(), s.pending_offsets.end(),
+                      [](const auto& offset) { return offset.committed_leader_epoch != -1; })
+            ? 2
             : 1;
     buf.writeInt8(version);
     putBytes(buf, s.transactional_id);
@@ -79,6 +80,10 @@ std::vector<uint8_t> TransactionStateManager::serialize(
         if (version >= 2)
             buf.writeInt32(po.committed_leader_epoch);
     }
+    if (version >= 3) {
+        buf.writeInt64(s.previous_producer_id);
+        buf.writeInt16(s.previous_producer_epoch);
+    }
     return std::vector<uint8_t>(buf.data(), buf.data() + buf.size());
 }
 
@@ -87,7 +92,7 @@ TransactionCoordinator::TxnSnapshot TransactionStateManager::deserialize(
     Buffer buf(bytes);
     TransactionCoordinator::TxnSnapshot s;
     const int8_t version = buf.readInt8();
-    if (version != 1 && version != kSnapshotVersion) {
+    if (version < 1 || version > kSnapshotVersion) {
         throw std::runtime_error("txn-state: unknown snapshot version " + std::to_string(version));
     }
     s.transactional_id = getBytes(buf);
@@ -127,6 +132,16 @@ TransactionCoordinator::TxnSnapshot TransactionStateManager::deserialize(
         po.metadata = getBytes(buf);
         po.committed_leader_epoch = version >= 2 ? buf.readInt32() : -1;
         s.pending_offsets.push_back(std::move(po));
+    }
+    if (version >= 3) {
+        s.previous_producer_id = buf.readInt64();
+        s.previous_producer_epoch = buf.readInt16();
+        if (s.previous_producer_id < 0 || s.previous_producer_epoch < 0 ||
+            (s.previous_producer_id == s.producer_id &&
+             s.previous_producer_epoch >= s.producer_epoch) ||
+            (s.previous_producer_id != s.producer_id &&
+             s.previous_producer_epoch < std::numeric_limits<int16_t>::max() - 1))
+            throw std::runtime_error("txn-state: invalid producer retry history");
     }
     if (buf.remaining() != 0)
         throw std::runtime_error("txn-state: trailing snapshot bytes");

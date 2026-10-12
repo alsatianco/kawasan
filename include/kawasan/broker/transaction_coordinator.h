@@ -98,6 +98,11 @@ public:
         // abort. This gates consumer-group offset visibility on the
         // transaction outcome — required for Streams EOS v2.
         std::vector<PendingOffset> pending_offsets;
+        // Last successful expected InitProducerId identity. Persisted so an
+        // exact KIP-360 retry survives owner acquisition and PID rotation.
+        // A new producer without an expectation clears both sentinels.
+        int64_t previous_producer_id = -1;
+        int16_t previous_producer_epoch = -1;
         bool operator==(const TxnSnapshot&) const = default;
     };
 

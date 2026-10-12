@@ -384,6 +384,366 @@ Buffer deleteWire(KawasanBroker& b, protocol::ApiKey api, const std::string& id,
     return response;
 }
 
+struct ProducerIdentity {
+    ErrorCode error;
+    int64_t id;
+    int16_t epoch;
+};
+Buffer producerInitPayload(const std::optional<std::string>& id, int16_t version = 4,
+                           int64_t expected_id = -1, int16_t expected_epoch = -1,
+                           int32_t timeout = 60000) {
+    Buffer payload;
+    if (version >= 2)
+        payload.writeCompactNullableString(id);
+    else
+        payload.writeNullableString(id);
+    payload.writeInt32(timeout);
+    if (version >= 3) {
+        payload.writeInt64(expected_id);
+        payload.writeInt16(expected_epoch);
+    }
+    if (version >= 2)
+        payload.writeEmptyTaggedFields();
+    return payload;
+}
+ProducerIdentity producerIdentity(Buffer response, int16_t version = 4) {
+    EXPECT_EQ(response.readInt32(), 91);
+    if (version >= 2)
+        response.skipTaggedFields();
+    EXPECT_EQ(response.readInt32(), 0);
+    const auto error = static_cast<ErrorCode>(response.readInt16());
+    const auto id = response.readInt64();
+    const auto epoch = response.readInt16();
+    if (version >= 2)
+        response.skipTaggedFields();
+    EXPECT_EQ(response.remaining(), 0);
+    return {error, id, epoch};
+}
+ProducerIdentity producerInitWire(KawasanBroker& b, const std::optional<std::string>& id,
+                                  int16_t version = 4, int64_t expected_id = -1,
+                                  int16_t expected_epoch = -1, int32_t timeout = 60000) {
+    Buffer request;
+    protocol::RequestHeader(protocol::ApiKey::INIT_PRODUCER_ID, version, 91, "identity-test")
+        .encode(request);
+    const auto payload = producerInitPayload(id, version, expected_id, expected_epoch, timeout);
+    request.writeBytes(payload.data(), payload.size());
+    return producerIdentity(test_support::brokerRequest(b.port(), request), version);
+}
+
+TEST_F(CoordinatorPersistenceTest, KeyedProducerInitializationCommitsIdentityAndRetries) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    const auto first = producerInitWire(b, id, 0);
+    ASSERT_EQ(first.error, ErrorCode::NONE);
+    EXPECT_EQ(first.epoch, 0);
+    const auto bumped = producerInitWire(b, id, 3, first.id, first.epoch);
+    ASSERT_EQ(bumped.error, ErrorCode::NONE);
+    EXPECT_EQ(bumped.id, first.id);
+    EXPECT_EQ(bumped.epoch, 1);
+    const auto retry = producerInitWire(b, id, 4, first.id, first.epoch);
+    EXPECT_EQ(retry.error, ErrorCode::NONE);
+    EXPECT_EQ(retry.id, bumped.id);
+    EXPECT_EQ(retry.epoch, bumped.epoch);
+    auto committed = TransactionStateManager(b.logManager(), 3).loadCommittedPartition(0);
+    ASSERT_EQ(committed.size(), 1u);
+    EXPECT_EQ(committed[0], *CoordinatorPersistenceProbe::transactions(b).describe(id));
+    EXPECT_EQ(committed[0].producer_epoch, 1);
+}
+
+TEST_F(CoordinatorPersistenceTest, KeyedProducerInitializationCheckpointFailurePreservesCache) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    const auto blocked = dir / "0/__transaction_state-0/checkpoint.meta.tmp";
+    fs::create_directory(blocked);
+    const auto failed = producerInitWire(b, id, 0);
+    EXPECT_EQ(failed.error, ErrorCode::KAFKA_STORAGE_ERROR);
+    EXPECT_EQ(failed.id, -1);
+    EXPECT_EQ(failed.epoch, -1);
+    EXPECT_FALSE(CoordinatorPersistenceProbe::transactions(b).describe(id));
+    fs::remove(blocked);
+    b.reconcileReplicas();
+    ASSERT_TRUE(waitUntil([&] {
+        return b.coordinatorLoadStatus(id, protocol::CoordinatorType::TRANSACTION) ==
+               ErrorCode::NONE;
+    }));
+    const auto recovered = producerInitWire(b, id, 4);
+    EXPECT_EQ(recovered.error, ErrorCode::NONE);
+    EXPECT_GE(recovered.id, 1);
+}
+
+TEST_F(CoordinatorPersistenceTest, KeyedProducerInitializationValidatesWithoutAllocating) {
+    auto cfg = config();
+    cfg.setInt("transaction.max.timeout.ms", 120000);
+    KawasanBroker b(cfg, KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    auto* log = b.logManager()->getLog("__transaction_state", 0);
+    ASSERT_NE(log, nullptr);
+    for (int16_t version : {0, 1, 2, 3, 4}) {
+        SCOPED_TRACE(version);
+        EXPECT_EQ(producerInitWire(b, "", version).error, ErrorCode::INVALID_REQUEST);
+        for (int32_t timeout : {-1, 0, 120001})
+            EXPECT_EQ(producerInitWire(b, id, version, -1, -1, timeout).error,
+                      ErrorCode::INVALID_TRANSACTION_TIMEOUT);
+    }
+    for (const auto& [pid, epoch] :
+         std::vector<std::pair<int64_t, int16_t>>{{-1, 0}, {1, -1}, {-2, 0}, {1, -2}})
+        EXPECT_EQ(producerInitWire(b, id, 4, pid, epoch).error, ErrorCode::INVALID_REQUEST);
+    EXPECT_EQ(producerInitWire(b, std::nullopt).error, ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+    EXPECT_FALSE(fs::exists(dir / "0/meta/producer_id.counter"));
+    EXPECT_EQ(log->logEndOffset(), 0);
+    const auto first = producerInitWire(b, id, 2);
+    ASSERT_EQ(first.error, ErrorCode::NONE);
+    EXPECT_EQ(first.id, 1);
+    const auto initial = CoordinatorPersistenceProbe::transactions(b).describe(id);
+    for (int16_t version : {3, 4}) {
+        EXPECT_EQ(producerInitWire(b, id, version, first.id + 1, first.epoch).error,
+                  version == 3 ? ErrorCode::INVALID_PRODUCER_EPOCH : ErrorCode::PRODUCER_FENCED);
+        EXPECT_EQ(producerInitWire(b, id, version, first.id, 99).error,
+                  version == 3 ? ErrorCode::INVALID_PRODUCER_EPOCH : ErrorCode::PRODUCER_FENCED);
+    }
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), initial);
+    EXPECT_EQ(log->logEndOffset(), 1);
+    const auto bumped = producerInitWire(b, id, 4, first.id, first.epoch);
+    ASSERT_EQ(bumped.error, ErrorCode::NONE);
+    EXPECT_EQ(log->logEndOffset(), 2);
+    EXPECT_EQ(producerInitWire(b, id, 4, first.id, first.epoch).epoch, bumped.epoch);
+    EXPECT_EQ(log->logEndOffset(), 2);  // exact retries are fenced no-ops
+    const auto new_instance = producerInitWire(b, id, 1);
+    ASSERT_EQ(new_instance.error, ErrorCode::NONE);
+    EXPECT_EQ(new_instance.epoch, 2);
+    EXPECT_EQ(producerInitWire(b, id, 4, first.id, first.epoch).error, ErrorCode::PRODUCER_FENCED);
+    EXPECT_EQ(producerInitWire(b, id, 4, first.id, bumped.epoch).error, ErrorCode::PRODUCER_FENCED);
+}
+
+TEST_F(CoordinatorPersistenceTest, KeyedProducerInitializationRefusesPendingCompletion) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    auto snapshot = transaction(id);
+    snapshot.pending_offsets = {{"group", "data", 0, 10, "pending", 7}};
+    ASSERT_EQ(init(b, snapshot), ErrorCode::NONE);
+    using State = TransactionCoordinator::State;
+    for (auto state : {State::Ongoing, State::PrepareCommit, State::PrepareAbort,
+                       State::PrepareEpochFence, State::Dead}) {
+        const auto before = CoordinatorPersistenceProbe::transactions(b).describe(id);
+        ASSERT_EQ(b.mutateCoordinatorTransaction(id, before,
+                                                 [&](auto& proposed) {
+                                                     proposed->state = state;
+                                                     return ErrorCode::NONE;
+                                                 }),
+                  ErrorCode::NONE);
+        const auto expected = CoordinatorPersistenceProbe::transactions(b).describe(id);
+        const auto end = b.logManager()->getLog("__transaction_state", 0)->logEndOffset();
+        const auto result =
+            producerInitWire(b, id, 4, snapshot.producer_id, snapshot.producer_epoch);
+        EXPECT_EQ(result.error, state == State::Dead ? ErrorCode::INVALID_TXN_STATE
+                                                     : ErrorCode::CONCURRENT_TRANSACTIONS);
+        EXPECT_EQ(result.id, -1);
+        EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), expected);
+        EXPECT_EQ(b.logManager()->getLog("__transaction_state", 0)->logEndOffset(), end);
+    }
+    EXPECT_FALSE(fs::exists(dir / "0/meta/producer_id.counter"));
+}
+
+TEST_F(CoordinatorPersistenceTest, KeyedProducerRotationRetrySurvivesRestartAndCacheRebuild) {
+    const auto id = key(0);
+    auto snapshot = transaction(id);
+    snapshot.producer_id = 777;
+    snapshot.producer_epoch = std::numeric_limits<int16_t>::max() - 1;
+    snapshot.state = TransactionCoordinator::State::Empty;
+    snapshot.partitions.clear();
+    ProducerIdentity rotated{};
+    {
+        KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+        b.start();
+        b.reconcileReplicas();
+        ASSERT_EQ(init(b, snapshot), ErrorCode::NONE);
+        rotated = producerInitWire(b, id, 4, snapshot.producer_id, snapshot.producer_epoch);
+        ASSERT_EQ(rotated.error, ErrorCode::NONE);
+        EXPECT_NE(rotated.id, snapshot.producer_id);
+        EXPECT_EQ(rotated.epoch, 0);
+        const auto retry =
+            producerInitWire(b, id, 4, snapshot.producer_id, snapshot.producer_epoch);
+        EXPECT_EQ(retry.error, ErrorCode::NONE);
+        EXPECT_EQ(retry.id, rotated.id);
+        EXPECT_EQ(retry.epoch, 0);
+        EXPECT_EQ(b.logManager()->getLog("__transaction_state", 0)->logEndOffset(), 2);
+        b.stop();
+    }
+    fs::remove_all(dir / "0/consumer_offsets");  // disposable cache loss
+    KawasanBroker recovered(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    recovered.start();
+    recovered.reconcileReplicas();
+    const auto retry =
+        producerInitWire(recovered, id, 3, snapshot.producer_id, snapshot.producer_epoch);
+    EXPECT_EQ(retry.error, ErrorCode::NONE);
+    EXPECT_EQ(retry.id, rotated.id);
+    EXPECT_EQ(retry.epoch, 0);
+    EXPECT_EQ(recovered.logManager()->getLog("__transaction_state", 0)->logEndOffset(), 2);
+    EXPECT_EQ(producerInitWire(recovered, id, 4, rotated.id, 0).epoch, 1);
+    EXPECT_EQ(
+        producerInitWire(recovered, id, 4, snapshot.producer_id, snapshot.producer_epoch).error,
+        ErrorCode::PRODUCER_FENCED);
+}
+
+TEST_F(CoordinatorPersistenceTest, ThreeBrokerKeyedProducerWireWaitsForIsrAndRefusesWrongOwner) {
+    startCluster();
+    const auto id = key(1);
+    auto& b = *brokers[1];
+    for (int wrong : {0, 2}) {
+        EXPECT_EQ(producerInitWire(*brokers[wrong], id).error, ErrorCode::NOT_COORDINATOR);
+        EXPECT_FALSE(fs::exists(dir / std::to_string(wrong) / "meta/producer_id.counter"));
+    }
+    brokers[0]->replicaManager()->stop();
+    brokers[2]->replicaManager()->stop();
+    auto pending = std::async(std::launch::async, [&] { return producerInitWire(b, id); });
+    EXPECT_TRUE(waitUntil(
+        [&] { return b.logManager()->getLog("__transaction_state", 1)->logEndOffset() == 1; }));
+    EXPECT_EQ(pending.wait_for(50ms), std::future_status::timeout);
+    EXPECT_FALSE(CoordinatorPersistenceProbe::transactions(b).describe(id));
+    Buffer versions;
+    protocol::RequestHeader(protocol::ApiKey::API_VERSIONS, 1, 95, "io-progress").encode(versions);
+    protocol::ApiVersionsRequest{}.encode(versions, 1);
+    auto progress = test_support::brokerRequest(b.port(), versions);
+    EXPECT_EQ(progress.readInt32(), 95);
+    brokers[0]->replicaManager()->start();
+    brokers[2]->replicaManager()->start();
+    ASSERT_EQ(pending.wait_for(10s), std::future_status::ready);
+    const auto committed = pending.get();
+    EXPECT_EQ(committed.error, ErrorCode::NONE);
+    EXPECT_EQ(committed.id, (int64_t{1} << 32) | 1);
+    EXPECT_EQ(committed.epoch, 0);
+    ASSERT_TRUE(waitUntil([&] {
+        for (auto& broker : brokers)
+            if (broker->logManager()->getLog("__transaction_state", 1)->highWatermark() < 1)
+                return false;
+        return true;
+    }));
+    for (auto& broker : brokers) {
+        const auto image =
+            TransactionStateManager(broker->logManager(), 3).loadCommittedPartition(1);
+        ASSERT_EQ(image.size(), 1u);
+        EXPECT_EQ(image[0].producer_id, committed.id);
+    }
+}
+
+ProducerIdentity publishProducer(RequestDispatcher::DispatchResult& result) {
+    auto frame = result.frame;
+    if (result.publication_guard)
+        result.publication_guard([&](auto status) {
+            if (status != ErrorCode::NONE)
+                frame = result.publication_error(status);
+        });
+    Buffer response(frame);
+    (void)response.readInt32();  // frame length
+    return producerIdentity(std::move(response));
+}
+
+TEST_F(CoordinatorPersistenceTest, KeyedProducerResponseFencesChangedEpochAndDrainsShutdown) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    std::promise<RequestDispatcher::DispatchResult> delivered;
+    EXPECT_TRUE(CoordinatorExecutorProbe::dispatchProtocol(
+                    b, protocol::ApiKey::INIT_PRODUCER_ID, 4, producerInitPayload(id),
+                    [&](auto result) { delivered.set_value(std::move(result)); })
+                    .deferred);
+    auto ready = delivered.get_future();
+    ASSERT_EQ(ready.wait_for(5s), std::future_status::ready);
+    auto result = ready.get();
+    EXPECT_EQ(publishProducer(result).error, ErrorCode::NONE);
+    ASSERT_EQ(b.metadataController()->updatePartitionLeader("__transaction_state", 0, 0).error_code,
+              ErrorCode::NONE);
+    b.reconcileReplicas();
+    EXPECT_EQ(publishProducer(result).error, ErrorCode::NOT_COORDINATOR);
+    const auto acknowledged = CoordinatorPersistenceProbe::transactions(b).describe(id);
+    ASSERT_TRUE(acknowledged);
+    EXPECT_EQ(acknowledged->producer_epoch, 0);
+    auto stopped = std::async(std::launch::async, [&] { b.stop(); });
+    EXPECT_TRUE(waitUntil([&] { return CoordinatorExecutorProbe::stopping(b); }));
+    EXPECT_EQ(stopped.wait_for(50ms), std::future_status::timeout);
+    EXPECT_EQ(publishProducer(result).error, ErrorCode::NOT_COORDINATOR);
+    result = {};  // release posted response ticket before shutdown may finish
+    EXPECT_EQ(stopped.wait_for(5s), std::future_status::ready);
+    stopped.get();
+}
+
+TEST_F(CoordinatorPersistenceTest, QueuedKeyedProducerCannotAllocateInReacquiredEpoch) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    std::promise<void> release;
+    struct ReleaseWorkers {
+        std::promise<void>& release;
+        bool done = false;
+        void finish() {
+            if (!done) {
+                done = true;
+                release.set_value();
+            }
+        }
+        ~ReleaseWorkers() { finish(); }
+    };
+    auto released = release.get_future().share();
+    std::atomic<int> entered{0};
+    // This guard must be destroyed before the broker joins its workers.
+    ReleaseWorkers guard{release};
+    for (int worker = 0; worker < 2; ++worker)
+        ASSERT_TRUE(CoordinatorExecutorProbe::submit(b, [&](bool admitted, auto) {
+            EXPECT_TRUE(admitted);
+            ++entered;
+            released.wait();
+        }));
+    ASSERT_TRUE(waitUntil([&] { return entered == 2; }));
+    auto delivered = std::make_shared<std::promise<RequestDispatcher::DispatchResult>>();
+    EXPECT_TRUE(CoordinatorExecutorProbe::dispatchProtocol(
+                    b, protocol::ApiKey::INIT_PRODUCER_ID, 4, producerInitPayload(id),
+                    [delivered](auto result) { delivered->set_value(std::move(result)); })
+                    .deferred);
+    auto ready = delivered->get_future();
+    EXPECT_EQ(ready.wait_for(50ms), std::future_status::timeout);
+    EXPECT_EQ(b.metadataController()->updatePartitionLeader("__transaction_state", 0, 0).error_code,
+              ErrorCode::NONE);
+    b.reconcileReplicas();
+    EXPECT_EQ(b.coordinatorLoadStatus(id, protocol::CoordinatorType::TRANSACTION), ErrorCode::NONE);
+    // Release exactly once, also on every early assertion return.
+    guard.finish();
+    ASSERT_EQ(ready.wait_for(5s), std::future_status::ready);
+    auto result = ready.get();
+    EXPECT_EQ(publishProducer(result).error, ErrorCode::NOT_COORDINATOR);
+    EXPECT_FALSE(CoordinatorPersistenceProbe::transactions(b).describe(id));
+    EXPECT_FALSE(fs::exists(dir / "0/meta/producer_id.counter"));
+    EXPECT_EQ(b.logManager()->getLog("__transaction_state", 0)->logEndOffset(), 0);
+}
+
+TEST_F(CoordinatorPersistenceTest, KeyedProducerCounterFailureLeavesNoSourceIdentity) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    const auto temporary = dir / "0/meta/producer_id.counter.tmp";
+    fs::create_directory(temporary);
+    const auto failed = producerInitWire(b, id);
+    EXPECT_EQ(failed.error, ErrorCode::KAFKA_STORAGE_ERROR);
+    EXPECT_EQ(failed.id, -1);
+    EXPECT_FALSE(CoordinatorPersistenceProbe::transactions(b).describe(id));
+    EXPECT_EQ(b.logManager()->getLog("__transaction_state", 0)->logEndOffset(), 0);
+    fs::remove(temporary);
+    const auto retry = producerInitWire(b, id);
+    EXPECT_EQ(retry.error, ErrorCode::NONE);
+    EXPECT_EQ(retry.id, 1);
+    EXPECT_EQ(retry.epoch, 0);
+}
+
 TEST_F(CoordinatorPersistenceTest, StagedOffsetWireCommitFetchAndExactDeletion) {
     KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
     b.start();

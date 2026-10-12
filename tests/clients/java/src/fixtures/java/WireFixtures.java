@@ -29,6 +29,14 @@ public class WireFixtures {
         add("describe-groups-null-v4",response,(short)4);
         add("describe-groups-null-v5",response,(short)5);
 
+        for (short v = 0; v <= 4; v++) {
+            var init = new InitProducerIdRequestData().setTransactionalId("txn").setTransactionTimeoutMs(60000);
+            if (v >= 3) init.setProducerId(42).setProducerEpoch((short)7);
+            add("init-producer-request-v"+v, init, v);
+            add("init-producer-response-v"+v, new InitProducerIdResponseData()
+                .setProducerId(42).setProducerEpoch((short)8), v);
+        }
+
         add("sasl-request-v2", new SaslAuthenticateRequestData().setAuthBytes(new byte[]{1,2,3}), (short)2);
         add("sasl-response-v2", new SaslAuthenticateResponseData().setErrorCode((short)58)
             .setErrorMessage("denied").setAuthBytes(new byte[]{4,5}).setSessionLifetimeMs(1234), (short)2);
