@@ -4,6 +4,7 @@
 # Usage: ./auto-improve.sh [watch|--help]
 # Optional environment: MAX_RUNS=0 MAX_FAILS=3 MAX_IDLE=2 RETRY_DELAY=60
 # MAX_RUNS=0 means unlimited. Logs and plan snapshots stay in ignored AI-TEMP.
+# Interrupted/uncommitted work is reviewed by a recovery session before new tasks.
 # Exit codes: 0 = verified complete; 1 = failed/stalled; 2 = blocked/config/limit.
 
 set -euo pipefail
@@ -90,15 +91,9 @@ log() {
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$STATE_DIR/loop.log"
 }
 check_repo() {
-  local branch dirty
+  local branch
   branch=$(git symbolic-ref --quiet --short HEAD) || branch='(detached)'
   [ "$branch" = main ] || { log "STOP: expected main; found $branch."; return 1; }
-  dirty=$(git status --porcelain --untracked-files=all)
-  if [ -n "$dirty" ]; then
-    log 'STOP: uncommitted changes need review before another session.'
-    printf '%s\n' "$dirty" | tee -a "$STATE_DIR/loop.log"
-    return 1
-  fi
 }
 check_repo || exit 1
 # Fail early on an older CLI rather than retrying unsupported permission flags.
@@ -129,7 +124,9 @@ Rules:
    dependency order, including implementation, relevant checks and documentation.
    Complete one coherent task, update the plan, then end this session. If an
    earlier run was interrupted, inspect its uncommitted work, history and plan,
-   and finish that task first. Do not discard existing work.
+   and finish that task first. Review and test meaningful changes before committing
+   them. If changes are unrelated or unusable, preserve those specific paths in a
+   named git stash and record the stash and reason in the plan; never discard work.
 2. Follow AGENTS.md and repository agreements. Commit after every meaningful
    change, with a concise one-line message. Work on main and preserve linear
    history. Never git push, publish externally, or modify remote settings or
@@ -181,6 +178,20 @@ while :; do
   head_before=$(git rev-parse HEAD)
   log "Session $runs: $RUN_DIR"
   session_prompt=$PROMPT
+  dirty_before=$(git status --porcelain --untracked-files=all)
+  printf '%s\n' "$dirty_before" > "$RUN_DIR/status-before.txt"
+  git diff --binary HEAD > "$RUN_DIR/tracked-before.patch"
+  if [ -n "$dirty_before" ]; then
+    done_streak=0
+    log 'Recovery session: review unfinished changes before starting any new task.'
+    session_prompt="$PROMPT
+
+This is a recovery session. The working tree contains unfinished changes. Read
+the previous session logs under AI-TEMP/auto-improve and review the current diff
+and untracked files. Validate and finish meaningful work, or preserve unusable
+work in a named stash as described above. Update the plan with recovery evidence.
+Do not report task_done or all_done until the working tree is clean."
+  fi
   if [ "$done_streak" -gt 0 ]; then
     session_prompt="$PROMPT
 
@@ -215,7 +226,16 @@ The previous session reported all_done. This is the independent completion audit
     log "Session failed or returned an invalid result (exit $rc); see $RUN_DIR."
   fi
   log "Session $runs: status=$status, new commits=$new_commits"
+  # Failed/interrupted sessions may leave useful work. Retry with explicit recovery
+  # instructions, but never accept a completion claim with uncommitted changes.
   check_repo || exit 1
+  if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+    log 'Uncommitted changes remain; the next session must review and recover them.'
+    if [ "$status" = task_done ] || [ "$status" = all_done ]; then
+      log 'Rejecting completion claim: the working tree is not clean.'
+      status=failed
+    fi
+  fi
   case "$status" in
     task_done)
       fails=0

@@ -24,6 +24,10 @@ add_test(NAME NemesisTest
     COMMAND ${Python3_EXECUTABLE} -m unittest discover
             -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_nemesis.py)
 
+add_test(NAME AutoImproveTest
+    COMMAND ${Python3_EXECUTABLE} -m unittest discover
+            -s ${CMAKE_SOURCE_DIR}/scripts/tests -p test_auto_improve.py)
+
 # CM-1 result gate must reject missing cases, skips, and stale allowlists.
 add_test(NAME ClientMatrixResultTest
     COMMAND ${Python3_EXECUTABLE} -m unittest discover
