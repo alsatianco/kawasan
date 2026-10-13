@@ -1842,8 +1842,14 @@ void KawasanBroker::registerProtocolHandlers() {
                 return deferCoordinatorListings(context, errors);
             };
         }
+        const bool staged_replica_inspection =
+            staged_coordinator_persistence_ && key == protocol::ApiKey::DESCRIBE_PRODUCERS;
+        if (staged_replica_inspection) {
+            handler = [this](Context& context) { return deferProducerInspection(context); };
+        }
         if (staged_coordinator_format_ && !staged_membership && !staged_offsets &&
-            !staged_producer && !staged_registration && !staged_descriptions && !staged_listings) {
+            !staged_producer && !staged_registration && !staged_descriptions && !staged_listings &&
+            !staged_replica_inspection) {
             // Staged acquisition must never reach legacy writes, cleanup or
             // marker completion. Version-specific builders retain wire shape.
             switch (key) {
@@ -2641,9 +2647,8 @@ RequestDispatcher::HandlerResult KawasanBroker::handleProduce(
                     continue;
                 }
                 if (!replica_manager_->isLeader(tp)) {
-                    // Create a shared_ptr wrapper for the log (LogManager owns the actual log)
-                    // We use a non-owning shared_ptr to track it in ReplicaManager
-                    std::shared_ptr<storage::Log> log_ptr(log, [](storage::Log*) {});
+                    // Retain actual ownership through replica work and topic deletion.
+                    auto log_ptr = log_manager_->retainLog(tp.topic, tp.partition);
                     replica_manager_->addReplica(tp, log_ptr);
                 }
 
@@ -3194,8 +3199,8 @@ RequestDispatcher::HandlerResult KawasanBroker::handleFetch(
                     continue;
                 }
                 if (!replica_manager_->isLeader(tp)) {
-                    // Create a non-owning shared_ptr wrapper
-                    std::shared_ptr<storage::Log> log_ptr(log, [](storage::Log*) {});
+                    // Retain actual log ownership.
+                    auto log_ptr = log_manager_->retainLog(tp.topic, tp.partition);
                     replica_manager_->addReplica(tp, log_ptr);
                 }
 
@@ -4449,7 +4454,7 @@ void KawasanBroker::reconcileReplicas() {
             if (!log) {
                 continue;
             }
-            std::shared_ptr<storage::Log> log_ptr(log, [](storage::Log*) {});
+            auto log_ptr = log_manager_->retainLog(tp.topic, tp.partition);
             // leader == broker_id_ => this broker leads (ISR = assigned replicas,
             // so acks=all waits for followers); otherwise it is a follower and the
             // fetcher thread will replicate from pm.leader.

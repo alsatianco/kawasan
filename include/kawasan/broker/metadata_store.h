@@ -53,6 +53,11 @@ public:
         const std::vector<std::pair<TopicPartition, int32_t>>& sources,
         const std::function<void(ErrorCode)>& action);
 
+    // Simultaneously fence local replica assignments and topic identities.
+    // Callback must not reenter metadata; no storage scan under this lock.
+    void withReplicaAssignments(const std::vector<ReplicaAssignment>& sources, BrokerId local,
+                                const std::function<void(const std::vector<ErrorCode>&)>& action);
+
     /// @brief Loads metadata from disk (creates empty store if missing).
     void load();
 

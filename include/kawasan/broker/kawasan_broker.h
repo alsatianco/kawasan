@@ -237,6 +237,12 @@ private:
                                   const std::vector<RequestOwnership>& sources);
     Buffer buildListTransactionsError(const RequestDispatcher::RequestContext& context,
                                       ErrorCode code, int16_t version) const;
+    RequestDispatcher::HandlerResult deferProducerInspection(
+        RequestDispatcher::RequestContext context);
+    void withProducerInspectionFences(
+        const std::vector<ReplicaAssignment>& sources,
+        const std::vector<std::shared_ptr<storage::Log>>& logs,
+        const std::function<void(const std::vector<ErrorCode>&)>& publish);
     Buffer buildDescribeProducersError(const RequestDispatcher::RequestContext& context,
                                        ErrorCode code, int16_t version) const;
     RequestDispatcher::HandlerResult deferCoordinatorOffsetFetch(

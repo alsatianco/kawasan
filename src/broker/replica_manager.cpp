@@ -23,6 +23,8 @@ ReplicaManager::~ReplicaManager() {
 }
 
 void ReplicaManager::addReplica(const TopicPartition& tp, std::shared_ptr<storage::Log> log) {
+    if (!log)
+        throw StorageException(ErrorCode::KAFKA_STORAGE_ERROR, "Cannot register missing log");
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (replicas_.find(tp) != replicas_.end()) {
@@ -580,7 +582,13 @@ bool ReplicaManager::reconcileReplica(const TopicPartition& tp, std::shared_ptr<
                                       BrokerId leader, const std::vector<BrokerId>& isr,
                                       int32_t leader_epoch) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!log)
+        return false;
     auto it = replicas_.find(tp);
+    if (it != replicas_.end() && it->second.log.get() != log.get()) {
+        replicas_.erase(it);
+        it = replicas_.end();
+    }
     if (it == replicas_.end()) {
         ReplicaInfo info;
         info.log = std::move(log);
@@ -645,6 +653,28 @@ bool ReplicaManager::reconcileReplica(const TopicPartition& tp, std::shared_ptr<
         maybeAdvanceHighWatermarkLocked(info);
     }
     return changed;
+}
+
+void ReplicaManager::withProducerInspectionReplicas(
+    const std::vector<ReplicaAssignment>& sources,
+    const std::vector<std::shared_ptr<storage::Log>>& logs,
+    const std::function<void(const std::vector<ErrorCode>&)>& action) const {
+    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+    std::vector<ErrorCode> statuses(sources.size(), ErrorCode::OFFSET_NOT_AVAILABLE);
+    if (lock.owns_lock()) {
+        for (size_t i = 0; i < sources.size(); ++i) {
+            const auto& source = sources[i];
+            const auto found = replicas_.find(source.tp);
+            if (found == replicas_.end() || !logs[i] || found->second.log.get() != logs[i].get() ||
+                found->second.leader != source.leader || found->second.leader_epoch != source.epoch)
+                continue;
+            const auto& info = found->second;
+            if (info.leader != local_broker_id_ && info.epoch_check_pending)
+                continue;
+            statuses[i] = logs[i]->producerInspectionStatus();
+        }
+    }
+    action(statuses);
 }
 
 std::optional<Offset> ReplicaManager::getFetchOffset(const TopicPartition& tp) const {

@@ -53,6 +53,11 @@ public:
         store_.withOwnedPartitionLeaderships(topic, owner, sources, action);
     }
 
+    void withReplicaAssignments(const std::vector<ReplicaAssignment>& sources, BrokerId local,
+                                const std::function<void(const std::vector<ErrorCode>&)>& action) {
+        store_.withReplicaAssignments(sources, local, action);
+    }
+
     /// @brief Loads persisted metadata and installs commit hooks.
     void start();
 

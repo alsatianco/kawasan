@@ -149,6 +149,8 @@ public:
     /// sources; never returns a partial image. Caller must pin the log lifetime
     /// and separately fence assignment/topic identity/epochs before wire success.
     ProducerInspection inspectProducerState();
+    // Short, nonblocking online check for response publication; never scans.
+    ErrorCode producerInspectionStatus() const;
 
     /// @brief Phase 5.1: raw-bytes fetch path. Returns serialized
     /// record-batch bytes concatenated, suitable for direct write into

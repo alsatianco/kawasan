@@ -214,6 +214,12 @@ Log* LogManager::getLog(const std::string& topic, PartitionId partition) {
     return nullptr;
 }
 
+std::shared_ptr<Log> LogManager::retainLog(const std::string& topic, PartitionId partition) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    const auto found = logs_.find({topic, partition});
+    return found == logs_.end() ? nullptr : found->second;
+}
+
 void LogManager::deleteLog(const std::string& topic, PartitionId partition) {
     std::unique_lock<std::shared_mutex> write_lock(mutex_);
 

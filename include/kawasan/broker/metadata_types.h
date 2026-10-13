@@ -23,6 +23,14 @@ struct TopicSpecification {
     std::array<uint8_t, 16> topic_id{};
 };
 
+// Original identity/assignment for local leader OR follower inspection.
+struct ReplicaAssignment {
+    TopicPartition tp;
+    std::array<uint8_t, 16> topic_id{};
+    BrokerId leader = -1;
+    int32_t epoch = -1;
+};
+
 /// @brief Result of topic mutation commands.
 struct TopicOperationResult {
     ErrorCode error_code = ErrorCode::NONE;

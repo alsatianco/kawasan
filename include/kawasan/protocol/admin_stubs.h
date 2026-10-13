@@ -53,6 +53,7 @@ public:
         std::string topic;
         std::vector<PartitionResult> partitions;
     };
+    const std::vector<TopicResult>& topics() const { return topics_; }
     void setThrottleTimeMs(int32_t v) { throttle_time_ms_ = v; }
     void addTopic(TopicResult t) { topics_.push_back(std::move(t)); }
     void encode(Buffer& buf, int16_t v) const;

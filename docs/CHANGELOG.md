@@ -8,6 +8,17 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-13
 
+- Serve persistence-staged DescribeProducers v0 from log-derived producer state on
+  local leaders and followers. Pin topic UUID, assignment, leader/epoch and real
+  log lifetime through deferred scans and simultaneous response write fences;
+  preserve duplicates/order and per-partition errors without opening ghost logs.
+  Refuse closed sources, incomplete retained history and unresolved follower
+  reconciliation. Full inspection snapshots/history integration, default-handler
+  migration and public activation remain pending.
+- Give LogManager existing-only owning pins and replace broker replica no-op
+  ownership wrappers. Topic deletion closes/unregisters retained sources; replica
+  recreation resets role/progress against the new log instance.
+
 - Correct transaction marker values to Kafka's versioned six-byte layout
   (INT16 version plus INT32 coordinator epoch). Earlier prerelease markers
   omitted the version field; new markers now support strict Kafka decoding.
@@ -274,6 +285,7 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
   clustering remains experimental pending its prerequisites and acceptance gates.
 
 ## [Unreleased]
+
 
 Single-node durability, security and quotas; durable single-node transactions (M1–M3); and multi-broker replication, automatic clean leader failover, fencing, epoch-based divergence recovery, and coordinator routing (M4–M8). Single-node remains the primary supported mode. Multi-broker remains experimental pending randomized-fault validation and durable coordinator failover.
 

@@ -18,6 +18,7 @@
 #include "kawasan/broker/transaction_state_manager.h"
 #include "kawasan/common/logger.h"
 #include "kawasan/protocol/admin_misc_requests.h"
+#include "kawasan/protocol/admin_stubs.h"
 #include "kawasan/protocol/api_versions.h"
 #include "kawasan/protocol/describe_groups_request.h"
 #include "kawasan/protocol/leave_group_request.h"
@@ -2242,7 +2243,7 @@ TEST_F(CoordinatorPersistenceTest,
     b.stop();
 }
 
-TEST_F(CoordinatorPersistenceTest, OwnedListingsPersistenceProducerInspectionRemainsGated) {
+TEST_F(CoordinatorPersistenceTest, ProducerInspectionUnknownPartitionsDoNotCreateLogs) {
     KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
     b.start();
     b.reconcileReplicas();
@@ -2264,7 +2265,7 @@ TEST_F(CoordinatorPersistenceTest, OwnedListingsPersistenceProducerInspectionRem
     EXPECT_EQ(body.readCompactString(), "data");
     ASSERT_EQ(body.readCompactArrayLen(), 1);
     EXPECT_EQ(body.readInt32(), 7);
-    EXPECT_EQ(static_cast<ErrorCode>(body.readInt16()), ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+    EXPECT_EQ(static_cast<ErrorCode>(body.readInt16()), ErrorCode::UNKNOWN_TOPIC_OR_PARTITION);
     (void)body.readCompactNullableString();
     EXPECT_EQ(body.readCompactArrayLen(), 0);
     body.skipTaggedFields();
@@ -4681,3 +4682,357 @@ TEST_F(CoordinatorPersistenceTest, OwnershipRefusalTakesPriorityOverBusyAcquisit
     EXPECT_EQ(response.get(), ErrorCode::NOT_COORDINATOR);
 }
 }  // namespace
+
+Buffer producersPayload(const std::vector<protocol::DescribeProducersRequest::TopicSpec>& topics) {
+    Buffer payload;
+    payload.writeCompactArrayLen(static_cast<int32_t>(topics.size()));
+    for (const auto& topic : topics) {
+        payload.writeCompactString(topic.topic);
+        payload.writeCompactArrayLen(static_cast<int32_t>(topic.partitions.size()));
+        for (const auto partition : topic.partitions)
+            payload.writeInt32(partition);
+        payload.writeEmptyTaggedFields();
+    }
+    payload.writeEmptyTaggedFields();
+    return payload;
+}
+protocol::DescribeProducersResponse producersWire(
+    KawasanBroker& b, const std::vector<protocol::DescribeProducersRequest::TopicSpec>& topics) {
+    Buffer payload;
+    protocol::RequestHeader(protocol::ApiKey::DESCRIBE_PRODUCERS, 0, 91, "replica-test")
+        .encode(payload);
+    auto input = producersPayload(topics);
+    payload.writeBytes(input.data(), input.size());
+    auto body = test_support::brokerRequest(b.port(), payload);
+    protocol::ResponseHeader header;
+    header.setFlexible(true);
+    header.decode(body);
+    protocol::DescribeProducersResponse response;
+    response.decode(body, 0);
+    EXPECT_EQ(body.remaining(), 0u);
+    return response;
+}
+storage::RecordBatch inspectionData(int64_t pid = 42, bool transactional = true) {
+    storage::RecordBatch batch;
+    batch.setProducerId(pid);
+    batch.setProducerEpoch(3);
+    batch.setBaseSequence(17);
+    batch.setAttributes(transactional ? 0x10 : 0);
+    Record record("key", "value");
+    record.timestamp = 1234;
+    batch.addRecord(record);
+    batch.setFirstTimestamp(1234);
+    batch.setMaxTimestamp(1234);
+    return batch;
+}
+RequestDispatcher::DispatchResult parkedProducers(KawasanBroker& b) {
+    std::promise<RequestDispatcher::DispatchResult> delivered;
+    EXPECT_TRUE(CoordinatorExecutorProbe::dispatchProtocol(
+                    b, protocol::ApiKey::DESCRIBE_PRODUCERS, 0,
+                    producersPayload({{"data", {0, 1, 0}}}),
+                    [&](auto result) { delivered.set_value(std::move(result)); })
+                    .deferred);
+    auto ready = delivered.get_future();
+    if (ready.wait_for(5s) != std::future_status::ready)
+        throw std::runtime_error("inspection timeout");
+    return ready.get();
+}
+TEST_F(CoordinatorPersistenceTest,
+       ProducerInspectionWireUsesLogImageAndPreservesErrorsAndDuplicates) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    createData(b);
+    b.logManager()->getLog("data", 0)->appendBatch(inspectionData());
+    const auto count = b.openLogCount();
+    const auto response =
+        producersWire(b, {{"data", {0, -1, 1, 0}}, {"missing", {0}}, {"data", {0}}});
+    ASSERT_EQ(response.topics().size(), 3u);
+    const auto& partitions = response.topics()[0].partitions;
+    ASSERT_EQ(partitions.size(), 4u);
+    EXPECT_EQ(partitions[1].partition, -1);
+    EXPECT_EQ(partitions[1].error_code, ErrorCode::UNKNOWN_TOPIC_OR_PARTITION);
+    EXPECT_EQ(partitions[2].error_code, ErrorCode::NONE);
+    EXPECT_TRUE(partitions[2].active_producers.empty());
+    EXPECT_EQ(response.topics()[1].partitions[0].error_code, ErrorCode::UNKNOWN_TOPIC_OR_PARTITION);
+    for (const auto* p : {&partitions[0], &partitions[3], &response.topics()[2].partitions[0]}) {
+        EXPECT_EQ(p->error_code, ErrorCode::NONE);
+        ASSERT_EQ(p->active_producers.size(), 1u);
+        const auto& producer = p->active_producers[0];
+        EXPECT_EQ(producer.producer_id, 42);
+        EXPECT_EQ(producer.producer_epoch, 3);
+        EXPECT_EQ(producer.last_sequence, 17);
+        EXPECT_EQ(producer.last_timestamp, 1234);
+        EXPECT_EQ(producer.coordinator_epoch, -1);
+        EXPECT_EQ(producer.current_txn_start_offset, 0);
+    }
+    EXPECT_EQ(b.openLogCount(), count);
+    EXPECT_FALSE(b.logManager()->getLog("missing", 0));
+    EXPECT_TRUE(producersWire(b, {}).topics().empty());
+    b.stop();
+}
+TEST_F(CoordinatorPersistenceTest, ProducerInspectionResponsesFenceEachEpochAndDrainShutdown) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    createData(b);
+    b.logManager()->getLog("data", 0)->appendBatch(inspectionData());
+    auto result = parkedProducers(b);
+    ASSERT_TRUE(result.publication_guard);
+    EXPECT_EQ(publishProtocol<protocol::DescribeProducersResponse>(
+                  result, protocol::ApiKey::DESCRIBE_PRODUCERS, 0)
+                  .topics()[0]
+                  .partitions[0]
+                  .error_code,
+              ErrorCode::NONE);
+    ASSERT_EQ(b.metadataController()->updatePartitionLeader("data", 0, 0).error_code,
+              ErrorCode::NONE);
+    b.reconcileReplicas();
+    auto after = publishProtocol<protocol::DescribeProducersResponse>(
+        result, protocol::ApiKey::DESCRIBE_PRODUCERS, 0);
+    ASSERT_EQ(after.topics()[0].partitions.size(), 3u);
+    for (const auto i : {0, 2}) {
+        EXPECT_EQ(after.topics()[0].partitions[i].error_code, ErrorCode::NOT_LEADER_FOR_PARTITION);
+        EXPECT_TRUE(after.topics()[0].partitions[i].active_producers.empty());
+    }
+    EXPECT_EQ(after.topics()[0].partitions[1].error_code, ErrorCode::NONE);
+    auto stopped = std::async(std::launch::async, [&] { b.stop(); });
+    EXPECT_TRUE(waitUntil([&] { return CoordinatorExecutorProbe::stopping(b); }));
+    EXPECT_EQ(stopped.wait_for(50ms), std::future_status::timeout);
+    result = {};
+    ASSERT_EQ(stopped.wait_for(5s), std::future_status::ready);
+    stopped.get();
+}
+TEST_F(CoordinatorPersistenceTest, ProducerInspectionDeletedTopicCannotExposeOldImage) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    createData(b);
+    b.logManager()->getLog("data", 0)->appendBatch(inspectionData());
+    auto result = parkedProducers(b);
+    ASSERT_EQ(b.metadataController()->deleteTopic("data").error_code, ErrorCode::NONE);
+    createData(b);
+    const auto after = publishProtocol<protocol::DescribeProducersResponse>(
+        result, protocol::ApiKey::DESCRIBE_PRODUCERS, 0);
+    for (const auto& p : after.topics()[0].partitions) {
+        EXPECT_EQ(p.error_code, ErrorCode::NOT_LEADER_FOR_PARTITION);
+        EXPECT_TRUE(p.active_producers.empty());
+    }
+    result = {};
+    b.stop();
+}
+TEST_F(CoordinatorPersistenceTest, ProducerInspectionClosedAndRetainedPrefixRefusePartialImages) {
+    auto c = config();
+    c.setInt("log.segment.bytes", 1);
+    KawasanBroker b(c, KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    createData(b);
+    auto* log = b.logManager()->getLog("data", 0);
+    log->appendBatch(inspectionData());
+    log->appendBatch(inspectionData(43));
+    log->truncatePrefix(1);
+    auto response = producersWire(b, {{"data", {0, 1}}});
+    EXPECT_EQ(response.topics()[0].partitions[0].error_code, ErrorCode::OFFSET_NOT_AVAILABLE);
+    EXPECT_TRUE(response.topics()[0].partitions[0].active_producers.empty());
+    EXPECT_EQ(response.topics()[0].partitions[1].error_code, ErrorCode::NONE);
+    log->close();
+    response = producersWire(b, {{"data", {0}}});
+    EXPECT_EQ(response.topics()[0].partitions[0].error_code, ErrorCode::KAFKA_STORAGE_ERROR);
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, ProducerInspectionQueuedReadsKeepOriginalEpochAndLogLifetime) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    createData(b);
+    b.logManager()->getLog("data", 0)->appendBatch(inspectionData());
+    std::promise<void> release;
+    const auto released = release.get_future().share();
+    struct Release {
+        std::promise<void>& promise;
+        bool done = false;
+        void finish() {
+            if (!done) {
+                done = true;
+                promise.set_value();
+            }
+        }
+        ~Release() { finish(); }
+    } guard{release};
+    std::atomic<int> entered = 0;
+    for (int worker = 0; worker < 2; ++worker)
+        ASSERT_TRUE(CoordinatorExecutorProbe::submit(b, [&](bool, auto) {
+            ++entered;
+            released.wait();
+        }));
+    ASSERT_TRUE(waitUntil([&] { return entered.load() == 2; }));
+    std::promise<RequestDispatcher::DispatchResult> delivered;
+    EXPECT_TRUE(CoordinatorExecutorProbe::dispatchProtocol(
+                    b, protocol::ApiKey::DESCRIBE_PRODUCERS, 0,
+                    producersPayload({{"data", {0, 1}}}),
+                    [&](auto result) { delivered.set_value(std::move(result)); })
+                    .deferred);
+    auto ready = delivered.get_future();
+    // Queue pins must survive the registry freeing/deleting the original source.
+    ASSERT_EQ(b.metadataController()->deleteTopic("data").error_code, ErrorCode::NONE);
+    createData(b);
+    guard.finish();
+    ASSERT_EQ(ready.wait_for(5s), std::future_status::ready);
+    auto result = ready.get();
+    const auto response = publishProtocol<protocol::DescribeProducersResponse>(
+        result, protocol::ApiKey::DESCRIBE_PRODUCERS, 0);
+    for (const auto& p : response.topics()[0].partitions) {
+        EXPECT_EQ(p.error_code, ErrorCode::NOT_LEADER_FOR_PARTITION);
+        EXPECT_TRUE(p.active_producers.empty());
+    }
+    result = {};
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, ProducerInspectionHoldsAllSourcesThroughWriteInitiation) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    createData(b);
+    auto result = parkedProducers(b);
+    std::promise<void> entered, release;
+    auto publishing = entered.get_future();
+    const auto released = release.get_future().share();
+    auto publication = std::async(std::launch::async, [&] {
+        result.publication_guard([&](auto status) {
+            EXPECT_EQ(status, ErrorCode::NONE);
+            entered.set_value();
+            released.wait();
+        });
+    });
+    const bool started = publishing.wait_for(5s) == std::future_status::ready;
+    if (!started)
+        release.set_value();
+    ASSERT_TRUE(started);
+    auto changed = std::async(std::launch::async, [&] {
+        return b.metadataController()->updatePartitionLeader("data", 1, 0);
+    });
+    EXPECT_EQ(changed.wait_for(50ms), std::future_status::timeout);
+    release.set_value();
+    publication.get();
+    EXPECT_EQ(changed.get().error_code, ErrorCode::NONE);
+    const auto response = publishProtocol<protocol::DescribeProducersResponse>(
+        result, protocol::ApiKey::DESCRIBE_PRODUCERS, 0);
+    EXPECT_EQ(response.topics()[0].partitions[0].error_code, ErrorCode::NONE);
+    EXPECT_EQ(response.topics()[0].partitions[1].error_code, ErrorCode::NOT_LEADER_FOR_PARTITION);
+    result = {};
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, ProducerInspectionClosedAfterReadCannotPublishSuccess) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    createData(b);
+    auto result = parkedProducers(b);
+    b.logManager()->getLog("data", 0)->close();
+    const auto response = publishProtocol<protocol::DescribeProducersResponse>(
+        result, protocol::ApiKey::DESCRIBE_PRODUCERS, 0);
+    for (const auto i : {0, 2})
+        EXPECT_EQ(response.topics()[0].partitions[i].error_code, ErrorCode::KAFKA_STORAGE_ERROR);
+    EXPECT_EQ(response.topics()[0].partitions[1].error_code, ErrorCode::NONE);
+    result = {};
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest,
+       ProducerInspectionClusterReadsRealFollowerAndRefusesUnhostedReplica) {
+    startCluster();
+    KawasanBroker* controller = nullptr;
+    ASSERT_TRUE(waitUntil([&] {
+        for (auto& broker : brokers)
+            if (broker->raftNode()->isLeader())
+                controller = broker.get();
+        return controller != nullptr;
+    }));
+    TopicSpecification spec;
+    spec.name = "data";
+    spec.num_partitions = 1;
+    spec.replication_factor = 2;
+    spec.assignments = {{0, 1}};
+    ASSERT_EQ(controller->metadataController()->createTopic(spec).error_code, ErrorCode::NONE);
+    ASSERT_TRUE(waitUntil([&] {
+        for (auto& broker : brokers)
+            broker->reconcileReplicas();
+        return brokers[0]->logManager()->getLog("data", 0) &&
+               brokers[1]->logManager()->getLog("data", 0);
+    }));
+    auto* leader = brokers[0]->logManager()->getLog("data", 0);
+    leader->appendBatch(inspectionData(), false);
+    ASSERT_TRUE(waitUntil([&] {
+        const auto follower = producersWire(*brokers[1], {{"data", {0}}});
+        const auto& p = follower.topics()[0].partitions[0];
+        return p.error_code == ErrorCode::NONE && p.active_producers.size() == 1;
+    }));
+    auto response = producersWire(*brokers[1], {{"data", {0, 0}}});
+    for (const auto& p : response.topics()[0].partitions) {
+        ASSERT_EQ(p.active_producers.size(), 1u);
+        EXPECT_EQ(p.error_code, ErrorCode::NONE);
+        EXPECT_EQ(p.active_producers[0].producer_id, 42);
+        EXPECT_EQ(p.active_producers[0].producer_epoch, 3);
+        EXPECT_EQ(p.active_producers[0].last_sequence, 17);
+        EXPECT_EQ(p.active_producers[0].last_timestamp, 1234);
+        EXPECT_EQ(p.active_producers[0].current_txn_start_offset, 0);
+    }
+    storage::RecordBatch marker;
+    marker.setProducerId(42);
+    marker.setProducerEpoch(3);
+    marker.setBaseSequence(-1);
+    marker.setAttributes(0x30);
+    Record control;
+    control.timestamp = 4321;
+    control.key = std::vector<uint8_t>{0, 0, 0, 1};
+    Buffer value;
+    value.writeInt16(0);
+    value.writeInt32(11);
+    control.value = value.vector();
+    marker.addRecord(control);
+    marker.setFirstTimestamp(4321);
+    marker.setMaxTimestamp(4321);
+    leader->appendBatch(marker, false);
+    ASSERT_TRUE(waitUntil([&] {
+        const auto snapshot = producersWire(*brokers[1], {{"data", {0}}});
+        const auto& p = snapshot.topics()[0].partitions[0];
+        return p.error_code == ErrorCode::NONE && p.active_producers.size() == 1 &&
+               p.active_producers[0].coordinator_epoch == 11 &&
+               p.active_producers[0].last_timestamp == 4321 &&
+               p.active_producers[0].last_sequence == 17 &&
+               p.active_producers[0].current_txn_start_offset == -1;
+    }));
+    // Metadata creation eagerly opens ordinary logs even on unassigned brokers.
+    // Remove that preexisting log; inspection must neither use nor recreate it.
+    brokers[2]->logManager()->deleteLog("data", 0);
+    const auto count = brokers[2]->openLogCount();
+    response = producersWire(*brokers[2], {{"data", {0}}, {"absent", {0}}});
+    EXPECT_EQ(response.topics()[0].partitions[0].error_code, ErrorCode::NOT_LEADER_FOR_PARTITION);
+    EXPECT_EQ(response.topics()[1].partitions[0].error_code, ErrorCode::UNKNOWN_TOPIC_OR_PARTITION);
+    EXPECT_EQ(brokers[2]->openLogCount(), count);
+    EXPECT_FALSE(brokers[2]->logManager()->getLog("data", 0));
+    // Fence a response read on a follower across an actual Raft leader transfer.
+    std::promise<RequestDispatcher::DispatchResult> delivered;
+    EXPECT_TRUE(CoordinatorExecutorProbe::dispatchProtocol(
+                    *brokers[1], protocol::ApiKey::DESCRIBE_PRODUCERS, 0,
+                    producersPayload({{"data", {0}}}),
+                    [&](auto result) { delivered.set_value(std::move(result)); })
+                    .deferred);
+    auto ready = delivered.get_future();
+    ASSERT_EQ(ready.wait_for(5s), std::future_status::ready);
+    auto result = ready.get();
+    brokers[0]->replicaManager()->stop();
+    ASSERT_EQ(controller->metadataController()->updatePartitionLeader("data", 0, 1).error_code,
+              ErrorCode::NONE);
+    ASSERT_TRUE(waitUntil([&] {
+        const auto metadata = brokers[1]->metadataController()->describeTopics({"data"});
+        return metadata[0].partitions[0].leader == 1;
+    }));
+    EXPECT_EQ(publishProtocol<protocol::DescribeProducersResponse>(
+                  result, protocol::ApiKey::DESCRIBE_PRODUCERS, 0)
+                  .topics()[0]
+                  .partitions[0]
+                  .error_code,
+              ErrorCode::NOT_LEADER_FOR_PARTITION);
+    result = {};
+    brokers[0]->reconcileReplicas();
+    EXPECT_EQ(producersWire(*brokers[0], {{"data", {0}}}).topics()[0].partitions[0].error_code,
+              ErrorCode::OFFSET_NOT_AVAILABLE);  // New follower must reconcile divergence first.
+}

@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include "kawasan/broker/metadata_types.h"
 #include "kawasan/common/types.h"
 #include "kawasan/storage/log.h"
 
@@ -113,6 +114,13 @@ public:
 
     /// @brief Gets the log for a partition, or nullptr if not managed.
     std::shared_ptr<storage::Log> getLog(const TopicPartition& tp) const;
+
+    // Readiness and instance pins remain locked through the short continuation.
+    // A follower awaiting divergence reconciliation cannot expose its older tail.
+    void withProducerInspectionReplicas(
+        const std::vector<ReplicaAssignment>& sources,
+        const std::vector<std::shared_ptr<storage::Log>>& logs,
+        const std::function<void(const std::vector<ErrorCode>&)>& action) const;
 
     /// @brief Gets all managed topic-partitions
     /// @return Vector of all topic-partitions

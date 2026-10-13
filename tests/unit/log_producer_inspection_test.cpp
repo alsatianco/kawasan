@@ -292,5 +292,23 @@ TEST_F(LogProducerInspectionTest, ConcurrentAppendCannotMixLogEndAndProducerSequ
     EXPECT_TRUE(writer.get());
     EXPECT_EQ(log.inspectProducerState().log_end_offset, 100);
 }
+TEST_F(LogProducerInspectionTest, OwningPinsSurviveDeleteAndRegistryRecreation) {
+    LogManager manager(dir_.string(), config_);
+    auto* original = manager.getOrCreateLog("data", 0);
+    append(*original, data(0, 9, 3, 0, 500));
+    auto pin = manager.retainLog("data", 0);
+    ASSERT_EQ(pin.get(), original);
+    std::weak_ptr<Log> lifetime = pin;
+    manager.deleteLog("data", 0);
+    EXPECT_FALSE(manager.retainLog("data", 0));
+    EXPECT_EQ(pin->producerInspectionStatus(), ErrorCode::KAFKA_STORAGE_ERROR);
+    expectError(*pin, ErrorCode::KAFKA_STORAGE_ERROR);
+    auto* recreated = manager.getOrCreateLog("data", 0);
+    EXPECT_NE(recreated, pin.get());
+    EXPECT_TRUE(recreated->inspectProducerState().producers.empty());
+    pin.reset();
+    EXPECT_TRUE(lifetime.expired());
+}
+
 }  // namespace
 }  // namespace kawasan::storage

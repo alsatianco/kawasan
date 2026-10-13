@@ -130,10 +130,15 @@ owned source set and original epochs from committed metadata. A simultaneous
 metadata fence covers cache selection and response write initiation, including
 empty-to-nonempty ownership changes. Any owned source that is loading or unreadable
 refuses the whole listing; nonowned cache entries are excluded before inspection.
-Response tickets drain at shutdown. DescribeProducers remains a separate migration:
-Kafka allows local follower inspection, and replicated/truncated follower logs need
-truthful producer state before replica/UUID/epoch-fenced inspection can serve it.
-Both staging seams now refuse that API with complete per-partition error bodies.
+Response tickets drain at shutdown. Persistence staging now admits DescribeProducers
+for hosted leaders and followers against original assignment, topic UUID, leader,
+epoch and an owning log pin. Workers derive complete fields from one local LEO
+image; metadata/replica fences cover response write initiation without scanning
+under those locks. Topic deletion/recreation, replica replacement and unresolved
+follower epoch reconciliation refuse stale success. Acquisition-only staging still
+refuses that API. Prefix removal and missing whole-batch history return
+OFFSET_NOT_AVAILABLE until full inspection snapshots/history integration exist;
+the default runtime handler is not migrated by this checkpoint.
 Public discovery/configuration, timeout proposals and marker completion remain gated.
 
 The staged membership checkpoint enables normal JoinGroup/SyncGroup/Heartbeat/

@@ -426,6 +426,34 @@ void MetadataStore::withPartitionLeaderships(
     action(statuses);
 }
 
+void MetadataStore::withReplicaAssignments(
+    const std::vector<ReplicaAssignment>& sources, BrokerId local,
+    const std::function<void(const std::vector<ErrorCode>&)>& action) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<ErrorCode> statuses;
+    for (const auto& source : sources) {
+        auto status = ErrorCode::UNKNOWN_TOPIC_OR_PARTITION;
+        const auto topic = topics_.find(source.tp.topic);
+        if (topic != topics_.end()) {
+            const auto& metadata = topic->second.metadata;
+            const auto partition =
+                std::find_if(metadata.partitions.begin(), metadata.partitions.end(),
+                             [&](const auto& p) { return p.partition == source.tp.partition; });
+            if (partition != metadata.partitions.end()) {
+                status = metadata.topic_id == source.topic_id &&
+                                 partition->leader == source.leader &&
+                                 partition->leader_epoch == source.epoch &&
+                                 std::find(partition->replicas.begin(), partition->replicas.end(),
+                                           local) != partition->replicas.end()
+                             ? ErrorCode::NONE
+                             : ErrorCode::NOT_LEADER_FOR_PARTITION;
+            }
+        }
+        statuses.push_back(status);
+    }
+    action(statuses);
+}
+
 void MetadataStore::withOwnedPartitionLeaderships(
     const std::string& topic, BrokerId owner,
     const std::vector<std::pair<TopicPartition, int32_t>>& sources,

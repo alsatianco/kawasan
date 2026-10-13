@@ -85,6 +85,9 @@ public:
     /// @return Pointer to the log, or nullptr if not found
     Log* getLog(const std::string& topic, PartitionId partition);
 
+    // Existing-only owning pin; deletion closes/unregisters but cannot free a retained log.
+    std::shared_ptr<Log> retainLog(const std::string& topic, PartitionId partition);
+
     /// @brief Deletes a log for the given topic-partition
     /// @param topic Topic name
     /// @param partition Partition ID
@@ -146,7 +149,7 @@ private:
 
     std::string base_log_dir_;
     LogConfig default_config_;
-    std::map<TopicPartition, std::unique_ptr<Log>> logs_;
+    std::map<TopicPartition, std::shared_ptr<Log>> logs_;
     // 0A.4: per-topic config overrides (cleanup.policy etc. from CreateTopics).
     std::unordered_map<std::string, LogConfig> topic_configs_;
     std::unordered_set<std::string> authoritative_topics_;

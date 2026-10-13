@@ -789,12 +789,26 @@ error body. Nonowned cached entries cannot appear. ListGroups v4 applies state
 filters; ListTransactions reports unknown state filters and omits Dead identities.
 These filter corrections also apply to the default runtime.
 
-DescribeProducers remains refused in both staging seams with complete requested
-topic/partition error bodies. Kafka permits hosted follower inspection, but follower
-producer caches are not yet refreshed on replication/truncation. Migration requires
-truthful follower state plus online replica, topic-identity and epoch admission.
-Serving integration still needs that DescribeProducers migration, owned transaction timeout proposals,
-unkeyed producer admission, and group-owned pending-offset routing.
+Persistence staging now serves DescribeProducers v0 for locally hosted leaders
+and followers. It pins committed assignment, topic UUID, leader/epoch and the actual
+log instance at admission. The bounded executor scans a consistent local LEO image
+outside metadata/replica locks, independently of the dedup cache. Duplicate requests
+share an image while retaining topic/partition order and per-partition errors.
+Response write initiation simultaneously fences every admitted metadata/replica
+source, checks the current log instance and refuses followers still awaiting epoch
+reconciliation. Unknown/unhosted requests never open logs. Queue/work/response
+tickets and owning log pins drain before storage teardown. LogManager now retains
+real shared ownership; deletion closes/unregisters sources while pins preserve the
+object, and replica reconciliation resets state for a replaced log instance.
+
+Closed/unreadable sources return storage errors. Prefix removal and missing whole
+batches return OFFSET_NOT_AVAILABLE until full producer inspection snapshots and
+retention/compaction history integration exist. Busy readiness checks are also
+retryable, with no scan on IO threads. This bounded staging checkpoint does not
+establish broad DescribeProducers acceptance: the default handler still uses its
+historical dedup cache and acquisition-only staging still refuses inspection.
+Public activation remains gated on full inspection history plus owned transaction
+timeout proposals, unkeyed producer admission and group-owned pending-offset routing.
 Abrupt RF>1 client continuity and remote
 marker/LSO/EOS acceptance remain separate requirements before public activation.
 InitProducerId now propagates counter-write and directory-fsync failures before acknowledging an ID or creating a transaction;

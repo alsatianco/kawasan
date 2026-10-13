@@ -313,6 +313,13 @@ std::vector<uint8_t> Log::readRaw(Offset start_offset, size_t max_bytes) {
     return out;
 }
 
+ErrorCode Log::producerInspectionStatus() const {
+    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock())
+        return ErrorCode::OFFSET_NOT_AVAILABLE;
+    return closed_ ? ErrorCode::KAFKA_STORAGE_ERROR : ErrorCode::NONE;
+}
+
 Log::ProducerInspection Log::inspectProducerState() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (closed_)
