@@ -179,6 +179,9 @@ public:
     /// transaction_timeout_ms). The background sweep aborts each so a hung
     /// transaction never blocks read_committed consumers forever.
     std::vector<TxnSnapshot> expiredOngoing(int64_t now_ms) const;
+    // Shared deadline check for candidate collection and fenced execution.
+    // Clock rollback and the exact deadline do not expire a transaction.
+    static bool hasTimedOut(const TxnSnapshot& snapshot, int64_t now_ms);
 
     /// @brief M2: the coordinator's current wall-clock (epoch ms), via the
     /// injected clock. Used by the broker sweep to compute deadlines.

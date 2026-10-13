@@ -11,7 +11,8 @@ Persistence staging now migrates group membership handlers and owned timeout
 jobs through those proposals and the deferred executor, along with offset
 commits/reads, exact deletions, owned retention cleanup and keyed producer
 initialization, transaction partition/offset participation, keyed group/transaction
-inspection and owned source listings. Public runtime
+inspection, owned source listings and owned transaction timeout PrepareAbort
+proposals. Public runtime
 activation, remaining handler/background migration,
 marker redrive and failover acceptance remain pending. No broker configuration enables either seam.
 
@@ -122,7 +123,7 @@ and transaction sources. DescribeGroups and DescribeTransactions inspect caches
 only inside the admitted epoch fence, preserve per-key errors and duplicates, and
 hold all response source epochs through write initiation. Error builders do not
 reenter metadata or expose cached state on refusal. Missing/dead transaction IDs
-return Kafka error 105. Owned transaction timeout PrepareAbort proposals remain pending.
+return Kafka error 105. Owned transaction timeout proposals are implemented below.
 This checkpoint does not enable discovery, marker redrive or public activation.
 
 The listing checkpoint admits ListGroups/ListTransactions against the complete
@@ -139,7 +140,7 @@ follower epoch reconciliation refuse stale success. Acquisition-only staging sti
 refuses that API. Prefix removal and missing whole-batch history return
 OFFSET_NOT_AVAILABLE until full inspection snapshots/history integration exist;
 the default runtime handler is not migrated by this checkpoint.
-Public discovery/configuration, timeout proposals and marker completion remain gated.
+Public discovery/configuration and marker completion remain gated.
 
 The staged membership checkpoint enables normal JoinGroup/SyncGroup/Heartbeat/
 LeaveGroup registrations only in the internal persistence seam, plus a bounded
@@ -159,7 +160,7 @@ source through transport write initiation; errors stay per group. Committed
 offset proposals include activity/heartbeat effects, stable reads use group-owned
 pending keys, and deletion/retention append exact tombstones. Queued retention
 rechecks current committed membership, expiry and pending state. This checkpoint
-keeps discovery, transaction/producer/sweep migration and public activation gated;
+keeps discovery, remaining producer/pending migration and public activation gated;
 abrupt RF>1 client continuity and marker/EOS acceptance remain unfinished.
 
 The keyed producer checkpoint migrates InitProducerId onto original-epoch deferred
@@ -171,9 +172,8 @@ Counter corruption/exhaustion refuses allocation instead of wrapping into a prio
 producer's range. An unchanged retry or protocol refusal is a fenced no-op; a
 valid retry changing timeout commits without another identity bump. Ongoing and
 Prepare transactions remain unchanged and return CONCURRENT_TRANSACTIONS until
-idempotent marker completion exists. Unkeyed allocation, remaining reads/sweeps,
-pending routing and public activation are still unfinished. No public format
-gate or API cap changed.
+idempotent marker completion exists. Unkeyed allocation, pending routing and public
+activation are still unfinished. No public format gate or API cap changed.
 
 The registration checkpoint migrates AddPartitionsToTxn/AddOffsetsToTxn onto the
 same original-epoch deferred execution and full-snapshot CAS. Duplicate/retried
@@ -186,3 +186,14 @@ borrowed from a follower's LEO. AddOffsets records participation only and cannot
 write group-owned pending offsets. Cache publication is separate from LSO and
 marker effects; EndTxn, Prepare redrive and public activation remain gated.
 Unreadable authoritative prefixes invalidate source admission until reopening.
+
+The owned transaction timeout checkpoint captures expired Ongoing snapshots inside
+original acquired/readable source epoch fences and submits bounded executor jobs.
+A full-snapshot CAS and fresh deadline check precede a durable PrepareAbort proposal;
+publication preserves all producer/retry, partition and pending offset fields.
+No legacy completion, marker delivery or LSO effects occur. Original epoch loss,
+clock rollback and intervening snapshot changes defeat stale jobs; durability
+errors and ambiguous-tail barriers retain the existing writer semantics. Shutdown
+drains queued/active jobs. Recovered Prepare states still cannot redrive until
+idempotent markers and group-owned pending completion are implemented. No storage
+schema, advertised API or public activation gate changes at this checkpoint.

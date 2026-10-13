@@ -807,8 +807,26 @@ retention/compaction history integration exist. Busy readiness checks are also
 retryable, with no scan on IO threads. This bounded staging checkpoint does not
 establish broad DescribeProducers acceptance: the default handler still uses its
 historical dedup cache and acquisition-only staging still refuses inspection.
-Public activation remains gated on full inspection history plus owned transaction
-timeout proposals, unkeyed producer admission and group-owned pending-offset routing.
+Public activation remains gated on full inspection history, unkeyed producer
+admission and group-owned pending-offset routing.
+
+Persistence staging uses the existing coordinator scheduling thread for transaction
+scans at `transaction.abort.timed.out.transaction.cleanup.interval.ms` (minimum
+one second). It captures expired Ongoing snapshots only inside acquired/readable
+owned transaction-source fences, selecting cache keys by routing before inspecting
+their fields. At most one bounded executor job per transactional ID retains that
+original epoch and a lifecycle ticket. Under the partition mutation lock, execution
+compares the full observed snapshot and rechecks the wall clock before proposing
+PrepareAbort. Identity, retry history, partitions and pending offsets stay intact;
+only state and state-start time change after fsync, ISR commitment and strict HW
+checkpointing. Clock rollback produces a fenced no-op. Stale identities, clocks,
+participation or ownership cannot abort newer state. Storage/ISR/fencing errors
+retain their exact mutation result and are logged; uncertain source barriers prevent
+new scans until safe recovery. Shutdown seals queued jobs, cancels active ISR waits
+and drains tickets before storage teardown. Restart/acquisition preserves Prepare
+states without calling legacy completion. EndTxn and all Prepare redrive remain
+refused until idempotent local/remote markers and group-owned pending completion
+exist. This checkpoint does not release LSO holds or establish completed aborts.
 Abrupt RF>1 client continuity and remote
 marker/LSO/EOS acceptance remain separate requirements before public activation.
 InitProducerId now propagates counter-write and directory-fsync failures before acknowledging an ID or creating a transaction;

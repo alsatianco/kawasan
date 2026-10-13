@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
+
 using kawasan::broker::TransactionCoordinator;
 using State = TransactionCoordinator::State;
 
@@ -196,3 +198,21 @@ TEST(TransactionCoordinatorTest, OnlyOngoingTxnsExpire) {
 }
 
 }  // namespace
+
+TEST(TransactionCoordinatorDeadlineTest, BoundaryRollbackAndWideElapsedTime) {
+    using TC = TransactionCoordinator;
+    TC::TxnSnapshot s;
+    s.state = TC::State::Ongoing;
+    s.transaction_timeout_ms = 1000;
+    s.state_start_time_ms = 100;
+    EXPECT_FALSE(TC::hasTimedOut(s, 99));
+    EXPECT_FALSE(TC::hasTimedOut(s, 1100));
+    EXPECT_TRUE(TC::hasTimedOut(s, 1101));
+    s.state_start_time_ms = std::numeric_limits<int64_t>::min();
+    EXPECT_TRUE(TC::hasTimedOut(s, std::numeric_limits<int64_t>::max()));
+    s.transaction_timeout_ms = 0;
+    EXPECT_FALSE(TC::hasTimedOut(s, std::numeric_limits<int64_t>::max()));
+    s.transaction_timeout_ms = 1;
+    s.state = TC::State::PrepareAbort;
+    EXPECT_FALSE(TC::hasTimedOut(s, std::numeric_limits<int64_t>::max()));
+}

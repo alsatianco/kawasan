@@ -8,6 +8,17 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-13
 
+- Schedule persistence-staged transaction timeouts on the bounded coordinator
+  executor. Capture expired Ongoing snapshots under their owned source/epoch
+  fence, recheck the entire snapshot and current deadline, and fsync/ISR-commit
+  PrepareAbort before publishing. Preserve producer retry history, participation
+  and pending offsets; stale jobs, storage/ISR errors and shutdown cannot publish
+  an abort decision. Prepare states remain recoverable without legacy completion;
+  EndTxn, marker redrive, pending-offset routing and public activation stay gated.
+- Share an overflow-safe transaction deadline check between the legacy candidate
+  scan and staged timeout proposals; clock rollback and the exact deadline do not
+  expire transactions.
+
 - Serve persistence-staged DescribeProducers v0 from log-derived producer state on
   local leaders and followers. Pin topic UUID, assignment, leader/epoch and real
   log lifetime through deferred scans and simultaneous response write fences;

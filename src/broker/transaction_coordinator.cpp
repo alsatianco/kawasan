@@ -216,16 +216,19 @@ std::optional<TransactionCoordinator::TxnSnapshot> TransactionCoordinator::descr
     return it->second;
 }
 
+bool TransactionCoordinator::hasTimedOut(const TxnSnapshot& snapshot, int64_t now_ms) {
+    return snapshot.state == State::Ongoing && snapshot.transaction_timeout_ms > 0 &&
+           now_ms > snapshot.state_start_time_ms &&
+           static_cast<uint64_t>(now_ms) - static_cast<uint64_t>(snapshot.state_start_time_ms) >
+               static_cast<uint64_t>(snapshot.transaction_timeout_ms);
+}
+
 std::vector<TransactionCoordinator::TxnSnapshot> TransactionCoordinator::expiredOngoing(
     int64_t now_ms) const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<TxnSnapshot> out;
     for (const auto& [_, s] : txns_) {
-        if (s.state != State::Ongoing)
-            continue;
-        if (s.transaction_timeout_ms <= 0)
-            continue;  // no deadline configured
-        if (now_ms - s.state_start_time_ms > s.transaction_timeout_ms) {
+        if (hasTimedOut(s, now_ms)) {
             out.push_back(s);
         }
     }

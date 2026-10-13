@@ -77,6 +77,18 @@ struct CoordinatorExecutorProbe {
         return b.coordinator_executor_->submit(std::move(task));
     }
     static void scheduleTimeouts(KawasanBroker& b) { b.scheduleCoordinatorTimeouts(); }
+    static void scheduleTransactionTimeouts(KawasanBroker& b) {
+        b.scheduleCoordinatorTransactionTimeouts();
+    }
+    static bool transactionTimeoutPending(KawasanBroker& b, const std::string& id) {
+        std::lock_guard<std::mutex> lock(b.coordinator_timeout_mutex_);
+        return b.coordinator_transaction_timeout_pending_.contains(id);
+    }
+    static ErrorCode prepareTransactionTimeout(KawasanBroker& b,
+                                               const TransactionCoordinator::TxnSnapshot& expected,
+                                               std::chrono::milliseconds timeout = 5s) {
+        return b.prepareCoordinatorTransactionTimeout(expected, timeout);
+    }
     static void scheduleRetention(KawasanBroker& b) { b.scheduleCoordinatorRetention(); }
     static bool retentionPending(KawasanBroker& b, const std::string& id) {
         std::lock_guard<std::mutex> lock(b.coordinator_timeout_mutex_);
@@ -102,6 +114,9 @@ struct CoordinatorPersistenceProbe {
     static OffsetManager& offsets(KawasanBroker& b) { return *b.offset_manager_; }
     static std::shared_ptr<OffsetManager> retainOffsets(KawasanBroker& b) {
         return b.offset_manager_;
+    }
+    static void transactionClockBeforeStart(KawasanBroker& b, TransactionCoordinator::Clock clock) {
+        b.transaction_coordinator_ = std::make_unique<TransactionCoordinator>(std::move(clock));
     }
     static TransactionCoordinator& transactions(KawasanBroker& b) {
         return *b.transaction_coordinator_;
@@ -151,8 +166,8 @@ struct CoordinatorAcquisitionProbe {
 
 namespace {
 template <typename F>
-bool waitUntil(F f) {
-    auto until = std::chrono::steady_clock::now() + 20s;
+bool waitUntil(F f, std::chrono::milliseconds timeout = 20s) {
+    auto until = std::chrono::steady_clock::now() + timeout;
     do {
         if (f())
             return true;
@@ -209,6 +224,10 @@ protected:
         c.setInt("replica.lag.time.max.ms", 60000);
         c.setInt("offsets.topic.num.partitions", 3);
         c.setInt("transaction.state.topic.num.partitions", 3);
+        // Historical snapshot fixtures intentionally use old wall clocks. Keep
+        // the automatic scan outside those tests; timeout cases invoke the real
+        // scheduler explicitly, and the timer integration case uses 1000 ms.
+        c.setInt("transaction.abort.timed.out.transaction.cleanup.interval.ms", 600000);
         return c;
     }
     void startCluster() {
@@ -5035,4 +5054,455 @@ TEST_F(CoordinatorPersistenceTest,
     brokers[0]->reconcileReplicas();
     EXPECT_EQ(producersWire(*brokers[0], {{"data", {0}}}).topics()[0].partitions[0].error_code,
               ErrorCode::OFFSET_NOT_AVAILABLE);  // New follower must reconcile divergence first.
+}
+
+TEST_F(CoordinatorPersistenceTest, AutomaticTransactionTimeoutCommitsPrepareOnlyAndReplays) {
+    auto cfg = config();
+    cfg.setInt("transaction.abort.timed.out.transaction.cleanup.interval.ms", 1000);
+    const auto id = key(0);
+    auto original = transaction(id);
+    original.previous_producer_id = 75;
+    original.previous_producer_epoch = 1;
+    original.pending_offsets = {{key(1), "data", 0, 42, "pending", 5}};
+    {
+        KawasanBroker b(cfg, KawasanBroker::CoordinatorPersistenceOnly{format});
+        b.start();
+        b.reconcileReplicas();
+        ASSERT_EQ(init(b, original), ErrorCode::NONE);
+        ASSERT_TRUE(waitUntil(
+            [&] {
+                const auto s = CoordinatorPersistenceProbe::transactions(b).describe(id);
+                return s && s->state == TransactionCoordinator::State::PrepareAbort;
+            },
+            4s));
+        const auto prepared = *CoordinatorPersistenceProbe::transactions(b).describe(id);
+        auto expected = original;
+        expected.state = TransactionCoordinator::State::PrepareAbort;
+        expected.state_start_time_ms = prepared.state_start_time_ms;
+        EXPECT_EQ(prepared, expected);
+        EXPECT_GT(prepared.state_start_time_ms, original.state_start_time_ms);
+        EXPECT_EQ(TransactionStateManager(b.logManager(), 3).loadCommittedPartition(0).front(),
+                  prepared);
+        EXPECT_EQ(b.logManager()->getLog("__transaction_state", 0)->logEndOffset(), 2);
+        EXPECT_FALSE(b.logManager()->getLog("data", 0));
+        EXPECT_FALSE(CoordinatorPersistenceProbe::offsets(b).fetchOffset(key(1), "data", 0));
+        EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).getMetrics().aborts_total, 0);
+        b.stop();
+    }
+    KawasanBroker restarted(cfg, KawasanBroker::CoordinatorPersistenceOnly{format});
+    restarted.start();
+    restarted.reconcileReplicas();
+    ASSERT_TRUE(waitUntil([&] {
+        return restarted.coordinatorLoadStatus(id, protocol::CoordinatorType::TRANSACTION) ==
+               ErrorCode::NONE;
+    }));
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(restarted).describe(id)->state,
+              TransactionCoordinator::State::PrepareAbort);
+    // Let an actual scheduled scan pass: Prepare states must never run legacy completion.
+    std::this_thread::sleep_for(1200ms);
+    EXPECT_EQ(restarted.logManager()->getLog("__transaction_state", 0)->logEndOffset(), 2);
+    EXPECT_FALSE(restarted.logManager()->getLog("data", 0));
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(restarted).getMetrics().aborts_total, 0);
+    restarted.stop();
+}
+
+namespace {
+// Release blocked executor tasks even when an assertion exits a test early.
+struct TransactionTimeoutQueueBlock {
+    std::promise<void> release;
+    std::shared_ptr<std::atomic<int>> entered = std::make_shared<std::atomic<int>>(0);
+    bool done = false;
+    explicit TransactionTimeoutQueueBlock(KawasanBroker& b) {
+        const auto released = release.get_future().share();
+        for (int i = 0; i < 2; ++i)
+            EXPECT_TRUE(
+                CoordinatorExecutorProbe::submit(b, [released, count = entered](bool, auto) {
+                    ++*count;
+                    released.wait();
+                }));
+    }
+    bool ready() {
+        return waitUntil([&] { return entered->load() == 2; });
+    }
+    void finish() {
+        if (!done) {
+            release.set_value();
+            done = true;
+        }
+    }
+    ~TransactionTimeoutQueueBlock() { finish(); }
+};
+}  // namespace
+
+TEST_F(CoordinatorPersistenceTest, QueuedTransactionTimeoutRejectsEveryChangedSnapshotField) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    auto& tc = CoordinatorPersistenceProbe::transactions(b);
+    auto expected = transaction(id);
+    ASSERT_EQ(init(b, expected), ErrorCode::NONE);
+    const std::vector<KawasanBroker::TransactionMutation> changes = {
+        [](auto& s) {
+            ++s->producer_id;
+            return ErrorCode::NONE;
+        },
+        [](auto& s) {
+            ++s->producer_epoch;
+            return ErrorCode::NONE;
+        },
+        [](auto& s) {
+            s->state = TransactionCoordinator::State::PrepareCommit;
+            return ErrorCode::NONE;
+        },
+        [](auto& s) {
+            s->state_start_time_ms += 1;
+            return ErrorCode::NONE;
+        },
+        [](auto& s) {
+            s->transaction_timeout_ms += 1;
+            return ErrorCode::NONE;
+        },
+        [](auto& s) {
+            s->partitions.push_back({"other", 1, -1});
+            return ErrorCode::NONE;
+        },
+        [](auto& s) {
+            s->pending_offsets.push_back({"group", "data", 0, 42, "pending", 7});
+            return ErrorCode::NONE;
+        },
+        [](auto& s) {
+            s->previous_producer_id = s->producer_id;
+            s->previous_producer_epoch = s->producer_epoch - 1;
+            return ErrorCode::NONE;
+        }};
+    for (size_t n = 0; n < changes.size(); ++n) {
+        SCOPED_TRACE(n);
+        // Reset to an expired Ongoing identity for each independent queued job.
+        const auto before = tc.describe(id);
+        ASSERT_EQ(b.mutateCoordinatorTransaction(id, before,
+                                                 [&](auto& s) {
+                                                     s = expected;
+                                                     return ErrorCode::NONE;
+                                                 }),
+                  ErrorCode::NONE);
+        TransactionTimeoutQueueBlock blocked(b);
+        ASSERT_TRUE(blocked.ready());
+        CoordinatorExecutorProbe::scheduleTransactionTimeouts(b);
+        ASSERT_TRUE(CoordinatorExecutorProbe::transactionTimeoutPending(b, id));
+        // A second scan must neither enqueue another job nor replace its snapshot.
+        CoordinatorExecutorProbe::scheduleTransactionTimeouts(b);
+        ASSERT_EQ(b.mutateCoordinatorTransaction(id, expected, changes[n]), ErrorCode::NONE);
+        const auto newer = tc.describe(id);
+        const auto end = b.logManager()->getLog("__transaction_state", 0)->logEndOffset();
+        blocked.finish();
+        ASSERT_TRUE(
+            waitUntil([&] { return !CoordinatorExecutorProbe::transactionTimeoutPending(b, id); }));
+        EXPECT_EQ(tc.describe(id), newer);
+        EXPECT_EQ(b.logManager()->getLog("__transaction_state", 0)->logEndOffset(), end);
+    }
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, QueuedTransactionTimeoutRejectsReacquiredOriginalEpoch) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    const auto original = transaction(id);
+    ASSERT_EQ(init(b, original), ErrorCode::NONE);
+    TransactionTimeoutQueueBlock blocked(b);
+    ASSERT_TRUE(blocked.ready());
+    CoordinatorExecutorProbe::scheduleTransactionTimeouts(b);
+    ASSERT_TRUE(CoordinatorExecutorProbe::transactionTimeoutPending(b, id));
+    ASSERT_EQ(b.metadataController()->updatePartitionLeader("__transaction_state", 0, 0).error_code,
+              ErrorCode::NONE);
+    b.reconcileReplicas();
+    ASSERT_EQ(b.coordinatorLoadStatus(id, protocol::CoordinatorType::TRANSACTION), ErrorCode::NONE);
+    blocked.finish();
+    ASSERT_TRUE(
+        waitUntil([&] { return !CoordinatorExecutorProbe::transactionTimeoutPending(b, id); }));
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), original);
+    EXPECT_EQ(b.logManager()->getLog("__transaction_state", 0)->logEndOffset(), 1);
+    // A fresh job in the new epoch may commit the still-expired transaction.
+    CoordinatorExecutorProbe::scheduleTransactionTimeouts(b);
+    ASSERT_TRUE(waitUntil([&] {
+        return CoordinatorPersistenceProbe::transactions(b).describe(id)->state ==
+               TransactionCoordinator::State::PrepareAbort;
+    }));
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, TransactionTimeoutRechecksDeadlineAndRefusesNonOngoingStates) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    auto original = transaction(id);
+    original.state_start_time_ms = CoordinatorPersistenceProbe::transactions(b).nowMs() + 60000;
+    ASSERT_EQ(init(b, original), ErrorCode::NONE);
+    EXPECT_EQ(CoordinatorExecutorProbe::prepareTransactionTimeout(b, original), ErrorCode::NONE);
+    EXPECT_EQ(b.logManager()->getLog("__transaction_state", 0)->logEndOffset(), 1);
+    using State = TransactionCoordinator::State;
+    for (const auto state :
+         {State::Empty, State::PrepareCommit, State::PrepareAbort, State::CompleteCommit,
+          State::CompleteAbort, State::Dead, State::PrepareEpochFence}) {
+        const auto before = CoordinatorPersistenceProbe::transactions(b).describe(id);
+        ASSERT_EQ(b.mutateCoordinatorTransaction(id, before,
+                                                 [&](auto& s) {
+                                                     s->state = state;
+                                                     s->state_start_time_ms = 123;
+                                                     return ErrorCode::NONE;
+                                                 }),
+                  ErrorCode::NONE);
+        const auto current = CoordinatorPersistenceProbe::transactions(b).describe(id);
+        const auto end = b.logManager()->getLog("__transaction_state", 0)->logEndOffset();
+        CoordinatorExecutorProbe::scheduleTransactionTimeouts(b);
+        EXPECT_FALSE(CoordinatorExecutorProbe::transactionTimeoutPending(b, id));
+        EXPECT_EQ(CoordinatorExecutorProbe::prepareTransactionTimeout(b, *current),
+                  ErrorCode::NONE);
+        EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), current);
+        EXPECT_EQ(b.logManager()->getLog("__transaction_state", 0)->logEndOffset(), end);
+    }
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, TransactionTimeoutKeepsCheckpointFailureAndSourceBarrier) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    const auto original = transaction(id);
+    ASSERT_EQ(init(b, original), ErrorCode::NONE);
+    const auto blocked = dir / "0/__transaction_state-0/checkpoint.meta.tmp";
+    fs::create_directory(blocked);
+    EXPECT_EQ(CoordinatorExecutorProbe::prepareTransactionTimeout(b, original),
+              ErrorCode::KAFKA_STORAGE_ERROR);
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), original);
+    EXPECT_EQ(b.coordinatorLoadStatus(id, protocol::CoordinatorType::TRANSACTION),
+              ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+    CoordinatorExecutorProbe::scheduleTransactionTimeouts(b);
+    EXPECT_FALSE(CoordinatorExecutorProbe::transactionTimeoutPending(b, id));
+    fs::remove(blocked);
+    b.acquireCoordinatorPartitions();
+    ASSERT_EQ(b.coordinatorLoadStatus(id, protocol::CoordinatorType::TRANSACTION), ErrorCode::NONE);
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id)->state,
+              TransactionCoordinator::State::PrepareAbort);
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).getMetrics().aborts_total, 0);
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, QueuedTransactionTimeoutShutdownDrainsWithoutPublication) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    const auto original = transaction(id);
+    ASSERT_EQ(init(b, original), ErrorCode::NONE);
+    TransactionTimeoutQueueBlock blocked(b);
+    ASSERT_TRUE(blocked.ready());
+    CoordinatorExecutorProbe::scheduleTransactionTimeouts(b);
+    ASSERT_TRUE(CoordinatorExecutorProbe::transactionTimeoutPending(b, id));
+    auto stopped = std::async(std::launch::async, [&] { b.stop(); });
+    EXPECT_TRUE(waitUntil([&] { return CoordinatorExecutorProbe::stopping(b); }));
+    EXPECT_EQ(stopped.wait_for(50ms), std::future_status::timeout);
+    blocked.finish();
+    ASSERT_EQ(stopped.wait_for(5s), std::future_status::ready);
+    stopped.get();
+    EXPECT_FALSE(CoordinatorExecutorProbe::transactionTimeoutPending(b, id));
+    KawasanBroker reopened(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    reopened.start();
+    reopened.reconcileReplicas();
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(reopened).describe(id), original);
+    EXPECT_EQ(reopened.logManager()->getLog("__transaction_state", 0)->logEndOffset(), 1);
+    reopened.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, OwnedTransactionTimeoutReplicatesAndIgnoresNonownedCache) {
+    startCluster();
+    const auto id = key(1);
+    const auto original = transaction(id);
+    ASSERT_EQ(init(*brokers[1], original), ErrorCode::NONE);
+    CoordinatorPersistenceProbe::transactions(*brokers[0]).restore(original);
+    CoordinatorExecutorProbe::scheduleTransactionTimeouts(*brokers[0]);
+    EXPECT_FALSE(CoordinatorExecutorProbe::transactionTimeoutPending(*brokers[0], id));
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(*brokers[0]).describe(id), original);
+    CoordinatorExecutorProbe::scheduleTransactionTimeouts(*brokers[1]);
+    ASSERT_TRUE(waitUntil([&] {
+        return CoordinatorPersistenceProbe::transactions(*brokers[1]).describe(id)->state ==
+               TransactionCoordinator::State::PrepareAbort;
+    }));
+    const auto prepared = *CoordinatorPersistenceProbe::transactions(*brokers[1]).describe(id);
+    for (auto& broker : brokers)
+        ASSERT_TRUE(waitUntil([&] {
+            const auto image =
+                TransactionStateManager(broker->logManager(), 3).loadCommittedPartition(1);
+            return !image.empty() && image.front() == prepared;
+        }));
+    KawasanBroker* controller = nullptr;
+    for (auto& broker : brokers)
+        if (broker->raftNode()->isLeader())
+            controller = broker.get();
+    ASSERT_NE(controller, nullptr);
+    ASSERT_EQ(controller->metadataController()
+                  ->updatePartitionLeader("__transaction_state", 1, 2)
+                  .error_code,
+              ErrorCode::NONE);
+    ASSERT_TRUE(waitUntil([&] {
+        return brokers[2]->coordinatorLoadStatus(id, protocol::CoordinatorType::TRANSACTION) ==
+               ErrorCode::NONE;
+    }));
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(*brokers[2]).describe(id), prepared);
+    CoordinatorExecutorProbe::scheduleTransactionTimeouts(*brokers[2]);
+    EXPECT_FALSE(CoordinatorExecutorProbe::transactionTimeoutPending(*brokers[2], id));
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(*brokers[2]).getMetrics().aborts_total, 0);
+}
+
+TEST_F(CoordinatorPersistenceTest, TransactionTimeoutIsrFailureAndActiveShutdownRemainUnpublished) {
+    startCluster();
+    auto& b = *brokers[1];
+    const auto id = key(1);
+    const auto original = transaction(id);
+    ASSERT_EQ(init(b, original), ErrorCode::NONE);
+    KawasanBroker* controller = nullptr;
+    for (auto& broker : brokers)
+        if (broker->raftNode()->isLeader())
+            controller = broker.get();
+    ASSERT_NE(controller, nullptr);
+    for (auto& broker : brokers)
+        broker->replicaManager()->stop();
+    ASSERT_EQ(controller->metadataController()
+                  ->updatePartitionISR("__transaction_state", 1, {1})
+                  .error_code,
+              ErrorCode::NONE);
+    ASSERT_TRUE(waitUntil([&] {
+        b.reconcileReplicas();
+        return b.replicaManager()->getISR({"__transaction_state", 1}).size() == 1;
+    }));
+    EXPECT_EQ(CoordinatorExecutorProbe::prepareTransactionTimeout(b, original, 100ms),
+              ErrorCode::NOT_ENOUGH_REPLICAS);
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), original);
+    EXPECT_EQ(b.logManager()->getLog("__transaction_state", 1)->logEndOffset(), 1);
+    ASSERT_EQ(controller->metadataController()
+                  ->updatePartitionISR("__transaction_state", 1, {0, 1, 2})
+                  .error_code,
+              ErrorCode::NONE);
+    ASSERT_TRUE(waitUntil([&] {
+        b.reconcileReplicas();
+        return b.replicaManager()->getISR({"__transaction_state", 1}).size() == 3;
+    }));
+    b.replicaManager()->start();
+    EXPECT_EQ(CoordinatorExecutorProbe::prepareTransactionTimeout(b, original, 100ms),
+              ErrorCode::REQUEST_TIMED_OUT);
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), original);
+    EXPECT_EQ(b.coordinatorLoadStatus(id, protocol::CoordinatorType::TRANSACTION),
+              ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+    brokers[0]->replicaManager()->start();
+    brokers[2]->replicaManager()->start();
+    ASSERT_TRUE(waitUntil([&] {
+        return b.coordinatorLoadStatus(id, protocol::CoordinatorType::TRANSACTION) ==
+               ErrorCode::NONE;
+    }));
+    auto current = CoordinatorPersistenceProbe::transactions(b).describe(id);
+    ASSERT_EQ(current->state, TransactionCoordinator::State::PrepareAbort);
+    ASSERT_EQ(b.mutateCoordinatorTransaction(id, current,
+                                             [&](auto& s) {
+                                                 s = original;
+                                                 return ErrorCode::NONE;
+                                             }),
+              ErrorCode::NONE);
+    brokers[0]->replicaManager()->stop();
+    brokers[2]->replicaManager()->stop();
+    const auto end = b.logManager()->getLog("__transaction_state", 1)->logEndOffset();
+    CoordinatorExecutorProbe::scheduleTransactionTimeouts(b);
+    ASSERT_TRUE(waitUntil([&] {
+        return b.logManager()->getLog("__transaction_state", 1)->logEndOffset() == end + 1;
+    }));
+    EXPECT_TRUE(CoordinatorExecutorProbe::transactionTimeoutPending(b, id));
+    auto stopped = std::async(std::launch::async, [&] { b.stop(); });
+    ASSERT_EQ(stopped.wait_for(5s), std::future_status::ready);
+    stopped.get();
+    EXPECT_FALSE(CoordinatorExecutorProbe::transactionTimeoutPending(b, id));
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), original);
+}
+
+TEST_F(CoordinatorPersistenceTest, QueuedTransactionTimeoutRechecksRolledBackWallClock) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    auto clock = std::make_shared<std::atomic<int64_t>>(2000);
+    CoordinatorPersistenceProbe::transactionClockBeforeStart(b, [clock] { return clock->load(); });
+    b.start();
+    b.reconcileReplicas();
+    const auto id = key(0);
+    const auto original = transaction(id);
+    ASSERT_EQ(init(b, original), ErrorCode::NONE);
+    TransactionTimeoutQueueBlock blocked(b);
+    ASSERT_TRUE(blocked.ready());
+    CoordinatorExecutorProbe::scheduleTransactionTimeouts(b);
+    ASSERT_TRUE(CoordinatorExecutorProbe::transactionTimeoutPending(b, id));
+    clock->store(100);
+    blocked.finish();
+    ASSERT_TRUE(
+        waitUntil([&] { return !CoordinatorExecutorProbe::transactionTimeoutPending(b, id); }));
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), original);
+    EXPECT_EQ(b.logManager()->getLog("__transaction_state", 0)->logEndOffset(), 1);
+    clock->store(3000);
+    CoordinatorExecutorProbe::scheduleTransactionTimeouts(b);
+    ASSERT_TRUE(waitUntil([&] {
+        return CoordinatorPersistenceProbe::transactions(b).describe(id)->state ==
+               TransactionCoordinator::State::PrepareAbort;
+    }));
+    EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id)->state_start_time_ms, 3000);
+    b.stop();
+}
+
+TEST_F(CoordinatorPersistenceTest, TransactionTimeoutWalWriteAndSyncFailuresRetainOriginalError) {
+    for (const bool fail_sync : {false, true}) {
+        auto cfg = config();
+        const auto root = fs::canonical(fs::temp_directory_path()) / dir.filename() /
+                          (fail_sync ? "timeout-sync-failure" : "timeout-write-failure");
+        cfg.setString("log.dirs", root.string());
+        KawasanBroker b(cfg, KawasanBroker::CoordinatorPersistenceOnly{format});
+        b.start();
+        b.reconcileReplicas();
+        const auto id = key(0);
+        const auto original = transaction(id);
+        ASSERT_EQ(init(b, original), ErrorCode::NONE);
+        const int wal = sourceWalDescriptor(root / "__transaction_state-0");
+        ASSERT_GE(wal, 0);
+        struct RestoreDescriptor {
+            int wal;
+            int original;
+            std::array<int, 2> pipe{-1, -1};
+            int replacement = -1;
+            ~RestoreDescriptor() {
+                if (original >= 0) {
+                    ::dup2(original, wal);
+                    ::close(original);
+                }
+                if (replacement >= 0)
+                    ::close(replacement);
+                for (const auto fd : pipe)
+                    if (fd >= 0)
+                        ::close(fd);
+            }
+        } restore{wal, ::dup(wal)};
+        ASSERT_GE(restore.original, 0);
+        if (fail_sync) {
+            ASSERT_EQ(::pipe(restore.pipe.data()), 0);
+            ASSERT_GE(::dup2(restore.pipe[1], wal), 0);
+        } else {
+            restore.replacement = ::open("/dev/null", O_RDONLY);
+            ASSERT_GE(restore.replacement, 0);
+            ASSERT_GE(::dup2(restore.replacement, wal), 0);
+        }
+        EXPECT_EQ(CoordinatorExecutorProbe::prepareTransactionTimeout(b, original),
+                  ErrorCode::KAFKA_STORAGE_ERROR);
+        EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), original);
+        EXPECT_EQ(b.logManager()->getLog("__transaction_state", 0)->logEndOffset(), 1);
+        b.acquireCoordinatorPartitions();
+        EXPECT_EQ(b.coordinatorLoadStatus(id, protocol::CoordinatorType::TRANSACTION),
+                  ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+        CoordinatorExecutorProbe::scheduleTransactionTimeouts(b);
+        EXPECT_FALSE(CoordinatorExecutorProbe::transactionTimeoutPending(b, id));
+    }
 }

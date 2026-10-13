@@ -3,6 +3,7 @@
 #include "kawasan/broker/coordinator_routing.h"
 #include "kawasan/broker/kawasan_broker.h"
 #include "kawasan/common/error.h"
+#include "kawasan/common/logger.h"
 
 namespace kawasan::broker {
 namespace {
@@ -162,6 +163,84 @@ Buffer KawasanBroker::handleCoordinatorAddOffsets(RequestDispatcher::RequestCont
     // Participation is transaction-owned; pending offset staging/completion
     // remains group-owned work. No group cache or offset source is mutated here.
     return buildTransactionRegistrationError(context, error, context.header.apiVersion());
+}
+
+ErrorCode KawasanBroker::prepareCoordinatorTransactionTimeout(
+    const TransactionCoordinator::TxnSnapshot& expected, std::chrono::milliseconds timeout) {
+    return mutateCoordinatorTransaction(
+        expected.transactional_id, expected,
+        [&](auto& proposed) {
+            const auto now = transaction_coordinator_->nowMs();
+            if (!proposed || !TransactionCoordinator::hasTimedOut(*proposed, now))
+                return ErrorCode::NONE;  // Clock rollback or an unexpired candidate: fenced no-op.
+            proposed->state = TransactionCoordinator::State::PrepareAbort;
+            proposed->state_start_time_ms = now;
+            // Preserve every identity, retry, participation and pending offset field.
+            // This is a durable decision only: no legacy completion/LSO/marker effects.
+            return ErrorCode::NONE;
+        },
+        timeout);
+}
+
+void KawasanBroker::scheduleCoordinatorTransactionTimeouts() {
+    if (!staged_coordinator_persistence_ || coordinator_mutations_stopping_.load() ||
+        !running_.load() || !internal_topics_ready_.load())
+        return;
+    const auto topics = metadata_controller_->describeTopics({"__transaction_state"});
+    if (topics.empty())
+        return;
+    for (const auto& partition : topics.front().partitions) {
+        if (partition.leader != broker_id_)
+            continue;
+        const TopicPartition tp{"__transaction_state", partition.partition};
+        const auto epoch = partition.leader_epoch;
+        std::vector<TransactionCoordinator::TxnSnapshot> candidates;
+        // Capture snapshots inside the original readable source/epoch fence.
+        // Select by routing before inspecting fields in potentially nonowned caches.
+        withCoordinatorRequestFence(tp, epoch, [&](auto status) {
+            if (status != ErrorCode::NONE)
+                return;
+            candidates = transaction_coordinator_->list({}, {}, [&](const auto& id) {
+                return coordinatorPartitionFor(id, txn_state_num_partitions_) == tp.partition;
+            });
+            const auto now = transaction_coordinator_->nowMs();
+            std::erase_if(candidates, [&](const auto& s) {
+                return !TransactionCoordinator::hasTimedOut(s, now);
+            });
+        });
+        for (const auto& snapshot : candidates) {
+            const auto id = snapshot.transactional_id;
+            {
+                std::lock_guard<std::mutex> lock(coordinator_timeout_mutex_);
+                if (!coordinator_transaction_timeout_pending_.insert(id).second)
+                    continue;
+            }
+            const bool queued = coordinator_executor_->submit(
+                [this, snapshot, tp, epoch](bool admitted, auto ticket) {
+                    (void)ticket;  // Retains the broker through queued/work shutdown draining.
+                    const auto previous = coordinator_request_owner_;
+                    coordinator_request_owner_ = RequestOwnership{this, tp, epoch};
+                    try {
+                        if (admitted) {
+                            const auto error = prepareCoordinatorTransactionTimeout(snapshot);
+                            if (error != ErrorCode::NONE)
+                                Logger::warn("Coordinator transaction timeout '{}' refused: {}",
+                                             snapshot.transactional_id, static_cast<int>(error));
+                        }
+                    } catch (const std::exception& ex) {
+                        Logger::error("Coordinator transaction timeout '{}' failed: {}",
+                                      snapshot.transactional_id, ex.what());
+                    }
+                    coordinator_request_owner_ = previous;
+                    std::lock_guard<std::mutex> lock(coordinator_timeout_mutex_);
+                    coordinator_transaction_timeout_pending_.erase(snapshot.transactional_id);
+                });
+            if (!queued) {
+                std::lock_guard<std::mutex> lock(coordinator_timeout_mutex_);
+                coordinator_transaction_timeout_pending_.erase(id);
+            }
+        }
+    }
 }
 
 }  // namespace kawasan::broker

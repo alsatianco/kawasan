@@ -848,6 +848,7 @@ void KawasanBroker::start() {
     bootstrap_thread_ = std::thread(&KawasanBroker::controllerBootstrapLoop, this);
     if (staged_coordinator_persistence_) {
         coordinator_retention_scan_ = std::chrono::steady_clock::now();
+        coordinator_transaction_scan_ = coordinator_retention_scan_;
         coordinator_timeout_thread_ = std::thread(&KawasanBroker::coordinatorTimeoutLoop, this);
     }
 

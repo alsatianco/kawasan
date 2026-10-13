@@ -255,6 +255,12 @@ private:
     void coordinatorTimeoutLoop();
     void scheduleCoordinatorTimeouts();
     void scheduleCoordinatorRetention();
+    void scheduleCoordinatorTransactionTimeouts();
+    ErrorCode prepareCoordinatorTransactionTimeout(
+        const TransactionCoordinator::TxnSnapshot& expected,
+        std::chrono::milliseconds timeout = std::chrono::seconds(5));
+    std::chrono::steady_clock::time_point coordinator_transaction_scan_;
+    std::set<std::string> coordinator_transaction_timeout_pending_;
     std::chrono::steady_clock::time_point coordinator_retention_scan_;
     std::set<std::string> coordinator_retention_pending_;
     std::thread coordinator_timeout_thread_;

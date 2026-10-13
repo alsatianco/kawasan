@@ -529,6 +529,11 @@ void KawasanBroker::coordinatorTimeoutLoop() {
         try {
             scheduleCoordinatorTimeouts();
             const auto now = std::chrono::steady_clock::now();
+            if (now - coordinator_transaction_scan_ >=
+                std::chrono::milliseconds(txn_sweep_interval_ms_)) {
+                coordinator_transaction_scan_ = now;
+                scheduleCoordinatorTransactionTimeouts();
+            }
             if (now - coordinator_retention_scan_ >= std::chrono::minutes(10)) {
                 coordinator_retention_scan_ = now;
                 scheduleCoordinatorRetention();
