@@ -2574,8 +2574,11 @@ TEST_F(CoordinatorPersistenceTest, KeyedInspectionQueuedReadsRefuseReacquiredEpo
     b.acquireCoordinatorPartitions();
     release[0].set_value();
     guard.first_done = true;
+    // Both read jobs must finish before publication: publishing the first while
+    // the worker reads the second legitimately trips the busy-acquisition fence.
+    for (auto& result : results)
+        ASSERT_EQ(result.wait_for(5s), std::future_status::ready);
     for (size_t i = 0; i < results.size(); ++i) {
-        ASSERT_EQ(results[i].wait_for(5s), std::future_status::ready);
         auto result = results[i].get();
         const auto entries = publishInspection(
             result,

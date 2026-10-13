@@ -8,6 +8,9 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-13
 
+- Synchronize queued keyed-inspection test reads before publishing responses;
+  retain exact original-epoch refusal and unrelated-source success assertions.
+
 - Schedule persistence-staged transaction timeouts on the bounded coordinator
   executor. Capture expired Ongoing snapshots under their owned source/epoch
   fence, recheck the entire snapshot and current deadline, and fsync/ISR-commit
