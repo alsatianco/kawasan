@@ -2873,9 +2873,34 @@ TEST_F(CoordinatorPersistenceTest, OwnedRetentionUsesExactKeysAndPreservesPendin
     ASSERT_EQ(put(b, neighbor, {emptyGroup(neighbor), fresh}), ErrorCode::NONE);
     ASSERT_EQ(put(b, key(1), {emptyGroup(key(1)), offsetRecord(key(1))}), ErrorCode::NONE);
     ASSERT_EQ(put(b, key(2), {offsetRecord(key(2))}), ErrorCode::NONE);
+    // Scheduling uses nonblocking source fences. Keep workers from acquiring
+    // those locks until every candidate has been admitted to this sweep.
+    struct BlockWorkers {
+        std::promise<void> release;
+        bool finished = false;
+        void finish() {
+            if (!finished) {
+                release.set_value();
+                finished = true;
+            }
+        }
+        ~BlockWorkers() { finish(); }
+    } blocked;
+    const auto released = blocked.release.get_future().share();
+    const auto entered = std::make_shared<std::atomic<int>>(0);
+    for (int n = 0; n < 2; ++n)
+        ASSERT_TRUE(CoordinatorExecutorProbe::submit(b, [entered, released](bool, auto) {
+            ++*entered;
+            released.wait();
+        }));
+    ASSERT_TRUE(waitUntil([&] { return entered->load() == 2; }));
     CoordinatorExecutorProbe::scheduleRetention(b);
+    for (const auto& candidate : {id, neighbor, key(1), key(2)})
+        EXPECT_TRUE(CoordinatorExecutorProbe::retentionPending(b, candidate));
+    blocked.finish();
     ASSERT_TRUE(waitUntil([&] {
         return !CoordinatorExecutorProbe::retentionPending(b, id) &&
+               !CoordinatorExecutorProbe::retentionPending(b, neighbor) &&
                !CoordinatorExecutorProbe::retentionPending(b, key(1)) &&
                !CoordinatorExecutorProbe::retentionPending(b, key(2));
     }));

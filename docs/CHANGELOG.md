@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgrade and operational procedures see [./OPERATIONS.md](./OPERATIONS.md); for the full protocol surface see [./api_coverage_matrix.md](./api_coverage_matrix.md).
 
+## 2026-10-16
+
+- Synchronize retention test scheduling before workers acquire source fences;
+  require all candidates to be queued and finished before checking exact cleanup.
+
 ## 2026-10-13
 
 - Synchronize queued keyed-inspection test reads before publishing responses;
