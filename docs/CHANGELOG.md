@@ -8,6 +8,8 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-16
 
+- Register coordinator transaction-timeout tests as a separate bounded CTest
+  gate; retain every case and assertion without extending the persistence timeout.
 - Wait for the frozen-peer Raft fixture to establish a committed quorum before
   measuring heartbeat stability, and pause automatic failover while the acquisition
   fixture drives manual ownership loss and restoration.
