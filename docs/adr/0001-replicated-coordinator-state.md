@@ -12,7 +12,7 @@ jobs through those proposals and the deferred executor, along with offset
 commits/reads, exact deletions, owned retention cleanup and keyed producer
 initialization, transaction partition/offset participation, keyed group/transaction
 inspection, owned source listings and owned transaction timeout PrepareAbort
-proposals. Public runtime
+proposals, plus unkeyed producer admission. Public runtime
 activation, remaining handler/background migration,
 marker redrive and failover acceptance remain pending. No broker configuration enables either seam.
 
@@ -172,8 +172,9 @@ Counter corruption/exhaustion refuses allocation instead of wrapping into a prio
 producer's range. An unchanged retry or protocol refusal is a fenced no-op; a
 valid retry changing timeout commits without another identity bump. Ongoing and
 Prepare transactions remain unchanged and return CONCURRENT_TRANSACTIONS until
-idempotent marker completion exists. Unkeyed allocation, pending routing and public
-activation are still unfinished. No public format gate or API cap changed.
+idempotent marker completion exists. Pending routing and public activation are
+still unfinished. Unkeyed allocation is implemented below. No public format gate
+or API cap changed.
 
 The registration checkpoint migrates AddPartitionsToTxn/AddOffsetsToTxn onto the
 same original-epoch deferred execution and full-snapshot CAS. Duplicate/retried
@@ -197,3 +198,15 @@ errors and ambiguous-tail barriers retain the existing writer semantics. Shutdow
 drains queued/active jobs. Recovered Prepare states still cannot redrive until
 idempotent markers and group-owned pending completion are implemented. No storage
 schema, advertised API or public activation gate changes at this checkpoint.
+
+Unkeyed producer initialization uses broker-wide immutable committed-format and
+metadata-currency fences rather than a fabricated coordinator source. It shares
+the bounded executor and shutdown/response tickets; the durable counter rechecks
+admission after acquiring its mutex before disk IO. No transaction state is
+created, and source cache/HW availability is independent of safe ID allocation.
+Valid null-ID requests always allocate a new ID/epoch zero; paired expectation
+validation remains, and keyed timeout bounds do not apply. Counter errors preserve
+Kafka error bodies; a durably consumed unused ID is not recycled when response
+publication is fenced. No format, schema, advertised cap or public activation
+changes. Group-owned pending routing and idempotent marker completion remain next
+transaction dependencies. This does not establish abrupt RF>1 continuity or EOS.

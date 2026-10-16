@@ -441,7 +441,11 @@ private:
                                              ErrorCode code, int16_t response_version) const;
     Buffer buildInitProducerIdError(const RequestDispatcher::RequestContext& context,
                                     ErrorCode code, int16_t response_version) const;
-    int64_t allocateNextProducerId();
+    int64_t allocateNextProducerId(bool broker_admission = false);
+    void withBrokerProducerFence(const std::function<void(ErrorCode)>& publish);
+    RequestDispatcher::HandlerResult deferBrokerProducerInitialization(
+        RequestDispatcher::RequestContext context, RequestDispatcher::HandlerFunc work,
+        RequestDispatcher::ErrorBuilder errors);
     // Phase 1.19: OffsetForLeaderEpoch (API 23) — single-broker stub returning
     // (epoch=0, end_offset=log_end_offset) for known partitions.
     Buffer handleOffsetForLeaderEpoch(RequestDispatcher::RequestContext& context);

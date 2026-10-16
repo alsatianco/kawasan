@@ -30,6 +30,10 @@ public:
     std::optional<CoordinatorFormat> coordinatorFormat() const {
         return store_.coordinatorFormat();
     }
+    void withCoordinatorFormat(const CoordinatorFormat& expected,
+                               const std::function<void(ErrorCode)>& action) {
+        store_.withCoordinatorFormat(expected, action);
+    }
 
     storage::Log* openCoordinatorReplica(const std::string& topic, PartitionId partition) {
         return store_.openCoordinatorReplica(topic, partition);

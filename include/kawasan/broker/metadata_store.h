@@ -33,6 +33,9 @@ public:
     void configureCoordinatorFormat(const CoordinatorFormat& expected, const std::string& log_dir);
     TopicOperationResult applyCoordinatorFormat(const CoordinatorFormat& format);
     std::optional<CoordinatorFormat> coordinatorFormat() const;
+    // Broker-wide format fence; the callback must not reenter this store.
+    void withCoordinatorFormat(const CoordinatorFormat& expected,
+                               const std::function<void(ErrorCode)>& action);
     storage::Log* openCoordinatorReplica(const std::string& topic, PartitionId partition);
     // Runs a short append/publication action atomically with respect to metadata
     // leadership/ISR changes. The action must not call back into this store.

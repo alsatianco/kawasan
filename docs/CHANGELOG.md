@@ -10,6 +10,13 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 - Register coordinator transaction-timeout tests as a separate bounded CTest
   gate; retain every case and assertion without extending the persistence timeout.
+- Admit persistence-staged unkeyed InitProducerId v0–v4 through bounded workers
+  and broker-wide committed-format/metadata/lifetime fences. Allocate durable
+  fresh IDs at epoch zero without transaction records or source-owner dependence;
+  recheck admission after counter contention, propagate counter/storage errors,
+  and drain queued, active and retained-response work during shutdown. Public
+  activation, pending offsets and transaction completion remain gated.
+
 - Wait for the frozen-peer Raft fixture to establish a committed quorum before
   measuring heartbeat stability, and pause automatic failover while the acquisition
   fixture drives manual ownership loss and restoration.

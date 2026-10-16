@@ -1795,13 +1795,8 @@ void KawasanBroker::registerProtocolHandlers() {
                     result.payload = errors(context, invalid, context.header.apiVersion());
                     return result;
                 }
-                // Null IDs need broker-wide admission, implemented separately.
-                if (!request.transactionalId()) {
-                    RequestDispatcher::HandlerResult result;
-                    result.payload = errors(context, ErrorCode::COORDINATOR_LOAD_IN_PROGRESS,
-                                            context.header.apiVersion());
-                    return result;
-                }
+                if (!request.transactionalId())
+                    return deferBrokerProducerInitialization(context, work, errors);
                 return deferCoordinatorRequest(context, *request.transactionalId(),
                                                protocol::CoordinatorType::TRANSACTION, work,
                                                errors);
@@ -4956,11 +4951,19 @@ Buffer KawasanBroker::buildDescribeClusterError(const RequestDispatcher::Request
     return encodeResponse(context, [&](Buffer& buffer) { response.encode(buffer, version); });
 }
 
-int64_t KawasanBroker::allocateNextProducerId() {
+int64_t KawasanBroker::allocateNextProducerId(bool broker_admission) {
     // Phase 1.18: synchronous load → increment → persist. Simple and correct.
     // Phase 2.1 will replace with a block-allocator (Kafka allocates 1000 IDs
     // at a time to amortize the fsync cost).
     std::lock_guard<std::mutex> lock(producer_id_mutex_);
+    if (broker_admission) {
+        // Counter contention can outlive queue/worker admission. Recheck only
+        // after obtaining its lock, before touching the durable counter.
+        auto status = ErrorCode::NOT_COORDINATOR;
+        withBrokerProducerFence([&](auto error) { status = error; });
+        if (status != ErrorCode::NONE)
+            throw KawasanException(status);
+    }
     const std::string counter_path = metadata_dir_ + "/producer_id.counter";
     int64_t current = next_producer_id_.load();
     // Fail closed on corruption or rollback. Ignoring a bad durable counter

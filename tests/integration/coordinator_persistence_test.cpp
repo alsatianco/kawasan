@@ -6,6 +6,7 @@
 #include <boost/asio.hpp>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <iostream>
 #include <limits>
@@ -73,6 +74,11 @@ struct CoordinatorExecutorProbe {
         return status;
     }
     static int64_t allocate(KawasanBroker& b) { return b.allocateNextProducerId(); }
+    static std::unique_lock<std::mutex> holdProducerIds(KawasanBroker& b) {
+        return std::unique_lock<std::mutex>(b.producer_id_mutex_);
+    }
+    static bool current(KawasanBroker& b) { return b.dataPlaneCurrent(); }
+
     static bool submit(KawasanBroker& b, CoordinatorExecutor::Task task) {
         return b.coordinator_executor_->submit(std::move(task));
     }
@@ -1319,7 +1325,7 @@ TEST_F(CoordinatorPersistenceTest, KeyedProducerInitializationValidatesWithoutAl
     for (const auto& [pid, epoch] :
          std::vector<std::pair<int64_t, int16_t>>{{-1, 0}, {1, -1}, {-2, 0}, {1, -2}})
         EXPECT_EQ(producerInitWire(b, id, 4, pid, epoch).error, ErrorCode::INVALID_REQUEST);
-    EXPECT_EQ(producerInitWire(b, std::nullopt).error, ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+    EXPECT_EQ(producerInitWire(b, std::nullopt, 4, -1, 0).error, ErrorCode::INVALID_REQUEST);
     EXPECT_FALSE(fs::exists(dir / "0/meta/producer_id.counter"));
     EXPECT_EQ(log->logEndOffset(), 0);
     const auto first = producerInitWire(b, id, 2);
@@ -5533,4 +5539,321 @@ TEST_F(CoordinatorPersistenceTest, TransactionTimeoutWalWriteAndSyncFailuresReta
         CoordinatorExecutorProbe::scheduleTransactionTimeouts(b);
         EXPECT_FALSE(CoordinatorExecutorProbe::transactionTimeoutPending(b, id));
     }
+}
+
+namespace {
+std::future<RequestDispatcher::DispatchResult> queuedUnkeyedProducer(KawasanBroker& b) {
+    auto delivered = std::make_shared<std::promise<RequestDispatcher::DispatchResult>>();
+    auto future = delivered->get_future();
+    auto immediate = CoordinatorExecutorProbe::dispatchProtocol(
+        b, protocol::ApiKey::INIT_PRODUCER_ID, 4, producerInitPayload(std::nullopt),
+        [delivered](auto result) { delivered->set_value(std::move(result)); });
+    EXPECT_TRUE(immediate.deferred);
+    if (!immediate.deferred)
+        delivered->set_value(std::move(immediate));
+    return future;
+}
+}  // namespace
+
+class CoordinatorUnkeyedProducerTest : public CoordinatorPersistenceTest {};
+
+TEST_F(CoordinatorUnkeyedProducerTest, UnkeyedProducerWireVersionsPersistFreshIdsAndRestart) {
+    int64_t last = 0;
+    {
+        KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+        b.start();
+        b.reconcileReplicas();
+        for (int16_t version : {0, 1, 2, 3, 4}) {
+            SCOPED_TRACE(version);
+            const auto result = producerInitWire(b, std::nullopt, version, version >= 3 ? 1234 : -1,
+                                                 version >= 3 ? 7 : -1, version % 2 ? -1 : 0);
+            ASSERT_EQ(result.error, ErrorCode::NONE);
+            EXPECT_EQ(result.id, ++last);
+            EXPECT_EQ(result.epoch, 0);
+            int64_t next = 0;
+            std::ifstream counter_file(dir / "0/meta/producer_id.counter");
+            counter_file >> next;
+            EXPECT_EQ(next, last + 1);
+        }
+        EXPECT_TRUE(CoordinatorPersistenceProbe::transactions(b).list({}, {}).empty());
+        for (int p = 0; p < 3; ++p) {
+            EXPECT_EQ(b.logManager()->getLog("__transaction_state", p)->logEndOffset(), 0);
+            EXPECT_EQ(b.logManager()->getLog("__consumer_offsets", p)->logEndOffset(), 0);
+        }
+        b.stop();
+    }
+    KawasanBroker restarted(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    restarted.start();
+    restarted.reconcileReplicas();
+    const auto next = producerInitWire(restarted, std::nullopt);
+    EXPECT_EQ(next.error, ErrorCode::NONE);
+    EXPECT_EQ(next.id, last + 1);
+    EXPECT_EQ(next.epoch, 0);
+    restarted.stop();
+}
+
+TEST_F(CoordinatorUnkeyedProducerTest,
+       UnkeyedProducerInvalidInputsAndAcquisitionOnlyNeverAllocate) {
+    {
+        KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+        b.start();
+        b.reconcileReplicas();
+        for (const auto& [id, epoch] :
+             std::vector<std::pair<int64_t, int16_t>>{{-1, 0}, {1, -1}, {-2, 0}, {1, -2}}) {
+            const auto refused = producerInitWire(b, std::nullopt, 4, id, epoch);
+            EXPECT_EQ(refused.error, ErrorCode::INVALID_REQUEST);
+            EXPECT_EQ(refused.id, -1);
+            EXPECT_EQ(refused.epoch, -1);
+        }
+        EXPECT_FALSE(fs::exists(dir / "0/meta/producer_id.counter"));
+        b.stop();
+    }
+    KawasanBroker acquisition(config(), KawasanBroker::CoordinatorAcquisitionOnly{format});
+    acquisition.start();
+    acquisition.reconcileReplicas();
+    for (int16_t version : {0, 1, 2, 3, 4}) {
+        const auto refused = producerInitWire(acquisition, std::nullopt, version);
+        EXPECT_EQ(refused.error, ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+        EXPECT_EQ(refused.id, -1);
+        EXPECT_EQ(refused.epoch, -1);
+    }
+    EXPECT_FALSE(fs::exists(dir / "0/meta/producer_id.counter"));
+    acquisition.stop();
+}
+
+TEST_F(CoordinatorUnkeyedProducerTest, UnkeyedProducerCounterFailuresKeepExactWireErrors) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    const auto counter = dir / "0/meta/producer_id.counter";
+    const auto blocked = dir / "0/meta/producer_id.counter.tmp";
+    fs::create_directory(blocked);
+    for (int16_t version : {0, 1, 2, 3, 4}) {
+        const auto refused = producerInitWire(b, std::nullopt, version);
+        EXPECT_EQ(refused.error, ErrorCode::KAFKA_STORAGE_ERROR);
+        EXPECT_EQ(refused.id, -1);
+        EXPECT_EQ(refused.epoch, -1);
+    }
+    EXPECT_FALSE(fs::exists(counter));
+    fs::remove(blocked);
+    struct CounterPipe {
+        std::array<int, 2> fds{-1, -1};
+        ~CounterPipe() {
+            for (const int fd : fds)
+                if (fd >= 0)
+                    ::close(fd);
+        }
+    } counter_pipe;
+    ASSERT_EQ(::pipe(counter_pipe.fds.data()), 0);
+    for (int16_t version : {0, 1, 2, 3, 4}) {
+        // A pipe accepts the counter write but rejects fsync on both platforms.
+        // The atomic writer must unlink the failed temporary path and refuse
+        // the identity without advancing either durable or in-memory state.
+        fs::create_symlink("/dev/fd/" + std::to_string(counter_pipe.fds[1]), blocked);
+        const auto refused = producerInitWire(b, std::nullopt, version);
+        EXPECT_EQ(refused.error, ErrorCode::KAFKA_STORAGE_ERROR);
+        EXPECT_EQ(refused.id, -1);
+        EXPECT_EQ(refused.epoch, -1);
+        EXPECT_FALSE(fs::exists(counter));
+        EXPECT_FALSE(fs::exists(blocked));
+    }
+    const auto first = producerInitWire(b, std::nullopt);
+    ASSERT_EQ(first.error, ErrorCode::NONE);
+    EXPECT_EQ(first.id, 1);
+    for (const auto& invalid : {std::string("garbage"), std::string("1"),
+                                std::to_string(std::numeric_limits<int64_t>::max())}) {
+        std::ofstream(counter) << invalid;
+        const auto refused = producerInitWire(b, std::nullopt);
+        EXPECT_EQ(refused.error, ErrorCode::KAFKA_STORAGE_ERROR);
+        EXPECT_EQ(refused.id, -1);
+        EXPECT_EQ(refused.epoch, -1);
+    }
+    std::ofstream(counter) << 2;
+    const auto second = producerInitWire(b, std::nullopt);
+    EXPECT_EQ(second.error, ErrorCode::NONE);
+    EXPECT_EQ(second.id, 2);
+    EXPECT_TRUE(CoordinatorPersistenceProbe::transactions(b).list({}, {}).empty());
+    b.stop();
+}
+
+TEST_F(CoordinatorUnkeyedProducerTest,
+       UnkeyedProducerQueueDefersCounterIoAndLeavesSocketResponsive) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    TransactionTimeoutQueueBlock blocked(b);
+    ASSERT_TRUE(blocked.ready());
+    auto future = queuedUnkeyedProducer(b);
+    EXPECT_EQ(future.wait_for(50ms), std::future_status::timeout);
+    EXPECT_FALSE(fs::exists(dir / "0/meta/producer_id.counter"));
+    Buffer request;
+    protocol::RequestHeader(protocol::ApiKey::API_VERSIONS, 1, 92, "io-progress").encode(request);
+    protocol::ApiVersionsRequest{}.encode(request, 1);
+    const auto response = test_support::brokerRequest(b.port(), request);
+    EXPECT_GT(response.size(), 10u);
+    blocked.finish();
+    ASSERT_EQ(future.wait_for(5s), std::future_status::ready);
+    auto result = future.get();
+    const auto identity = publishProducer(result);
+    EXPECT_EQ(identity.error, ErrorCode::NONE);
+    EXPECT_EQ(identity.id, 1);
+    result = {};
+    b.stop();
+}
+
+TEST_F(CoordinatorUnkeyedProducerTest, UnkeyedProducerQueueCapacityRefusesWithoutCounterIo) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    TransactionTimeoutQueueBlock blocked(b);
+    ASSERT_TRUE(blocked.ready());
+    for (int n = 0; n < 1024; ++n)
+        ASSERT_TRUE(CoordinatorExecutorProbe::submit(b, [](bool, auto) {}));
+    auto immediate = CoordinatorExecutorProbe::dispatchProtocol(
+        b, protocol::ApiKey::INIT_PRODUCER_ID, 4, producerInitPayload(std::nullopt), [](auto) {});
+    EXPECT_FALSE(immediate.deferred);
+    const auto refused = publishProducer(immediate);
+    EXPECT_EQ(refused.error, ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+    EXPECT_EQ(refused.id, -1);
+    EXPECT_EQ(refused.epoch, -1);
+    EXPECT_FALSE(fs::exists(dir / "0/meta/producer_id.counter"));
+    blocked.finish();
+    b.stop();
+}
+
+TEST_F(CoordinatorUnkeyedProducerTest, UnkeyedProducerQueuedAndActiveShutdownRefuseAllocation) {
+    for (const bool active : {false, true}) {
+        SCOPED_TRACE(active);
+        auto cfg = config();
+        const auto root = dir / (active ? "active" : "queued");
+        cfg.setString("log.dirs", root.string());
+        KawasanBroker b(cfg, KawasanBroker::CoordinatorPersistenceOnly{format});
+        b.start();
+        b.reconcileReplicas();
+        std::optional<TransactionTimeoutQueueBlock> blocked;
+        std::optional<std::unique_lock<std::mutex>> allocation;
+        if (active)
+            allocation.emplace(CoordinatorExecutorProbe::holdProducerIds(b));
+        else {
+            blocked.emplace(b);
+            ASSERT_TRUE(blocked->ready());
+        }
+        auto future = queuedUnkeyedProducer(b);
+        EXPECT_EQ(future.wait_for(100ms), std::future_status::timeout);
+        EXPECT_FALSE(fs::exists(root / "meta/producer_id.counter"));
+        auto stopped = std::async(std::launch::async, [&] { b.stop(); });
+        EXPECT_TRUE(waitUntil([&] { return CoordinatorExecutorProbe::stopping(b); }));
+        EXPECT_EQ(stopped.wait_for(50ms), std::future_status::timeout);
+        allocation.reset();
+        if (blocked)
+            blocked->finish();
+        ASSERT_EQ(future.wait_for(5s), std::future_status::ready);
+        auto result = future.get();
+        const auto refused = publishProducer(result);
+        EXPECT_EQ(refused.error, ErrorCode::NOT_COORDINATOR);
+        EXPECT_EQ(refused.id, -1);
+        EXPECT_EQ(refused.epoch, -1);
+        result = {};
+        EXPECT_EQ(stopped.wait_for(5s), std::future_status::ready);
+        stopped.get();
+        EXPECT_FALSE(fs::exists(root / "meta/producer_id.counter"));
+    }
+}
+
+TEST_F(CoordinatorUnkeyedProducerTest,
+       UnkeyedProducerResponseFencesWriteAndDrainsWithoutSourceEpoch) {
+    KawasanBroker b(config(), KawasanBroker::CoordinatorPersistenceOnly{format});
+    b.start();
+    b.reconcileReplicas();
+    auto future = queuedUnkeyedProducer(b);
+    ASSERT_EQ(future.wait_for(5s), std::future_status::ready);
+    auto result = future.get();
+    ASSERT_TRUE(result.publication_guard);
+    ASSERT_EQ(publishProducer(result).error, ErrorCode::NONE);
+    std::promise<void> entered, release;
+    auto entered_future = entered.get_future();
+    auto released = release.get_future().share();
+    auto publishing = std::async(std::launch::async, [&] {
+        result.publication_guard([&](auto status) {
+            EXPECT_EQ(status, ErrorCode::NONE);
+            entered.set_value();
+            released.wait();
+        });
+    });
+    const bool ready = entered_future.wait_for(5s) == std::future_status::ready;
+    if (!ready)
+        release.set_value();
+    ASSERT_TRUE(ready);
+    auto changed = std::async(std::launch::async, [&] {
+        return b.metadataController()->updatePartitionLeader("__transaction_state", 0, 0);
+    });
+    EXPECT_EQ(changed.wait_for(50ms), std::future_status::timeout);
+    release.set_value();
+    publishing.get();
+    EXPECT_EQ(changed.get().error_code, ErrorCode::NONE);
+    // Null IDs have no source owner epoch: this change cannot fence the result.
+    EXPECT_EQ(publishProducer(result).error, ErrorCode::NONE);
+    auto stopped = std::async(std::launch::async, [&] { b.stop(); });
+    EXPECT_TRUE(waitUntil([&] { return CoordinatorExecutorProbe::stopping(b); }));
+    EXPECT_EQ(stopped.wait_for(50ms), std::future_status::timeout);
+    EXPECT_EQ(publishProducer(result).error, ErrorCode::NOT_COORDINATOR);
+    result = {};
+    ASSERT_EQ(stopped.wait_for(5s), std::future_status::ready);
+    stopped.get();
+}
+
+TEST_F(CoordinatorUnkeyedProducerTest,
+       UnkeyedProducerClusterRangesIgnoreSourcesAndFenceStaleMetadata) {
+    startCluster();
+    for (int id = 0; id < 3; ++id) {
+        auto& b = *brokers[id];
+        const auto first = producerInitWire(b, std::nullopt);
+        ASSERT_EQ(first.error, ErrorCode::NONE);
+        EXPECT_EQ(first.id, (static_cast<int64_t>(id) << 32) | 1);
+        EXPECT_EQ(first.epoch, 0);
+        const auto snapshot = transaction(key(id));
+        ASSERT_EQ(init(b, snapshot), ErrorCode::NONE);
+        fs::create_directory(dir / std::to_string(id) /
+                             ("__transaction_state-" + std::to_string(id)) / "checkpoint.meta.tmp");
+        ASSERT_EQ(b.mutateCoordinatorTransaction(key(id), snapshot,
+                                                 [](auto& proposed) {
+                                                     ++proposed->producer_epoch;
+                                                     return ErrorCode::NONE;
+                                                 }),
+                  ErrorCode::KAFKA_STORAGE_ERROR);
+        EXPECT_EQ(b.coordinatorLoadStatus(key(id), protocol::CoordinatorType::TRANSACTION),
+                  ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+        const auto second = producerInitWire(b, std::nullopt);
+        EXPECT_EQ(second.error, ErrorCode::NONE);
+        EXPECT_EQ(second.id, (static_cast<int64_t>(id) << 32) | 2);
+    }
+    auto future = queuedUnkeyedProducer(*brokers[0]);
+    ASSERT_EQ(future.wait_for(5s), std::future_status::ready);
+    auto result = future.get();
+    EXPECT_EQ(publishProducer(result).error, ErrorCode::NONE);
+    TransactionTimeoutQueueBlock blocked(*brokers[0]);
+    ASSERT_TRUE(blocked.ready());
+    auto queued = queuedUnkeyedProducer(*brokers[0]);
+    EXPECT_EQ(queued.wait_for(50ms), std::future_status::timeout);
+    for (auto& b : brokers)
+        b->raftNode()->stop();
+    ASSERT_TRUE(waitUntil([&] { return !CoordinatorExecutorProbe::current(*brokers[0]); }));
+    blocked.finish();
+    ASSERT_EQ(queued.wait_for(5s), std::future_status::ready);
+    auto refused_job = queued.get();
+    const auto refused_identity = publishProducer(refused_job);
+    EXPECT_EQ(refused_identity.error, ErrorCode::NOT_COORDINATOR);
+    EXPECT_EQ(refused_identity.id, -1);
+    EXPECT_EQ(refused_identity.epoch, -1);
+    refused_job = {};
+    const auto stale = producerInitWire(*brokers[0], std::nullopt);
+    EXPECT_EQ(stale.error, ErrorCode::NOT_COORDINATOR);
+    EXPECT_EQ(stale.id, -1);
+    EXPECT_EQ(stale.epoch, -1);
+    EXPECT_EQ(publishProducer(result).error, ErrorCode::NOT_COORDINATOR);
+    result = {};
+    int64_t next = 0;
+    std::ifstream counter_file(dir / "0/meta/producer_id.counter");
+    counter_file >> next;
+    EXPECT_EQ(next, 4);  // Stale requests cannot consume another ID.
 }

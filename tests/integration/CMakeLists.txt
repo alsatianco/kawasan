@@ -166,14 +166,18 @@ set_tests_properties(CoordinatorAcquisitionTest PROPERTIES TIMEOUT 150)
 
 add_executable(coordinator_persistence_test coordinator_persistence_test.cpp)
 target_link_libraries(coordinator_persistence_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
-# Keep the expanded timeout coverage in a separate bounded gate. The combined
-# process approaches its 180-second limit on macOS; these filters are disjoint.
+# Keep persistence, timeout and unkeyed producer checks in bounded gates. The
+# original combined persistence process approached its 180-second limit on macOS.
+# These disjoint filters register every case without changing assertions/timeouts.
 add_test(NAME CoordinatorPersistenceTest COMMAND coordinator_persistence_test
     --gtest_filter=CoordinatorPersistenceTest.*-CoordinatorPersistenceTest.*TransactionTimeout*)
 set_tests_properties(CoordinatorPersistenceTest PROPERTIES TIMEOUT 180)
 add_test(NAME CoordinatorTransactionTimeoutTest COMMAND coordinator_persistence_test
     --gtest_filter=CoordinatorPersistenceTest.*TransactionTimeout*)
 set_tests_properties(CoordinatorTransactionTimeoutTest PROPERTIES TIMEOUT 60)
+add_test(NAME CoordinatorUnkeyedProducerTest COMMAND coordinator_persistence_test
+    --gtest_filter=CoordinatorUnkeyedProducerTest.*)
+set_tests_properties(CoordinatorUnkeyedProducerTest PROPERTIES TIMEOUT 60)
 
 add_executable(deferred_response_test deferred_response_test.cpp)
 target_link_libraries(deferred_response_test PRIVATE kawasan GTest::gtest GTest::gtest_main)

@@ -239,6 +239,14 @@ std::optional<CoordinatorFormat> MetadataStore::coordinatorFormat() const {
     return coordinator_format_;
 }
 
+void MetadataStore::withCoordinatorFormat(const CoordinatorFormat& expected,
+                                          const std::function<void(ErrorCode)>& action) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    action(coordinator_format_ && *coordinator_format_ == expected
+               ? ErrorCode::NONE
+               : ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
+}
+
 storage::Log* MetadataStore::openCoordinatorReplica(const std::string& topic,
                                                     PartitionId partition) {
     std::lock_guard<std::mutex> lock(mutex_);

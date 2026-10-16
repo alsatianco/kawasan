@@ -664,9 +664,8 @@ normal JoinGroup, SyncGroup, Heartbeat and LeaveGroup registrations now defer to
 the executor and mutate detached committed proposals. Protocol results are sent
 only after durable success. A LeaveGroup member batch commits as one proposal.
 Persistence staging also migrates OffsetCommit/OffsetFetch, OffsetDelete and
-DeleteGroups, keyed InitProducerId, AddPartitionsToTxn and AddOffsetsToTxn.
-Acquisition-only staging still refuses them. Transaction sweeps and legacy
-Prepare completion remain gated.
+DeleteGroups, InitProducerId, AddPartitionsToTxn and AddOffsetsToTxn.
+Acquisition-only staging still refuses them. Legacy transaction completion and Prepare redrive remain gated.
 FindCoordinator is also gated until serving integration is complete.
 
 A one-second staged scheduler inspects member/rebalance deadlines without changing
@@ -717,6 +716,24 @@ rejoin or owner epoch fences an obsolete cleanup. No-op rechecks append nothing.
 The existing scheduler/queue/worker shutdown drain covers retention too.
 Subscription-aware retention for active managed groups remains future work.
 
+Unkeyed InitProducerId (null transactional ID) uses a separate broker-wide deferred
+path in persistence staging. Queue, worker, counter-lock admission and response
+write initiation require a running broker with current metadata, the matching
+committed coordinator format and completed internal bootstrap. The bounded worker
+fsyncs the counter file and directory; socket IO threads only validate/queue work.
+Every valid request returns a fresh durable ID and epoch zero, even with a valid
+expected identity; transaction timeout limits apply only to keyed requests.
+No transaction key, source ownership, source log append or coordinator cache is
+involved. Loading/unreadable coordinator partitions therefore do not prevent a
+safe broker-local allocation. Counter corruption, rollback, exhaustion and write
+errors propagate with unset response identity. Queue/active shutdown refuse new
+allocation; tickets retain worker and response lifetime until delivery/cancellation.
+The broker-wide format/metadata fence covers synchronous response write initiation,
+and lost metadata currency refuses a queued or retained result. An ID durably
+consumed before a refused response remains unused, never recycled. Acquisition-only
+staging still refuses this API; discovery, pending offsets, transaction completion
+and public activation remain gated.
+
 Keyed InitProducerId uses deferred transaction-source admission and full-snapshot
 CAS under the original owner epoch. New identities, epoch bumps and ID rotations
 publish only after source fsync, ISR commitment and strict HW checkpointing.
@@ -730,7 +747,7 @@ without an expectation invalidates previous retry history. InitProducerId v0–v
 maps fencing to INVALID_PRODUCER_EPOCH; v4 uses PRODUCER_FENCED. Its v2+ request
 and response bodies now use Kafka's compact/tagged encoding.
 
-Staged initialization validates nonempty transactional IDs, paired expected
+Keyed staged initialization validates nonempty transactional IDs, paired expected
 ID/epoch fields and the configured transaction timeout before allocation. Pending
 Ongoing/Prepare states return CONCURRENT_TRANSACTIONS without clearing partitions,
 pending offsets or invoking legacy marker completion. This refusal remains until
@@ -807,8 +824,8 @@ retention/compaction history integration exist. Busy readiness checks are also
 retryable, with no scan on IO threads. This bounded staging checkpoint does not
 establish broad DescribeProducers acceptance: the default handler still uses its
 historical dedup cache and acquisition-only staging still refuses inspection.
-Public activation remains gated on full inspection history, unkeyed producer
-admission and group-owned pending-offset routing.
+Public activation remains gated on full inspection history and group-owned
+pending-offset routing.
 
 Persistence staging uses the existing coordinator scheduling thread for transaction
 scans at `transaction.abort.timed.out.transaction.cleanup.interval.ms` (minimum
