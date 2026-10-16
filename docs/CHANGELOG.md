@@ -10,6 +10,8 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 - Register coordinator transaction-timeout tests as a separate bounded CTest
   gate; retain every case and assertion without extending the persistence timeout.
+  Serialize the persistence gate against other CTest storage stress suites to avoid
+  overlapping synchronous log creation/checkpoint workloads in parallel runs.
 - Admit persistence-staged unkeyed InitProducerId v0–v4 through bounded workers
   and broker-wide committed-format/metadata/lifetime fences. Allocate durable
   fresh IDs at epoch zero without transaction records or source-owner dependence;
