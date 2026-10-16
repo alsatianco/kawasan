@@ -457,7 +457,17 @@ TEST(RaftLivenessTest, FrozenFirstPeerDoesNotBlockElection) {
     const auto deadline = std::chrono::steady_clock::now() + 10s;
     bool elected = false;
     while (!elected && std::chrono::steady_clock::now() < deadline) {
-        elected = nodes[0]->isLeader() || nodes[1]->isLeader();
+        // Startup can briefly expose a leader while the other node's
+        // concurrent election is still in flight. Start the cadence proof only
+        // once the live quorum has committed a leader's no-op.
+        for (int i = 0; i < 2; ++i) {
+            const auto& leader = nodes[i];
+            const auto& follower = nodes[1 - i];
+            if (leader->isLeader() && leader->commitIndex() > 0 && follower->leaderId() == i + 1 &&
+                follower->currentTerm() == leader->currentTerm() &&
+                follower->commitIndex() >= leader->commitIndex())
+                elected = true;
+        }
         std::this_thread::sleep_for(20ms);
     }
     EXPECT_TRUE(elected);
@@ -508,8 +518,8 @@ TEST(RaftLivenessTest, ReadyQuorumDoesNotWaitForFrozenFirstVote) {
             voted.set_value();
         return RequestVoteResponse{request.term, true};
     });
-    RaftNode node(1, {{0, "127.0.0.1", frozen_port}, {2, "127.0.0.1", live_port}},
-                  node_io.io, freePort(), "");
+    RaftNode node(1, {{0, "127.0.0.1", frozen_port}, {2, "127.0.0.1", live_port}}, node_io.io,
+                  freePort(), "");
     node.setCommitCallback([](const LogEntry&) {});
     node.start();
     EXPECT_EQ(vote.wait_for(2s), std::future_status::ready);

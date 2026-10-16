@@ -563,6 +563,11 @@ TEST_F(CoordinatorAcquisitionTest, FreshFollowersAcquireOnlyOwnedPartitionsAndRe
             }
         return false;
     }));
+    // This fixture drives ownership itself. Pause the automatic failover
+    // sweep so it cannot heal leader=-1 before the restarted owner observes it.
+    // Raft transport/commit threads stay live for both metadata commands.
+    for (auto& candidate : brokers)
+        candidate->replicaManager()->stop();
     auto fence = restarted.lockPartitionWrites({"__consumer_offsets", owner});
     ASSERT_EQ(controller->metadataController()
                   ->updatePartitionLeader("__consumer_offsets", owner, -1)
@@ -587,6 +592,8 @@ TEST_F(CoordinatorAcquisitionTest, FreshFollowersAcquireOnlyOwnedPartitionsAndRe
     EXPECT_EQ(restarted.coordinatorLoadStatus(key(owner), protocol::CoordinatorType::GROUP),
               ErrorCode::COORDINATOR_LOAD_IN_PROGRESS);
     fence.unlock();
+    for (auto& candidate : brokers)
+        candidate->replicaManager()->start();
     ASSERT_TRUE(waitUntil([&] {
         return restarted.coordinatorLoadStatus(key(owner), protocol::CoordinatorType::GROUP) ==
                ErrorCode::NONE;

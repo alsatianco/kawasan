@@ -8,6 +8,9 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-16
 
+- Wait for the frozen-peer Raft fixture to establish a committed quorum before
+  measuring heartbeat stability, and pause automatic failover while the acquisition
+  fixture drives manual ownership loss and restoration.
 - Synchronize retention test scheduling before workers acquire source fences;
   require all candidates to be queued and finished before checking exact cleanup.
 
