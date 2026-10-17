@@ -8,6 +8,8 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-17
 
+- Pause automatic ISR expansion during the coordinator fixture's manual ISR
+  shrink, keeping the minimum-ISR and timeout assertions deterministic.
 - Synchronize the deferred ISR socket fixture by pausing the owner's periodic
   acquisition sweep while follower Fetch RPCs commit the write. The response
   keeps its exact success assertion and original publication fences.

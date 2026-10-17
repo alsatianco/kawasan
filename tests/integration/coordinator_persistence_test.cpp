@@ -998,8 +998,9 @@ TEST_F(CoordinatorPersistenceTest, ThreeBrokerRegistrationPropagatesMinIsrAndTim
     const auto producer = producerInitWire(b, id);
     ASSERT_EQ(producer.error, ErrorCode::NONE);
     const auto before = CoordinatorPersistenceProbe::transactions(b).describe(id);
-    brokers[0]->replicaManager()->stop();
-    brokers[2]->replicaManager()->stop();
+    // Manual ISR transitions must not race the owner's automatic ISR expansion.
+    for (auto& broker : brokers)
+        broker->replicaManager()->stop();
     ASSERT_EQ(controller->metadataController()
                   ->updatePartitionISR("__transaction_state", 1, {1})
                   .error_code,
@@ -1034,16 +1035,17 @@ TEST_F(CoordinatorPersistenceTest, ThreeBrokerRegistrationPropagatesMinIsrAndTim
                   .error_code,
               ErrorCode::REQUEST_TIMED_OUT);
     EXPECT_EQ(CoordinatorPersistenceProbe::transactions(b).describe(id), before);
-    brokers[0]->replicaManager()->start();
-    brokers[2]->replicaManager()->start();
+    for (auto& broker : brokers)
+        broker->replicaManager()->start();
     ASSERT_TRUE(waitUntil([&] {
         return b.coordinatorLoadStatus(id, protocol::CoordinatorType::TRANSACTION) ==
                ErrorCode::NONE;
     }));
     const auto ongoing = CoordinatorPersistenceProbe::transactions(b).describe(id);
     ASSERT_EQ(ongoing->state, TransactionCoordinator::State::Ongoing);
-    brokers[0]->replicaManager()->stop();
-    brokers[2]->replicaManager()->stop();
+    // Manual ISR transitions must not race the owner's automatic ISR expansion.
+    for (auto& broker : brokers)
+        broker->replicaManager()->stop();
     const auto end = b.logManager()->getLog("__transaction_state", 1)->logEndOffset();
     auto pending = std::async(std::launch::async, [&] {
         return membershipWire<protocol::AddOffsetsToTxnResponse>(
@@ -1062,8 +1064,8 @@ TEST_F(CoordinatorPersistenceTest, ThreeBrokerRegistrationPropagatesMinIsrAndTim
     EXPECT_TRUE(CoordinatorPersistenceProbe::transactions(b).describe(id) == ongoing ||
                 b.coordinatorLoadStatus(id, protocol::CoordinatorType::TRANSACTION) !=
                     ErrorCode::NONE);
-    brokers[0]->replicaManager()->start();
-    brokers[2]->replicaManager()->start();
+    for (auto& broker : brokers)
+        broker->replicaManager()->start();
 }
 
 TEST_F(CoordinatorPersistenceTest,
