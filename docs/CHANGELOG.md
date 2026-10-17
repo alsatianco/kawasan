@@ -8,6 +8,9 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-17
 
+- Bound consistency scans by each partition's first read-committed fetch EOF,
+  recording that offset for regression checks. Ambiguous writes may commit after
+  the preceding ListOffsets sample; acknowledgement and gap checks remain strict.
 - Pause automatic ISR expansion during the coordinator fixture's manual ISR
   shrink, keeping the minimum-ISR and timeout assertions deterministic.
 - Synchronize the deferred ISR socket fixture by pausing the owner's periodic

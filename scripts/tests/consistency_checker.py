@@ -117,7 +117,7 @@ def check_watermark(previous, partition, offset):
 
 
 def verify_watermarks(events, partitions):
-    """I3 successful committed ListOffsets observations may never regress."""
+    """I3 successful committed-offset observations may never regress."""
     previous = {}
     counts = Counter()
     for event in events:
@@ -297,7 +297,7 @@ def observe_offsets(admin, topic, partitions, ledger):
     return result
 
 
-def scan_output(cluster, topic, ends, timeout=45):
+def scan_output(cluster, topic, ends, timeout=45, ledger=None):
     import time
     import uuid
     from confluent_kafka import Consumer, KafkaError, TopicPartition
@@ -306,24 +306,40 @@ def scan_output(cluster, topic, ends, timeout=45):
         'enable.partition.eof': True, 'isolation.level': 'read_committed',
         'auto.offset.reset': 'error'}))
     consumer.assign([TopicPartition(topic, p, 0) for p in ends])
-    records, finished = [], set()
+    records, observed_ends = [], {}
+    previous = dict(ends)
     deadline = time.monotonic() + timeout
     try:
-        while time.monotonic() < deadline and len(finished) != len(ends):
+        while time.monotonic() < deadline and len(observed_ends) != len(ends):
             message = consumer.poll(.2)
             if message is None:
                 continue
+            partition = message.partition()
+            if partition not in ends:
+                raise RuntimeError(f'healed scan returned unassigned partition {partition}')
+            if partition in observed_ends:
+                # Already queued messages can follow pause(); this partition's
+                # snapshot ended at its first EOF, even while others catch up.
+                continue
             if message.error():
                 if message.error().code() == KafkaError._PARTITION_EOF:
-                    finished.add(message.partition())
+                    # An ambiguous write can commit after ListOffsets. The
+                    # read_committed EOF is the boundary of this actual scan.
+                    end = message.offset()
+                    check_watermark(previous, partition, end)
+                    observed_ends[partition] = end
+                    if ledger is not None:
+                        ledger.append(dict(type='watermark', partition=partition,
+                                           offset=end, source='scan-eof'))
+                    consumer.pause([TopicPartition(topic, partition)])
                     continue
                 raise RuntimeError(f'healed scan failed: {message.error()}')
             records.append(dict(topic=message.topic(), partition=message.partition(),
                                 offset=message.offset(), key=message.key().decode(),
                                 value=message.value().decode()))
-        if len(finished) != len(ends):
-            raise RuntimeError(f'full scan timed out: EOF partitions {sorted(finished)}')
-        return records
+        if len(observed_ends) != len(ends):
+            raise RuntimeError(f'full scan timed out: EOF partitions {sorted(observed_ends)}')
+        return records, observed_ends
     finally:
         consumer.close()
 
@@ -604,7 +620,7 @@ def run_live(args):
             else:
                 ends, stats = run_writes(cluster, topic, args.duration, ledger, args.seed, args.no_faults)
             summary.update(stats)
-            records = scan_output(cluster, topic, ends)
+            records, ends = scan_output(cluster, topic, ends, ledger=ledger)
             scan = {'records': records, 'end_offsets': ends, 'transactional': args.transactions}
             if args.transactions: scan['group_offset'] = group_offset
             save_json(directory / 'scan.json', scan)

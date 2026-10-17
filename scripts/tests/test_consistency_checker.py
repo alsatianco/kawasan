@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch, Mock
 
-from consistency_checker import Ledger, Violation, verify_records, verify_watermarks, verify_transactions, observe_offsets, Cluster, fetch_committed_offset
+from consistency_checker import Ledger, Violation, verify_records, verify_watermarks, verify_transactions, observe_offsets, Cluster, fetch_committed_offset, scan_output
 
 
 def record(offset, key=None, partition=0):
@@ -171,6 +171,64 @@ class CheckerTest(unittest.TestCase):
         verify_transactions(events, [record(0, 'a'), record(1, 'b')], 2)
         with self.assertRaisesRegex(Violation, 'I4'):
             verify_transactions(events, [record(0, 'a')], 2)
+
+    def run_scan(self, messages, ends):
+        from types import SimpleNamespace
+        import sys
+        consumer = Mock()
+        consumer.poll.side_effect = messages
+        fake_kafka = SimpleNamespace(
+            Consumer=Mock(return_value=consumer),
+            KafkaError=SimpleNamespace(_PARTITION_EOF=-191),
+            TopicPartition=lambda topic, partition, offset=0: SimpleNamespace(
+                topic=topic, partition=partition, offset=offset))
+        ledger = Mock()
+        with patch.dict(sys.modules, {'confluent_kafka': fake_kafka}):
+            result = scan_output(SimpleNamespace(client_config={}), 't', ends, ledger=ledger)
+        consumer.close.assert_called_once()
+        return result, ledger
+
+    def scan_message(self, offset, partition=0, eof=False):
+        from types import SimpleNamespace
+        message = Mock()
+        message.partition.return_value = partition
+        message.offset.return_value = offset
+        message.topic.return_value = 't'
+        message.key.return_value = f'run:{partition}:{offset}'.encode()
+        message.value.return_value = message.key.return_value
+        message.error.return_value = SimpleNamespace(code=lambda: -191) if eof else None
+        return message
+
+    def test_scan_uses_fetch_eof_after_an_ambiguous_write_commits(self):
+        result, ledger = self.run_scan([
+            self.scan_message(0), self.scan_message(1), self.scan_message(2, eof=True)], {0: 1})
+        records, ends = result
+        self.assertEqual(ends, {0: 2})
+        self.assertEqual([r['offset'] for r in records], [0, 1])
+        verify_records([], records, ends)
+        self.assertEqual(ledger.append.call_args.args[0],
+                         dict(type='watermark', partition=0, offset=2, source='scan-eof'))
+
+    def test_scan_eof_cannot_regress_from_the_prior_observation(self):
+        with self.assertRaisesRegex(Violation, 'I3'):
+            self.run_scan([self.scan_message(1, eof=True)], {0: 2})
+
+    def test_scan_closes_each_partition_at_its_first_eof(self):
+        result, _ = self.run_scan([
+            self.scan_message(0), self.scan_message(1, eof=True),
+            self.scan_message(1), self.scan_message(0, partition=1),
+            self.scan_message(1, partition=1, eof=True)], {0: 1, 1: 1})
+        records, ends = result
+        self.assertEqual([(r['partition'], r['offset']) for r in records], [(0, 0), (1, 0)])
+        verify_records([], records, ends)
+
+    def test_scan_does_not_hide_data_beyond_its_fetch_eof(self):
+        result, _ = self.run_scan([
+            self.scan_message(0), self.scan_message(1), self.scan_message(2),
+            self.scan_message(2, eof=True)], {0: 1})
+        records, ends = result
+        with self.assertRaisesRegex(Violation, 'I2'):
+            verify_records([], records, ends)
 
     def test_run_pins_binary_across_rebuilds(self):
         with tempfile.TemporaryDirectory() as directory:
