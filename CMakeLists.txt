@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.22)
 project(kawasan VERSION 0.1.0 LANGUAGES CXX)
 
 # Prefer legacy FindBoost module until the project migrates to Boost's CMake config packages

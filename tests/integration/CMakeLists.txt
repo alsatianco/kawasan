@@ -176,9 +176,13 @@ add_test(NAME CoordinatorPersistenceTest COMMAND coordinator_persistence_test
 # Source creation/checkpoint proofs issue many synchronous writes. Keep them
 # isolated from storage stress suites even when callers use ctest --parallel.
 set_tests_properties(CoordinatorPersistenceTest PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
-add_test(NAME CoordinatorClusterPersistenceTest COMMAND coordinator_persistence_test
-    --gtest_filter=CoordinatorClusterPersistenceTest.*)
-set_tests_properties(CoordinatorClusterPersistenceTest PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
+# Each cluster case starts and stops three durable brokers. Register cases
+# individually so their cumulative startup/fsync time cannot exhaust one
+# suite-wide timeout, while still bounding hangs and serializing disk workloads.
+include(GoogleTest)
+gtest_discover_tests(coordinator_persistence_test
+    TEST_FILTER CoordinatorClusterPersistenceTest.*
+    PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
 add_test(NAME CoordinatorTransactionTimeoutTest COMMAND coordinator_persistence_test
     --gtest_filter=CoordinatorPersistenceTest.*TransactionTimeout*)
 set_tests_properties(CoordinatorTransactionTimeoutTest PROPERTIES TIMEOUT 60)
