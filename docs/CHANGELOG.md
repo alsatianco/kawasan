@@ -8,6 +8,8 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-17
 
+- Reserve distinct Raft fixture ports until each node binds, preventing repeated
+  ephemeral-port probes from assigning two peers the same endpoint.
 - Register the 19 cluster persistence cases in a separate 120-second serial CTest
   gate; keep the other 81 persistence cases and existing timeout/unkeyed gates.
   Retain every case and assertion while bounding independent startup workloads.

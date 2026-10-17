@@ -59,7 +59,17 @@ struct Cluster {
             return true;
         }();
         (void)logger;
-        std::vector<int> ports{freePort(), freePort(), freePort()};
+        // Hold every endpoint until its node starts. Repeated bind(0)/close
+        // probes can return the same port, giving two peers one address.
+        boost::asio::io_context reservation_io;
+        std::vector<boost::asio::ip::tcp::acceptor> reservations;
+        std::vector<int> ports;
+        for (int id = 0; id < 3; ++id) {
+            reservations.emplace_back(
+                reservation_io,
+                boost::asio::ip::tcp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 0));
+            ports.push_back(reservations.back().local_endpoint().port());
+        }
         for (int id = 0; id < 3; ++id) {
             std::vector<PeerInfo> peers;
             for (int other = 0; other < 3; ++other) {
@@ -73,8 +83,9 @@ struct Cluster {
             // without one nothing is applied and no follower is ever current.
             nodes.back()->setCommitCallback([](const LogEntry&) {});
         }
-        for (auto& node : nodes) {
-            node->start();
+        for (int id = 0; id < 3; ++id) {
+            reservations[id].close();
+            nodes[id]->start();
         }
     }
     ~Cluster() {
@@ -442,7 +453,14 @@ TEST(RaftLivenessTest, FrozenFirstPeerDoesNotBlockElection) {
     });
     const int hole_port = hole.local_endpoint().port();
 
-    std::vector<int> ports{freePort(), freePort()};  // brokers 1 and 2
+    // Reserve both live-peer addresses together, as in Cluster above.
+    std::vector<boost::asio::ip::tcp::acceptor> reservations;
+    std::vector<int> ports;
+    for (int i = 0; i < 2; ++i) {
+        reservations.emplace_back(
+            hole_io, boost::asio::ip::tcp::endpoint(boost::asio::ip::make_address("127.0.0.1"), 0));
+        ports.push_back(reservations.back().local_endpoint().port());
+    }
     std::vector<std::unique_ptr<NodeIo>> ios;
     std::vector<std::unique_ptr<RaftNode>> nodes;
     for (int i = 0; i < 2; ++i) {
@@ -452,6 +470,7 @@ TEST(RaftLivenessTest, FrozenFirstPeerDoesNotBlockElection) {
         ios.push_back(std::make_unique<NodeIo>());
         nodes.push_back(std::make_unique<RaftNode>(id, peers, ios.back()->io, ports[i], ""));
         nodes.back()->setCommitCallback([](const LogEntry&) {});
+        reservations[i].close();
         nodes.back()->start();
     }
     const auto deadline = std::chrono::steady_clock::now() + 10s;
