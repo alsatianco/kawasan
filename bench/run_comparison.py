@@ -52,7 +52,9 @@ def main():
     ap.add_argument("--base-binary", type=Path, required=True)
     ap.add_argument("--head-binary", type=Path, required=True)
     ap.add_argument("--output-dir", type=Path, required=True)
-    ap.add_argument("--samples", type=int, default=5)
+    # Nine pairs let the confidence gate tolerate one anomalous pair without
+    # losing the ability to detect a sustained regression in the other eight.
+    ap.add_argument("--samples", type=int, default=9)
     args = ap.parse_args()
     if args.samples < 3 or args.samples % 2 == 0:
         ap.error("--samples must be an odd number of at least 3")

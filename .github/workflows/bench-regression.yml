@@ -1,7 +1,7 @@
 # Phase EX-4 (§6.4): Commit-triggered benchmark regression check. Compares the
-# previous and current commits using five alternating runs on the same runner.
-# Compares median metrics and retains raw samples. Alerts
-# (failing the job) when regression > 10%.
+# previous and current commits using nine alternating runs on the same runner.
+# Compares median metrics and retains raw samples. Fails when a regression
+# exceeds 10% with a one-sided 95% paired-bootstrap confidence bound.
 name: bench-regression
 on:
   push:
@@ -52,7 +52,7 @@ jobs:
           python3 bench/run_comparison.py \
             --base-binary "$RUNNER_TEMP/bench-base/build/tools/kawasan-broker" \
             --head-binary "$GITHUB_WORKSPACE/build/tools/kawasan-broker" \
-            --output-dir /tmp/bench-results --samples 5
+            --output-dir /tmp/bench-results --samples 9
 
       - name: Compare to baseline
         run: |

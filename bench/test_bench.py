@@ -103,9 +103,9 @@ class ComparisonTest(unittest.TestCase):
         self.assertEqual(result["sample_count"], 5)
 
     def test_sustained_throughput_and_latency_regressions_still_fail(self):
-        baseline = run_comparison.aggregate([self.sample()] * 5)
-        for rows in ([self.sample(v) for v in (292, 293, 291, 290, 350)],
-                     [self.sample(p99=v) for v in (25, 26, 24, 25, 20)]):
+        baseline = run_comparison.aggregate([self.sample()] * 9)
+        for rows in ([self.sample(v) for v in (292, 293, 291, 290, 292, 293, 291, 290, 350)],
+                     [self.sample(p99=v) for v in (25, 26, 24, 25, 25, 26, 24, 25, 20)]):
             with self.subTest(rows=rows), contextlib.redirect_stdout(io.StringIO()):
                 current = run_comparison.aggregate(rows)
                 failures = check_regression.compare({"scenario": baseline},
@@ -117,6 +117,42 @@ class ComparisonTest(unittest.TestCase):
                      [self.sample(float("nan"))], [self.sample(0)]):
             with self.subTest(rows=rows), self.assertRaises(ValueError):
                 run_comparison.aggregate(rows)
+
+    def test_borderline_noisy_regression_is_inconclusive(self):
+        baseline = run_comparison.aggregate([self.sample()] * 5)
+        current = run_comparison.aggregate(
+            [self.sample(p99=v) for v in (20, 21, 22.4, 23, 24)])
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            failures = check_regression.compare({"scenario": baseline},
+                                                {"scenario": current}, 10, "base", "head")
+        self.assertEqual(failures, [])
+        self.assertIn("inconclusive", output.getvalue())
+
+    def test_shared_runner_drift_preserves_paired_regression(self):
+        # The large common drift cancels within each adjacent measurement pair.
+        baseline = run_comparison.aggregate(
+            [self.sample(p99=v) for v in (10, 20, 30, 40, 50)])
+        current = run_comparison.aggregate(
+            [self.sample(p99=v) for v in (12, 24, 36, 48, 60)])
+        self.assertAlmostEqual(
+            check_regression.regression_lower_bound(baseline, current, "p99_ms"), 20)
+
+    def test_single_measurement_keeps_strict_threshold(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            failures = check_regression.compare({"scenario": self.sample()},
+                {"scenario": self.sample(p99=22.4)}, 10, "base", "head")
+        self.assertEqual(len(failures), 1)
+
+    def test_invalid_raw_samples_cannot_hide_regression(self):
+        baseline = run_comparison.aggregate([self.sample()] * 5)
+        current = run_comparison.aggregate([self.sample(p99=25)] * 5)
+        for invalid in ({**current, "samples": []},
+                        {**current, "sample_count": 4},
+                        {**current, "p99_ms": 26},
+                        run_comparison.aggregate([self.sample(p99=25)] * 3),
+                        {**current, "samples": [self.sample(p99=float("nan"))] * 5}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                check_regression.regression_lower_bound(baseline, invalid, "p99_ms")
 
     def test_comparison_alternates_order_and_writes_raw_and_aggregate_results(self):
         calls = []

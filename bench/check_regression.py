@@ -6,8 +6,8 @@
 #                                    baseline (nightly absolute gate).
 #   --base FILE --head FILE          A/B mode: compare a base-branch run to a
 #                                    head-branch run measured back-to-back on
-#                                    the SAME runner (PR gate; cancels
-#                                    shared-runner noise).
+#                                    the SAME runner. Aggregated A/B results
+#                                    use paired samples to quantify runner noise.
 # Exits non-zero if throughput dropped or p99 latency rose by more than
 # --threshold-pct. Both files may be a single JSON object or JSONL (one
 # object per scenario) — in JSONL mode scenarios are matched by a key built
@@ -15,7 +15,55 @@
 
 import argparse
 import json
+import math
+import random
+import statistics
 import sys
+
+
+def regression_lower_bound(baseline, current, metric):
+    """One-sided 95% paired-bootstrap bound on the median regression (%).
+
+    Adjacent base/head measurements form pairs; resampling those pairs keeps
+    their shared runner conditions together. A point estimate just beyond the
+    threshold is inconclusive when the uncertainty still includes that threshold.
+    Legacy single measurements retain the strict point-estimate gate.
+    """
+    if "samples" not in baseline and "samples" not in current:
+        return None
+    pairs = []
+    for result in (baseline, current):
+        rows = result.get("samples", [])
+        if (result.get("aggregation") != "median" or len(rows) < 3 or
+                result.get("sample_count") != len(rows)):
+            raise ValueError("expected at least three median-aggregated benchmark samples")
+        values = [row[metric] for row in rows]
+        if any(not math.isfinite(v) or v <= 0 for v in values):
+            raise ValueError(f"invalid {metric} in benchmark samples")
+        if result[metric] != statistics.median(values):
+            raise ValueError(f"aggregate {metric} does not match benchmark samples")
+        pairs.append(values)
+    base, head = pairs
+    if len(base) != len(head):
+        raise ValueError("base/head benchmark sample counts differ")
+    rng = random.Random(0)
+    regressions = []
+    for _ in range(10000):
+        indices = rng.choices(range(len(base)), k=len(base))
+        b = statistics.median(base[i] for i in indices)
+        h = statistics.median(head[i] for i in indices)
+        delta = (h - b) / b * 100
+        regressions.append(-delta if metric == "throughput_mb_s" else delta)
+    return sorted(regressions)[499]
+
+
+def confirmed_regression(skey, baseline, current, metric, threshold):
+    bound = regression_lower_bound(baseline, current, metric)
+    if bound is None or bound > threshold:
+        return True
+    print(f"  [{skey}] {metric}: inconclusive regression; "
+          f"95% lower bound {bound:+.1f}% does not exceed +{threshold:g}%")
+    return False
 
 
 def load(path):
@@ -54,10 +102,11 @@ def _compare_one(skey, baseline, current, threshold, failures):
     if b_thru > 0:
         delta_pct = (c_thru - b_thru) / b_thru * 100
         if delta_pct < -threshold:
-            failures.append(
-                f"[{skey}] throughput regression: {b_thru:.1f} → {c_thru:.1f} MB/s "
-                f"({delta_pct:.1f}%, threshold -{threshold}%)"
-            )
+            if confirmed_regression(skey, baseline, current, "throughput_mb_s", threshold):
+                failures.append(
+                    f"[{skey}] throughput regression: {b_thru:.1f} → {c_thru:.1f} MB/s "
+                    f"({delta_pct:.1f}%, threshold -{threshold}%)"
+                )
         else:
             print(f"  [{skey}] throughput: {b_thru:.1f} → {c_thru:.1f} MB/s ({delta_pct:+.1f}%) OK")
 
@@ -68,10 +117,11 @@ def _compare_one(skey, baseline, current, threshold, failures):
         if b > 0:
             delta_pct = (c - b) / b * 100
             if delta_pct > threshold:
-                failures.append(
-                    f"[{skey}] {k} regression: {b:.2f} → {c:.2f} ms "
-                    f"({delta_pct:+.1f}%, threshold +{threshold}%)"
-                )
+                if confirmed_regression(skey, baseline, current, k, threshold):
+                    failures.append(
+                        f"[{skey}] {k} regression: {b:.2f} → {c:.2f} ms "
+                        f"({delta_pct:+.1f}%, threshold +{threshold}%)"
+                    )
             else:
                 print(f"  [{skey}] {k}: {b:.2f} → {c:.2f} ms ({delta_pct:+.1f}%) OK")
 
@@ -102,7 +152,7 @@ def main():
             print(f"  {f}", file=sys.stderr)
         sys.exit(1)
 
-    print("\nAll metrics within ±%g%% threshold." % args.threshold_pct)
+    print("\nNo confirmed regressions beyond %g%%." % args.threshold_pct)
 
 
 if __name__ == "__main__":
