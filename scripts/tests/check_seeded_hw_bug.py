@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a disposable broker with an HW bug; require the live checker to catch I1.
+"""Build a disposable broker with an HW bug; require an I1 or I3 rejection.
 
 Copies only build inputs. The main worktree, branch, user changes and normal
 build directory remain intact. A compiler/client/startup failure is NOT proof.
@@ -58,11 +58,17 @@ def main():
                                  str(directory / 'rejected')], stdout=stream,
                                 stderr=subprocess.STDOUT, timeout=120)
     summary = json.loads((directory / 'rejected/summary.json').read_text())
-    if result.returncode == 0 or not summary.get('error', '').startswith('Violation: I1:'):
-        raise RuntimeError(f'checker did not reject the seeded HW bug with I1: {summary}')
-    save_json(directory / 'proof.json', {'status': 'passed', 'invariant': 'I1',
-                                       'mutation': replacement, 'error': summary['error']})
-    print(f'PASS: live seeded HW bug rejected by I1; evidence: {directory}', flush=True)
+    # Fetch EOF can expose the regressing HW before the later acknowledged-data
+    # check. Only these specific invariant violations count, never a client,
+    # startup, compiler, timeout or unrelated checker failure.
+    error = summary.get('error', '')
+    invariant = next((name for name in ('I1', 'I3')
+                      if error.startswith(f'Violation: {name}:')), None)
+    if result.returncode == 0 or invariant is None:
+        raise RuntimeError(f'checker did not reject the seeded HW bug with I1/I3: {summary}')
+    save_json(directory / 'proof.json', {'status': 'passed', 'invariant': invariant,
+                                       'mutation': replacement, 'error': error})
+    print(f'PASS: live seeded HW bug rejected by {invariant}; evidence: {directory}', flush=True)
 
 
 if __name__ == '__main__':

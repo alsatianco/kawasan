@@ -828,11 +828,11 @@ python3 scripts/tests/consistency_checker.py --single-node --transactions --dura
   --artifacts /tmp/kawasan-chaos-txn
 # Recheck saved evidence without starting brokers
 python3 scripts/tests/consistency_checker.py --verify-only /tmp/kawasan-chaos-45
-# Build a disposable mutated broker and require a live I1 rejection
+# Build a disposable mutated broker and require a live I1/I3 rejection
 python3 scripts/tests/check_seeded_hw_bug.py --artifacts /tmp/kawasan-chaos-hw-proof
 ```
 
-Use a new artifact directory for every run. Evidence includes an immutable executable copy used for every restart, the seed, commit and binary/checker/nemesis hashes, ordered scan, summary, fault/heal events, broker logs and RocksDB data on success and failure. The HW proof copies build inputs into its artifact directory and leaves the main worktree intact; compiler/startup failures do not count as detection. Default broker ports are 9092/9192/9292; `--port-base` allocates a separate block, with Raft and monitoring at +1/+2. `--broker-bin` selects a candidate binary. Keep the machine awake for timing-sensitive local runs.
+Use a new artifact directory for every run. Evidence includes an immutable executable copy used for every restart, the seed, commit and binary/checker/nemesis hashes, ordered scan, summary, fault/heal events, broker logs and RocksDB data on success and failure. The HW proof copies build inputs into its artifact directory and leaves the main worktree intact. It requires acknowledged-data loss (I1) or a committed-offset regression (I3); the fetch EOF check can detect the regression before the final I1 check. Compiler/startup failures do not count as detection. Default broker ports are 9092/9192/9292; `--port-base` allocates a separate block, with Raft and monitoring at +1/+2. `--broker-bin` selects a candidate binary. Keep the machine awake for timing-sensitive local runs.
 
 The nemesis permits one fault at a time only when the remaining live ISR meets minISR and the remaining brokers retain a Raft majority. It resumes/restarts the victim and waits for readiness plus the full ISR before choosing another fault. Incomplete role/action coverage, failed healing, missing samples and undrained delivery callbacks fail the run.
 
