@@ -152,7 +152,9 @@ set_tests_properties(ChaosKillTest PROPERTIES TIMEOUT 60)
 add_executable(client_api_parity_test client_api_parity_test.cpp)
 target_link_libraries(client_api_parity_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
 add_test(NAME ClientApiParityTest COMMAND client_api_parity_test)
-set_tests_properties(ClientApiParityTest PROPERTIES TIMEOUT 90)
+# Default internal-topic bootstraps perform many synchronous RocksDB writes.
+# Isolate them from other storage suites while retaining the original budget.
+set_tests_properties(ClientApiParityTest PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
 
 # CM-4: real group metadata fencing before transactional offsets are staged.
 add_executable(txn_offset_fencing_test txn_offset_fencing_test.cpp)

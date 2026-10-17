@@ -907,6 +907,8 @@ TEST_F(CoordinatorClusterPersistenceTest,
         broker->reconcileReplicas();
     const auto id = key(1);
     auto& b = *brokers[1];
+    // Isolate exact wire success from the periodic acquisition try-lock.
+    b.replicaManager()->stop();
     const auto producer = producerInitWire(b, id);
     ASSERT_EQ(producer.error, ErrorCode::NONE);
     for (int wrong : {0, 2}) {
@@ -967,6 +969,8 @@ TEST_F(CoordinatorClusterPersistenceTest,
     EXPECT_EQ(snapshot.partitions,
               (std::vector<TransactionCoordinator::TxnPartition>{
                   {"data", 0, -1}, {"data", 1, 0}, {"__consumer_offsets", 2, -1}}));
+    // Resume replication before moving this source to another owner.
+    b.replicaManager()->start();
     // Move ownership through an actual Raft command and acquire the committed image.
     ASSERT_EQ(controller->metadataController()
                   ->updatePartitionLeader("__transaction_state", 1, 2)
@@ -976,6 +980,7 @@ TEST_F(CoordinatorClusterPersistenceTest,
         return brokers[2]->coordinatorLoadStatus(id, protocol::CoordinatorType::TRANSACTION) ==
                ErrorCode::NONE;
     }));
+    brokers[2]->replicaManager()->stop();
     EXPECT_EQ(CoordinatorPersistenceProbe::transactions(*brokers[2]).describe(id), snapshot);
     EXPECT_EQ(membershipWire<protocol::AddPartitionsToTxnResponse>(
                   *brokers[2], protocol::ApiKey::ADD_PARTITIONS_TO_TXN,
@@ -1435,6 +1440,8 @@ TEST_F(CoordinatorClusterPersistenceTest,
     startCluster();
     const auto id = key(1);
     auto& b = *brokers[1];
+    // Isolate exact wire success from the periodic acquisition try-lock.
+    b.replicaManager()->stop();
     for (int wrong : {0, 2}) {
         EXPECT_EQ(producerInitWire(*brokers[wrong], id).error, ErrorCode::NOT_COORDINATOR);
         EXPECT_FALSE(fs::exists(dir / std::to_string(wrong) / "meta/producer_id.counter"));
@@ -2983,6 +2990,8 @@ TEST_F(CoordinatorClusterPersistenceTest,
     startCluster();
     const auto id = key(1);
     auto& b = *brokers[1];
+    // Isolate exact wire success from the periodic acquisition try-lock.
+    b.replicaManager()->stop();
     ASSERT_EQ(put(b, id, {groupRecord(id)}), ErrorCode::NONE);
     brokers[0]->replicaManager()->stop();
     brokers[2]->replicaManager()->stop();
@@ -3305,6 +3314,9 @@ TEST_F(CoordinatorClusterPersistenceTest,
     const auto id = key(1);
     auto& b = *brokers[1];
     ASSERT_EQ(put(b, id, {groupRecord(id)}), ErrorCode::NONE);
+    // Keep the success publication fence independent of acquisition sweeps;
+    // follower Fetch RPCs still advance the owner's HW on its single IO thread.
+    b.replicaManager()->stop();
     const auto before =
         CoordinatorAcquisitionProbe::runtime(CoordinatorPersistenceProbe::groups(b), id);
     auto* log = b.logManager()->getLog("__consumer_offsets", 1);

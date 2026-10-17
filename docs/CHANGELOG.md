@@ -8,6 +8,10 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-17
 
+- Isolate ISR-wait wire fixtures from periodic owner acquisition during exact
+  success publication, including membership, offsets and keyed transactions.
+- Serialize the API parity suite's synchronous internal-topic bootstraps against
+  other CTest storage workloads, retaining its original 90-second limit.
 - Reserve distinct Raft fixture ports until each node binds, preventing repeated
   ephemeral-port probes from assigning two peers the same endpoint.
 - Register the 19 cluster persistence cases in a separate 120-second serial CTest
