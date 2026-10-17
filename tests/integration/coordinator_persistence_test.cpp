@@ -5475,10 +5475,14 @@ TEST_F(CoordinatorPersistenceTest, TransactionTimeoutIsrFailureAndActiveShutdown
                                                  return ErrorCode::NONE;
                                              }),
               ErrorCode::NONE);
+    // The explicit one-shot scheduler must not lose admission to an acquisition
+    // sweep. Real periodic scans can retry on the next tick; this proof cannot.
+    b.replicaManager()->stop();
     brokers[0]->replicaManager()->stop();
     brokers[2]->replicaManager()->stop();
     const auto end = b.logManager()->getLog("__transaction_state", 1)->logEndOffset();
     CoordinatorExecutorProbe::scheduleTransactionTimeouts(b);
+    ASSERT_TRUE(CoordinatorExecutorProbe::transactionTimeoutPending(b, id));
     ASSERT_TRUE(waitUntil([&] {
         return b.logManager()->getLog("__transaction_state", 1)->logEndOffset() == end + 1;
     }));

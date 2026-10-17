@@ -8,6 +8,8 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-17
 
+- Quiesce acquisition before the shutdown fixture's one-shot transaction timeout
+  scan and assert enrollment before waiting for its blocked ISR append.
 - Isolate ISR-wait wire fixtures from periodic owner acquisition during exact
   success publication, including membership, offsets and keyed transactions.
 - Serialize the API parity suite's synchronous internal-topic bootstraps against
