@@ -8,6 +8,9 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-17
 
+- Register the 19 cluster persistence cases in a separate 120-second serial CTest
+  gate; keep the other 81 persistence cases and existing timeout/unkeyed gates.
+  Retain every case and assertion while bounding independent startup workloads.
 - Bound consistency scans by each partition's first read-committed fetch EOF,
   recording that offset for regression checks. Ambiguous writes may commit after
   the preceding ListOffsets sample; acknowledgement and gap checks remain strict.

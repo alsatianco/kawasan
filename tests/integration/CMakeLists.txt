@@ -166,14 +166,17 @@ set_tests_properties(CoordinatorAcquisitionTest PROPERTIES TIMEOUT 150)
 
 add_executable(coordinator_persistence_test coordinator_persistence_test.cpp)
 target_link_libraries(coordinator_persistence_test PRIVATE kawasan GTest::gtest GTest::gtest_main)
-# Keep persistence, timeout and unkeyed producer checks in bounded gates. The
-# original combined persistence process approached its 180-second limit on macOS.
-# These disjoint filters register every case without changing assertions/timeouts.
+# Keep single-broker, cluster, timeout and unkeyed checks in bounded gates.
+# Cluster startup/fsync workloads can exhaust a combined process's macOS budget.
+# These disjoint filters register every case without changing assertions.
 add_test(NAME CoordinatorPersistenceTest COMMAND coordinator_persistence_test
     --gtest_filter=CoordinatorPersistenceTest.*-CoordinatorPersistenceTest.*TransactionTimeout*)
 # Source creation/checkpoint proofs issue many synchronous writes. Keep them
 # isolated from storage stress suites even when callers use ctest --parallel.
 set_tests_properties(CoordinatorPersistenceTest PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+add_test(NAME CoordinatorClusterPersistenceTest COMMAND coordinator_persistence_test
+    --gtest_filter=CoordinatorClusterPersistenceTest.*)
+set_tests_properties(CoordinatorClusterPersistenceTest PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 add_test(NAME CoordinatorTransactionTimeoutTest COMMAND coordinator_persistence_test
     --gtest_filter=CoordinatorPersistenceTest.*TransactionTimeout*)
 set_tests_properties(CoordinatorTransactionTimeoutTest PROPERTIES TIMEOUT 60)

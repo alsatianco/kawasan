@@ -301,6 +301,9 @@ protected:
     }
 };
 
+// Separate cluster startup/fsync workloads into their own bounded CTest gate.
+class CoordinatorClusterPersistenceTest : public CoordinatorPersistenceTest {};
+
 GroupRecord groupRecord(const std::string& key) {
     GroupRecord r;
     r.key.group_id = key;
@@ -889,7 +892,7 @@ TEST_F(CoordinatorPersistenceTest, TransactionRegistrationWireRestartRebuildsPar
     EXPECT_EQ(CoordinatorPersistenceProbe::transactions(recovered).describe(id), snapshot);
 }
 
-TEST_F(CoordinatorPersistenceTest,
+TEST_F(CoordinatorClusterPersistenceTest,
        ThreeBrokerTransactionRegistrationWireWaitsForIsrAndKeepsIoLive) {
     startCluster();
     KawasanBroker* controller = nullptr;
@@ -983,7 +986,8 @@ TEST_F(CoordinatorPersistenceTest,
               ErrorCode::NONE);
 }
 
-TEST_F(CoordinatorPersistenceTest, ThreeBrokerRegistrationPropagatesMinIsrAndTimeoutFailures) {
+TEST_F(CoordinatorClusterPersistenceTest,
+       ThreeBrokerRegistrationPropagatesMinIsrAndTimeoutFailures) {
     startCluster();
     KawasanBroker* controller = nullptr;
     ASSERT_TRUE(waitUntil([&] {
@@ -1068,7 +1072,7 @@ TEST_F(CoordinatorPersistenceTest, ThreeBrokerRegistrationPropagatesMinIsrAndTim
         broker->replicaManager()->start();
 }
 
-TEST_F(CoordinatorPersistenceTest,
+TEST_F(CoordinatorClusterPersistenceTest,
        ThreeBrokerRegistrationOwnerEpochLossDuringIsrRefusesWireSuccess) {
     startCluster();
     KawasanBroker* controller = nullptr;
@@ -1426,7 +1430,8 @@ TEST_F(CoordinatorPersistenceTest, KeyedProducerRotationRetrySurvivesRestartAndC
         ErrorCode::PRODUCER_FENCED);
 }
 
-TEST_F(CoordinatorPersistenceTest, ThreeBrokerKeyedProducerWireWaitsForIsrAndRefusesWrongOwner) {
+TEST_F(CoordinatorClusterPersistenceTest,
+       ThreeBrokerKeyedProducerWireWaitsForIsrAndRefusesWrongOwner) {
     startCluster();
     const auto id = key(1);
     auto& b = *brokers[1];
@@ -2033,7 +2038,8 @@ TEST_F(CoordinatorPersistenceTest, OwnedListingsUnreadableSourceRefusesEntireLis
     b.stop();
 }
 
-TEST_F(CoordinatorPersistenceTest, OwnedListingsClusterExcludesPoisonedNonownedCachesAndAcquires) {
+TEST_F(CoordinatorClusterPersistenceTest,
+       OwnedListingsClusterExcludesPoisonedNonownedCachesAndAcquires) {
     startCluster();
     for (int owner = 0; owner < 3; ++owner) {
         ASSERT_EQ(put(*brokers[owner], key(owner), {groupRecord(key(owner))}), ErrorCode::NONE);
@@ -2096,7 +2102,7 @@ TEST_F(CoordinatorPersistenceTest, OwnedListingsClusterExcludesPoisonedNonownedC
     }
     before_acquisition.clear();
 }
-TEST_F(CoordinatorPersistenceTest, OwnedListingsEmptyOwnedSetIsFencedAgainstNewAcquisition) {
+TEST_F(CoordinatorClusterPersistenceTest, OwnedListingsEmptyOwnedSetIsFencedAgainstNewAcquisition) {
     startCluster();
     ASSERT_EQ(put(*brokers[0], key(0), {groupRecord(key(0))}), ErrorCode::NONE);
     ASSERT_EQ(init(*brokers[0], transaction(key(0))), ErrorCode::NONE);
@@ -2390,7 +2396,8 @@ TEST_F(CoordinatorPersistenceTest, KeyedInspectionResponsesFenceEachEpochAndDrai
     }
 }
 
-TEST_F(CoordinatorPersistenceTest, KeyedInspectionClusterRefusesOtherOwnersWithPerKeyErrors) {
+TEST_F(CoordinatorClusterPersistenceTest,
+       KeyedInspectionClusterRefusesOtherOwnersWithPerKeyErrors) {
     startCluster();
     for (int owner = 0; owner < 2; ++owner) {
         ASSERT_EQ(put(*brokers[owner], key(owner), {groupRecord(key(owner))}), ErrorCode::NONE);
@@ -2971,7 +2978,8 @@ TEST_F(CoordinatorPersistenceTest, QueuedRetentionRechecksCommitRejoinAndOrigina
     b.stop();
 }
 
-TEST_F(CoordinatorPersistenceTest, ThreeBrokerOffsetWireWaitsForIsrAndAggregatesWrongOwners) {
+TEST_F(CoordinatorClusterPersistenceTest,
+       ThreeBrokerOffsetWireWaitsForIsrAndAggregatesWrongOwners) {
     startCluster();
     const auto id = key(1);
     auto& b = *brokers[1];
@@ -3291,7 +3299,7 @@ TEST_F(CoordinatorPersistenceTest,
     b.stop();
 }
 
-TEST_F(CoordinatorPersistenceTest,
+TEST_F(CoordinatorClusterPersistenceTest,
        ActualMembershipIsrWaitLeavesIoResponsiveAndPublishesOnlyAfterCommit) {
     startCluster();
     const auto id = key(1);
@@ -3747,7 +3755,7 @@ TEST_F(CoordinatorPersistenceTest, UnknownGroupProposalPreservesExactOffsetAndPe
     b.stop();
 }
 
-TEST_F(CoordinatorPersistenceTest, ThreeBrokerGroupDraftWaitsForIsrAndFencesOwnerChange) {
+TEST_F(CoordinatorClusterPersistenceTest, ThreeBrokerGroupDraftWaitsForIsrAndFencesOwnerChange) {
     startCluster();
     const auto id = key(1);
     auto& b = *brokers[1];
@@ -4135,7 +4143,7 @@ TEST_F(CoordinatorPersistenceTest, InvalidAndRejectedProposalsDoNotAppendOrPubli
     b.stop();
 }
 
-TEST_F(CoordinatorPersistenceTest, ThreeBrokerCommitSurvivesOwnerLossWithCompleteState) {
+TEST_F(CoordinatorClusterPersistenceTest, ThreeBrokerCommitSurvivesOwnerLossWithCompleteState) {
     startCluster();
     const int owner = 1;
     const auto id = key(owner);
@@ -4212,7 +4220,8 @@ TEST_F(CoordinatorPersistenceTest, ThreeBrokerCommitSurvivesOwnerLossWithComplet
     EXPECT_EQ(CoordinatorPersistenceProbe::offsets(new_broker).fetchOffset(id, "data", 0), 44);
 }
 
-TEST_F(CoordinatorPersistenceTest, IsrTimeoutDoesNotPublishOrAdmitNewMutationsUntilTailResolves) {
+TEST_F(CoordinatorClusterPersistenceTest,
+       IsrTimeoutDoesNotPublishOrAdmitNewMutationsUntilTailResolves) {
     startCluster();
     const auto id = key(1);
     auto& b = *brokers[1];
@@ -4244,7 +4253,7 @@ TEST_F(CoordinatorPersistenceTest, IsrTimeoutDoesNotPublishOrAdmitNewMutationsUn
     EXPECT_EQ(put(b, id, {offsetRecord(id, 12)}), ErrorCode::NONE);
 }
 
-TEST_F(CoordinatorPersistenceTest, InsufficientIsrBeforeAndAfterAppendCannotAcknowledge) {
+TEST_F(CoordinatorClusterPersistenceTest, InsufficientIsrBeforeAndAfterAppendCannotAcknowledge) {
     startCluster();
     const auto id = key(1);
     auto& b = *brokers[1];
@@ -4302,7 +4311,7 @@ TEST_F(CoordinatorPersistenceTest, InsufficientIsrBeforeAndAfterAppendCannotAckn
     EXPECT_NE(CoordinatorPersistenceProbe::offsets(b).fetchOffset(id, "data", 0), 11);
 }
 
-TEST_F(CoordinatorPersistenceTest, OwnershipLossDuringIsrWaitPreventsCachePublication) {
+TEST_F(CoordinatorClusterPersistenceTest, OwnershipLossDuringIsrWaitPreventsCachePublication) {
     startCluster();
     const auto id = key(1);
     auto& b = *brokers[1];
@@ -4342,7 +4351,7 @@ TEST_F(CoordinatorPersistenceTest, OwnershipLossDuringIsrWaitPreventsCachePublic
     EXPECT_FALSE(invoked);
 }
 
-TEST_F(CoordinatorPersistenceTest, ShutdownCancelsIsrWaitBeforeClosingStorage) {
+TEST_F(CoordinatorClusterPersistenceTest, ShutdownCancelsIsrWaitBeforeClosingStorage) {
     startCluster();
     const auto id = key(1);
     auto& b = *brokers[1];
@@ -4416,7 +4425,8 @@ Buffer heartbeatWire(const std::string& id) {
     return payload;
 }
 
-TEST_F(CoordinatorPersistenceTest, DeferredWireIsrWaitLeavesSingleIoThreadAndReplicaFetchLive) {
+TEST_F(CoordinatorClusterPersistenceTest,
+       DeferredWireIsrWaitLeavesSingleIoThreadAndReplicaFetchLive) {
     startCluster();
     const auto id = key(1);
     auto& b = *brokers[1];
@@ -4534,7 +4544,8 @@ TEST_F(CoordinatorPersistenceTest, DeferredShutdownWaitsForRetainedPublicationAn
     stopped.get();
 }
 
-TEST_F(CoordinatorPersistenceTest, DeferredWireOwnerLossAfterMutationBeforeDeliveryRefusesSuccess) {
+TEST_F(CoordinatorClusterPersistenceTest,
+       DeferredWireOwnerLossAfterMutationBeforeDeliveryRefusesSuccess) {
     startCluster();
     const auto id = key(1);
     auto& b = *brokers[1];
@@ -4658,7 +4669,8 @@ TEST_F(CoordinatorPersistenceTest, DeferredMutationCannotUseReacquiredEpochFromO
     EXPECT_EQ(b.logManager()->getLog("__consumer_offsets", 0)->logEndOffset(), 1);
 }
 
-TEST_F(CoordinatorPersistenceTest, DeferredShutdownCancelsActiveIsrWorkerBeforeStorageCloses) {
+TEST_F(CoordinatorClusterPersistenceTest,
+       DeferredShutdownCancelsActiveIsrWorkerBeforeStorageCloses) {
     startCluster();
     const auto id = key(1);
     auto& b = *brokers[1];
@@ -4994,7 +5006,7 @@ TEST_F(CoordinatorPersistenceTest, ProducerInspectionClosedAfterReadCannotPublis
     b.stop();
 }
 
-TEST_F(CoordinatorPersistenceTest,
+TEST_F(CoordinatorClusterPersistenceTest,
        ProducerInspectionClusterReadsRealFollowerAndRefusesUnhostedReplica) {
     startCluster();
     KawasanBroker* controller = nullptr;
