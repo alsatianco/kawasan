@@ -743,7 +743,7 @@ TEST_F(CoordinatorPersistenceTest, TransactionRegistrationSourceReadFailureLatch
 // Fault the actual RocksDB WAL descriptor, without a production test hook.
 // A read-only replacement fails write; a pipe accepts write but refuses fsync.
 int sourceWalDescriptor(const fs::path& source) {
-    struct rlimit limit{};
+    struct rlimit limit {};
     if (::getrlimit(RLIMIT_NOFILE, &limit) != 0)
         return -1;
     for (int fd = 0; fd < static_cast<int>(std::min<rlim_t>(limit.rlim_cur, 65536)); ++fd) {
@@ -4422,6 +4422,10 @@ TEST_F(CoordinatorPersistenceTest, DeferredWireIsrWaitLeavesSingleIoThreadAndRep
         return b.coordinatorLoadStatus(id, protocol::CoordinatorType::GROUP) == ErrorCode::NONE;
     }));
     ASSERT_EQ(put(b, id, {offsetRecord(id, 10)}), ErrorCode::NONE);
+    // Freeze owner maintenance after setup so its periodic acquisition sweep
+    // cannot race the response's nonblocking publication fence. Follower Fetch
+    // RPCs still advance the owner's HW on its single socket IO thread.
+    b.replicaManager()->stop();
     brokers[0]->replicaManager()->stop();
     brokers[2]->replicaManager()->stop();
     CoordinatorExecutorProbe::wire(b, id, [&](auto& context) {

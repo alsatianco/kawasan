@@ -8,6 +8,9 @@ For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgr
 
 ## 2026-10-17
 
+- Synchronize the deferred ISR socket fixture by pausing the owner's periodic
+  acquisition sweep while follower Fetch RPCs commit the write. The response
+  keeps its exact success assertion and original publication fences.
 - Allow durable Raft voters 500 ms to reply and randomize elections over
   500–1000 ms, so slower term/vote persistence can form a stable quorum.
   Ready quorums still proceed immediately; heartbeat cadence is 50 ms.
