@@ -456,6 +456,13 @@ There are six message types (`enum class RaftMessageType : uint8_t`):
 
 Log entries (`struct LogEntry`) carry a term, index, command type, and serialized command bytes. For the exact per-field byte layout and encode/decode of each message, see `include/kawasan/raft/raft_protocol.h` (and the `encode`/`decode` functions in `src/raft/raft_protocol.cpp`) — that header is the authoritative wire spec rather than reproducing every field table here. In a multi-node group a newly elected leader first appends a `noop` entry of its own term (Raft §5.4.2), so entries committed by the previous leader reach every state machine without waiting for the next command. `MetadataController` ignores `noop` entries.
 
+Raft randomizes election timeouts between 500 and 1000 ms and collects ready
+votes for up to 500 ms, returning as soon as a quorum is available. This budget
+allows synchronous term/vote persistence on candidates and voters; discarding
+votes after 100 ms caused repeated elections on slower durable storage. Leader
+heartbeats run every 50 ms. Metadata currency leases still independently fence
+brokers that lose leader contact or quorum acknowledgements.
+
 Outgoing RPCs run on a dedicated thread per peer inside `RaftTransport`, never on the io_context that serves incoming RPCs. Connects are bounded and done outside the transport lock. Each one is bounded by a deadline: 1 s, or 10 s for InstallSnapshot. Sockets are non-blocking and waits use `poll()`. An RPC still queued past its deadline fails without being sent, and a socket that timed out is never reused. Before this, the broker's single Raft io thread did blocking reads with no timeout. One frozen peer wedged it for good, and two nodes calling each other at once (for example two election candidates) deadlocked permanently.
 
 ### Known limitation: Raft TLS is not enforced

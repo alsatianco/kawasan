@@ -394,7 +394,7 @@ std::shared_ptr<tcp::socket> RaftTransport::get_connection(
     auto socket = std::make_shared<tcp::socket>(io_context_);
     try {
         connectWithDeadline(*socket, host, port, deadline);
-        // Heartbeats must fit within the 150ms minimum election timeout.
+        // Small heartbeats must stay well within the election timeout.
         // Nagle can hold a small RPC behind a delayed ACK, especially on macOS.
         socket->set_option(tcp::no_delay(true));
     } catch (const std::exception& e) {

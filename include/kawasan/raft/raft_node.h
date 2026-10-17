@@ -204,7 +204,10 @@ private:
     std::chrono::steady_clock::time_point last_leader_contact_{};
     int64_t first_leader_commit_ = -1;
     static constexpr std::chrono::milliseconds kCatchUpAfterContactGap{1000};
-    std::chrono::milliseconds election_timeout_{150};
+    // Durable term/vote writes and their replies must fit within an election.
+    static constexpr std::chrono::milliseconds kMinimumElectionTimeout{500};
+    static constexpr std::chrono::milliseconds kMaximumElectionTimeout{1000};
+    std::chrono::milliseconds election_timeout_{kMinimumElectionTimeout};
     std::chrono::milliseconds heartbeat_interval_{50};
 
     std::atomic<bool> running_{false};

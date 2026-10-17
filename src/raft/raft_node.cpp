@@ -133,7 +133,7 @@ void RaftNode::stop() {
 
         // Phase 5.2: wake the CV-driven election thread immediately so
         // shutdown is bounded by lock contention rather than the election
-        // timeout (previously up to 300 ms).
+        // timeout.
         election_cv_.notify_all();
 
         if (election_thread_.joinable()) {
@@ -548,7 +548,7 @@ void RaftNode::startElection() {
     for (const auto& peer : peers_) {
         responses.push_back(transport_->sendRequestVote(peer.id, request));
     }
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    const auto deadline = std::chrono::steady_clock::now() + kMinimumElectionTimeout;
     // Count ready replies from every peer before waiting again. A frozen
     // first peer must not consume the response window after a live quorum
     // has voted: that delay can let the voters' election timers expire.
@@ -767,10 +767,13 @@ std::map<BrokerId, int64_t> RaftNode::peerAckAgesMs() const {
 }
 
 void RaftNode::resetElectionTimeout() {
-    // Random timeout between 150-300ms
+    // Leave room for synchronous term/vote persistence on both candidates and
+    // voters. A 100ms reply budget and 150ms election floor repeatedly discarded
+    // healthy durable votes on slower disks.
     std::random_device rd;
     std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(150, 300);
+    std::uniform_int_distribution<> dis(kMinimumElectionTimeout.count(),
+                                        kMaximumElectionTimeout.count());
 
     election_timeout_ = std::chrono::milliseconds(dis(gen));
     last_heartbeat_ = std::chrono::steady_clock::now();

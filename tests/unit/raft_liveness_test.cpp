@@ -493,7 +493,7 @@ TEST(RaftLivenessTest, FrozenFirstPeerDoesNotBlockElection) {
 }
 
 // A ready quorum must be counted before the frozen first peer consumes the
-// 100ms response window, leaving too little time for the first heartbeat.
+// response window, leaving too little time for the first heartbeat.
 TEST(RaftLivenessTest, ReadyQuorumDoesNotWaitForFrozenFirstVote) {
     NodeIo frozen_io;
     NodeIo live_io;
@@ -571,6 +571,38 @@ TEST(RaftLivenessTest, DelayedVoteReplyCannotRollBackANewerTerm) {
         EXPECT_GE(node.currentTerm(), newer_term);
         std::this_thread::sleep_for(1ms);
     }
+    node.stop();
+    peer.stop();
+}
+
+// Durable voters may need multiple synchronous writes before acknowledging a
+// higher term and its vote. A healthy 200ms reply must not miss every election.
+TEST(RaftLivenessTest, SlowDurableVoteStillElectsAndCommits) {
+    NodeIo peer_io;
+    NodeIo node_io;
+    RaftTransport peer(peer_io.io, 1);
+    const int peer_port = freePort();
+    peer.start(peer_port);
+    peer.setRequestVoteHandler([](const RequestVoteRequest& request) {
+        std::this_thread::sleep_for(200ms);
+        return RequestVoteResponse{request.term, true};
+    });
+    peer.setAppendEntriesHandler([](const AppendEntriesRequest& request) {
+        AppendEntriesResponse response;
+        response.term = request.term;
+        response.success = true;
+        response.last_log_index = request.prev_log_index + request.entries.size();
+        return response;
+    });
+    RaftNode node(0, {{1, "127.0.0.1", peer_port}}, node_io.io, freePort(), "");
+    node.setCommitCallback([](const LogEntry&) {});
+    node.start();
+    const auto deadline = std::chrono::steady_clock::now() + 4s;
+    while ((!node.isLeader() || node.commitIndex() == 0) &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(5ms);
+    EXPECT_TRUE(node.isLeader());
+    EXPECT_GT(node.commitIndex(), 0);
     node.stop();
     peer.stop();
 }

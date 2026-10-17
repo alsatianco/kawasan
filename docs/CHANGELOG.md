@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 For configuration details see [./CONFIGURATION.md](./CONFIGURATION.md); for upgrade and operational procedures see [./OPERATIONS.md](./OPERATIONS.md); for the full protocol surface see [./api_coverage_matrix.md](./api_coverage_matrix.md).
 
+## 2026-10-17
+
+- Allow durable Raft voters 500 ms to reply and randomize elections over
+  500–1000 ms, so slower term/vote persistence can form a stable quorum.
+  Ready quorums still proceed immediately; heartbeat cadence is 50 ms.
+
 ## 2026-10-16
 
 - Register coordinator transaction-timeout tests as a separate bounded CTest
